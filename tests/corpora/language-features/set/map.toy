@@ -1,0 +1,24 @@
+# Feature: `Set.map` returns a new Set of `f(x)` for each element, in insertion order; two
+# elements that map to one value leave one, at the first one's place. The element type may
+# change (`int` to `str` or `bool`), and it must be Hashable, as for any Set.
+# expect: stdout "2 1 4 \nodd even \n"
+# expect: exit 32
+import std/io
+import std/set
+
+fn main() -> int {
+    s := Set[int].new()
+    s.add(5)
+    s.add(3)
+    s.add(9)
+    s.add(4)
+    halves := s.map(fn(x) { x / 2 })
+    halves.each(fn(h) { io.print(h.to_string().concat(" ")) })
+    io.println("")
+    kinds := s.map(fn(x) { if x % 2 == 0 { "even" } else { "odd" } })
+    kinds.each(fn(k) { io.print(k.concat(" ")) })
+    io.println("")
+    flags := s.map(fn(x) { x > 4 })
+    if halves.contains(0) || !kinds.contains("odd") { return 1 }
+    return halves.len() * 10 + flags.len()
+}

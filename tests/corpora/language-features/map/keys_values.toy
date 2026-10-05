@@ -1,0 +1,32 @@
+# Feature: `Map.keys()` and `Map.values()` (from std/mapvec) return a new `Vec` of the keys or
+# the values in insertion order. Nine keys force a grow, and overwriting the first key keeps it first. The
+# Vecs work with the Vec closure methods: `fold` sums the values (154 + 1), and sorting
+# `keys()` sorts only that Vec, so the Map's own order is unchanged.
+# expect: stdout "2 3 5 7 11 13 17 19 21 \n"
+# expect: exit 155
+import std/io
+import std/map
+import std/mapvec
+import std/vec
+
+fn main() -> int {
+    m := Map[int, int].new()
+    order: Vec[int] = [21, 5, 13, 3, 11, 19, 7, 2, 17]
+    order.each(fn(k) { m.set(k, k * 2) })
+    m.set(21, 1)
+    ks := m.keys()
+    vs := m.values()
+    if ks.len() != 9 || vs.len() != 9 { return 1 }
+    if ks.first().unwrap_or(0) != 21 || vs.first().unwrap_or(0) != 1 { return 2 }
+    if ks[8] != 17 || vs[8] != 34 { return 3 }
+    sorted := m.keys()
+    sorted.sort()
+    sorted.each(fn(k) {
+        io.print(k)
+        io.print(" ")
+    })
+    io.println("")
+    m.keys().sort()
+    if m.keys().first().unwrap_or(0) != 21 { return 4 }
+    return vs.fold(0, fn(acc, v) { acc + v })
+}

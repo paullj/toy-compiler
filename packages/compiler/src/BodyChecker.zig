@@ -3063,7 +3063,8 @@ pub const BodyChecker = struct {
                 try bc.drainArgs(args);
                 const name = bc.nameText(bc.tree.nodes[recv.lhs.int()].main_token);
                 const ref_struct = if (bc.model.prelude) |pre| pre.ref_struct else null;
-                const hint = if (ref_struct == e.ctor) bc.refImportHint(e.ctor, member) else "";
+                var hb: [64]u8 = undefined;
+                const hint = importHint(&hb, if (ref_struct == e.ctor) bc.stdMethodModule(.ref, member) else null);
                 try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' has no associated function '{s}'{s}", .{ name, member, hint });
                 return .invalid;
             };
@@ -3100,7 +3101,8 @@ pub const BodyChecker = struct {
                     // when no module of the program brought it in.
                     if (bc.model.prelude) |pre| if (pre.ref_struct) |rs| if (sid == rs) {
                         try bc.drainArgs(args);
-                        try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' has no associated function '{s}'{s}", .{ name, member, bc.refImportHint(rs, member) });
+                        var hb: [64]u8 = undefined;
+                        try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' has no associated function '{s}'{s}", .{ name, member, importHint(&hb, bc.stdMethodModule(.ref, member)) });
                         return .invalid;
                     };
                 }
@@ -3392,33 +3394,38 @@ pub const BodyChecker = struct {
         try bc.sink.report(.{ .span = bc.tokSpan(recv.main_token), .code = .T0016 }, "cannot infer type parameter for '{s}.{s}'; add explicit type arguments, e.g. {s}[int].{s}", .{ name, member, name, member });
     }
 
-    /// "; add 'import std/ref'" for a missing method `member` of the prelude `Ref` (`rs`),
-    /// when std/ref is not in the program: `member` is one std/ref declares, or no module
-    /// declares any method on `Ref`. Else "".
-    fn refImportHint(bc: *const BodyChecker, rs: u32, member: []const u8) []const u8 {
-        const hint = comptime "; add 'import std/" ++ StdNames.importHintFor("Ref").?.module ++ "'";
-        for (StdNames.ref_methods) |rm| if (std.mem.eql(u8, rm, member)) return hint;
-        for (bc.model.templates) |tm| if (tm.recv_ctor == rs and !tm.recv_is_enum) return "";
-        return hint;
+    /// The std module to import for a missing method `member` of the type whose ctor or
+    /// kind is `family`, or null when importing one would not provide it. `Ref`'s every
+    /// method comes from std/ref, so while no module declares one, any member names it.
+    fn stdMethodModule(bc: *const BodyChecker, family: StdNames.MethodFamily, member: []const u8) ?[]const u8 {
+        if (StdNames.methodModule(family, member)) |m| return m;
+        if (family != .ref) return null;
+        const rs = (bc.model.prelude orelse return null).ref_struct orelse return null;
+        for (bc.model.templates) |tm| if (tm.recv_ctor == rs and !tm.recv_is_enum) return null;
+        return StdNames.familyModule(.ref);
     }
 
-    /// "; add 'import std/<m>'" when `member` is a method std/<m> declares on the prelude
-    /// type `recv_ty`, so its absence means the module is not in the program. Else "".
-    fn stdImportHint(bc: *const BodyChecker, recv_ty: Type, member: []const u8) []const u8 {
-        if (recv_ty.kind == .str) {
-            for (StdNames.str_methods) |n| if (std.mem.eql(u8, n, member)) return "; add 'import std/str'";
-            return "";
-        }
-        if (!recv_ty.isApp()) return "";
+    /// The family of `recv_ty` whose methods partly live in a std module (`StdNames`).
+    fn methodFamily(bc: *const BodyChecker, recv_ty: Type) ?StdNames.MethodFamily {
+        if (recv_ty.kind == .str) return .str;
+        if (!recv_ty.isApp()) return null;
         const e = bc.composite.at(recv_ty.appIdx());
-        if (!e.ctor_is_enum) return "";
-        const names: []const []const u8 = switch (Typecheck.optResultFamilyOf(bc.model, e.ctor)) {
-            .none => return "",
-            .option => &StdNames.option_methods,
-            .result => &StdNames.result_methods,
+        if (e.ctor_is_enum) return switch (Typecheck.optResultFamilyOf(bc.model, e.ctor)) {
+            .none => null,
+            .option => .option,
+            .result => .result,
         };
-        for (names) |n| if (std.mem.eql(u8, n, member)) return "; add 'import std/option'";
-        return "";
+        if (bc.model.prelude) |p| if (p.ref_struct == e.ctor) return .ref;
+        if (e.ctor >= bc.model.structs.len) return null;
+        const sym = bc.model.structs[e.ctor];
+        if (std.mem.eql(u8, sym.name, StdNames.map_struct) and bc.model.graph.mods[sym.mod].bundled) return .map;
+        return null;
+    }
+
+    /// "; add 'import std/<module>'" into `buf` for `stdMethodModule`, else "".
+    fn importHint(buf: []u8, module: ?[]const u8) []const u8 {
+        const m = module orelse return "";
+        return std.fmt.bufPrint(buf, "; add 'import std/{s}'", .{m}) catch "";
     }
 
     /// Type a bare `Box.new(5)`: bind the impl's type params from the value args alone,
@@ -4630,9 +4637,8 @@ pub const BodyChecker = struct {
     /// candidate set is the concrete-receiver methods plus, for a generic-instance (`App`)
     /// receiver, its ctor's template methods (so `xs.pushh(1)` on a Vec suggests `push`).
     fn emitNoMethod(bc: *BodyChecker, at: Span, member: []const u8, recv_ty: Type) error{OutOfMemory}!void {
-        const std_hint = bc.stdImportHint(recv_ty, member);
-        if (std_hint.len != 0)
-            return bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'{s}", .{ member, bc.typeName(recv_ty), std_hint });
+        if (bc.methodFamily(recv_ty)) |fam| if (bc.stdMethodModule(fam, member)) |module|
+            return bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'; add 'import std/{s}'", .{ member, bc.typeName(recv_ty), module });
         var iter = MethodNameIter{ .methods = bc.model.methods, .recv = recv_ty };
         if (recv_ty.isApp()) {
             const e = bc.composite.at(recv_ty.appIdx());
@@ -4644,7 +4650,7 @@ pub const BodyChecker = struct {
         if (nearmiss.suggest(member, iter)) |cand|
             try bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'; did you mean '{s}'?", .{ member, bc.typeName(recv_ty), cand })
         else
-            try bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'{s}", .{ member, bc.typeName(recv_ty), if (bc.refPayload(recv_ty).kind != .invalid) bc.refImportHint(bc.model.prelude.?.ref_struct.?, member) else "" });
+            try bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
     }
 
     pub fn activeStructMap(bc: *const BodyChecker) *const std.StringHashMapUnmanaged(u32) {

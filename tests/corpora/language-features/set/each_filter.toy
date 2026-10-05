@@ -1,0 +1,22 @@
+# Feature: `Set.each` calls `f(x)` once per element in insertion order (adding 5 again keeps
+# its first place), and `Set.filter` returns a new Set of the elements whose `f(x)` is true,
+# in the same order.
+# expect: stdout "539\n59\n"
+# expect: exit 2
+import std/io
+import std/set
+
+fn main() -> int {
+    s := Set[int].new()
+    s.add(5)
+    s.add(3)
+    s.add(5)
+    s.add(9)
+    s.each(fn(x) { io.print(x) })
+    io.println("")
+    kept := s.filter(fn(x) { x != 3 })
+    kept.each(fn(x) { io.print(x) })
+    io.println("")
+    if s.len() != 3 || kept.contains(3) { return 1 }
+    return kept.len()
+}

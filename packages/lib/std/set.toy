@@ -8,7 +8,9 @@ import std/iter
 # a cell is `size_of[T] + 0` bytes and the value store/load are no-ops. The `[T has Hashable]`
 # bound mirrors `Map`'s: it makes a non-Hashable element a clean T0023 at the user's `Set[..]`
 # call, naming the type and `Hashable`, instead of pointing inside this file. `new` is an
-# ASSOCIATED function, called `Set[int].new()`.
+# ASSOCIATED function, called `Set[int].new()`. Every walk (`for x`, `each`, `filter`, `map`)
+# visits elements in insertion order: the order they were first added; adding one again keeps
+# its place.
 pub struct Set[T] { m: Map[T, ()] }
 
 impl Set[T has Hashable] {
@@ -30,6 +32,39 @@ impl Set[T has Hashable] {
 
     fn iter(self) -> SetIter[T] {
         return SetIter[T] { m: self.m, i: -1 }
+    }
+
+    fn each(self, f: fn(T)) {
+        n := mem.mp_len[T, ()](self.m.h)
+        i := 0
+        while i < n {
+            f(mem.mp_key_at[T, ()](self.m.h, i))
+            i = i + 1
+        }
+    }
+
+    fn filter(self, f: fn(T) -> bool) -> Set[T] {
+        n := mem.mp_len[T, ()](self.m.h)
+        out := Set[T].new()
+        i := 0
+        while i < n {
+            x := mem.mp_key_at[T, ()](self.m.h, i)
+            if f(x) { out.add(x) }
+            i = i + 1
+        }
+        return out
+    }
+
+    # Two elements that map to one value leave one, at the first one's place.
+    fn map[U has Hashable](self, f: fn(T) -> U) -> Set[U] {
+        n := mem.mp_len[T, ()](self.m.h)
+        out := Set[U].new()
+        i := 0
+        while i < n {
+            out.add(f(mem.mp_key_at[T, ()](self.m.h, i)))
+            i = i + 1
+        }
+        return out
     }
 }
 

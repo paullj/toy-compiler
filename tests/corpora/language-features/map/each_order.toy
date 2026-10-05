@@ -1,0 +1,22 @@
+# Feature: `Map.each` calls `f(k, v)` once per entry in insertion order: the order the keys
+# were first set. Setting "b" again updates its value in place and keeps its first place, so
+# the walk prints `bac` and sums the updated value (4 + 2 + 3).
+# expect: stdout "bac\n"
+# expect: exit 9
+import std/io
+import std/map
+
+fn main() -> int {
+    m := Map[str, int].new()
+    m.set("b", 1)
+    m.set("a", 2)
+    m.set("c", 3)
+    m.set("b", 4)
+    total := 0
+    m.each(fn(k, v) {
+        io.print(k)
+        total = total + v
+    })
+    io.println("")
+    return total
+}

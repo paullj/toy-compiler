@@ -1,0 +1,25 @@
+# Feature: `Map.filter` returns a new Map of the entries whose `f(k, v)` is true, in the
+# receiver's insertion order; the receiver keeps all its entries. A filter can test the key,
+# the value or both, and one that keeps nothing returns an empty Map.
+# expect: stdout "c=3\nb=2\n"
+# expect: exit 32
+import std/io
+import std/map
+
+fn main() -> int {
+    m := Map[str, int].new()
+    m.set("c", 3)
+    m.set("a", 1)
+    m.set("b", 2)
+    big := m.filter(fn(_k, v) { v > 1 })
+    for k, v in big {
+        io.print(k)
+        io.print("=")
+        io.println(v)
+    }
+    if big.get("a").is_some() { return 1 }
+    not_a := m.filter(fn(k, _v) { k != "a" })
+    none := m.filter(fn(k, v) { k == "z" || v > 9 })
+    if none.len() != 0 { return 2 }
+    return big.len() * 10 + not_a.len() * 5 + m.len() - 1
+}

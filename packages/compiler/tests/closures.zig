@@ -289,7 +289,13 @@ test "every std method that takes a closure keeps its caller's env in the frame 
     defer gpa.free(o1);
     const o0 = try harness.emitIr(gpa, io, cases_dir ++ "/escape_std_methods.toy", &.{"-O0"});
     defer gpa.free(o0);
-    for ([_][]const u8{ "escape_std_methods.vec_methods", "escape_std_methods.option_methods" }) |owner| {
+    const owners = [_][]const u8{
+        "escape_std_methods.vec_methods",
+        "escape_std_methods.option_methods",
+        "escape_std_methods.map_methods",
+        "escape_std_methods.set_methods",
+    };
+    for (owners) |owner| {
         const body1 = harness.irBody(o1, owner) orelse return error.TestExpectedOwner;
         if (std.mem.indexOf(u8, body1, "call @gc_alloc") != null) {
             std.debug.print("{s} allocates at -O1: a std method it calls keeps its closure\n", .{owner});
