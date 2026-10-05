@@ -1,0 +1,30 @@
+struct Box[T] { v: T }
+impl Box[T] {
+    fn tag[U](self) -> int { 0 }
+    fn with[U](v: T, _u: U) -> Box[T] { Box { v: v } }
+    fn pick[U](self, a: U, _b: U) -> U { a }
+    fn map[U](self, f: fn(T) -> U) -> Box[U] { Box { v: f(self.v) } }
+    fn conv[T](self, x: T) -> T { x }  #~ ERROR [T0053] already the impl's
+}
+struct Pair[A, B] { a: A, b: B }
+impl Pair[T, int] {  #~ ERROR [T0013] partly concrete or repeats a name
+    fn first(self) -> int { 1 }
+}
+struct P { v: int }
+impl P {
+    fn conv[U](self, f: fn(int) -> U) -> U { f(self.v) }
+}
+
+fn main() -> int {
+    b := Box { v: 20 }
+    p := P { v: 4 }
+    _t := b.tag()  #~ ERROR [T0016] of method 'tag'
+    _k := b.pick(1, true)  #~ ERROR [T0015]
+    _c := p.conv(fn(x: int) { x * 3 })  #~ ERROR [T0013] declares its own type parameters
+    _d := p.conv(fn(x) { x * 3 })  #~ ERROR [T0013] declares its own type parameters
+    _m := b.map(fn(x, y) { x + y })  #~ ERROR [T0039] the expected type fn(int) -> U takes 1
+    _n := b.map(fn(x: int, y: int) { x + y })  #~ ERROR [T0040] expected fn(int) -> U, got fn(int, int) -> int
+    _a := b.map()  #~ ERROR [T0039] 'map' takes (fn(int) -> U)
+    _w := Box[int].with  #~ ERROR [T0049] associated function
+    return 0
+}

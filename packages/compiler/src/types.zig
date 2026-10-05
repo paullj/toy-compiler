@@ -2914,20 +2914,64 @@ fn sealCallees(t: *Typecheck) void {
 }
 
 /// Each slot is a pure lookup over the final method table by reified receiver and
-/// member, so the order slots are sealed in cannot matter. An unresolvable slot becomes
-/// `.none` rather than a panic: `toy check` accepts such a program and only codegen
-/// rejects it.
+/// member (and, for a call of a method with its own type params, by the call's reified
+/// arg types), so the order slots are sealed in cannot matter. An unresolvable slot
+/// becomes `.none` rather than a panic: `toy check` accepts such a program and only
+/// codegen rejects it.
 fn sealSlice(t: *const Typecheck, mod: u32, nts: []const Type, cs: []Callee) void {
     const mc = &t.graph.mods[mod];
     for (cs, 0..) |*c, i| {
         if (c.tag != .pending) continue;
         const fa = mc.tree.nodes[i];
         const member = mc.tokens[fa.main_token].text(mc.source);
+        if (c.sub == Callee.pending_call_sub) {
+            c.* = t.pickInstanceRow(mc, nts, fa, member, c.id);
+            continue;
+        }
         c.* = switch (pickMethodIndex(t.methods.items, nts[fa.lhs.int()], member, null, null)) {
             .one => |mi| if (c.sub == Callee.pending_bound.sub) Callee.boundMethod(mi) else Callee.method(mi),
             .none, .ambiguous => .{},
         };
     }
+}
+
+/// The instance row an own-generic call selects: the first row, in table order, with an
+/// instance, the call's reified receiver and member, whose instance params accept the
+/// call's reified args (`Type.assignable`, as `Mono.findByReifiedParams`). A static row's
+/// params are all value params; an instance method's `params[0]` is `self`. Every row is
+/// matched, never just the only candidate, so a check/discovery disagreement surfaces as
+/// a lowering error rather than a wrong instance. A call whose args did not check picks
+/// no row (another call's instance would show the wrong types) but keeps its template.
+fn pickInstanceRow(t: *const Typecheck, mc: *const GraphCtx.ModuleCtx, nts: []const Type, fa: Ast.Node, member: []const u8, call: u32) Callee {
+    const recv = nts[fa.lhs.int()];
+    const args = Ast.rangeSlice(mc.tree, mc.tree.nodes[call].rhs.int());
+    for (args) |a| if (nts[a.int()].kind == .invalid) return t.templateCallee(recv, member);
+    rows: for (t.methods.items, 0..) |m, mi| {
+        const ii = m.instance orelse continue;
+        if (!Type.eql(m.recv, recv) or !std.mem.eql(u8, m.name, member)) continue;
+        const ps = t.mono.items[ii].params;
+        const off: usize = if (m.is_static) 0 else 1;
+        if (ps.len != args.len + off) continue;
+        for (ps[off..], args) |p, a| if (!Type.assignable(p, nts[a.int()])) continue :rows;
+        return Callee.method(@intCast(mi));
+    }
+    return t.templateCallee(recv, member);
+}
+
+/// `Callee.template` for the generic method `member` of the type `recv` reified from,
+/// else none. Only a call that already failed to check gets here, so the scan of the
+/// reify table is off the hot path.
+fn templateCallee(t: *const Typecheck, recv: Type, member: []const u8) Callee {
+    if (recv.kind != .@"struct" and recv.kind != .@"enum") return .{};
+    var it = t.reify_map.iterator();
+    while (it.next()) |kv| {
+        if (!Type.eql(kv.value_ptr.*, recv)) continue;
+        const e = t.composite.at(kv.key_ptr.*);
+        if (e.is_fn) continue;
+        const m = findGenericMethod(t.templates.items, e.ctor, e.ctor_is_enum, member) orelse return .{};
+        return Callee.template(m.fn_id);
+    }
+    return .{};
 }
 
 /// Whether module `importer` directly imports the module with id `target` (any namespace
@@ -3004,6 +3048,47 @@ pub fn bindImplParams(gpa: std.mem.Allocator, composite: *Composite, mf: FnSym, 
     }
 }
 
+/// The impl's own type params at the front of `mf.generic_params` (the parser puts them
+/// first): one past the largest `type_var` ordinal among the `Self` pattern's args, 0
+/// when the `Self` type is not an `App`. Any params past it are the method's own.
+pub fn implParamCount(composite: *Composite, mf: FnSym) u32 {
+    if (!mf.self_type.isApp()) return 0;
+    var n: u32 = 0;
+    for (composite.at(mf.self_type.appIdx()).args) |a| {
+        if (a.isTypeVar()) n = @max(n, a.typeVarOrd() + 1);
+    }
+    return n;
+}
+
+/// Whether a method of a generic type declares type params of its own (`fn map[U]`),
+/// which its call's args bind rather than its receiver.
+pub fn hasOwnTypeParams(composite: *Composite, mf: FnSym) bool {
+    return implParamCount(composite, mf) < mf.generic_params.len;
+}
+
+/// The type args of a call of a method with its own type params (`b.map(f)` for
+/// `fn map[U](self, f: fn(T) -> U)`, or `Box.with(3, true)`): one left-to-right match of
+/// `[Self] ++ params` against `[recv] ++` the value args' `node_types`, the final match
+/// Pass C's `inferArgs` runs, so both pick one instance. Null for any other method or
+/// call; the caller owns the slice.
+fn ownGenericArgs(gpa: std.mem.Allocator, composite: *Composite, mf: FnSym, has_self: bool, tree: Ast.Tree, node_types: []const Type, call: Ast.Node, recv: Type) error{OutOfMemory}!?[]Type {
+    if (!hasOwnTypeParams(composite, mf)) return null;
+    const args = Ast.rangeSlice(tree, call.rhs.int());
+    const n_params = mf.params.len + @intFromBool(!has_self);
+    if (args.len + 1 != n_params) return null;
+    const params = try gpa.alloc(Type, n_params);
+    defer gpa.free(params);
+    if (has_self) @memcpy(params, mf.params) else {
+        params[0] = mf.self_type;
+        @memcpy(params[1..], mf.params);
+    }
+    const arg_types = try gpa.alloc(Type, n_params);
+    defer gpa.free(arg_types);
+    arg_types[0] = recv;
+    for (args, arg_types[1..]) |a, *at| at.* = node_types[a.int()];
+    return Infer.infer(gpa, @intCast(mf.generic_params.len), params, arg_types, composite.decomposer());
+}
+
 /// The read-only view mono discovery hands `Mono.callInstanceRef`: the module's
 /// tree/resolutions + the pass's `node_types`, plus `genericTemplate` derived from
 /// the `FnSym` (`generic_params.len` is the inference count — the fingerprint side
@@ -3065,14 +3150,17 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
             // `impl Box[T]` method TEMPLATE. Bind the impl's type-params by matching the
             // template's `Self` pattern-args against the receiver App's concrete args —
             // the SAME `Infer.match` Pass C runs — then enqueue `(method_gid, targs)`.
-            // (A method's OWN `[U]` generics are not inferred here; only the impl's
-            // params bind, so `n_gp` == the impl's param count — deferred.)
+            // A method with its own `[U]` binds them from the call's value args too.
             const recv = node_types[callee.lhs.int()];
             if (!recv.isApp()) continue;
             const re = t.composite.at(recv.appIdx());
             const member = mc.tokens[callee.main_token].text(mc.source);
             const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, member) orelse continue;
-            const out = (try bindImplParams(t.gpa, t.composite, model.fns[m.fn_id], re.args)) orelse continue;
+            const mf = model.fns[m.fn_id];
+            const out = (if (hasOwnTypeParams(t.composite, mf))
+                try ownGenericArgs(t.gpa, t.composite, mf, m.has_self, tree, node_types, n, recv)
+            else
+                try bindImplParams(t.gpa, t.composite, mf, re.args)) orelse continue;
             defer t.gpa.free(out);
             var conc = true;
             for (out) |ta| {
@@ -3891,6 +3979,23 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
         gnames = try t.gpa.alloc([]const u8, proto.generic_params.len);
         for (proto.generic_params, 0..) |gp, i| gnames[i] = t.nameText(t.tree.nodes[gp.int()].main_token);
     }
+    // Every use of a repeated name resolves to its first param, so a later one could
+    // never be bound. The impl's own pattern is checked once, below, against `Self`.
+    const impl_n: usize = if (recv_type != Ast.none and t.tree.nodes[recv_type.int()].tag == .type_app)
+        Ast.rangeSlice(t.tree, t.tree.nodes[recv_type.int()].rhs.int()).len
+    else
+        0;
+    for (proto.generic_params, 0..) |gp, i| {
+        if (i < impl_n) continue;
+        for (gnames[0..i], 0..) |prev, j| if (std.mem.eql(u8, prev, gnames[i])) {
+            const span = t.tokSpan(t.tree.nodes[gp.int()].main_token);
+            if (j < impl_n)
+                try t.sink.report(.{ .span = span, .code = .T0053 }, "type parameter '{s}' is already the impl's; give the method's own a different name", .{gnames[i]})
+            else
+                try t.sink.report(.{ .span = span, .code = .T0053 }, "type parameter '{s}' is declared twice", .{gnames[i]});
+            break;
+        };
+    }
     // Put the fn's generic params in scope BEFORE decoding the bound args, so a bound arg
     // referencing another param resolves to a `type_var` rather than an unknown type.
     t.cur_generic_params = gnames;
@@ -3974,6 +4079,12 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                 try t.sink.report(.{ .span = t.spanOf(recv_type) }, "an inherent 'impl' on a concrete type instance is not yet supported (use 'impl Box[T]')", .{});
                 return;
             }
+            // The impl's params are the pattern's args, in order: a concrete or repeated
+            // arg would leave a param no receiver binds.
+            for (e.args, 0..) |a, i| if (!a.isTypeVar() or a.typeVarOrd() != i) {
+                try t.sink.report(.{ .span = t.spanOf(recv_type), .code = .T0013 }, "an inherent 'impl' whose pattern is partly concrete or repeats a name is not yet supported; name each type parameter once, as in 'impl Pair[A, B]'", .{});
+                return;
+            };
             try t.templates.append(t.gpa, .{
                 .recv_ctor = e.ctor,
                 .recv_is_enum = e.ctor_is_enum,
@@ -9554,7 +9665,7 @@ test "an unannotated param with no expected type is T0050 (incl. a generic call 
     const gpa = testing.allocator;
     const srcs = [_][]const u8{
         "fn main() -> int {\n f := fn(x) { x }\n return f(1)\n}\n",
-        "fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }\nfn main() -> int { return apply(fn(x) { x }, 1) }\n",
+        "fn apply1[T](f: fn(T) -> T) -> int { 0 }\nfn main() -> int { return apply1(fn(x) { x }) }\n",
         "fn main() -> int { return fn(x) { x }(1) }\n",
     };
     for (srcs) |src| {
@@ -9567,13 +9678,17 @@ test "an unannotated param with no expected type is T0050 (incl. a generic call 
     var ok = try checkSource("fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }\nfn main() -> int { return apply(fn(x: int) { x * 2 }, 21) }\n");
     defer ok.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
+    // Another arg of the generic call binds what the lambda's param needs.
+    var bound = try checkSource("fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }\nfn main() -> int { return apply(fn(x) { x }, 1) }\n");
+    defer bound.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), bound.result.diags.len);
 }
 
 test "T0050 names a generic call only when one expected the lambda" {
     const gpa = testing.allocator;
     const cases = [_]struct { src: []const u8, generic: bool }{
         .{ .src = "fn main() -> int {\n f := fn(x) { x }\n return f(1)\n}\n", .generic = false },
-        .{ .src = "fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }\nfn main() -> int { return apply(fn(x) { x }, 1) }\n", .generic = true },
+        .{ .src = "fn apply1[T](f: fn(T) -> T) -> int { 0 }\nfn main() -> int { return apply1(fn(x) { x }) }\n", .generic = true },
     };
     for (cases) |cs| {
         var c = try checkSource(cs.src);
@@ -9632,25 +9747,30 @@ test "an expected fn type gives a capture its param type before the call does" {
     try expectOneDiag("fn add(a: int, b: int) -> int { a + b }\nfn main() -> int {\n h: fn(int8) -> int = add(1, _)\n return h(1)\n}\n", .T0040, "argument 2: expected int, got int8; 'add' takes (int, int)");
 }
 
-test "a capture in a bare generic call is typed by its own call; a written lambda is still T0050" {
+test "a capture in a bare generic call is typed by its own call; a written lambda takes the type the other args bind" {
     const gpa = testing.allocator;
     const pre = "fn add(a: int, b: int) -> int { a + b }\nfn twice[T](f: fn(T) -> T, x: T) -> T { f(f(x)) }\n";
     var ok = try checkSource(pre ++ "fn main() -> int { return twice(add(1, _), 5) }\n");
     defer ok.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
-    try expectOnlyDiag(pre ++ "fn main() -> int { return twice(fn(v) { add(1, v) }, 5) }\n", .T0050);
+    var lam = try checkSource(pre ++ "fn main() -> int { return twice(fn(v) { add(1, v) }, 5) }\n");
+    defer lam.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), lam.result.diags.len);
+    try testing.expect(Type.eql(Type.int, lambdaParamType(&lam, try nthLambda(&lam, 0), 0)));
 }
 
 test "a capture whose '_' no position types is one diagnostic" {
     const gpa = testing.allocator;
-    const pre = "fn pair[T](a: T, _b: T) -> T { a }\nfn id[T](a: T) -> T { a }\n";
+    const pre = "fn pair[T](a: T, _b: T) -> T { a }\nfn id[T](a: T) -> T { a }\nenum Two[T] { both(T, T) }\n";
     const cases = [_]struct { body: []const u8, codes: []const codes.Code }{
-        .{ .body = "_q := pair(1, _)", .codes = &.{.T0050} },
+        .{ .body = "_q := pair(1, _)", .codes = &.{} },
+        .{ .body = "_s := pair(_, 1)", .codes = &.{} },
         .{ .body = "_r := id(_)", .codes = &.{.T0016} },
         .{ .body = "_k := pair[int](1, _)", .codes = &.{} },
+        .{ .body = "_p := pair(if true { 1 } else { 2 }, _)", .codes = &.{.W0007} },
         // A warning in the body does not stand in for the T0050: it would leave the
         // capture poisoned with no error.
-        .{ .body = "_p := pair(if true { 1 } else { 2 }, _)", .codes = &.{ .W0007, .T0050 } },
+        .{ .body = "_t := Two.both(if true { 1 } else { 2 }, _)", .codes = &.{ .W0007, .T0050 } },
     };
     for (cases) |cs| {
         const src = try std.fmt.allocPrint(gpa, "{s}fn main() -> int {{\n {s}\n return 0\n}}\n", .{ pre, cs.body });
@@ -9663,6 +9783,353 @@ test "a capture whose '_' no position types is one diagnostic" {
         for (c.result.diags) |d| if (d.code == .T0050)
             try testing.expect(std.mem.startsWith(u8, d.message, "cannot infer the type of '_'"));
     }
+}
+
+const own_box_pre =
+    \\struct Box[T] { v: T }
+    \\impl Box[T] {
+    \\ fn map[U](self, f: fn(T) -> U) -> Box[U] { Box { v: f(self.v) } }
+    \\ fn fold[A](self, init: A, f: fn(A, T) -> A) -> A { f(init, self.v) }
+    \\ fn tag[U](self) -> int { 0 }
+    \\ fn pick[U](self, a: U, _b: U) -> U { a }
+    \\ fn with[U](v: T, _tag: U) -> Box[T] { Box { v: v } }
+    \\ fn get(self) -> T { self.v }
+    \\}
+    \\
+;
+
+fn expectOwnGenericOk(c: *const Checked) !void {
+    for (c.result.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try expectNoPending(&c.result);
+}
+
+fn instanceNameOf(c: *const Checked, member: []const u8, nth: usize) ![]const u8 {
+    const m = try calleeMethod(c, member, nth);
+    return c.result.instances[m.instance orelse return error.TestExpectedInstanceRow].name.?;
+}
+
+test "a method's own type param binds from a lambda's return" {
+    const gpa = testing.allocator;
+    var c = try checkSource(own_box_pre ++
+        \\fn main() -> int {
+        \\ b := Box { v: 20 }
+        \\ c := b.map(fn(x) { x > 1 })
+        \\ return if c.get() { 1 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try expectOwnGenericOk(&c);
+    try testing.expect(Type.eql(Type.int, lambdaParamType(&c, try nthLambda(&c, 0), 0)));
+    try testing.expect(std.mem.endsWith(u8, try instanceNameOf(&c, "map", 0), "Box.map$int$bool"));
+}
+
+test "two instances of one own-generic method on one receiver seal to their own rows" {
+    const gpa = testing.allocator;
+    var c = try checkSource(own_box_pre ++
+        \\fn main() -> int {
+        \\ b := Box { v: 20 }
+        \\ c := b.map(fn(x) { x + 1 })
+        \\ d := b.map(fn(_x) { "s" })
+        \\ return c.get() + d.get().len()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try expectOwnGenericOk(&c);
+    const first = try calleeView(&c, "map", 0);
+    const second = try calleeView(&c, "map", 1);
+    try testing.expect(first.method != second.method);
+    try testing.expect(std.mem.endsWith(u8, try instanceNameOf(&c, "map", 0), "Box.map$int$int"));
+    try testing.expect(std.mem.endsWith(u8, try instanceNameOf(&c, "map", 1), "Box.map$int$str"));
+}
+
+test "an own type param fixed by a non-lambda arg types the lambda" {
+    const gpa = testing.allocator;
+    var c = try checkSource(own_box_pre ++
+        \\fn main() -> int {
+        \\ b := Box { v: 20 }
+        \\ return b.fold(0, fn(acc, x) { acc + x })
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try expectOwnGenericOk(&c);
+    const lam = try nthLambda(&c, 0);
+    try testing.expect(Type.eql(Type.int, lambdaParamType(&c, lam, 0)));
+    try testing.expect(Type.eql(Type.int, lambdaParamType(&c, lam, 1)));
+}
+
+test "a later lambda sees what an earlier lambda bound" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn g[T, U](f: fn(int) -> T, h: fn(T) -> U) -> U { h(f(1)) }
+        \\fn main() -> int {
+        \\ return if g(fn(x) { x + 1 }, fn(y) { y > 1 }) { 1 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try expectOwnGenericOk(&c);
+    try testing.expect(Type.eql(Type.int, lambdaParamType(&c, try nthLambda(&c, 1), 0)));
+}
+
+test "a lambda in a bare generic call takes T from a later or an earlier arg" {
+    const gpa = testing.allocator;
+    const pre = "fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }\nfn apply2[T](x: T, f: fn(T) -> T) -> T { f(x) }\n";
+    for ([_][]const u8{ "apply(fn(x) { x * 7 }, 1)", "apply2(1, fn(x) { x * 7 })" }) |call| {
+        const src = try std.fmt.allocPrint(gpa, "{s}fn main() -> int {{ return {s} }}\n", .{ pre, call });
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        try expectOwnGenericOk(&c);
+        try testing.expect(Type.eql(Type.int, lambdaParamType(&c, try nthLambda(&c, 0), 0)));
+    }
+}
+
+test "a call's expected fn type still types a lambda no other arg fixes" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn id[T](a: T) -> T { a }
+        \\fn main() -> int {
+        \\ g: fn(int) -> int = id(fn(x) { x + 1 })
+        \\ return g(1)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try expectOwnGenericOk(&c);
+    try testing.expect(Type.eql(Type.int, lambdaParamType(&c, try nthLambda(&c, 0), 0)));
+}
+
+test "a method's own type param no arg fixes is T0016" {
+    const src = own_box_pre ++ "fn main() -> int {\n b := Box { v: 20 }\n return b.tag()\n}\n";
+    try expectOnlyDiag(src, .T0016);
+    try expectOneDiag(src, .T0016, "cannot infer type parameter 'U' of method 'tag' from its arguments; a method takes no explicit type arguments yet");
+}
+
+test "conflicting own-param args are one T0015 naming both" {
+    const gpa = testing.allocator;
+    const src = own_box_pre ++ "fn main() -> int {\n b := Box { v: 20 }\n return b.pick(1, true)\n}\n";
+    try expectOnlyDiag(src, .T0015);
+    var c = try checkSource(src);
+    defer c.deinit(gpa);
+    const d = c.result.diags[0];
+    const sp = d.span();
+    try testing.expectEqualStrings("true", src[sp.start..sp.end]);
+    const rel = d.relatedSpan().?;
+    try testing.expectEqualStrings("1", src[rel.start..rel.end]);
+}
+
+test "a pass-1 conflict types the waiting lambda once" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn tri[T](a: T, b: T, f: fn(T) -> T) -> T { f(a) }
+        \\fn main() -> int { return tri(1, true, fn(x) { x }) }
+        \\
+    );
+    defer c.deinit(gpa);
+    errdefer for (c.result.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+    try testing.expectEqual(@as(usize, 2), c.result.diags.len);
+    try testing.expect(hasCode(&c, .T0015));
+    try testing.expect(hasCode(&c, .T0050));
+}
+
+test "own type params on a non-generic type are T0013" {
+    const gpa = testing.allocator;
+    const src =
+        \\struct P { v: int }
+        \\impl P {
+        \\ fn conv[U](self, f: fn(int) -> U) -> U { f(self.v) }
+        \\}
+        \\fn main() -> int {
+        \\ p := P { v: 4 }
+        \\ return p.conv(fn(x: int) { x * 3 })
+        \\}
+        \\
+    ;
+    try expectOnlyDiag(src, .T0013);
+    var c = try checkSource(src);
+    defer c.deinit(gpa);
+    for (c.result.diags) |d| try testing.expect(std.mem.indexOf(u8, d.message, "type_var") == null);
+}
+
+test "an associated fn's own type param binds from its args" {
+    const gpa = testing.allocator;
+    var c = try checkSource(own_box_pre ++
+        \\fn main() -> int {
+        \\ return Box.with(3, true).get() + Box[int].with(4, "s").get()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try expectOwnGenericOk(&c);
+    const a = try calleeMethod(&c, "with", 0);
+    const b = try calleeMethod(&c, "with", 1);
+    try testing.expect(a.is_static and b.is_static);
+    try testing.expect(a.instance.? != b.instance.?);
+    try testing.expect(std.mem.endsWith(u8, try instanceNameOf(&c, "with", 0), "Box.with$int$bool"));
+    try testing.expect(std.mem.endsWith(u8, try instanceNameOf(&c, "with", 1), "Box.with$int$str"));
+}
+
+test "an own-generic method of a bounded impl binds the impl params from the receiver and its own from the lambda" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Pair[K, V] { k: K, v: V }
+        \\impl Pair[K has Hashable, V] {
+        \\ fn mapv[W](self, f: fn(V) -> W) -> Pair[K, W] { Pair { k: self.k, v: f(self.v) } }
+        \\}
+        \\fn main() -> int {
+        \\ p := Pair { k: "a", v: 2 }
+        \\ q := p.mapv(fn(v) { v > 1 })
+        \\ return if q.v { q.k.len() } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try expectOwnGenericOk(&c);
+    const m = try calleeMethod(&c, "mapv", 0);
+    const args = c.result.instances[m.instance.?].args;
+    try testing.expectEqual(@as(usize, 3), args.len);
+    try testing.expect(Type.eql(Type.str, args[0]));
+    try testing.expect(Type.eql(Type.int, args[1]));
+    try testing.expect(Type.eql(Type.bool, args[2]));
+}
+
+test "a lambda of the wrong arity in a generic call reports its count, naming the open param" {
+    const pre = own_box_pre ++ "fn apg[T](x: T, f: fn(T, T) -> T) -> T { f(x, x) }\n";
+    const own = pre ++ "fn main() -> int {\n b := Box { v: 2 }\n return b.map(fn(x, y) { x + y }).get()\n}\n";
+    try expectOnlyDiag(own, .T0039);
+    try expectOneDiag(own, .T0039, "lambda takes 2 parameter(s), but the expected type fn(int) -> U takes 1");
+    const bare = pre ++ "fn main() -> int { return apg(1, fn(p) { p }) }\n";
+    try expectOnlyDiag(bare, .T0039);
+    try expectOneDiag(bare, .T0039, "lambda takes 1 parameter(s), but the expected type fn(int, int) -> int takes 2");
+}
+
+test "an argument that cannot fit its partly bound param is T0040, not T0016" {
+    const pre = own_box_pre ++
+        \\impl Box[T] { fn then[U](self, f: fn(T) -> Box[U]) -> Box[U] { f(self.v) } }
+        \\
+    ;
+    const annotated = pre ++ "fn main() -> int {\n b := Box { v: 2 }\n return b.map(fn(x: int, y: int) { x + y }).get()\n}\n";
+    try expectOnlyDiag(annotated, .T0040);
+    try expectOneDiag(annotated, .T0040, "argument 1: expected fn(int) -> U, got fn(int, int) -> int; 'map' takes (fn(int) -> U)");
+    const flat = pre ++ "fn main() -> int {\n b := Box { v: 2 }\n return b.then(fn(y) { y + 1 }).get()\n}\n";
+    try expectOnlyDiag(flat, .T0040);
+    try expectOneDiag(flat, .T0040, "argument 1: expected fn(int) -> Box, got fn(int) -> int; 'then' takes (fn(int) -> Box)");
+}
+
+test "an own-generic arity error shows the signature as the receiver binds it" {
+    const pre = own_box_pre ++ "fn main() -> int {\n b := Box { v: 2 }\n";
+    try expectOnlyDiag(pre ++ " return b.map().get()\n}\n", .T0039);
+    try expectOneDiag(pre ++ " return b.map().get()\n}\n", .T0039, "expected 1 argument(s), got 0; 'map' takes (fn(int) -> U)");
+    try expectOneDiag(pre ++ " return b.fold(0)\n}\n", .T0039, "expected 2 argument(s), got 1; 'fold' takes (A, fn(A, int) -> A)");
+    // The rejected call's lambda is no second error.
+    try expectOnlyDiag(pre ++ " return b.map(fn(x) { x }, 2).get()\n}\n", .T0039);
+}
+
+test "a generic call's failed argument is its only error" {
+    const src = own_box_pre ++
+        \\fn main() -> int {
+        \\ b := Box { v: "a" }
+        \\ sep := "-"
+        \\ return b.map(sep.concat).get().len()
+        \\}
+        \\
+    ;
+    try expectOnlyDiag(src, .T0049);
+    try expectOnlyDiag("fn id[T](x: T) -> T { x }\nfn main() -> int { return id(1 + true) }\n", .T0044);
+}
+
+test "the args of a call rejected for its type params add no T0050" {
+    try expectOnlyDiag(
+        \\struct P { v: int }
+        \\impl P { fn conv[U](self, f: fn(int) -> U) -> U { f(self.v) } }
+        \\fn main() -> int {
+        \\ p := P { v: 4 }
+        \\ return p.conv(fn(x) { x + 1 })
+        \\}
+        \\
+    , .T0013);
+    try expectOnlyDiag(own_box_pre ++ "fn main() -> int {\n b := Box { v: 2 }\n return b.map[int](fn(x) { x }).get()\n}\n", .T0018);
+}
+
+test "a type param that repeats a name is an error at its declaration" {
+    const shadow = "struct Box[T] { v: T }\nimpl Box[T] {\n fn conv[T](self, x: T) -> T { x }\n}\nfn main() -> int { return 0 }\n";
+    try expectOnlyDiag(shadow, .T0053);
+    try expectOneDiag(shadow, .T0053, "type parameter 'T' is already the impl's; give the method's own a different name");
+    const twice = "fn id[T, T](x: T) -> T { x }\nfn main() -> int { return 0 }\n";
+    try expectOnlyDiag(twice, .T0053);
+    try expectOneDiag(twice, .T0053, "type parameter 'T' is declared twice");
+}
+
+test "an impl pattern that is partly concrete or repeats a name is T0013" {
+    const want = "an inherent 'impl' whose pattern is partly concrete or repeats a name is not yet supported; name each type parameter once, as in 'impl Pair[A, B]'";
+    for ([_][]const u8{ "Pair[T, int]", "Pair[T, T]" }) |pat| {
+        const src = try std.fmt.allocPrint(testing.allocator, "struct Pair[A, B] {{ a: A, b: B }}\nimpl {s} {{ fn first(self) -> int {{ 1 }} }}\nfn main() -> int {{ return 0 }}\n", .{pat});
+        defer testing.allocator.free(src);
+        try expectOnlyDiag(src, .T0013);
+        try expectOneDiag(src, .T0013, want);
+    }
+}
+
+test "an associated fn named through a type is not a value" {
+    const src = own_box_pre ++ "fn main() -> int {\n h := Box[int].with\n return 0\n}\n";
+    try expectOnlyDiag(src, .T0049);
+    try expectOneDiag(src, .T0049, "'with' is an associated function and cannot be used as a value; wrap the call in a lambda");
+}
+
+test "a call's expected type reaches a literal receiver only as a hint" {
+    const gpa = testing.allocator;
+    var c = try checkSource(own_box_pre ++
+        \\fn names() -> Box[str] {
+        \\ return Box { v: 1 }.map(fn(v) { v.to_string() })
+        \\}
+        \\fn main() -> int {
+        \\ n: int = Box { v: 2 }.fold(0, fn(a, x) { a + x })
+        \\ x: int8 = Box { v: 1 }.get()
+        \\ return names().get().len() + n + if x == 1 { 1 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try expectOwnGenericOk(&c);
+}
+
+test "a struct literal's field value is typed against its field" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int8, o: Option[int] }
+        \\fn main() -> int {
+        \\ p := P { x: 5, o: .none }
+        \\ q: P = P { x: 6, o: Option.some(1) }
+        \\ return if p.x == 5 { q.o.unwrap() } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try expectOwnGenericOk(&c);
+}
+
+test "an own-generic call that selects no instance keeps its template, never another call's row" {
+    const gpa = testing.allocator;
+    var c = try checkSource(own_box_pre ++
+        \\fn main() -> int {
+        \\ b := Box { v: "s" }
+        \\ k := b.map(fn(s) { s.len() })
+        \\ z := b.map(fn(s) { s.nope() })
+        \\ _w := b.map()
+        \\ return k.get() + z.get()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expect(c.result.diags.len > 0);
+    try testing.expect((try calleeView(&c, "map", 0)) == .method);
+    const map_fn = c.result.callees[0][(try memberSlot(&c, "map", 1)).int()].templateFn() orelse return error.TestExpectedTemplate;
+    try testing.expectEqual(map_fn, c.result.callees[0][(try memberSlot(&c, "map", 2)).int()].templateFn().?);
+    try testing.expectEqual(Callee.View.none, try calleeView(&c, "map", 1));
 }
 
 test "a capture passed where a non-function is wanted is T0040 with the capture hint" {

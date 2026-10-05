@@ -408,7 +408,19 @@ pub fn barrier(
 
 /// Dual-metric output of a fresh `lowerOne`: the summed opt counters for this fn
 /// and its post-opt IR instruction count. Surfaced via `--opt-stats`.
-pub const OptOut = struct { stats: Opt.Stats = .{}, ir_instrs: usize = 0 };
+pub const OptOut = struct {
+    stats: Opt.Stats = .{},
+    ir_instrs: usize = 0,
+    /// The first lowering diagnostic of a unit that failed with `error.CodegenDiagnostic`.
+    diag: ?CodegenIr.Diagnostic = null,
+};
+
+/// Fail a unit's lowering, keeping its first diagnostic where the driver reports it: such
+/// a diagnostic is an internal error, and its text must reach the user.
+fn failLowering(diags: []const CodegenIr.Diagnostic, out: anytype) error{CodegenDiagnostic} {
+    if (out) |o| o.diag = diags[0];
+    return error.CodegenDiagnostic;
+}
 
 /// A base fn or instance body, as `lowerFitted` lowers it.
 pub const FnBody = struct {
@@ -507,7 +519,7 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Li
     defer irf.deinit(gpa);
     // A lower diagnostic (an unsupported/not-yet-lowered construct) fails the build
     // before we emit a partial FnCode.
-    if (diags.items.len > 0) return error.CodegenDiagnostic;
+    if (diags.items.len > 0) return failLowering(diags.items, opt_out);
     if (opt_out) |o| o.* = .{ .stats = opt_st, .ir_instrs = Ir.instrCount(&irf) };
 
     const fc = try CodegenIr.lowerIr(gpa, &irf, frozen.layouts, frozen.enum_layouts, is_entry, &diags);
@@ -517,7 +529,7 @@ fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Li
     if (diags.items.len > 0) {
         var tmp = fc;
         tmp.deinit(gpa);
-        return error.CodegenDiagnostic;
+        return failLowering(diags.items, opt_out);
     }
     // The UAF tripwire runs only in `--verify` (a real runtime check, like the
     // determinism/cache audits): every reference must be spill-backed for the collector's
@@ -655,7 +667,10 @@ fn serve(
 
     if (mode == .verify) {
         var opt_out: OptOut = .{};
-        var fresh = try lowerFresh(ctx, &opt_out);
+        var fresh = lowerFresh(ctx, &opt_out) catch |e| {
+            slot.diag = opt_out.diag;
+            return e;
+        };
         errdefer fresh.deinit(gpa);
         const fb = try Link.pack(gpa, fresh);
         defer gpa.free(fb);
@@ -694,7 +709,10 @@ fn serve(
 
     var opt_out: OptOut = .{};
     const comp_t0: i128 = if (self.probe != null) StageProbe.now(io) else 0;
-    var fc = try lowerFresh(ctx, &opt_out);
+    var fc = lowerFresh(ctx, &opt_out) catch |e| {
+        slot.diag = opt_out.diag;
+        return e;
+    };
     if (self.probe) |p| StageProbe.lap(io, &p.compute_ns, comp_t0);
     errdefer fc.deinit(gpa);
     if (Link.pack(gpa, fc) catch null) |b| {
@@ -733,7 +751,7 @@ fn lowerSynthetic(gpa: std.mem.Allocator, frozen: anytype, d: anytype, sym: Link
     };
     var irf = try DeriveEmit.lower(gpa, in, d, sym, &diags);
     defer irf.deinit(gpa);
-    if (diags.items.len > 0) return error.CodegenDiagnostic;
+    if (diags.items.len > 0) return failLowering(diags.items, opt_out);
 
     var opt_st: Opt.Stats = .{};
     try Opt.run(gpa, &irf, frozen.opt, &opt_st);
@@ -743,7 +761,7 @@ fn lowerSynthetic(gpa: std.mem.Allocator, frozen: anytype, d: anytype, sym: Link
     if (diags.items.len > 0) {
         var tmp = fc;
         tmp.deinit(gpa);
-        return error.CodegenDiagnostic;
+        return failLowering(diags.items, opt_out);
     }
     return fc;
 }
@@ -843,7 +861,7 @@ pub fn codegenErased(
     };
     var irf = try DeriveEmit.lowerErased(gpa, in, u.ty, u.kind, sym, &diags);
     defer irf.deinit(gpa);
-    if (diags.items.len > 0) return error.CodegenDiagnostic;
+    if (diags.items.len > 0) return failLowering(diags.items, @as(?@TypeOf(slot), slot));
 
     var opt_st: Opt.Stats = .{};
     try Opt.run(gpa, &irf, frozen.opt, &opt_st);
@@ -853,7 +871,7 @@ pub fn codegenErased(
     if (diags.items.len > 0) {
         var tmp = fc;
         tmp.deinit(gpa);
-        return error.CodegenDiagnostic;
+        return failLowering(diags.items, @as(?@TypeOf(slot), slot));
     }
     slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_st, .ir_instrs = ir_instrs };
 }
@@ -924,7 +942,7 @@ pub fn codegenClosure(
         .spec => try lower.lowerFn(gpa, in, spec_inst.?.decl_node, sym, false, &diags),
     };
     defer irf.deinit(gpa);
-    if (diags.items.len > 0) return error.CodegenDiagnostic;
+    if (diags.items.len > 0) return failLowering(diags.items, @as(?@TypeOf(slot), slot));
 
     if (unit != .lambda) try Opt.run(gpa, &irf, frozen.opt, &opt_st);
     const ir_instrs = Ir.instrCount(&irf);
@@ -933,7 +951,7 @@ pub fn codegenClosure(
     if (diags.items.len > 0) {
         var tmp = fc;
         tmp.deinit(gpa);
-        return error.CodegenDiagnostic;
+        return failLowering(diags.items, @as(?@TypeOf(slot), slot));
     }
     if (self.mode == .verify) {
         CodegenIr.verifyRefsSpilled(gpa, &irf, frozen.layouts, frozen.enum_layouts) catch |e| {

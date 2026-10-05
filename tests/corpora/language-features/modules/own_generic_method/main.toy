@@ -1,0 +1,12 @@
+# Feature: a method with its own type parameter, declared in another module and called
+# twice on one receiver with different `U` (one through an unannotated lambda). Each
+# call runs its own instance; a swapped instance would change the result: 45 + 1.
+# expect: exit 46
+import boxes
+
+fn main() -> int {
+    b := boxes.boxed(5)
+    n := b.map(fn(x) { x * 9 })
+    t := b.map(fn(x: int) { x > 3 })
+    return n.get() + (if t.get() { 1 } else { 0 })
+}

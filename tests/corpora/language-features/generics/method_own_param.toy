@@ -1,0 +1,15 @@
+# Feature: a method with its own type parameter on a generic type. `map[U]` binds the
+# impl's `T` from the receiver and its own `U` from the argument, and each `U` is its
+# own instance (`Box.map$int$int`, `Box.map$int$bool`): 21 + 100.
+# expect: exit 121
+struct Box[T] { v: T }
+impl Box[T] {
+    fn map[U](self, f: fn(T) -> U) -> Box[U] { Box{ v: f(self.v) } }
+    fn get(self) -> T { self.v }
+}
+fn main() -> int {
+    b := Box{ v: 20 }
+    c := b.map(fn(x: int) { x + 1 })
+    d := b.map(fn(x: int) { x > 5 })
+    return c.get() + (if d.get() { 100 } else { 0 })
+}

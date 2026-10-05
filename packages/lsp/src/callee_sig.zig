@@ -74,8 +74,20 @@ fn select(
     const fa_node = m.nodes[fa];
     const name = m.tokens[fa_node.main_token].text(m.source);
     switch (tc.callees[mod][fa].view()) {
+        // A generic method whose call did not check (`xs.map(` mid-typing) picked no
+        // instance; its template still names what the user is calling.
+        .none => {
+            const gid = tc.callees[mod][fa].templateFn() orelse return null;
+            if (gid >= res.fns.len or gid >= tc.sigs.len) return null;
+            const gf = res.fns[gid];
+            if (gf.decl_node == Ast.none) return null;
+            const sig = tc.sigs[gid];
+            const names = try declParamNames(a, graph, gf.module, gf.decl_node);
+            const has_self = names.len > 0 and std.mem.eql(u8, names[0], "self");
+            return .{ .name = name, .params = sig.params, .param_names = names, .ret = sig.ret, .has_self = has_self, .mut_mask = sig.mut_mask, .decl = .{ .module = gf.module, .node = gf.decl_node.int() } };
+        },
         // A function value's signature is its type, not a declaration's.
-        .none, .value, .fn_ref, .bound_method => return null,
+        .value, .fn_ref, .bound_method => return null,
         .method => |i| {
             if (i >= tc.methods.len) return null;
             const meth = tc.methods[i];
@@ -148,6 +160,14 @@ fn select(
             return .{ .name = name, .params = shape.params, .param_names = shape.names, .ret = shape.ret, .has_self = true };
         },
     }
+}
+
+/// Whether the method `fa` calls is best shown as its declaration spells it: a user
+/// protocol's method or a generic method's template, whose checked types are opaque once
+/// typecheck is done.
+pub fn spelledFromDecl(tc: *const TypecheckGraph.GraphResult, mod: u32, fa: u32) bool {
+    const c = tc.callees[mod][fa];
+    return c.view() == .protocol or c.templateFn() != null;
 }
 
 /// The names of a source-less method's params (a derive, a prelude protocol's method): a

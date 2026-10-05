@@ -674,9 +674,10 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
     // `generic_len` 0, which `protoAt` decodes to an empty (safe) slice.
     //
     // A generic impl's params (`[T]`) come FIRST in the run, then the method's
-    // own `[U]` (parsed above but NOT yet inference-bound — deferred; only the impl's
-    // params are matched at a call site). Both `impl_gparams` and `generics` are empty
-    // for a bare impl / a top-level fn, so the run stays byte-identical there.
+    // own `[U]`: a call binds the impl's from the receiver and the method's from its
+    // args (`Typecheck.implParamCount` splits the run). Both `impl_gparams` and
+    // `generics` are empty for a bare impl / a top-level fn, so the run stays
+    // byte-identical there.
     const params_start: u32 = @intCast(p.extra.items.len);
     const param_cells: []const u32 = @ptrCast(params.items);
     try p.extra.appendSlice(p.gpa, param_cells);

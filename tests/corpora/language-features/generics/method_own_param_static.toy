@@ -1,0 +1,12 @@
+# Feature: an associated fn with its own type parameter. `Box.with(3, true)` infers
+# `T` and `U` from its args, `Box[int].with(4, "s")` takes `T` from the turbofish and
+# `U` from its arg; each is its own instance: 3 + 4.
+# expect: exit 7
+struct Box[T] { v: T }
+impl Box[T] {
+    fn with[U](v: T, _tag: U) -> Box[T] { Box { v: v } }
+    fn get(self) -> T { self.v }
+}
+fn main() -> int {
+    return Box.with(3, true).get() + Box[int].with(4, "s").get()
+}

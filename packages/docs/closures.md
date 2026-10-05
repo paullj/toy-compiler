@@ -51,7 +51,8 @@ fn() { io.println("hi") }
 - **Body:** a block. Its trailing expression is the value, the same as a function body.
 - **Parameter types:**
   - They come from the expected function type, through bidirectional checking, the same way literals get their types.
-  - With no expected type, every parameter needs a type annotation. A missing one is a coded error.
+  - In a generic call a lambda is checked after the call's other arguments and its receiver: `apply(fn(x) { x * 7 }, 1)` and `b.map(fn(x) { x + 1 })` need no annotation. A type parameter that only the lambda's return fixes is inferred from it.
+  - When nothing else fixes a parameter, an expected function type on the call still does (`g: fn(int) -> int = id(fn(x) { x + 1 })`). Otherwise the parameter needs a type annotation. A missing one is a coded error (T0050).
 - **Return type:** inferred from the body.
 - **Early exit:** `return` and `?` exit the **lambda**, not the enclosing function. `?` requires the lambda's own return type to be `Option` or `Result`.
 - **Loops:** a lambda cannot `break` or `continue` a loop outside it, labeled or not. That is a coded error. Loops inside the lambda work as usual.
@@ -102,6 +103,7 @@ fn main() -> int {
 - **Known at compile time:** when the argument is a lambda literal or a named function, the call site gets its own instance. The call is then direct and can be inlined.
 - **A function value:** a variable, a field or a return value goes through an erased instance, keyed only on `T, U`, with the fat pair and `call_indirect`.
 - **A cap per generic function** on specialized instances limits code size. Past the cap, calls use the erased instance.
+- **Methods with their own type parameters:** a method of a generic type can declare its own (`impl Box[T] { fn map[U](self, f: fn(T) -> U) -> Box[U] }`), and so can an associated fn (`fn with[U](v: T, tag: U)`). They are inferred from the arguments, never written (`b.map[int](..)` stays T0018), and each instantiation is its own instance. On a non-generic type they are T0013 for now. A method's own parameter may not reuse a name of its impl's (`fn conv[T]` in `impl Box[T]` is T0053). A lambda of the wrong shape is reported as itself, T0039 for a wrong parameter count or T0040 for a wrong type (`expected fn(int) -> U, got fn(int, int) -> int`), not as a parameter nothing could infer.
 
 ## `mut` parameters
 
@@ -153,10 +155,10 @@ There is one sharing model, so the `&x` / `*r` operators are removed.
 - **Inferred variants:** `.some(_)` is not a call, so it is not a capture; write `Option[int].some(_)`, or `Option.some(_)` where an expected fn type gives its `T`.
 - **The parameter type**, in order:
   1. the expected fn type's parameter, when it is ground (as for any lambda);
-  2. otherwise the type the call wants at the `_`: `inc := add(1, _)` is `fn(int) -> int`, `b.put(_)` on a `Box[int]` takes an `int`;
+  2. otherwise the type the call wants at the `_`, including what a generic call's other arguments bind: `inc := add(1, _)` is `fn(int) -> int`, `b.put(_)` on a `Box[int]` takes an `int`;
   3. otherwise T0050 "cannot infer the type of '_'", reported only when nothing else in the call is an error.
 
-  A bare generic callee gives the `_` no type until its other arguments can (L1): `pair(1, _)` is T0050 and `id(_)` is the callee's own T0016. Write `pair[int](1, _)`. A capture passed to a bare generic call is typed by its own call, so `twice(add(1, _), 5)` works.
+  `pair(1, _)` is `fn(int) -> int`; `id(_)`, where nothing binds `T`, stays the callee's T0016. A capture passed to a bare generic call is typed by its own call, so `twice(add(1, _), 5)` works.
 - **Evaluation:** the other arguments are evaluated each time the capture is called, as in the lambda it means. `add(tick(), _)` calls `tick` on every call, and a `?` or `return` among them exits the capture. A capture has no `-> R` to write, so such a `?` needs an expected fn type that returns an Option or Result (T0032 otherwise), and a `break` or `continue` there is T0051, as in a lambda.
 - **As a statement:** a capture dropped as a statement (`show(_)`) never runs its call, so it is W0008. Before captures, that statement passed a `_` local; rename the local to keep that meaning.
 - **`mut` positions:** a `_` at a `mut` parameter is T0019. The capture's parameter is a copy of the value it is called with, so the change would be lost.

@@ -420,3 +420,26 @@ test "warm: a callee flip makes a bound method on a mut param T0052 and back" {
         try std.testing.expectEqual(@as(u8, 14), try harness.runExitIn(gpa, io, w, "b/prog"));
     }
 }
+
+test "warm: an own-generic method call follows its argument's new type" {
+    const main_src =
+        \\import lib
+        \\struct Box[T] { v: T }
+        \\impl Box[T] {
+        \\    fn map[U](self, f: fn(T) -> U) -> Box[U] { Box { v: f(self.v) } }
+        \\    fn get(self) -> T { self.v }
+        \\}
+        \\fn main() -> int {
+        \\    b := Box { v: 41 }
+        \\    return b.map(lib.f).get().to_string().len()
+        \\}
+        \\
+    ;
+    try flip(
+        ".toy-test-places-own-generic",
+        &.{ .{ .name = "main.toy", .src = main_src }, .{ .name = "lib.toy", .src = "pub fn f(x: int) -> int { x + 1 }\n" } },
+        2,
+        &.{.{ .name = "lib.toy", .src = "pub fn f(x: int) -> bool { x > 0 }\n" }},
+        4,
+    );
+}

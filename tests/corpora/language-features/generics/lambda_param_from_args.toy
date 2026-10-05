@@ -1,0 +1,26 @@
+# Feature: an unannotated lambda or `_` in a generic call takes its param type from
+# what the call's other arguments bind, in either order; a type only the lambda's
+# return fixes is inferred from it, and an expected fn type still types a lambda that
+# nothing else fixes: 7 + 7 + 2 + 1 + 21 + 1.
+# expect: exit 39
+struct Box[T] { v: T }
+impl Box[T] {
+    fn map[U](self, f: fn(T) -> U) -> Box[U] { Box{ v: f(self.v) } }
+    fn get(self) -> T { self.v }
+}
+fn apply[T](f: fn(T) -> T, x: T) -> T { f(x) }
+fn apply2[T](x: T, f: fn(T) -> T) -> T { f(x) }
+fn id[T](a: T) -> T { a }
+fn pair[T](a: T, _b: T) -> T { a }
+fn add(a: int, b: int) -> int { a + b }
+fn g[T, U](f: fn(int) -> T, h: fn(T) -> U) -> U { h(f(1)) }
+fn main() -> int {
+    a := apply(fn(x) { x * 7 }, 1)
+    b := apply2(1, fn(x) { x * 7 })
+    k: fn(int) -> int = id(fn(x) { x + 1 })
+    inc := pair(1, _)
+    bx := Box { v: 20 }
+    c := bx.map(add(1, _)).get()
+    d := if g(fn(x) { x + 1 }, fn(y) { y > 1 }) { 1 } else { 0 }
+    return a + b + k(1) + inc(2) + c + d
+}

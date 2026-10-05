@@ -1,0 +1,10 @@
+# Module `boxes`: a generic `Box[T]` whose `map[U]` declares its own type parameter,
+# and a pub generic constructor.
+pub struct Box[T] { v: T }
+
+impl Box[T] {
+    fn map[U](self, f: fn(T) -> U) -> Box[U] { Box { v: f(self.v) } }
+    fn get(self) -> T { self.v }
+}
+
+pub fn boxed[T](v: T) -> Box[T] { Box { v: v } }

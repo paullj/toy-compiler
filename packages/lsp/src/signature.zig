@@ -284,7 +284,7 @@ pub fn signatureHelpAt(
             const sig = tc.sigs[fid];
             try renderLabel(a, &label, render.bareName(sig.name), sig.params, sig.mut_mask, sig.ret, tc.layouts, tc.enum_layouts, &.{}, &ranges);
         },
-        .method => |ms| if (ms.decl != null and tc.callees[entry][callee.node].view() == .protocol)
+        .method => |ms| if (ms.decl != null and callee_sig.spelledFromDecl(&tc, entry, @intCast(callee.node)))
             try renderDeclLabel(a, &label, &graph.modules[ms.decl.?.module], ms.decl.?.node, ms.name, ms.has_self, &ranges)
         else
             try renderLabel(a, &label, ms.name, ms.params[@intFromBool(ms.has_self)..], ms.mut_mask >> @intFromBool(ms.has_self), ms.ret, tc.layouts, tc.enum_layouts, ms.var_names, &ranges),
@@ -561,6 +561,40 @@ test "signatureHelpAt: method calls show the selected method, piped or not" {
         const p = test_util.posAfterLast(src, c.after);
         var r = (try signatureHelpAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse {
             std.debug.print("no signature help after '{s}'\n", .{c.after});
+            return error.NoSignatureHelp;
+        };
+        defer r.deinit();
+        try testing.expectEqualStrings(c.label, r.help.signatures[0].label);
+        try testing.expectEqual(c.active, r.help.activeParameter);
+    }
+}
+
+test "signatureHelpAt: a generic method's own type params show while its call is incomplete" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const pre =
+        \\struct Box[T] { v: T }
+        \\impl Box[T] {
+        \\    fn map[U](self, f: fn(T) -> U) -> Box[U] { Box { v: f(self.v) } }
+        \\    fn fold[A](self, init: A, f: fn(A, T) -> A) -> A { f(init, self.v) }
+        \\}
+        \\fn main() -> int {
+        \\    b := Box { v: 2 }
+        \\
+    ;
+    const cases = [_]struct { tail: []const u8, label: []const u8, active: u32 }{
+        .{ .tail = "    k := b.map(", .label = "fn map(fn(T) -> U) -> Box[U]", .active = 0 },
+        .{ .tail = "    k := b.fold(0, ", .label = "fn fold(A, fn(A, T) -> A) -> A", .active = 1 },
+        .{ .tail = "    k := b.map(fn(s) { s.nope() }", .label = "fn map(fn(T) -> U) -> Box[U]", .active = 0 },
+    };
+    for (cases) |c| {
+        const src = try std.mem.concat(gpa, u8, &.{ pre, c.tail });
+        defer gpa.free(src);
+        const p = test_util.posAfterLast(src, c.tail);
+        var r = (try signatureHelpAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no signature help after '{s}'\n", .{c.tail});
             return error.NoSignatureHelp;
         };
         defer r.deinit();

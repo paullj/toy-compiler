@@ -115,11 +115,24 @@ pub const LowerProgramResult = union(enum) {
     err: EmitError,
 };
 
+/// A lowering diagnostic as the CLI renders it. One with no source position of its own (a
+/// frame that outgrew codegen) points at the failing unit's declaration, so the user learns
+/// which function to split; a unit with no declaration renders without a snippet.
+fn emitErrorOf(graph: *const Graph.Graph, d: CodegenIr.Diagnostic, module: u32, decl: Ast.Index) EmitError {
+    if (d.end != 0) return .{ .message = d.message, .span = d.span(), .module = module };
+    const m = &graph.modules[module];
+    if (decl == Ast.none or decl.int() >= m.nodes.len) return .{ .message = d.message, .span = null, .module = module };
+    const tok = m.tokens[m.nodes[decl.int()].main_token];
+    return .{ .message = d.message, .span = .{ .start = tok.start, .end = tok.end }, .module = module };
+}
+
 /// One parallel codegen job's slot. Each job owns exactly one slot (no locks).
 const FnSlot = struct {
     fc: ?Link.FnCode = null,
     cached: bool = false,
     err: ?anyerror = null,
+    /// With `err == error.CodegenDiagnostic`: the lowering's first diagnostic.
+    diag: ?CodegenIr.Diagnostic = null,
     /// dual-metric, set only when the fn is freshly lowered (cached fns
     /// leave these at 0). Accumulated into the LinkedProgram in the collect loop.
     opt_stats: Opt.Stats = .{},
@@ -861,12 +874,14 @@ pub fn lowerGraphProgram(
         .slots = slots,
     });
 
-    var first_err: ?anyerror = null;
-    for (slots) |s| if (s.err) |e| {
-        if (first_err == null) first_err = e;
+    var first_err: ?usize = null;
+    for (slots, 0..) |s, i| if (s.err != null) {
+        if (first_err == null) first_err = i;
     };
-    if (first_err) |e| {
+    if (first_err) |i| {
         for (slots) |*s| if (s.fc) |*fc| fc.deinit(gpa);
+        const e = slots[i].err.?;
+        if (e == error.CodegenDiagnostic) if (slots[i].diag) |d| return .{ .err = emitErrorOf(graph, d, fn_modules.items[i], fn_decls.items[i]) };
         return e;
     }
 
@@ -1093,9 +1108,12 @@ pub fn renderGraphIr(
     defer diags.deinit(gpa);
 
     var first = true;
+    // The unit that produced `diags[0]`: noted before each unit lowers, until one fails.
+    var fail: struct { mod: u32 = 0, decl: Ast.Index = Ast.none } = .{};
     for (res.fns, 0..) |gf, gid| {
         if (!lowerableBase(graph, gf)) continue;
         const m = &graph.modules[gf.module];
+        if (diags.items.len == 0) fail = .{ .mod = gf.module, .decl = gf.decl_node };
         const is_entry = gf.module == graph.entry_index and std.mem.eql(u8, gf.name, "main");
         const in = lower.Inputs{
             .tree = m.tree(),
@@ -1128,6 +1146,7 @@ pub fn renderGraphIr(
     // substituted sig), in canonical order — the same units codegen lowers.
     for (tc.instances, 0..) |inst, k| {
         const m = &graph.modules[inst.mod];
+        if (diags.items.len == 0) fail = .{ .mod = inst.mod, .decl = inst.decl_node };
         const sym = Link.SymName{ .kind = .user_fn, .name = inst.name.? };
         const in = lower.Inputs{
             .tree = m.tree(),
@@ -1162,6 +1181,7 @@ pub fn renderGraphIr(
     // this). Dispatch on the recipe kind, mirroring `Engine.lowerSynthetic`.
     for (tc.derives) |d| {
         const m = &graph.modules[d.mod];
+        if (diags.items.len == 0) fail = .{ .mod = d.mod };
         const sym = Link.SymName{ .kind = .user_fn, .name = d.name.? };
         const in = lower.Inputs{
             .tree = m.tree(),
@@ -1196,6 +1216,7 @@ pub fn renderGraphIr(
     // `descriptor$eq$…` per hashable descriptor type.
     for (tc.erased_units) |u| {
         const m = &graph.modules[u.mod];
+        if (diags.items.len == 0) fail = .{ .mod = u.mod };
         const sym = Link.SymName{ .kind = .user_fn, .name = u.name.? };
         const in = lower.Inputs{
             .tree = m.tree(),
@@ -1229,6 +1250,7 @@ pub fn renderGraphIr(
     // units codegen lowers.
     for (tc.lambda_units, 0..) |u, ui| {
         const m = &graph.modules[u.mod];
+        if (diags.items.len == 0) fail = .{ .mod = u.mod, .decl = u.fn_node };
         const sym = Link.SymName{ .kind = .user_fn, .name = u.name };
         const inst: ?*const Mono.Instance = switch (u.owner) {
             .instance => |k| &tc.instances[k],
@@ -1264,6 +1286,7 @@ pub fn renderGraphIr(
     // Render each fn-value thunk, in canonical order — the same units codegen lowers.
     for (tc.adapters) |a| {
         const m = &graph.modules[0];
+        if (diags.items.len == 0) fail = .{};
         const sym = Link.SymName{ .kind = .user_fn, .name = a.name };
         const in = lower.Inputs{
             .tree = m.tree(),
@@ -1298,6 +1321,7 @@ pub fn renderGraphIr(
     for (specs.units) |u| {
         const inst = &tc.instances[u.inst];
         const m = &graph.modules[inst.mod];
+        if (diags.items.len == 0) fail = .{ .mod = inst.mod, .decl = inst.decl_node };
         const sym = Link.SymName{ .kind = .user_fn, .name = u.name };
         const in = lower.Inputs{
             .tree = m.tree(),
@@ -1327,6 +1351,10 @@ pub fn renderGraphIr(
         first = false;
     }
 
+    if (diags.items.len > 0) {
+        aw.deinit();
+        return .{ .err = emitErrorOf(graph, diags.items[0], fail.mod, fail.decl) };
+    }
     var list = aw.toArrayList();
     return .{ .ok = try list.toOwnedSlice(gpa) };
 }

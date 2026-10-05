@@ -178,8 +178,9 @@ pub const Describer = struct {
     /// A user protocol's method shows as written, like the protocol-decl hover.
     fn callee(d: *Describer, fa: u32) !bool {
         const sig = (try callee_sig.of(d.a, d.graph, d.res, d.tc, d.graph.entry_index, fa)) orelse return false;
-        if (d.tc.callees[d.graph.entry_index][fa].view() == .protocol) if (sig.decl) |decl| {
-            try d.appendNodeText(&d.graph.modules[decl.module], decl.node);
+        if (callee_sig.spelledFromDecl(d.tc, d.graph.entry_index, fa)) if (sig.decl) |decl| {
+            const dm = &d.graph.modules[decl.module];
+            if (d.tc.callees[d.graph.entry_index][fa].templateFn() != null) try d.appendFnHeader(dm, decl.node, sig.name) else try d.appendNodeText(dm, decl.node);
             return true;
         };
         try d.buf.print(d.a, "fn {s}(", .{sig.name});
@@ -245,6 +246,27 @@ pub const Describer = struct {
 
     /// Node `i`'s source as written, whitespace collapsed: a declaration spread over lines
     /// reads as one signature.
+    /// A method declaration's header as written (`fn map(self, f: fn(T) -> U) -> Vec[U]`),
+    /// without its body.
+    fn appendFnHeader(d: *Describer, m: *const Graph.Module, decl: u32, name: []const u8) !void {
+        const tree = m.tree();
+        const proto = Ast.protoAt(tree, m.nodes[decl].lhs.int());
+        try d.buf.print(d.a, "fn {s}(", .{name});
+        for (proto.params, 0..) |p, k| {
+            if (k != 0) try d.buf.appendSlice(d.a, ", ");
+            if (Ast.isMutParam(tree, m.tokens, p)) try d.buf.appendSlice(d.a, "mut ");
+            const pn = m.nodes[p.int()];
+            const pname = m.tokens[pn.main_token].text(m.source);
+            try d.buf.appendSlice(d.a, pname);
+            // The receiver's type is synthesized from the impl, not written.
+            if (pn.lhs == Ast.none or (k == 0 and std.mem.eql(u8, pname, "self"))) continue;
+            try d.buf.appendSlice(d.a, ": ");
+            try d.appendNodeText(m, pn.lhs.int());
+        }
+        try d.buf.appendSlice(d.a, ") -> ");
+        if (proto.ret_type == Ast.none) try d.buf.appendSlice(d.a, "()") else try d.appendNodeText(m, proto.ret_type.int());
+    }
+
     fn appendNodeText(d: *Describer, m: *const Graph.Module, i: u32) !void {
         const sp = toyc.AstWalk.nodeSpan(.{ .tree = m.tree(), .tokens = m.tokens, .source = m.source }, Ast.Index.from(i));
         try render.appendCollapsed(d.a, &d.buf, m.source[sp.start..sp.end]);
