@@ -1,7 +1,8 @@
 //! What the source does not spell about a place: how a closure holds each local it
-//! captures, and which call writes a local through a `mut` param. Hover and inlay hints
-//! show these. Everything is read from what the compiler already decided: the lambda
-//! units' envs and the owners' boxed slots (`Closure`), and the arg modes lower passes by
+//! captures, which call writes a local through a `mut` param, and whether a local still
+//! holds what it was bound to. Hover, inlay hints and signature help show these.
+//! Everything is read from what the compiler already decided: the lambda units' envs and
+//! the owners' boxed slots (`Closure`), and the arg modes lower passes by
 //! (`Modes.argMask`), so the editor cannot disagree with the binary.
 //!
 //! The LSP does not know the opt level, and since escape analysis a captured-and-assigned
@@ -201,6 +202,59 @@ pub const Facts = struct {
                     .field_access, .tuple_field => cur = n.lhs.int(),
                     else => break,
                 }
+            }
+        }
+        return null;
+    }
+
+    /// The binder (a `:=` or a local fn) of the local that the identifier node `ident`
+    /// names, when nothing in its fn writes that local again: no assignment rooted at it
+    /// and no `mut` argument rooted at it. Null for a param, a loop or match binding, or
+    /// a local written after its binding.
+    pub fn soleBinding(f: Facts, a: std.mem.Allocator, ident: u32) !?u32 {
+        const m = f.module();
+        const resolutions = f.res.resolutions[f.entry()];
+        if (ident >= resolutions.len) return null;
+        const slot = switch (resolutions[ident]) {
+            .local => |s| s,
+            else => return null,
+        };
+        const fn_node = f.enclosingFn(m.nodes[ident].main_token) orelse return null;
+        // Slots number a whole top-level fn, so the span keeps another fn's same slot out.
+        const sp = f.span(fn_node);
+        var binder: ?u32 = null;
+        for (m.nodes[0..@min(m.nodes.len, resolutions.len)], 0..) |n, i| {
+            const at = m.tokens[n.main_token].start;
+            if (at < sp.start or at >= sp.end) continue;
+            switch (n.tag) {
+                .var_decl, .local_fn => if (resolutions[i] == .local and resolutions[i].local == slot) {
+                    binder = @intCast(i);
+                },
+                .assign => if (f.placeSlot(n.lhs) == slot) return null,
+                else => {},
+            }
+        }
+        for (try f.mutArgs(a)) |ma| {
+            const at = m.tokens[m.nodes[ma.node].main_token].start;
+            if (at >= sp.start and at < sp.end and f.placeSlot(Ast.Index.from(ma.node)) == slot) return null;
+        }
+        return binder;
+    }
+
+    /// The local a place (a local, or a field / tuple-field chain rooted at one) is rooted at.
+    fn placeSlot(f: Facts, place: Ast.Index) ?u32 {
+        const m = f.module();
+        const resolutions = f.res.resolutions[f.entry()];
+        var cur = place;
+        while (cur != Ast.none and cur.int() < resolutions.len) {
+            const n = m.nodes[cur.int()];
+            switch (n.tag) {
+                .field_access, .tuple_field => cur = n.lhs,
+                .identifier => return switch (resolutions[cur.int()]) {
+                    .local => |s| s,
+                    else => null,
+                },
+                else => return null,
             }
         }
         return null;
@@ -555,6 +609,66 @@ test "mutArgs: mut args and mut self receivers, named by their callee" {
     var receivers: usize = 0;
     for (try f.mutArgs(a)) |ma| receivers += @intFromBool(ma.receiver);
     try testing.expectEqual(@as(usize, 1), receivers);
+}
+
+test "soleBinding: a := or a local fn nothing writes again; not a param, a loop var or a written local" {
+    const gpa = testing.allocator;
+    const src =
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, k: int) -> int { self.n + k } }
+        \\fn reset(mut f: fn(int) -> int) { f = fn(v) { v } }
+        \\fn main(arg: int) -> int {
+        \\    acc := Acc { n: 1 }
+        \\    kept := acc.plus
+        \\    moved := acc.plus
+        \\    moved = acc.plus
+        \\    lent := acc.plus
+        \\    reset(lent)
+        \\    inner := acc.plus
+        \\    w := fn() { inner = acc.plus }
+        \\    fn step(k: int) -> int { k + arg }
+        \\    t := 0
+        \\    for i in 0..2 { t = t + i }
+        \\    w()
+        \\    return kept(1) + moved(1) + lent(1) + inner(1) + step(1) + arg + t
+        \\}
+        \\fn other() -> int {
+        \\    kept := 1
+        \\    kept = 2
+        \\    return kept
+        \\}
+        \\
+    ;
+    const c = try Checked.init(gpa, src);
+    defer c.deinit(gpa);
+    const f = c.facts();
+    const a = c.arena.allocator();
+    const m = c.graph.entry();
+    const cases = [_]struct { needle: []const u8, binder: ?[]const u8 }{
+        // `other` has its own `kept`, whose write does not reach this one.
+        .{ .needle = "kept(1)", .binder = "kept :=" },
+        .{ .needle = "step(1)", .binder = "step(k" },
+        .{ .needle = "moved(1)", .binder = null },
+        .{ .needle = "lent(1)", .binder = null },
+        // Written inside a closure, which shares the local.
+        .{ .needle = "inner(1)", .binder = null },
+        .{ .needle = "arg + t", .binder = null },
+        .{ .needle = "i }", .binder = null },
+    };
+    for (cases) |cs| {
+        const tok = c.tokOf(cs.needle, 0);
+        const ident: u32 = for (m.nodes, 0..) |n, i| {
+            if (n.tag == .identifier and n.main_token == tok) break @intCast(i);
+        } else return error.NoIdentifier;
+        const got = try f.soleBinding(a, ident);
+        if (cs.binder) |want| {
+            const b = got orelse {
+                std.debug.print("no sole binding for '{s}'\n", .{cs.needle});
+                return error.NoSoleBinding;
+            };
+            try testing.expectEqual(c.tokOf(want, 0), m.nodes[b].main_token);
+        } else try testing.expect(got == null);
+    }
 }
 
 test "Hold.merge keeps a detail only when both agree" {

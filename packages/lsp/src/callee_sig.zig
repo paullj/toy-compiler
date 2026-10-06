@@ -1,6 +1,6 @@
-//! The signature of the method a `recv.m(..)` call selected, read from the checker's
-//! Callee table. Hover, definition and signature help all go through `of`, so the three
-//! features agree on which method a call invokes.
+//! The signature of the method a `recv.m(..)` call selected, or a `recv.m` bound method
+//! value binds, read from the checker's Callee table. Hover, definition and signature help
+//! all go through `of`, so the three features agree on which method a call invokes.
 //!
 //! KNOWN LIMITATIONS:
 //!   * No selection is recorded, so `of` is null, for a method call inside an unbounded
@@ -44,8 +44,9 @@ pub const CalleeSig = struct {
     pub const Decl = struct { module: u32, node: u32 };
 };
 
-/// The selected method of the call whose member node is `fa` in module `mod`, or null
-/// when `fa` records no selection (a field read, a variant, a `mod.f`, a failed dispatch).
+/// The selected method of the call whose member node is `fa` in module `mod`, or the
+/// method the bound method value `fa` binds; null when `fa` records no method (a field
+/// read, a fn-typed field's call, a variant, a `mod.f`, a failed dispatch).
 /// Borrowed type/name slices point into the compiler results; `a` owns only what is built.
 pub fn of(
     a: std.mem.Allocator,
@@ -87,8 +88,10 @@ fn select(
             return .{ .name = name, .params = sig.params, .param_names = names, .ret = sig.ret, .has_self = has_self, .mut_mask = sig.mut_mask, .decl = .{ .module = gf.module, .node = gf.decl_node.int() } };
         },
         // A function value's signature is its type, not a declaration's.
-        .value, .fn_ref, .bound_method => return null,
-        .method => |i| {
+        .value, .fn_ref => return null,
+        // A bound method value is typed as its method minus `self`, and the method's own
+        // row says the rest: names, decl and modes.
+        .method, .bound_method => |i| {
             if (i >= tc.methods.len) return null;
             const meth = tc.methods[i];
             // A derive's `fn_id` is 0, so it must be read before any fn-table lookup.
@@ -250,4 +253,54 @@ test "of: every recorded callee in the fixture yields a signature; a non-method 
             try testing.expect((try of(a, &graph, &res, &tc, entry, @intCast(i))) == null);
         }
     }
+}
+
+test "of: a bound method value yields its method's signature; a value call and a fn name yield null" {
+    const gpa = testing.allocator;
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, k: int) -> int { self.n + k } }
+        \\struct Box[T] { v: T }
+        \\impl Box[T] { fn get(self) -> T { self.v } }
+        \\fn add(a: int, b: int) -> int { a + b }
+        \\fn main() -> int {
+        \\    acc := Acc { n: 1 }
+        \\    g := acc.plus
+        \\    bg := Box { v: 2 }.get
+        \\    f := add
+        \\    return g(1) + bg() + f(1, 2)
+        \\}
+        \\
+    ;
+    var graph = try ws.discover(gpa, "file:///p/main.toy", src);
+    defer graph.deinit(gpa);
+    try testing.expect(graph.err == null);
+    var res = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer res.deinit(gpa);
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, ws.io, 0);
+    defer tc.deinit(gpa);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+
+    const entry = graph.entry_index;
+    var bound: usize = 0;
+    var values: usize = 0;
+    for (tc.callees[entry], 0..) |c, n| switch (c.view()) {
+        .bound_method => {
+            const sig = (try of(arena.allocator(), &graph, &res, &tc, entry, @intCast(n))) orelse return error.BoundMethodWithoutSig;
+            try testing.expect(sig.has_self and sig.decl != null);
+            try testing.expectEqualStrings("self", sig.param_names[0]);
+            bound += 1;
+        },
+        .value, .fn_ref => {
+            try testing.expect((try of(arena.allocator(), &graph, &res, &tc, entry, @intCast(n))) == null);
+            values += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 2), bound);
+    try testing.expect(values >= 4);
 }

@@ -33,12 +33,19 @@ pub fn renderType(a: std.mem.Allocator, buf: *std.ArrayList(u8), t: Type, layout
         .rawptr => try buf.appendSlice(a, "rawptr"),
         .never => try buf.appendSlice(a, "never"),
         .@"struct" => if (t.struct_id < layouts.len) {
-            if (layouts[t.struct_id].fn_sig) |fs| try renderFnType(a, buf, fs, layouts, enum_layouts) else try renderNominal(a, buf, layouts[t.struct_id].name, layouts, enum_layouts);
+            if (fnSigOf(t, layouts)) |fs| try renderFnType(a, buf, fs, layouts, enum_layouts) else try renderNominal(a, buf, layouts[t.struct_id].name, layouts, enum_layouts);
         } else try buf.appendSlice(a, "struct"),
         .@"enum" => if (t.enum_id < enum_layouts.len) try renderNominal(a, buf, enum_layouts[t.enum_id].name, layouts, enum_layouts) else try buf.appendSlice(a, "enum"),
         // Filtered out by `isRenderable` before we get here; kept total for the compiler.
         .invalid, .type_var, .app, .func => try buf.appendSlice(a, "?"),
     }
+}
+
+/// The signature of a function type, which reifies to a `{code, env}` pair struct; null
+/// for any other type.
+pub fn fnSigOf(t: Type, layouts: []const Layout) ?toyc.LayoutEngine.FnSig {
+    if (t.kind != .@"struct" or t.struct_id >= layouts.len) return null;
+    return layouts[t.struct_id].fn_sig;
 }
 
 /// `fn(A, B) -> R`, the spelling of the pair struct a function type reifies to. A unit
