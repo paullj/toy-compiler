@@ -1,6 +1,6 @@
 import { EditorView } from '@codemirror/view';
 
-// Tooltips, the completion list, and lint marks in the site's own palette.
+// Tooltips, the completion list, lint marks, and inlay hints in the site's own palette.
 export const lspTheme = EditorView.theme({
 	'.cm-tooltip': {
 		backgroundColor: 'var(--bg-elev)',
@@ -56,6 +56,21 @@ export const lspTheme = EditorView.theme({
 	'.toy-diag-related:hover': { color: 'var(--accent)' },
 	'.cm-diagnostic-error': { borderLeftColor: 'var(--accent)' },
 	'.cm-diagnostic-warning': { borderLeftColor: '#c89a2c' },
+	// A hint must never make its line taller, so a block keeps the height of the static code
+	// it replaced: no vertical padding, and a line height of its own, since one inherited at
+	// the smaller size rounds the line up by a fraction of a pixel.
+	'.toy-inlay': {
+		color: 'var(--fg-muted)',
+		backgroundColor: 'var(--border)',
+		borderRadius: '0.25rem',
+		padding: '0 0.3em',
+		fontSize: '0.9em',
+		lineHeight: '1',
+		userSelect: 'none',
+		cursor: 'default'
+	},
+	'.toy-inlay-pad-left': { marginLeft: '0.5ch' },
+	'.toy-inlay-pad-right': { marginRight: '0.5ch' },
 	'.cm-lintRange-error': {
 		backgroundImage: 'none',
 		textDecoration: 'underline wavy var(--accent)',

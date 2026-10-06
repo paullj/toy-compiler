@@ -7,6 +7,7 @@ import {
 } from '@codemirror/lsp-client';
 import { asset } from '$app/paths';
 import { toyDiagnostics } from './diagnostics';
+import { toyInlayHints } from './inlay';
 
 // A server that has not answered for this long is presumed stuck (a check is ~1ms).
 const HANG_MS = 5000;
@@ -81,7 +82,8 @@ export function toyClient(): LSPClient {
 
 	client = new LSPClient({
 		rootUri: 'file:///examples/',
-		extensions: [toyDiagnostics(), serverCompletion(), hoverTooltips(), signatureHelp()]
+		// Inlay hints come first: their publish handler passes each publish on to diagnostics.
+		extensions: [toyInlayHints(), toyDiagnostics(), serverCompletion(), hoverTooltips(), signatureHelp()]
 	}).connect(transport);
 	return client;
 }
