@@ -318,8 +318,10 @@ address and are **T0049** as values. Qualified `mod.f` works the same way.
 Any expression of function type can be called: a local `f(1)`, an index `fs[i](x)`, a
 call `get_op()(2)`, a pipe `x |> g`. The args are checked against the type's params, so
 their expected types flow in as for a direct call. `recv.m(..)` selects a method first
-and only then a fn-typed field named `m`. A call of a non-function is "called value is
-not a function", whatever the callee's shape.
+and only then a fn-typed field named `m` (the value `recv.m` takes them in the other
+order, see [Bound methods](#bound-methods); a method named like a fn-typed field is
+**W0013**). A call of a non-function is "called value is not a function", whatever the
+callee's shape.
 
 An expression statement whose value is a function it never calls does nothing, so it
 is warning **W0012**: a function name (`one`), a bound method (`c.bump`), a field, local,
@@ -435,6 +437,19 @@ is `fn(int) -> int`), so it is passed, stored and called like any function value
 field of that name wins, and an assignment target never binds (`acc.plus = f` is
 T0046, no field). Methods of generic-type instances bind too (`b.get` on a `Box[int]`,
 `xs.len` on a `Vec[int]`), through the instance's own method.
+
+So a method and a field of function type with one name reach two functions: with
+`struct H { run: fn(int) -> int }` and `impl H { fn run(self, x: int) -> int }`,
+`h.run(1)` calls the method and `f := h.run; f(1)` calls the field. Each rule keeps a
+use working when the other member appears (a call when a field is added, a field read
+when a method is added), so neither changes; instead the method declaration is warning
+**W0013** whenever its struct has a field of that name whose type is a function type
+(an alias of one included): "method 'run' on 'H' has the same name as its field 'run'
+of fn type: 'h.run(..)' calls the method and 'h.run' reads the field; rename one". It
+covers inherent and conformance methods and the methods of a generic struct (a field
+`f: fn(T) -> T` of `Box[T]`). A field of another type cannot be called, so it does not
+warn, even a type parameter `v: T` that an instance grounds to a function type, and
+neither does an associated fn, on which `h.run(1)` is already T0018.
 
 The receiver is captured like any other variable. A bare local receiver that is
 assigned anywhere in the function (including by a `mut self` call) is boxed, and the

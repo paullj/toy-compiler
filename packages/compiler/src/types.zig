@@ -2738,6 +2738,7 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
 
     // Before the derive barrier and the mono tail append method rows no source declares.
     try t.checkStdShadows();
+    try t.checkFnFieldMethods();
 
     // WHOLE-PROGRAM COHERENCE: walk every `impl .. has ..`, reject a duplicate
     // (protocol, receiver-ctor) conformance (T0020) — including a retroactive one in a
@@ -3904,6 +3905,46 @@ fn reportStdShadow(t: *Typecheck, own_fn: u32, ty_name: []const u8, std_fn: ?u32
             .{ t.nameText(name_tok), ty_name },
         );
     }
+}
+
+/// W0013 at each method whose receiver struct has a field of function type with the same
+/// name. Both stay reachable, by two rules a reader cannot see at the use: `x.m(..)` selects
+/// the method first, and `x.m` as a value reads the field first. A field of another type
+/// cannot be called, so it is never taken for the method. An associated fn is left out:
+/// `x.m(..)` on one is T0018, an error that already names it.
+fn checkFnFieldMethods(t: *Typecheck) !void {
+    for (t.methods.items) |m| {
+        if (m.is_static or m.recv.kind != .@"struct") continue;
+        try t.reportFnFieldMethod(m.fn_id, m.recv.struct_id);
+    }
+    for (t.templates.items) |m| {
+        if (!m.has_self or m.recv_is_enum) continue;
+        try t.reportFnFieldMethod(m.fn_id, m.recv_ctor);
+    }
+}
+
+fn reportFnFieldMethod(t: *Typecheck, fn_id: u32, struct_id: u32) !void {
+    const s = t.structs.items[struct_id];
+    const f = t.fns.items[fn_id];
+    _ = t.gphSelect(f.mod);
+    const name_tok = t.tree.nodes[f.decl_node.int()].main_token;
+    const name = t.nameText(name_tok);
+    const fi = for (s.field_names, 0..) |fname, i| {
+        if (std.mem.eql(u8, fname, name)) break i;
+    } else return;
+    if (fi >= s.field_types.len or !s.field_types[fi].isFunc()) return;
+    // A related span indexes the diagnostic's own module, so a field declared in another
+    // module goes unlabelled.
+    const related: ?Span = if (s.decl_node != Ast.none and s.mod == f.mod) blk: {
+        const field_nodes = Ast.rangeSlice(t.tree, t.tree.nodes[s.decl_node.int()].lhs.int());
+        break :blk if (fi < field_nodes.len) t.tokSpan(t.tree.nodes[field_nodes[fi].int()].main_token) else null;
+    } else null;
+    const recv: u8 = if (s.name.len > 0 and std.ascii.isAlphabetic(s.name[0])) std.ascii.toLower(s.name[0]) else 'x';
+    try t.sink.report(
+        .{ .span = t.tokSpan(name_tok), .code = .W0013, .related = related },
+        "method '{s}' on '{s}' has the same name as its field '{s}' of fn type: '{c}.{s}(..)' calls the method and '{c}.{s}' reads the field; rename one",
+        .{ name, s.name, name, recv, name, recv, name },
+    );
 }
 
 /// Emit a coherence error if `ty` is a struct/enum whose declaration is not pub.
@@ -7462,7 +7503,9 @@ test "s.f(1) picks the method when both exist, else the fn-typed field" {
         \\
     );
     defer c.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // The documented rule, which W0013 points out at the method.
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.W0013, c.result.diags[0].code);
     try testing.expectEqualStrings("run", (try calleeMethod(&c, "run", 0)).name);
     try testing.expectEqual(Callee.View.value, try calleeView(&c, "go", 0));
     const go = try memberSlot(&c, "go", 0);
@@ -10450,6 +10493,65 @@ test "a function value that is used, or a call that returns one, is not W0012" {
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
+test "a method named like a fn-typed field of its struct is W0013 at the method, naming both rules" {
+    const gpa = testing.allocator;
+    const Case = struct { src: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{
+            .src = "struct H { run: fn(int) -> int }\nimpl H {\n fn run(self, x: int) -> int { x + 1000 }\n}\nfn main() -> int {\n h := H { run: fn(x) { x + 1 } }\n f := h.run\n return h.run(1) + f(1)\n}\n",
+            .want = "method 'run' on 'H' has the same name as its field 'run' of fn type: 'h.run(..)' calls the method and 'h.run' reads the field; rename one",
+        },
+        .{
+            .src = "struct Box[T] { v: T, f: fn() -> T }\nimpl Box[T] {\n fn f(self) -> T { self.v }\n}\nfn main() -> int {\n b := Box { v: 2, f: fn() { 3 } }\n return b.f()\n}\n",
+            .want = "method 'f' on 'Box' has the same name as its field 'f' of fn type: 'b.f(..)' calls the method and 'b.f' reads the field; rename one",
+        },
+        .{
+            .src = "protocol Runner { fn go(self) -> int }\ntype Op = fn() -> int\nstruct H { go: Op }\nimpl H has Runner {\n fn go(self) -> int { 1 }\n}\nfn main() -> int {\n h := H { go: fn() { 2 } }\n return h.go()\n}\n",
+            .want = "method 'go' on 'H' has the same name as its field 'go' of fn type: 'h.go(..)' calls the method and 'h.go' reads the field; rename one",
+        },
+    };
+    for (cases) |cs| {
+        try expectOnlyDiag(cs.src, .W0013);
+        try expectOneDiag(cs.src, .W0013, cs.want);
+        var c = try checkSource(cs.src);
+        defer c.deinit(gpa);
+        const d = c.result.diags[0];
+        const sp = d.span();
+        const rel = d.relatedSpan().?;
+        try testing.expectEqualStrings(cs.src[sp.start..sp.end], cs.src[rel.start..rel.end]);
+        try testing.expect(rel.start < sp.start);
+    }
+}
+
+test "a method beside a field of another type, or an associated fn beside a fn field, is not W0013" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct A { n: int, xs: Box[fn() -> int] }
+        \\struct Box[T] { v: T }
+        \\impl A {
+        \\ fn n(self) -> int { self.n }
+        \\ fn xs(self) -> int { self.n }
+        \\}
+        \\impl Box[T] {
+        \\ fn v(self) -> T { self.v }
+        \\}
+        \\struct H { run: fn(int) -> int }
+        \\impl H {
+        \\ fn run(x: int) -> int { x }
+        \\}
+        \\fn one() -> int { 1 }
+        \\fn main() -> int {
+        \\ a := A { n: 1, xs: Box { v: one } }
+        \\ h := H { run: fn(x) { x } }
+        \\ f := h.run
+        \\ return a.n() + a.xs() + a.xs.v()() + f(1)
+        \\}
+    );
+    defer c.deinit(gpa);
+    for (c.result.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+}
+
 test "W0012 is reported once for a generic fn, and not under a poison return type" {
     try expectOnlyDiag("fn gen[T](f: fn(T) -> T, x: T) -> T {\n f\n x\n}\nfn main() -> int { gen(fn(x: int) { x }, 0) + gen(fn(s: str) { s }, \"a\").len() }\n", .W0012);
     try expectOnlyDiag("fn one() -> int { 1 }\nfn f() -> Nope {\n one\n}\nfn main() -> int { 0 }\n", .T0001);
@@ -11487,7 +11589,9 @@ test "a field wins over a method in value position" {
         \\
     );
     defer c.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // The documented rule, which W0013 points out at the method.
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.W0013, c.result.diags[0].code);
     const fa = try valueMember(&c, "run", 0);
     try testing.expectEqual(Callee.View.none, c.result.callees[0][fa.int()].view());
     for (c.result.adapters) |a| try testing.expectEqual(Closure.AdapterKind.fn_value, a.kind);

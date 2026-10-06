@@ -118,6 +118,7 @@ pub const Code = enum(u16) {
     W0010, // dead-store
     W0011, // shadows-std-method
     W0012, // uncalled-function (an expression statement drops a function value it never calls)
+    W0013, // fn-field-method-clash (a method shares its name with a fn-typed field of its receiver)
 
     _,
 };
@@ -231,6 +232,7 @@ pub const table = [_]Entry{
     .{ .code = .W0010, .str = "W0010", .slug = "dead-store", .default_severity = .warning },
     .{ .code = .W0011, .str = "W0011", .slug = "shadows-std-method", .default_severity = .warning },
     .{ .code = .W0012, .str = "W0012", .slug = "uncalled-function", .default_severity = .warning },
+    .{ .code = .W0013, .str = "W0013", .slug = "fn-field-method-clash", .default_severity = .warning, .related = "field declared here" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -504,6 +506,11 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("uncalled-function", slug(.W0012).?);
     try testing.expectEqual(Severity.warning, defaultSeverity(.W0012));
     try testing.expectEqual(Code.W0012, fromStr("W0012").?);
+
+    try testing.expectEqualStrings("W0013", str(.W0013).?);
+    try testing.expectEqualStrings("fn-field-method-clash", slug(.W0013).?);
+    try testing.expectEqual(Severity.warning, defaultSeverity(.W0013));
+    try testing.expectEqual(Code.W0013, fromStr("W0013").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {
@@ -540,4 +547,5 @@ test "relatedLabel names what each code's related location is" {
     try testing.expectEqualStrings("previously defined here", relatedLabel(.R0002));
     try testing.expectEqualStrings("defined here", relatedLabel(.T0039));
     try testing.expectEqualStrings("outer binding declared here", relatedLabel(.W0009));
+    try testing.expectEqualStrings("field declared here", relatedLabel(.W0013));
 }

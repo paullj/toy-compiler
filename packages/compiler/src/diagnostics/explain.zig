@@ -90,4 +90,7 @@ test "docForStr resolves a known code and rejects garbage" {
 
     const w12 = docForStr("W0012") orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.indexOf(u8, w12, "function value is never called") != null);
+
+    const w13 = docForStr("W0013") orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, w13, "field of function type") != null);
 }

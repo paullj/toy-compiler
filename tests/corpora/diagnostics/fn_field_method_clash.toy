@@ -1,0 +1,44 @@
+# A method with the name of a field of function type on its struct: a call 'h.run(1)'
+# selects the method first, while the value 'h.run' reads the field first, so one name
+# reaches two functions. It warns W0013 at the method, for an inherent method, a method
+# of a generic struct and a conformance method alike. A field of another type, and an
+# associated fn beside a fn field, cannot be confused with it.
+protocol Stepper {
+    fn step(self) -> int
+}
+
+type Op = fn() -> int
+
+struct H { run: fn(int) -> int, n: int }
+struct Box[T] { v: T, map: fn(T) -> T }
+struct S { step: Op }
+struct K { make: fn() -> int }
+
+impl H {
+    fn run(self, x: int) -> int { x + 1000 }  #~ WARN [W0013] method 'run' on 'H' has the same name as its field 'run' of fn type: 'h.run(..)' calls the method and 'h.run' reads the field; rename one
+    fn n(self) -> int { self.n }
+}
+
+impl Box[T] {
+    fn map(self, x: T) -> T { x }  #~ WARN [W0013] method 'map' on 'Box' has the same name as its field 'map' of fn type
+    fn v(self) -> T { self.v }
+}
+
+impl S has Stepper {
+    fn step(self) -> int { 5 }  #~ WARN [W0013] 'step' on 'S' has the same name as its field 'step'
+}
+
+impl K {
+    fn make() -> int { 7 }
+}
+
+fn main() -> int {
+    h := H { run: fn(x) { x + 1 }, n: 1 }
+    f := h.run
+    b := Box { v: 2, map: fn(x: int) { x * 2 } }
+    g := b.map
+    s := S { step: fn() { 3 } }
+    k := K { make: fn() { 4 } }
+    m := k.make
+    return h.run(1) + f(1) + h.n() + b.map(1) + g(1) + b.v() + s.step() + m()
+}
