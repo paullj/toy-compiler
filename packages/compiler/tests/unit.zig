@@ -186,10 +186,6 @@ test "unit: a ()-value program (a () param + Map[int,()]) is byte-identical at -
     const io = threaded.io();
     try skipUnlessBackend(io);
 
-    const dir = ".toy-test-unit-determinism";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-
     const src =
         \\import std/map
         \\fn f(u: ()) -> int { return 0 }
@@ -201,22 +197,7 @@ test "unit: a ()-value program (a () param + Map[int,()]) is byte-identical at -
         \\}
         \\
     ;
-    // Same `-o` basename in both dirs so the ad-hoc code-sign identifier is identical; the
-    // () monomorphized instances are pure functions of source, so codegen is -jN identical.
-    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
-    defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(p8);
-
-    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
-    defer gpa.free(b1);
-    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
-    defer gpa.free(b8);
-
-    try std.testing.expectEqual(b1.len, b8.len);
-    var differing: usize = 0;
-    for (b1, b8) |x, y| {
-        if (x != y) differing += 1;
-    }
-    try std.testing.expect(differing <= 1);
+    // The () monomorphized instances are pure functions of source, so codegen is -jN
+    // identical.
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-unit-determinism", src, &.{}, null);
 }

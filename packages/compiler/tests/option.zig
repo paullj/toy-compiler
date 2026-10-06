@@ -135,26 +135,6 @@ test "option: Option and Result methods are byte-identical at -j1 and -j8" {
         \\}
         \\
     ;
-    const dir = ".toy-test-option-determinism";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const p1 = try harness.compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
-    defer gpa.free(p1);
-    const p8 = try harness.compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(p8);
-
-    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
-    defer gpa.free(b1);
-    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
-    defer gpa.free(b8);
-
-    try std.testing.expectEqual(b1.len, b8.len);
-    // Only the one-byte code-sign nonce may differ.
-    var differing: usize = 0;
-    for (b1, b8) |x, y| {
-        if (x != y) differing += 1;
-    }
-    try std.testing.expect(differing <= 1);
-    try std.testing.expectEqual(@as(u8, 48), try harness.runExit(gpa, io, p1));
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-option-determinism", src, &.{}, 48);
 }

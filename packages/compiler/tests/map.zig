@@ -148,26 +148,7 @@ test "map: an explicit-impl-Hashable key program is byte-identical at -j1 and -j
     const io = threaded.io();
     try skipUnlessBackend(io);
 
-    const dir = ".toy-test-map-custom-eq-determinism";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-
-    const p1 = try compile(gpa, io, dir ++ "/j1", custom_eq_src, &.{ "--no-cache", "-j1" });
-    defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", custom_eq_src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(p8);
-
-    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
-    defer gpa.free(b1);
-    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
-    defer gpa.free(b8);
-
-    try std.testing.expectEqual(b1.len, b8.len);
-    var differing: usize = 0;
-    for (b1, b8) |x, y| {
-        if (x != y) differing += 1;
-    }
-    try std.testing.expect(differing <= 1);
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-map-custom-eq-determinism", custom_eq_src, &.{}, null);
 }
 
 const struct_key_src =
@@ -216,30 +197,9 @@ test "map: the Map program is byte-identical at -j1 and -j8" {
     const io = threaded.io();
     try skipUnlessBackend(io);
 
-    const dir = ".toy-test-map-determinism";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-
-    // Same `-o` basename (`prog`) in both dirs, so the ad-hoc code-sign IDENTIFIER is
-    // identical — only the one-byte code-sign nonce may differ. The descriptor table +
-    // erased units + the Map's mono instances are pure functions of source, so codegen
-    // is `-jN` byte-identical.
-    const p1 = try compile(gpa, io, dir ++ "/j1", share_src, &.{ "--no-cache", "-j1" });
-    defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", share_src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(p8);
-
-    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
-    defer gpa.free(b1);
-    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
-    defer gpa.free(b8);
-
-    try std.testing.expectEqual(b1.len, b8.len);
-    var differing: usize = 0;
-    for (b1, b8) |x, y| {
-        if (x != y) differing += 1;
-    }
-    try std.testing.expect(differing <= 1);
+    // The descriptor table + erased units + the Map's mono instances are pure functions of
+    // source, so codegen is `-jN` byte-identical.
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-map-determinism", share_src, &.{}, null);
 }
 
 // A zero-sized value column (`V = ()`, the Set backing): the cell stride is `size_of[K] + 0`
@@ -484,26 +444,6 @@ test "map: Map closure methods are byte-identical at -j1 and -j8" {
         \\}
         \\
     ;
-    const dir = ".toy-test-map-methods-determinism";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
-    defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(p8);
-
-    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
-    defer gpa.free(b1);
-    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
-    defer gpa.free(b8);
-
-    try std.testing.expectEqual(b1.len, b8.len);
-    // Only the one-byte code-sign nonce may differ.
-    var differing: usize = 0;
-    for (b1, b8) |x, y| {
-        if (x != y) differing += 1;
-    }
-    try std.testing.expect(differing <= 1);
-    try std.testing.expectEqual(@as(u8, 81), try runExit(gpa, io, p1));
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-map-methods-determinism", src, &.{}, 81);
 }

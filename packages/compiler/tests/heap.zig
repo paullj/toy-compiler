@@ -54,39 +54,6 @@ fn buildAndRunWith(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, entry_s
     };
 }
 
-/// Compile `entry_src` with extra `args` (e.g. `--no-cache -j8`) into `dir_name/prog` and return
-/// the produced image bytes (caller frees). Same `-o prog` basename across calls, so the
-/// ad-hoc code-sign IDENTIFIER matches and only the one-byte code-sign nonce may differ —
-/// the seam a `-jN` determinism check compares. Skips off the aarch64-macos backend.
-fn compileBytes(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, entry_src: []const u8, args: []const []const u8) ![]u8 {
-    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
-    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/toy", gpa);
-    defer gpa.free(bin_abs);
-
-    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
-    try Io.Dir.cwd().createDirPath(io, dir_name);
-    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
-
-    const main_path = try std.fmt.allocPrint(gpa, "{s}/main.toy", .{dir_name});
-    defer gpa.free(main_path);
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = main_path, .data = entry_src });
-
-    const out_bin = try std.fmt.allocPrint(gpa, "{s}/prog", .{dir_name});
-    defer gpa.free(out_bin);
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(gpa);
-    try argv.appendSlice(gpa, &.{ bin_abs, "build", main_path, "-o", out_bin });
-    try argv.appendSlice(gpa, args);
-
-    var child = try std.process.spawn(io, .{ .argv = argv.items, .stdout = .pipe, .stderr = .pipe });
-    const term = try child.wait(io);
-    if (term != .exited or term.exited != 0) return error.CompileFailed;
-
-    return Io.Dir.cwd().readFileAlloc(io, out_bin, gpa, .unlimited);
-}
-
 /// The load-bearing precise-trace entry: 64 OWNED (heap `concat`-built) string keys inserted
 /// into a `Map[str,int]` (which grows `cap` to 128, scattering the 64 dense entries into
 /// physical buckets ≥ len), then a forced collection while ~20000 dead heap strings churn the
@@ -145,22 +112,12 @@ test "gc: high-bucket-collision Map[str,int] keys survive a forced collection (p
 
 test "gc: a descriptor-traced Map program is byte-identical at -j1 and -j8" {
     // The widened stack-map (off,tag) payload + the descriptor/trace-unit bytes are pure
-    // functions of source, so the container-tracing collector image is `-jN` byte-identical
-    // (only the one-byte code-sign nonce may differ).
+    // functions of source, so the container-tracing collector image is `-jN` byte-identical.
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const b1 = compileBytes(gpa, io, ".toy-test-gc-jN-1", map_high_bucket_src, &.{ "--no-cache", "-j1" }) catch |e| return if (e == error.SkipZigTest) e else e;
-    defer gpa.free(b1);
-    const b8 = try compileBytes(gpa, io, ".toy-test-gc-jN-8", map_high_bucket_src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(b8);
-    try std.testing.expectEqual(b1.len, b8.len);
-    var differing: usize = 0;
-    for (b1, b8) |x, y| {
-        if (x != y) differing += 1;
-    }
-    try std.testing.expect(differing <= 1);
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-gc-jN", map_high_bucket_src, &.{}, null);
 }
 
 test "heap: store + read-back through a rawptr cell returns 42" {
@@ -562,11 +519,7 @@ test "fn-value programs are byte-identical at -j1 and -j8" {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const b1 = try compileBytes(gpa, io, ".toy-test-fn-jN-1", fn_vec_src, &.{ "--no-cache", "-j1" });
-    defer gpa.free(b1);
-    const b8 = try compileBytes(gpa, io, ".toy-test-fn-jN-8", fn_vec_src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(b8);
-    try std.testing.expectEqualSlices(u8, b1, b8);
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-fn-jN", fn_vec_src, &.{}, null);
 }
 
 /// Closure GC-pressure fixtures. Every victim env is an 8- or 16-byte cell; `churn` makes

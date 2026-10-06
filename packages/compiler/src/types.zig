@@ -2000,22 +2000,32 @@ graph_mod: u32 = 0,
 /// IS `fns[i].name`). Null single-file (the decl-token name is used instead).
 gph_fn_names: ?[]const []const u8 = null,
 
-/// The runtime the per-fn body region (Pass C) dispatches onto. Set in graph
-/// mode (carries the `-j N` worker cap from the driver's own pool). The body region
-/// fans out per-fn body checks via `Engine.fanOut(io, ...)` whenever a pool is present
-/// (`io != null`). `.limited(0)` (`-j1`) drives every unit onto the inline serial path
-/// — the byte-identity baseline. `io == null` (single-file internal callers + inline
-/// tests) is the only serial trigger; both dispatch modes feed the SAME slots +
-/// merge+sort, so the result is byte-identical regardless.
-io: ?Io = null,
+/// How the per-fn body region (Pass C) dispatches. See `Jobs`.
+jobs: Jobs = .{},
 
-/// The `-j` jobs knob: the chunk-count basis for the per-fn Pass-C body fan-out
-/// (`checkBodies`), 0 => host cpu count. Body checks dispatch ~`ncpu`
-/// contiguous chunks (each looping its fns serially) instead of one task per fn, so
-/// `-jN` scales instead of drowning in per-task overhead. Only meaningful when
-/// `io != null` (the parallel dispatch path); determinism is unchanged (fn-id-ordered
-/// merge + one stable sort), so this is a perf lever only.
-ncpu: usize = 0,
+/// How the per-fn body region (Pass C, `checkBodies`) dispatches its units. Every
+/// setting feeds the SAME slots + merge + sort, so the result is byte-identical
+/// regardless; these are perf levers only.
+pub const Jobs = struct {
+    /// The runtime the body region dispatches onto. Set in graph mode (carries the
+    /// `-j N` worker cap from the driver's own pool). The body region fans out per-fn
+    /// body checks via `Engine.chunkedFanOut(io, ...)` whenever a pool is present
+    /// (`io != null`). `.limited(0)` (`-j1`) drives every unit onto the inline serial
+    /// path — the byte-identity baseline. `io == null` (single-file internal callers +
+    /// inline tests) is the only serial trigger: the single-source path passes null so
+    /// the per-file pipeline's own per-file fan-out is the only parallelism (no
+    /// nested-pool oversubscription). `-o`/`--emit ir` pass the real `io`.
+    io: ?Io = null,
+    /// The `-j` jobs knob: the chunk-count basis for the fan-out, 0 => host cpu count.
+    /// Body checks dispatch ~`ncpu` contiguous chunks (each looping its fns serially)
+    /// instead of one task per fn, so `-jN` scales instead of drowning in per-task
+    /// overhead. Only meaningful when `io != null`.
+    ncpu: usize = 0,
+    /// Fan out only above this many fns. The determinism tests lower it so a program of
+    /// a few fns still splits across workers: one large enough to cross the production
+    /// threshold took minutes per test under the stack-tracing test allocator (#34).
+    threshold: usize = Engine.Chunk.body.threshold,
+};
 
 /// The graph context the orchestrator hands the shared `Typecheck`. It owns the
 /// per-module bare-name maps + the import namespaces; `Typecheck` borrows it.
@@ -2281,16 +2291,7 @@ pub fn checkGraph(
     mods: []const GraphModuleInput,
     fns: []const GraphFnInput,
     entry_mod: u32,
-    /// The worker pool the parallel Pass-C body checks fan out onto. `null` forces
-    /// SERIAL Pass-C — the single-source path passes null so the per-file pipeline's
-    /// own per-file fan-out is the only parallelism (no nested-pool oversubscription),
-    /// and a 1-fn graph would never spawn anyway. `-o`/`--emit ir` pass the real `io`.
-    /// SERIAL and PARALLEL are byte-identical (the merge is fn-id ordered + stable-
-    /// sorted), so this is a perf lever only.
-    io: ?Io,
-    /// The `-j` jobs knob for the Pass-C body fan-out (0 => host cpus). Ignored when
-    /// `io == null` (serial). See `Typecheck.ncpu`.
-    ncpu: usize,
+    jobs: Jobs,
 ) !GraphResult {
     // Per-module node_types (parallel to each module's node array).
     const node_types = try gpa.alloc([]Type, mods.len);
@@ -2336,8 +2337,7 @@ pub fn checkGraph(
         .structs = .empty,
         .enums = .empty,
         .graph = ctx,
-        .io = io,
-        .ncpu = ncpu,
+        .jobs = jobs,
         .composite = composite,
     };
     defer {
@@ -3604,7 +3604,7 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
     defer for (slots) |*s| gpa.free(s.descriptor_reqs);
     defer for (slots) |*s| gpa.free(s.boxed);
 
-    if (t.io) |io| {
+    if (t.jobs.io) |io| {
         const Ctx = struct {
             t: *const Typecheck,
             model: *const Model,
@@ -3613,7 +3613,7 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
                 return .{ c.t, c.model, @as(u32, @intCast(i)), &c.slots[i] };
             }
         };
-        Engine.chunkedFanOut(io, n, t.ncpu, Engine.Chunk.body.threshold, Engine.Chunk.body.chunks_per_cpu, bodyUnit, Ctx{ .t = t, .model = model, .slots = slots });
+        Engine.chunkedFanOut(io, n, t.jobs.ncpu, t.jobs.threshold, Engine.Chunk.body.chunks_per_cpu, bodyUnit, Ctx{ .t = t, .model = model, .slots = slots });
     } else {
         for (slots, 0..) |*s, i| bodyUnit(t, model, @intCast(i), s);
     }

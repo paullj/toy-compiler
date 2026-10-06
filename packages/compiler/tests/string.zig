@@ -228,25 +228,8 @@ test "string: a concat program is byte-identical at -j1 and -j8" {
     const io = threaded.io();
     try skipUnlessBackend(io);
 
-    const dir = ".toy-test-string-determinism";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-
-    // Same `-o` basename (`prog`) in both dirs → identical basename-derived code-sign
-    // IDENTIFIER, and the packed String codegen is a pure function of source, so the two
-    // binaries are byte-for-byte identical (assert EXACT equality so a genuine 1-byte
-    // non-determinism cannot hide behind a slack tolerance).
-    const p1 = try compile(gpa, io, dir ++ "/j1", det_src, &.{ "--no-cache", "-j1" });
-    defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", det_src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(p8);
-
-    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
-    defer gpa.free(b1);
-    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
-    defer gpa.free(b8);
-
-    try std.testing.expectEqualSlices(u8, b1, b8);
+    // The packed String codegen is a pure function of source.
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-string-determinism", det_src, &.{}, null);
 }
 
 const ts_det_src =
@@ -269,21 +252,7 @@ test "string: a print/to_string program is byte-identical at -j1 and -j8" {
     const io = threaded.io();
     try skipUnlessBackend(io);
 
-    const dir = ".toy-test-string-ts-determinism";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-
-    const p1 = try compile(gpa, io, dir ++ "/j1", ts_det_src, &.{ "--no-cache", "-j1" });
-    defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", ts_det_src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(p8);
-
-    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
-    defer gpa.free(b1);
-    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
-    defer gpa.free(b8);
-
-    try std.testing.expectEqualSlices(u8, b1, b8);
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-string-ts-determinism", ts_det_src, &.{}, null);
 }
 
 test "string: split, trim and join results survive forced collections" {
@@ -505,20 +474,6 @@ test "string: str methods are byte-identical at -j1 and -j8" {
         \\}
         \\
     ;
-    const dir = ".toy-test-string-methods-determinism";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
-    defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(p8);
-
-    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
-    defer gpa.free(b1);
-    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
-    defer gpa.free(b8);
-
-    try std.testing.expectEqualSlices(u8, b1, b8);
-    try std.testing.expectEqual(@as(u8, 23), try runExit(gpa, io, p1));
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-string-methods-determinism", src, &.{}, 23);
 }

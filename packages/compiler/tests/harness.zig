@@ -42,6 +42,47 @@ pub fn compile(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, entry_src: 
     return Io.Dir.cwd().realPathFileAlloc(io, out_bin, gpa);
 }
 
+/// Build `src` with `flags` at -j1 and at -j8 (each `--no-cache`, in fresh subdirs of
+/// `dir_name`) and expect the two images to be identical; with `exit` set, also expect the
+/// -j1 binary to exit with it. Every byte must match: the code signature has no nonce, only
+/// the `-o` basename (which `compile` keeps fixed), so any difference is a -jN leak.
+pub fn expectDeterministicBuild(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, src: []const u8, flags: []const []const u8, exit: ?u8) !void {
+    try skipUnlessBackend(io);
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const one = try buildImage(gpa, io, dir_name, "-j1", src, flags);
+    defer one.deinit(gpa);
+    const many = try buildImage(gpa, io, dir_name, "-j8", src, flags);
+    defer many.deinit(gpa);
+    if (std.mem.indexOfDiff(u8, one.bytes, many.bytes)) |at| {
+        std.debug.print("-j1 and -j8 images differ at byte {d} of {d} and {d}\n", .{ at, one.bytes.len, many.bytes.len });
+        return error.TestExpectedEqual;
+    }
+    if (exit) |code| try std.testing.expectEqual(code, try runExit(gpa, io, one.prog));
+}
+
+const Image = struct {
+    prog: [:0]u8,
+    bytes: []u8,
+
+    fn deinit(img: Image, gpa: std.mem.Allocator) void {
+        gpa.free(img.prog);
+        gpa.free(img.bytes);
+    }
+};
+
+/// `compile` at `jobs` (`-jN`) into `dir_name/jN`, with the image read back.
+fn buildImage(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, jobs: []const u8, src: []const u8, flags: []const []const u8) !Image {
+    const sub = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir_name, jobs[1..] });
+    defer gpa.free(sub);
+    const args = try std.mem.concat(gpa, []const u8, &.{ &.{ "--no-cache", jobs }, flags });
+    defer gpa.free(args);
+    const prog = try compile(gpa, io, sub, src, args);
+    errdefer gpa.free(prog);
+    return .{ .prog = prog, .bytes = try Io.Dir.cwd().readFileAlloc(io, prog, gpa, .unlimited) };
+}
+
 /// Run the installed `toy` with `args` in the directory `cwd_abs` (absolute), which owns the
 /// `.toy/` cache the build reads and writes. Fails unless toy exits 0.
 pub fn buildIn(gpa: std.mem.Allocator, io: Io, cwd_abs: []const u8, args: []const []const u8) !void {

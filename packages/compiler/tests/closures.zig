@@ -49,16 +49,6 @@ fn freeCases(gpa: std.mem.Allocator, list: *std.ArrayList([]u8)) void {
     list.deinit(gpa);
 }
 
-/// Build `path` into `dir/prog` (same basenames for every build, so images compare) and
-/// return the image bytes.
-fn buildBytes(gpa: std.mem.Allocator, io: Io, dir: []const u8, path: []const u8, flags: []const []const u8) ![]u8 {
-    const src = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
-    defer gpa.free(src);
-    const prog = try harness.compile(gpa, io, dir, src, flags);
-    defer gpa.free(prog);
-    return Io.Dir.cwd().readFileAlloc(io, prog, gpa, .unlimited);
-}
-
 test "every closures/spec_*.toy has the same exit and stdout with --no-specialize" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -151,22 +141,16 @@ test "specialized binaries are identical at -j1 and -j8" {
     const io = threaded.io();
     try harness.skipUnlessBackend(io);
 
-    const tmp = ".toy-test-closures-jn";
-    Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-
     var cases = try specCases(gpa, io);
     defer freeCases(gpa, &cases);
-    for (cases.items) |path| for ([_][]const u8{ "-O0", "-O1" }) |opt| {
-        const a = try buildBytes(gpa, io, tmp, path, &.{ "--no-cache", "-j1", opt });
-        defer gpa.free(a);
-        const b = try buildBytes(gpa, io, tmp, path, &.{ "--no-cache", "-j8", opt });
-        defer gpa.free(b);
-        if (!std.mem.eql(u8, a, b)) {
-            std.debug.print("{s} differs between -j1 and -j8 at {s}\n", .{ path, opt });
-            return error.TestExpectedEqual;
+    for (cases.items) |path| {
+        const src = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
+        defer gpa.free(src);
+        for ([_][]const u8{ "-O0", "-O1" }) |opt| {
+            errdefer std.debug.print("{s} at {s}\n", .{ path, opt });
+            try harness.expectDeterministicBuild(gpa, io, ".toy-test-closures-jn", src, &.{opt}, null);
         }
-    };
+    }
 }
 
 test "a _ capture builds the same binary as the lambda it means" {
