@@ -82,11 +82,10 @@ pub const ref_methods = [_][]const u8{ "new", "get", "set" };
 pub const option_methods = [_][]const u8{ "map", "then", "or_else" };
 pub const result_methods = [_][]const u8{ "map", "then", "map_err", "or_else" };
 pub const str_methods = [_][]const u8{ "contains", "starts_with", "ends_with", "trim", "split", "join", "replace", "chars" };
-pub const mapvec_methods = [_][]const u8{ "keys", "values" };
 
-/// A type some of whose methods live in a std module the program imports, apart from the
-/// type itself: the prelude `Ref`, `Option`, `Result` and `str`, and std/map's `Map`.
-pub const MethodFamily = enum { ref, option, result, str, map };
+/// A prelude type some of whose methods live in a std module the program imports: `Ref`,
+/// `Option`, `Result` and `str`.
+pub const MethodFamily = enum { ref, option, result, str };
 
 /// The methods `std/<module>` declares on a family's type. A call of one of them that finds
 /// no such method means the module is not in the program, so the checker names it.
@@ -97,7 +96,6 @@ pub const std_methods = [_]StdMethods{
     .{ .family = .option, .module = "option", .methods = &option_methods },
     .{ .family = .result, .module = "option", .methods = &result_methods },
     .{ .family = .str, .module = "str", .methods = &str_methods },
-    .{ .family = .map, .module = "mapvec", .methods = &mapvec_methods },
 };
 
 /// The std module that declares `member` on `family`'s type, or null.

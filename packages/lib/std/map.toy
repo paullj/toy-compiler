@@ -1,5 +1,6 @@
 import core/mem
 import std/iter
+import std/vec
 
 # A thin `Map[K,V]` face over `core/mem`'s erased table. The sole field `h` is the 8-byte
 # reference handle, so `n := m` copies the handle and shares the SAME table (a set through
@@ -8,8 +9,8 @@ import std/iter
 # T0023) — the gate that keeps a non-Hashable key from reaching a descriptor. `new` is an
 # ASSOCIATED function, called as `Map[str, int].new()`. `[k]` is a compile error (a miss is
 # normal, so lookups return `Option`); use `.get`. Every walk (`for k, v`, `each`, `filter`,
-# `map`, and `keys`/`values` from std/mapvec) visits entries in insertion order: the order
-# keys were first set; setting an existing key keeps its place.
+# `map`, `keys`, `values`) visits entries in insertion order: the order keys were first set;
+# setting an existing key keeps its place.
 pub struct Map[K, V] { h: gc_array[int] }
 
 impl Map[K has Hashable, V] {
@@ -67,6 +68,28 @@ impl Map[K has Hashable, V] {
         i := 0
         while i < n {
             out.set(mem.mp_key_at[K, V](self.h, i), f(mem.mp_val_at[K, V](self.h, i)))
+            i = i + 1
+        }
+        return out
+    }
+
+    fn keys(self) -> Vec[K] {
+        n := mem.mp_len[K, V](self.h)
+        out := Vec[K].new()
+        i := 0
+        while i < n {
+            out.push(mem.mp_key_at[K, V](self.h, i))
+            i = i + 1
+        }
+        return out
+    }
+
+    fn values(self) -> Vec[V] {
+        n := mem.mp_len[K, V](self.h)
+        out := Vec[V].new()
+        i := 0
+        while i < n {
+            out.push(mem.mp_val_at[K, V](self.h, i))
             i = i + 1
         }
         return out
