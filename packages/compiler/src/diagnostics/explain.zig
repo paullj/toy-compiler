@@ -87,4 +87,7 @@ test "docForStr resolves a known code and rejects garbage" {
 
     const w11 = docForStr("W0011") orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.indexOf(u8, w11, "shadows a std method") != null);
+
+    const w12 = docForStr("W0012") orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, w12, "function value is never called") != null);
 }

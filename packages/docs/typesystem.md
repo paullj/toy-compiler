@@ -321,6 +321,15 @@ their expected types flow in as for a direct call. `recv.m(..)` selects a method
 and only then a fn-typed field named `m`. A call of a non-function is "called value is
 not a function", whatever the callee's shape.
 
+An expression statement whose value is a function it never calls does nothing, so it
+is warning **W0012**: a function name (`one`), a bound method (`c.bump`), a field, local,
+tuple field or element of function type, a lambda, or a `_` capture. The message spells
+the call from the source, `()` for a function of no parameters and `(..)` otherwise
+("function value is never called; did you mean 'c.bump()'?"). Only a statement's value
+counts: a value bound, assigned, passed, returned, piped, or that is the value of a
+block or body that is used, is used. A call that returns a function runs, so its dropped
+result does not warn; nor does any value under a return type that is already an error.
+
 `==`/`!=` on two values of the same function type is identity (both words of the pair);
 different function types are T0044. A function value has no methods (T0018) and meets
 no protocol bound (T0023), so it is neither a `Map` key nor `Display`-able. A generic

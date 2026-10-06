@@ -1,0 +1,37 @@
+# An expression statement whose value is a function it never calls does nothing: a
+# method or fn name written without its parens, a field, local or element of fn type,
+# a lambda, a '_' capture. Each warns W0012 and spells the call. A function value that
+# is bound, passed, piped or returned is used, and a call that returns a function runs.
+import std/vec
+
+struct Counter { n: int, step: fn(int) -> int }
+
+impl Counter {
+    fn bump(mut self) { self.n = self.n + 1 }
+    fn add(self, k: int) -> int { self.n + k }
+}
+
+fn one() -> int { 1 }
+fn inc(x: int) -> int { x + 1 }
+fn apply(f: fn() -> int) -> int { f() }
+fn make() -> fn() -> int { one }
+fn chosen() -> fn() -> int { one }
+
+fn main() -> int {
+    c := Counter { n: 0, step: inc }
+    xs: Vec[int] = [3, 1, 2]
+    fs: Vec[fn() -> int] = [one]
+    c.bump  #~ WARN [W0012] function value is never called; did you mean 'c.bump()'?
+    one  #~ WARN [W0012] did you mean 'one()'?
+    xs.sort  #~ WARN [W0012] did you mean 'xs.sort()'?
+    c.add  #~ WARN [W0012] did you mean 'c.add(..)'?
+    c.step  #~ WARN [W0012] did you mean 'c.step(..)'?
+    fs[0]  #~ WARN [W0012] did you mean 'fs[0]()'?
+    fn() { c.bump() }  #~ WARN [W0012] lambda is never called, so its body never runs
+    c.add(_)  #~ WARN [W0012] unused '_' capture; the '_' makes the call a function, which is never called
+    xs.each(fn(_v) { c.bump })  #~ WARN [W0012] did you mean 'c.bump()'?
+    make()
+    f := c.add
+    g := { one }
+    return f(1) + g() + apply(one) + (one |> apply) + chosen()() + c.n
+}
