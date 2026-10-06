@@ -359,8 +359,8 @@ pub const Builder = struct {
 const Merge = union(enum) {
     /// Non-value loop/block: a `break` carries no value.
     none,
-    /// SCALAR/str value: a value-break's value rides POSITIONALLY as the join
-    /// block's br arg, so the join param id need not be stored here.
+    /// SCALAR (or managed-box) value: a value-break's value rides POSITIONALLY as the
+    /// join block's br arg, so the join param id need not be stored here.
     scalar,
     /// AGGREGATE value: a value-break produces INTO `ptr` (of `ty`), then branches
     /// argless to `break_bb` (the exit reads the destination, not a block-arg merge).
@@ -4283,8 +4283,10 @@ fn lowerIfStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
 }
 
 /// `if cond { then } else { else }` as a VALUE: both arms produce the merge value
-/// carried as a block param on `join`. Typecheck guarantees an else.
+/// carried as a block param on `join`. Typecheck guarantees an else. An aggregate
+/// result is produced into a temp slot instead (see `paramOperand`).
 fn lowerIfValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
+    if (isAggregatePass(b, ty)) return try aggregateValue(b, node_idx, ty);
     const stmt = b.in.tree.nodes[(node_idx).int()];
     const h = Ast.ifHeaderAt(b.in.tree, (stmt.rhs).int());
     std.debug.assert(h.else_node != Ast.none);
@@ -4308,7 +4310,7 @@ fn lowerIfValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{OutO
     if (!b.termSet()) try brTo(b, join, ev);
 
     b.switchTo(join);
-    return paramOperand(ty, merge);
+    return paramOperand(b, ty, merge);
 }
 
 /// A `{ ... }` block in VALUE position: non-final stmts for effect, the trailing
@@ -4618,8 +4620,14 @@ fn lowerForIn2(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOf
 
 /// VALUE `loop { body }`: infinite loop yielding via `break <expr>`. `top` is the
 /// back-edge target; `exit` carries the merge param. A break-less (`never`) loop
-/// never reaches `exit` → its body just back-edges; the exit stays unreachable.
+/// never reaches `exit` → its body just back-edges; the exit stays unreachable. An
+/// aggregate result is produced into a temp slot instead (see `paramOperand`).
 fn lowerLoopValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type, label: ?[]const u8) error{OutOfMemory}!Ir.Operand {
+    if (isAggregatePass(b, ty)) {
+        const res = try aggSlot(b, ty);
+        try lowerLoopValueInto(b, node_idx, res.addr, ty, label);
+        return .{ .slot = res.slot };
+    }
     const n = b.in.tree.nodes[(node_idx).int()];
     const top = try b.addBlock();
     const exit = try b.addBlock();
@@ -4634,7 +4642,7 @@ fn lowerLoopValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type, label: ?
     if (!b.termSet()) try brTo(b, top, .none); // back-edge
 
     b.switchTo(exit);
-    return paramOperand(ty, merge);
+    return paramOperand(b, ty, merge);
 }
 
 /// A `labeled` wrapper as a STATEMENT: dispatch to the inner construct, threading
@@ -4687,8 +4695,14 @@ fn lowerLabeledValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error
 
 /// VALUE labeled BARE BLOCK: like a loop MINUS the back-edge PLUS a trailing-value
 /// store. `break @L <expr>` and the trailing expression both branch to `exit` with
-/// the value. The exit's merge param is the block's value.
+/// the value. The exit's merge param is the block's value; an aggregate result is
+/// produced into a temp slot instead (see `paramOperand`).
 fn lowerLabeledBlock(b: *Builder, block_idx: Ast.Index, ty: Typecheck.Type, label: []const u8) error{OutOfMemory}!Ir.Operand {
+    if (isAggregatePass(b, ty)) {
+        const res = try aggSlot(b, ty);
+        try lowerLabeledBlockInto(b, block_idx, res.addr, ty, label);
+        return .{ .slot = res.slot };
+    }
     const exit = try b.addBlock();
     const is_value = ty.kind != .unit and ty.kind != .never;
     const merge: Ir.ValueId = if (is_value) try b.addParam(exit, ty) else Ir.none_value;
@@ -4699,7 +4713,7 @@ fn lowerLabeledBlock(b: *Builder, block_idx: Ast.Index, ty: Typecheck.Type, labe
     if (!b.termSet()) try brTo(b, exit, tv); // fall-through value
 
     b.switchTo(exit);
-    return paramOperand(ty, merge);
+    return paramOperand(b, ty, merge);
 }
 
 // These mirror the value-yielding control-flow lowerings but write each arm's
@@ -4925,9 +4939,14 @@ pub fn brTo(b: *Builder, dest: Ir.BlockId, arg: Ir.Operand) error{OutOfMemory}!v
 }
 
 /// The Operand that reads a join's merge param: `.none` for a unit merge (the
-/// param value is `none_value`), else `.value` of the param.
-fn paramOperand(ty: Typecheck.Type, merge: Ir.ValueId) Ir.Operand {
-    _ = ty;
+/// param value is `none_value`), else `.value` of the param. Never an aggregate
+/// (str/struct/enum, so also a fn pair): the param's frame cell holds its bytes but has
+/// no address in the IR, while the consumers that read an aggregate in place (a value
+/// call, fn identity `==`, a field read, a `match` scrutinee) take the address of an
+/// `Operand.slot`; fed a `.value`, they fail to lower or read garbage. So an aggregate
+/// if/loop/labeled-block value is produced into a temp slot, as `match` and `?` are.
+fn paramOperand(b: *Builder, ty: Typecheck.Type, merge: Ir.ValueId) Ir.Operand {
+    std.debug.assert(!isAggregatePass(b, ty));
     if (merge == Ir.none_value) return .none;
     return .{ .value = merge };
 }
@@ -6637,14 +6656,15 @@ test "lower-aggregates: struct-variant enum init stores tag@0, fields@8/16" {
     );
 }
 
-test "lower-aggregates: value-if returning a struct produces into each arm slot" {
+test "lower-aggregates: value-if returning a struct produces both arms into one temp slot" {
     try expectLowered(
         "struct V { a: int, b: int }\n" ++
             "fn f(c: int) -> V {\n if c == 1 { V { a: 10, b: 20 } } else { V { a: 1, b: 1 } }\n}\n",
         "f",
         "fn f(s0) -> V {\n" ++
-            "  slots: s0:int s1:V s2:V\n" ++
+            "  slots: s0:int s1:V\n" ++
             "b0:\n" ++
+            "  %1 = slot_addr s1\n" ++
             "  %2 = slot_addr s0\n" ++
             "  %3 = load %2 : int\n" ++
             "  %4 = iconst 1\n" ++
@@ -6653,74 +6673,123 @@ test "lower-aggregates: value-if returning a struct produces into each arm slot"
             "b1(%0:V):\n" ++
             "  ret %0\n" ++
             "b2:\n" ++
-            "  %6 = slot_addr s1\n" ++
-            "  %7 = field_addr %6, 0 : int\n" ++
-            "  %8 = iconst 10\n" ++
-            "  store %7, %8 : int\n" ++
-            "  %9 = field_addr %6, 8 : int\n" ++
-            "  %10 = iconst 20\n" ++
-            "  store %9, %10 : int\n" ++
-            "  br b4(s1)\n" ++
+            "  %6 = field_addr %1, 0 : int\n" ++
+            "  %7 = iconst 10\n" ++
+            "  store %6, %7 : int\n" ++
+            "  %8 = field_addr %1, 8 : int\n" ++
+            "  %9 = iconst 20\n" ++
+            "  store %8, %9 : int\n" ++
+            "  br b4\n" ++
             "b3:\n" ++
-            "  %11 = slot_addr s2\n" ++
-            "  %12 = field_addr %11, 0 : int\n" ++
+            "  %10 = field_addr %1, 0 : int\n" ++
+            "  %11 = iconst 1\n" ++
+            "  store %10, %11 : int\n" ++
+            "  %12 = field_addr %1, 8 : int\n" ++
             "  %13 = iconst 1\n" ++
             "  store %12, %13 : int\n" ++
-            "  %14 = field_addr %11, 8 : int\n" ++
-            "  %15 = iconst 1\n" ++
-            "  store %14, %15 : int\n" ++
-            "  br b4(s2)\n" ++
-            "b4(%1:V):\n" ++
-            "  br b1(%1)\n" ++
+            "  br b4\n" ++
+            "b4:\n" ++
+            "  br b1(s1)\n" ++
             "}\n",
     );
 }
 
-test "lower-aggregates: value-loop break of a struct produces into the merge slot" {
+test "lower-aggregates: value-loop break of a struct produces into a temp slot" {
     try expectLowered(
         "struct V { a: int, b: int }\nfn f() -> V {\n loop { break V { a: 1, b: 2 } }\n}\n",
         "f",
         "fn f() -> V {\n" ++
             "  slots: s0:V\n" ++
             "b0:\n" ++
+            "  %1 = slot_addr s0\n" ++
             "  br b2\n" ++
             "b1(%0:V):\n" ++
             "  ret %0\n" ++
             "b2:\n" ++
-            "  %2 = slot_addr s0\n" ++
-            "  %3 = field_addr %2, 0 : int\n" ++
-            "  %4 = iconst 1\n" ++
-            "  store %3, %4 : int\n" ++
-            "  %5 = field_addr %2, 8 : int\n" ++
-            "  %6 = iconst 2\n" ++
-            "  store %5, %6 : int\n" ++
-            "  br b3(s0)\n" ++
-            "b3(%1:V):\n" ++
-            "  br b1(%1)\n" ++
+            "  %2 = field_addr %1, 0 : int\n" ++
+            "  %3 = iconst 1\n" ++
+            "  store %2, %3 : int\n" ++
+            "  %4 = field_addr %1, 8 : int\n" ++
+            "  %5 = iconst 2\n" ++
+            "  store %4, %5 : int\n" ++
+            "  br b3\n" ++
+            "b3:\n" ++
+            "  br b1(s0)\n" ++
             "}\n",
     );
 }
 
-test "lower-aggregates: labeled-block break of a struct produces into the merge slot" {
+test "lower-aggregates: labeled-block break of a struct produces into a temp slot" {
     try expectLowered(
         "struct V { a: int, b: int }\nfn f() -> V {\n @blk { break @blk V { a: 1, b: 2 } }\n}\n",
         "f",
         "fn f() -> V {\n" ++
             "  slots: s0:V\n" ++
             "b0:\n" ++
-            "  %2 = slot_addr s0\n" ++
-            "  %3 = field_addr %2, 0 : int\n" ++
-            "  %4 = iconst 1\n" ++
-            "  store %3, %4 : int\n" ++
-            "  %5 = field_addr %2, 8 : int\n" ++
-            "  %6 = iconst 2\n" ++
-            "  store %5, %6 : int\n" ++
-            "  br b2(s0)\n" ++
+            "  %1 = slot_addr s0\n" ++
+            "  %2 = field_addr %1, 0 : int\n" ++
+            "  %3 = iconst 1\n" ++
+            "  store %2, %3 : int\n" ++
+            "  %4 = field_addr %1, 8 : int\n" ++
+            "  %5 = iconst 2\n" ++
+            "  store %4, %5 : int\n" ++
+            "  br b2\n" ++
             "b1(%0:V):\n" ++
             "  ret %0\n" ++
-            "b2(%1:V):\n" ++
-            "  br b1(%1)\n" ++
+            "b2:\n" ++
+            "  br b1(s0)\n" ++
             "}\n",
+    );
+}
+
+test "lower-aggregates: a value call on an if reads the fn pair from its temp slot" {
+    // A join block param has no address to load the pair's code and env from; the temp
+    // slot both arms copy into does.
+    try expectLoweredG(
+        \\fn inc(x: int) -> int { x + 1 }
+        \\fn dec(x: int) -> int { x - 1 }
+        \\fn f(c: bool) -> int { (if c { inc } else { dec })(41) }
+        \\
+    , "f",
+        \\fn main.f(s0) -> int {
+        \\  slots: s0:bool s1:fn$int$int s2:fn$int$int s3:fn$int$int
+        \\b0:
+        \\  %1 = slot_addr s1
+        \\  %2 = slot_addr s0
+        \\  %3 = load %2 : bool
+        \\  cond_br %3, b2, b3
+        \\b1(%0:int):
+        \\  ret %0
+        \\b2:
+        \\  %4 = slot_addr s2
+        \\  %5 = fn_addr @main.inc$fnval
+        \\  store %4, %5 : int
+        \\  %6 = field_addr %4, 8 : rawptr
+        \\  %7 = iconst 0
+        \\  store %6, %7 : rawptr
+        \\  %8 = slot_addr s2
+        \\  copy %1 <- %8 : fn$int$int
+        \\  br b4
+        \\b3:
+        \\  %9 = slot_addr s3
+        \\  %10 = fn_addr @main.dec$fnval
+        \\  store %9, %10 : int
+        \\  %11 = field_addr %9, 8 : rawptr
+        \\  %12 = iconst 0
+        \\  store %11, %12 : rawptr
+        \\  %13 = slot_addr s3
+        \\  copy %1 <- %13 : fn$int$int
+        \\  br b4
+        \\b4:
+        \\  %14 = slot_addr s1
+        \\  %15 = load %14 : int
+        \\  %16 = field_addr %14, 8 : rawptr
+        \\  %17 = load %16 : rawptr
+        \\  %18 = iconst 41
+        \\  %19 = call_indirect %15(%17, %18)
+        \\  br b1(%19)
+        \\}
+        \\
     );
 }
 

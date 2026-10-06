@@ -1,0 +1,315 @@
+# Feature: an aggregate value (fn value, struct, tuple struct, enum, Option/Result of a struct, str) yielded by an `if`, a `loop`, a labeled loop or a labeled block is used in place: called, compared with `==`, read through a field or a method, matched, unwrapped with `?`, passed and returned
+# expect: stdout "149 checks passed"
+# expect: exit 0
+# Each check prints a line only when it fails, so a wrong value names its construct and use.
+# Every construct picks its value at run time from `t` (true), never from a constant. The
+# checks are split into small functions only to keep each frame under the codegen limit.
+import std/io
+
+struct P { x: int, y: int }
+impl P { fn sum(self) -> int { self.x + self.y } }
+struct T(int, int)
+impl T { fn diff(self) -> int { self.0 - self.1 } }
+enum S { Dot, Sq(int), Rect { w: int, h: int } }
+impl S {
+    fn area(self) -> int { match self { .Dot -> 0, .Sq(s) -> s * s, .Rect { w, h } -> w * h } }
+}
+struct H { f: fn(int) -> int }
+
+fn inc(x: int) -> int { x + 1 }
+fn dec(x: int) -> int { x - 1 }
+
+fn check(what: str, got: int, want: int) -> int {
+    if got == want { return 1 }
+    io.println(what.concat(": got ").concat(got.to_string()).concat(", want ").concat(want.to_string()))
+    0
+}
+fn yes(what: str, got: bool) -> int { check(what, if got { 1 } else { 0 }, 1) }
+
+# The argument use: each construct is passed straight to `same`.
+fn same[X](x: X) -> X { x }
+
+# The return use, as a tail expression and after `return`.
+fn ret_if[X](t: bool, a: X, b: X) -> X { if t { a } else { b } }
+fn ret_loop[X](t: bool, a: X, b: X) -> X { return loop { break if t { a } else { b } } }
+fn ret_lloop[X](t: bool, a: X, b: X) -> X { @l loop { break @l if t { a } else { b } } }
+fn ret_lblock[X](t: bool, a: X, b: X) -> X { return @k { if t { a } else { b } } }
+
+fn fn_calls(t: bool) -> int {
+    n := check("if fn call", (if t { inc } else { dec })(41), 42)
+    n = n + check("else-if fn call", (if !t { dec } else if t { inc } else { dec })(41), 42)
+    n = n + check("loop fn call", (loop { break if t { inc } else { dec } })(41), 42)
+    n = n + check("labeled loop fn call", (@l loop { break @l if t { inc } else { dec } })(41), 42)
+    n = n + check("labeled block fn call", (@k { if t { inc } else { dec } })(41), 42)
+    i := 0
+    n = n + check("multi-exit loop fn call", (loop {
+        i = i + 1
+        if i == 2 { break dec }
+        if i > 5 { break inc }
+    })(41), 40)
+    return n
+}
+
+fn fn_eqs(t: bool) -> int {
+    n := yes("if fn ==", (if t { inc } else { dec }) == inc)
+    n = n + yes("loop fn ==", loop { break if t { inc } else { dec } } == inc)
+    n = n + yes("labeled loop fn !=", (@l loop { break @l if t { inc } else { dec } }) != dec)
+    n = n + yes("labeled block fn ==", inc == @k { if t { inc } else { dec } })
+    return n
+}
+
+fn fn_fields(t: bool, a: H, b: H) -> int {
+    n := check("if field fn call", (if t { a } else { b }).f(41), 42)
+    n = n + check("loop field fn call", (loop { break if t { a } else { b } }).f(41), 42)
+    n = n + check("labeled loop field fn call", (@l loop { break @l if t { a } else { b } }).f(41), 42)
+    n = n + check("labeled block field fn call", (@k { if t { a } else { b } }).f(41), 42)
+    return n
+}
+
+fn fn_args(t: bool) -> int {
+    n := check("if fn arg", same(if t { inc } else { dec })(41), 42)
+    n = n + check("loop fn arg", same(loop { break if t { inc } else { dec } })(41), 42)
+    n = n + check("labeled loop fn arg", same(@l loop { break @l if t { inc } else { dec } })(41), 42)
+    n = n + check("labeled block fn arg", same(@k { if t { inc } else { dec } })(41), 42)
+    n = n + check("if fn ret", ret_if(t, inc, dec)(41), 42)
+    n = n + check("loop fn ret", ret_loop(t, inc, dec)(41), 42)
+    n = n + check("labeled loop fn ret", ret_lloop(t, inc, dec)(41), 42)
+    n = n + check("labeled block fn ret", ret_lblock(t, inc, dec)(41), 42)
+    return n
+}
+
+fn struct_fields(t: bool, a: P, b: P) -> int {
+    n := check("if struct .y", (if t { a } else { b }).y, 2)
+    n = n + check("else-if struct .y", (if !t { b } else if t { a } else { b }).y, 2)
+    n = n + check("if struct literal .y", (if t { P { x: 1, y: 2 } } else { P { x: 3, y: 4 } }).y, 2)
+    n = n + check("loop struct .y", (loop { break if t { a } else { b } }).y, 2)
+    n = n + check("labeled loop struct .y", (@l loop { break @l if t { a } else { b } }).y, 2)
+    n = n + check("labeled block struct .y", (@k { if t { a } else { b } }).y, 2)
+    i := 0
+    n = n + check("multi-exit labeled block struct .y", (@k {
+        i = i + 1
+        if t { break @k P { x: i, y: 7 } }
+        b
+    }).y, 7)
+    return n
+}
+
+fn struct_methods(t: bool, a: P, b: P) -> int {
+    n := check("if struct method", (if t { a } else { b }).sum(), 3)
+    n = n + check("loop struct method", (loop { break if t { a } else { b } }).sum(), 3)
+    n = n + check("labeled loop struct method", (@l loop { break @l if t { a } else { b } }).sum(), 3)
+    n = n + check("labeled block struct method", (@k { if t { a } else { b } }).sum(), 3)
+    n = n + yes("if struct ==", (if t { a } else { b }) == P { x: 1, y: 2 })
+    n = n + yes("loop struct ==", loop { break if t { a } else { b } } == a)
+    n = n + yes("labeled loop struct !=", (@l loop { break @l if t { a } else { b } }) != b)
+    n = n + yes("labeled block struct ==", a == @k { if t { a } else { b } })
+    return n
+}
+
+fn struct_args(t: bool, a: P, b: P) -> int {
+    n := check("if struct arg", same(if t { a } else { b }).y, 2)
+    n = n + check("loop struct arg", same(loop { break if t { a } else { b } }).y, 2)
+    n = n + check("labeled loop struct arg", same(@l loop { break @l if t { a } else { b } }).y, 2)
+    n = n + check("labeled block struct arg", same(@k { if t { a } else { b } }).y, 2)
+    n = n + check("if struct ret", ret_if(t, a, b).y, 2)
+    n = n + check("loop struct ret", ret_loop(t, a, b).y, 2)
+    n = n + check("labeled loop struct ret", ret_lloop(t, a, b).y, 2)
+    n = n + check("labeled block struct ret", ret_lblock(t, a, b).y, 2)
+    return n
+}
+
+fn tuple_methods(t: bool, a: T, b: T) -> int {
+    n := check("if tuple .1", (if t { a } else { b }).1, 4)
+    n = n + check("loop tuple .1", (loop { break if t { a } else { b } }).1, 4)
+    n = n + check("labeled loop tuple .1", (@l loop { break @l if t { a } else { b } }).1, 4)
+    n = n + check("labeled block tuple .1", (@k { if t { a } else { b } }).1, 4)
+    n = n + check("if tuple method", (if t { a } else { b }).diff(), 5)
+    n = n + check("loop tuple method", (loop { break if t { a } else { b } }).diff(), 5)
+    n = n + check("labeled loop tuple method", (@l loop { break @l if t { a } else { b } }).diff(), 5)
+    n = n + check("labeled block tuple method", (@k { if t { a } else { b } }).diff(), 5)
+    return n
+}
+
+fn tuple_args(t: bool, a: T, b: T) -> int {
+    n := yes("if tuple ==", (if t { a } else { b }) == T(9, 4))
+    n = n + yes("loop tuple ==", loop { break if t { a } else { b } } == a)
+    n = n + yes("labeled loop tuple !=", (@l loop { break @l if t { a } else { b } }) != b)
+    n = n + yes("labeled block tuple ==", a == @k { if t { a } else { b } })
+    n = n + check("if tuple arg", same(if t { a } else { b }).0, 9)
+    n = n + check("loop tuple arg", same(loop { break if t { a } else { b } }).0, 9)
+    n = n + check("labeled loop tuple arg", same(@l loop { break @l if t { a } else { b } }).0, 9)
+    n = n + check("labeled block tuple arg", same(@k { if t { a } else { b } }).0, 9)
+    n = n + check("if tuple ret", ret_if(t, a, b).0, 9)
+    n = n + check("loop tuple ret", ret_loop(t, a, b).0, 9)
+    n = n + check("labeled loop tuple ret", ret_lloop(t, a, b).0, 9)
+    n = n + check("labeled block tuple ret", ret_lblock(t, a, b).0, 9)
+    return n
+}
+
+fn sq_side(s: S) -> int { match s { .Sq(v) -> v, _ -> -1 } }
+
+fn enum_methods(t: bool, a: S, b: S) -> int {
+    n := check("if enum method", (if t { a } else { b }).area(), 12)
+    n = n + check("loop enum method", (loop { break if t { a } else { b } }).area(), 12)
+    n = n + check("labeled loop enum method", (@l loop { break @l if t { a } else { b } }).area(), 12)
+    n = n + check("labeled block enum method", (@k { if t { a } else { b } }).area(), 12)
+    n = n + yes("if enum ==", (if t { a } else { b }) == S.Rect { w: 3, h: 4 })
+    n = n + yes("loop enum ==", loop { break if t { a } else { b } } == a)
+    n = n + yes("labeled loop enum !=", (@l loop { break @l if t { a } else { b } }) != b)
+    n = n + yes("labeled block enum ==", a == @k { if t { a } else { b } })
+    return n
+}
+
+fn enum_matches(t: bool, a: S, b: S) -> int {
+    n := check("if enum match", match (if t { b } else { a }) { .Sq(v) -> v, _ -> 0 }, 5)
+    n = n + check("loop enum match", match (loop { break if t { b } else { a } }) { .Sq(v) -> v, _ -> 0 }, 5)
+    n = n + check("labeled loop enum match", match (@l loop { break @l if t { b } else { a } }) { .Sq(v) -> v, _ -> 0 }, 5)
+    n = n + check("labeled block enum match", match (@k { if t { b } else { a } }) { .Sq(v) -> v, _ -> 0 }, 5)
+    return n
+}
+
+fn enum_args(t: bool, a: S, b: S) -> int {
+    n := check("if enum arg", sq_side(same(if t { b } else { a })), 5)
+    n = n + check("loop enum arg", sq_side(same(loop { break if t { b } else { a } })), 5)
+    n = n + check("labeled loop enum arg", sq_side(same(@l loop { break @l if t { b } else { a } })), 5)
+    n = n + check("labeled block enum arg", sq_side(same(@k { if t { b } else { a } })), 5)
+    n = n + check("if enum ret", ret_if(t, a, b).area(), 12)
+    n = n + check("loop enum ret", ret_loop(t, a, b).area(), 12)
+    n = n + check("labeled loop enum ret", ret_lloop(t, a, b).area(), 12)
+    n = n + check("labeled block enum ret", ret_lblock(t, a, b).area(), 12)
+    return n
+}
+
+# `?` on each construct: the happy path yields the struct, whose field is read.
+fn try_option(t: bool, a: Option[P], b: Option[P]) -> Option[int] {
+    v := (if t { a } else { b })?.y
+    v = v + (loop { break if t { a } else { b } })?.y
+    v = v + (@l loop { break @l if t { a } else { b } })?.y
+    v = v + (@k { if t { a } else { b } })?.y
+    return Option.some(v)
+}
+
+fn option_methods(t: bool, a: Option[P], b: Option[P]) -> int {
+    n := check("if option unwrap", (if t { a } else { b }).unwrap().y, 6)
+    n = n + check("loop option unwrap", (loop { break if t { a } else { b } }).unwrap().y, 6)
+    n = n + check("labeled loop option unwrap", (@l loop { break @l if t { a } else { b } }).unwrap().y, 6)
+    n = n + check("labeled block option unwrap", (@k { if t { a } else { b } }).unwrap().y, 6)
+    n = n + yes("if option is_none", (if t { b } else { a }).is_none())
+    n = n + yes("loop option is_none", (loop { break if t { b } else { a } }).is_none())
+    n = n + yes("labeled loop option is_none", (@l loop { break @l if t { b } else { a } }).is_none())
+    n = n + yes("labeled block option is_none", (@k { if t { b } else { a } }).is_none())
+    n = n + check("option ?", try_option(t, a, b).unwrap_or(0), 24)
+    n = n + check("option ? none", try_option(t, b, a).unwrap_or(-1), -1)
+    return n
+}
+
+fn option_eqs(t: bool, a: Option[P], b: Option[P]) -> int {
+    n := yes("if option ==", (if t { a } else { b }) == Option[P].some(P { x: 5, y: 6 }))
+    n = n + yes("loop option ==", loop { break if t { a } else { b } } == a)
+    n = n + yes("labeled loop option !=", (@l loop { break @l if t { a } else { b } }) != b)
+    n = n + yes("labeled block option ==", b == @k { if t { b } else { a } })
+    return n
+}
+
+fn option_args(t: bool, a: Option[P], b: Option[P]) -> int {
+    n := check("if option arg", same(if t { a } else { b }).unwrap().x, 5)
+    n = n + check("loop option arg", same(loop { break if t { a } else { b } }).unwrap().x, 5)
+    n = n + check("labeled loop option arg", same(@l loop { break @l if t { a } else { b } }).unwrap().x, 5)
+    n = n + check("labeled block option arg", same(@k { if t { a } else { b } }).unwrap().x, 5)
+    n = n + check("if option ret", ret_if(t, a, b).unwrap().x, 5)
+    n = n + check("loop option ret", ret_loop(t, a, b).unwrap().x, 5)
+    n = n + check("labeled loop option ret", ret_lloop(t, a, b).unwrap().x, 5)
+    n = n + check("labeled block option ret", ret_lblock(t, a, b).unwrap().x, 5)
+    return n
+}
+
+fn try_result(t: bool, a: Result[P, str], b: Result[P, str]) -> Result[int, str] {
+    v := (if t { a } else { b })?.x
+    v = v + (loop { break if t { a } else { b } })?.x
+    v = v + (@l loop { break @l if t { a } else { b } })?.x
+    v = v + (@k { if t { a } else { b } })?.x
+    return Result.ok(v)
+}
+
+fn result_methods(t: bool, a: Result[P, str], b: Result[P, str]) -> int {
+    n := check("if result unwrap", (if t { a } else { b }).unwrap().x, 7)
+    n = n + check("loop result unwrap", (loop { break if t { a } else { b } }).unwrap().x, 7)
+    n = n + check("labeled loop result unwrap", (@l loop { break @l if t { a } else { b } }).unwrap().x, 7)
+    n = n + check("labeled block result unwrap", (@k { if t { a } else { b } }).unwrap().x, 7)
+    n = n + yes("if result is_err", (if t { b } else { a }).is_err())
+    n = n + yes("loop result is_err", (loop { break if t { b } else { a } }).is_err())
+    n = n + yes("labeled loop result is_err", (@l loop { break @l if t { b } else { a } }).is_err())
+    n = n + yes("labeled block result is_err", (@k { if t { b } else { a } }).is_err())
+    n = n + check("result ?", try_result(t, a, b).unwrap_or(0), 28)
+    n = n + check("result ? err", match try_result(t, b, a) { .ok(_) -> 0, .err(e) -> e.len() }, 3)
+    return n
+}
+
+fn result_eqs(t: bool, a: Result[P, str], b: Result[P, str]) -> int {
+    n := yes("if result ==", (if t { b } else { a }) == Result[P, str].err("bad"))
+    n = n + yes("loop result ==", loop { break if t { a } else { b } } == a)
+    n = n + yes("labeled loop result !=", (@l loop { break @l if t { a } else { b } }) != b)
+    n = n + yes("labeled block result ==", b == @k { if t { b } else { a } })
+    return n
+}
+
+fn result_args(t: bool, a: Result[P, str], b: Result[P, str]) -> int {
+    n := check("if result arg", same(if t { a } else { b }).unwrap().y, 8)
+    n = n + check("loop result arg", same(loop { break if t { a } else { b } }).unwrap().y, 8)
+    n = n + check("labeled loop result arg", same(@l loop { break @l if t { a } else { b } }).unwrap().y, 8)
+    n = n + check("labeled block result arg", same(@k { if t { a } else { b } }).unwrap().y, 8)
+    n = n + check("if result ret", ret_if(t, a, b).unwrap().y, 8)
+    n = n + check("loop result ret", ret_loop(t, a, b).unwrap().y, 8)
+    n = n + check("labeled loop result ret", ret_lloop(t, a, b).unwrap().y, 8)
+    n = n + check("labeled block result ret", ret_lblock(t, a, b).unwrap().y, 8)
+    return n
+}
+
+fn str_methods(t: bool, a: str, b: str) -> int {
+    n := check("if str method", (if t { a } else { b }).len(), 3)
+    n = n + check("loop str method", (loop { break if t { a } else { b } }).len(), 3)
+    n = n + check("labeled loop str method", (@l loop { break @l if t { a } else { b } }).len(), 3)
+    n = n + check("labeled block str method", (@k { if t { a } else { b } }).len(), 3)
+    n = n + check("if str concat", (if t { a } else { b }).concat(b).len(), 5)
+    n = n + check("loop str concat", (loop { break if t { a } else { b } }).concat(b).len(), 5)
+    n = n + check("labeled loop str concat", (@l loop { break @l if t { a } else { b } }).concat(b).len(), 5)
+    n = n + check("labeled block str concat", (@k { if t { a } else { b } }).concat(b).len(), 5)
+    return n
+}
+
+fn str_args(t: bool, a: str, b: str) -> int {
+    n := yes("if str ==", (if t { a } else { b }) == "abc")
+    n = n + yes("loop str ==", loop { break if t { a } else { b } } == a)
+    n = n + yes("labeled loop str !=", (@l loop { break @l if t { a } else { b } }) != b)
+    n = n + yes("labeled block str ==", a == @k { if t { a } else { b } })
+    n = n + check("if str arg", same(if t { a } else { b }).len(), 3)
+    n = n + check("loop str arg", same(loop { break if t { a } else { b } }).len(), 3)
+    n = n + check("labeled loop str arg", same(@l loop { break @l if t { a } else { b } }).len(), 3)
+    n = n + check("labeled block str arg", same(@k { if t { a } else { b } }).len(), 3)
+    n = n + check("if str ret", ret_if(t, a, b).len(), 3)
+    n = n + check("loop str ret", ret_loop(t, a, b).len(), 3)
+    n = n + check("labeled loop str ret", ret_lloop(t, a, b).len(), 3)
+    n = n + check("labeled block str ret", ret_lblock(t, a, b).len(), 3)
+    return n
+}
+
+fn main() -> int {
+    t := true
+    n := fn_calls(t) + fn_eqs(t) + fn_fields(t, H { f: inc }, H { f: dec }) + fn_args(t)
+    p := P { x: 1, y: 2 }
+    q := P { x: 30, y: 40 }
+    n = n + struct_fields(t, p, q) + struct_methods(t, p, q) + struct_args(t, p, q)
+    n = n + tuple_methods(t, T(9, 4), T(1, 1)) + tuple_args(t, T(9, 4), T(1, 1))
+    r := S.Rect { w: 3, h: 4 }
+    s := S.Sq(5)
+    n = n + enum_methods(t, r, s) + enum_matches(t, r, s) + enum_args(t, r, s)
+    o := Option[P].some(P { x: 5, y: 6 })
+    z := Option[P].none
+    n = n + option_methods(t, o, z) + option_eqs(t, o, z) + option_args(t, o, z)
+    k := Result[P, str].ok(P { x: 7, y: 8 })
+    e := Result[P, str].err("bad")
+    n = n + result_methods(t, k, e) + result_eqs(t, k, e) + result_args(t, k, e)
+    n = n + str_methods(t, "abc", "de") + str_args(t, "abc", "de")
+    io.println(n.to_string().concat(" checks passed"))
+    return 0
+}
