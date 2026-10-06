@@ -39,6 +39,7 @@ fn main() -> int {
   - A named function equals itself.
   - Two evaluations of the same lambda are equal only if it captures nothing: its environment is then null. A capturing lambda gets a new environment each time, so its evaluations are not equal.
 - **Protocols:** function values do not conform to `Hash` or `Display` (see issue #22).
+- **Dropped:** an expression statement that is a function value it never calls (a fn name `one`, a bound method `c.bump`, a fn-typed field, local or element, a lambda, a `_` capture) does nothing, so it is warning W0012, which spells the call: "function value is never called; did you mean 'c.bump()'?" (`(..)` when the function takes arguments). A value that is bound, assigned, passed, returned, piped or is a used block value does not warn, and neither does a call that returns a function: the call runs.
 
 ## Lambdas
 
@@ -144,6 +145,7 @@ There is one sharing model, so the `&x` / `*r` operators are removed.
 - The receiver is captured like any other variable.
 - For a `mut self` method, the receiver is assigned through the closure, so it is boxed.
 - On a `mut` parameter (`mut self` included), the receiver is held by address, like a lambda's capture of it.
+- `c.bump` alone as a statement is the bound method, dropped before it runs, so it is W0012 ("did you mean 'c.bump()'?"); before bound methods it was T0046, no field.
 
 ## `_` capture expressions
 
@@ -160,7 +162,7 @@ There is one sharing model, so the `&x` / `*r` operators are removed.
 
   `pair(1, _)` is `fn(int) -> int`; `id(_)`, where nothing binds `T`, stays the callee's T0016. A capture passed to a bare generic call is typed by its own call, so `twice(add(1, _), 5)` works.
 - **Evaluation:** the other arguments are evaluated each time the capture is called, as in the lambda it means. `add(tick(), _)` calls `tick` on every call, and a `?` or `return` among them exits the capture. A capture has no `-> R` to write, so such a `?` needs an expected fn type that returns an Option or Result (T0032 otherwise), and a `break` or `continue` there is T0051, as in a lambda.
-- **As a statement:** a capture dropped as a statement (`show(_)`) never runs its call, so it is W0008. Before captures, that statement passed a `_` local; rename the local to keep that meaning.
+- **As a statement:** a capture dropped as a statement (`show(_)`) never runs its call, so it is W0012, as any uncalled function value is. Before captures, that statement passed a `_` local; rename the local to keep that meaning.
 - **`mut` positions:** a `_` at a `mut` parameter is T0019. The capture's parameter is a copy of the value it is called with, so the change would be lost.
 - **Pipes:** `x |> f(a, _)` is the call `f(a, x)`: no closure and no env. The piped value is evaluated at its position, in argument order, so in `x |> f(a, _)` the `a` runs first.
 - **Methods:** `acc.plus(_)` is a short form of the bound method with an explicit argument. The receiver is captured like any other argument: a `mut self` receiver is boxed as an assigned capture is (so at `-O1` it may stay unboxed, see Escape analysis), and a `mut` parameter receiver is held by address.

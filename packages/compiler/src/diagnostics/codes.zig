@@ -117,6 +117,7 @@ pub const Code = enum(u16) {
     W0009, // shadowed-binding
     W0010, // dead-store
     W0011, // shadows-std-method
+    W0012, // uncalled-function (an expression statement drops a function value it never calls)
 
     _,
 };
@@ -229,6 +230,7 @@ pub const table = [_]Entry{
     .{ .code = .W0009, .str = "W0009", .slug = "shadowed-binding", .default_severity = .warning, .related = "outer binding declared here" },
     .{ .code = .W0010, .str = "W0010", .slug = "dead-store", .default_severity = .warning },
     .{ .code = .W0011, .str = "W0011", .slug = "shadows-std-method", .default_severity = .warning },
+    .{ .code = .W0012, .str = "W0012", .slug = "uncalled-function", .default_severity = .warning },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -497,6 +499,11 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("shadows-std-method", slug(.W0011).?);
     try testing.expectEqual(Severity.warning, defaultSeverity(.W0011));
     try testing.expectEqual(Code.W0011, fromStr("W0011").?);
+
+    try testing.expectEqualStrings("W0012", str(.W0012).?);
+    try testing.expectEqualStrings("uncalled-function", slug(.W0012).?);
+    try testing.expectEqual(Severity.warning, defaultSeverity(.W0012));
+    try testing.expectEqual(Code.W0012, fromStr("W0012").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {

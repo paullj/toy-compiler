@@ -216,6 +216,23 @@ const Lint = struct {
         if (fam == .none) return null;
         return familyName(fam);
     }
+
+    const Uncalled = enum { value, lambda, capture };
+
+    /// Which kind of uncalled function a dropped expression-statement value is, or null.
+    /// Only forms that do nothing once their value is dropped count, so the statement is
+    /// almost surely a call missing its `(..)`. A call that returns a function has run
+    /// its effects, so its dropped result is like any other dropped value. Suppressed under
+    /// a poison return type for the reason `droppedMustUseName` gives.
+    fn uncalledFn(tree: Ast.Tree, tokens: []const Token, cur_ret: Type, expr: Ast.Index, vt: Type) ?Uncalled {
+        if (Ast.isCaptureLambda(tree, tokens, expr)) return if (vt.kind == .invalid) null else .capture;
+        if (!vt.isFunc() or cur_ret.kind == .invalid) return null;
+        return switch (tree.nodes[expr.int()].tag) {
+            .identifier, .field_access, .tuple_field, .index => .value,
+            .lambda => .lambda,
+            else => null,
+        };
+    }
 };
 
 /// Per-function checking context over a FROZEN `*const Model`. Holds the per-fn
@@ -806,7 +823,7 @@ pub const BodyChecker = struct {
             try bc.checkStmt(s); // effect only
             const sn = bc.tree.nodes[(s).int()];
             if (sn.tag == .expr_stmt)
-                try bc.warnDroppedMustUse(s, bc.node_types[(sn.lhs).int()]);
+                try bc.warnDroppedValue(s, bc.node_types[(sn.lhs).int()]);
         }
         const last = stmts[stmts.len - 1];
         const last_n = bc.tree.nodes[(last).int()];
@@ -814,7 +831,7 @@ pub const BodyChecker = struct {
         if (last_n.tag == .expr_stmt) {
             bt = try bc.typeOfExpected(last_n.lhs, if (want_value) block_expected else null);
             bc.node_types[(last).int()] = bt; // the expr_stmt carries the value type
-            if (!want_value) try bc.warnDroppedMustUse(last, bt);
+            if (!want_value) try bc.warnDroppedValue(last, bt);
         } else if (want_value and last_n.tag == .block) {
             bt = try bc.typeOfExpected(last, block_expected); // value context: validates + types + memoizes
         } else if (want_value and last_n.tag == .if_stmt and
@@ -842,22 +859,40 @@ pub const BodyChecker = struct {
         try bc.sink.report(.{ .span = bc.spanOf(stmts[dead]), .code = .W0005 }, "unreachable code; the previous statement always diverges", .{});
     }
 
-    /// Emit W0008 when a discarded expression statement's value is an `Option`/`Result`.
-    /// The message names only the family (not the full type), so a re-check of a generic
-    /// fn per monomorphization instance produces a byte-identical diagnostic that the
-    /// sink dedups on (scope, offset, code, message). Diagnostics-only — it reads the
+    /// Emit W0012 when a discarded expression statement's value is a function it never
+    /// calls, else W0008 when it is an `Option`/`Result`. Each message is the same for
+    /// every monomorphization instance (W0008 names only the family; W0012 spells the
+    /// source), so the per-instance re-checks of a generic fn yield one diagnostic that
+    /// the sink dedups on (scope, offset, code, message). Diagnostics-only — it reads the
     /// already-memoized value type and never perturbs typing, the value-if path, or the
     /// emitted machine code.
-    fn warnDroppedMustUse(bc: *BodyChecker, stmt_idx: Ast.Index, vt: Type) error{OutOfMemory}!void {
-        // A dropped capture never runs its call, so the statement does nothing. Once that
-        // statement read a `_` local (`show(_)`), so flag it rather than change it silently.
-        if (Ast.isCaptureLambda(bc.tree, bc.tokens, bc.tree.nodes[stmt_idx.int()].lhs)) {
-            if (vt.kind != .invalid)
-                try bc.sink.report(.{ .span = bc.spanOf(stmt_idx), .code = .W0008 }, "unused '_' capture; the '_' makes the call a function, which is never called; to pass a local named '_', rename it", .{});
-            return;
-        }
+    fn warnDroppedValue(bc: *BodyChecker, stmt_idx: Ast.Index, vt: Type) error{OutOfMemory}!void {
+        const expr = bc.tree.nodes[stmt_idx.int()].lhs;
+        if (Lint.uncalledFn(bc.tree, bc.tokens, bc.cur_ret, expr, vt)) |form| return bc.warnUncalled(stmt_idx, expr, vt, form);
         const name = Lint.droppedMustUseName(bc.cur_ret, bc.optResultFamily(vt)) orelse return;
         try bc.sink.report(.{ .span = bc.spanOf(stmt_idx), .code = .W0008 }, "unused {s} value; handle it, bind it with ':=', or propagate with '?'", .{name});
+    }
+
+    /// W0012 for a function value an expression statement drops. Since function values
+    /// and bound methods became expressions, `c.bump` (meant as `c.bump()`) is no longer an
+    /// error but a statement that does nothing, so say so and spell the call.
+    fn warnUncalled(bc: *BodyChecker, stmt_idx: Ast.Index, expr: Ast.Index, vt: Type, form: Lint.Uncalled) error{OutOfMemory}!void {
+        const at: DiagnosticSink.Report = .{ .span = bc.spanOf(stmt_idx), .code = .W0012 };
+        switch (form) {
+            // Once that statement read a `_` local (`show(_)`), so the message names the rename.
+            .capture => try bc.sink.report(at, "unused '_' capture; the '_' makes the call a function, which is never called; to pass a local named '_', rename it", .{}),
+            .lambda => try bc.sink.report(at, "lambda is never called, so its body never runs; bind it with ':=' and call it, or write its statements without the lambda", .{}),
+            .value => {
+                const args = if (Composite.fnParts(bc.composite.at(vt.funcIdx())).params.len == 0) "()" else "(..)";
+                const span = bc.spanOf(expr);
+                const text = bc.source[span.start..span.end];
+                // A multi-line or commented receiver chain would quote badly; name the parens alone.
+                if (std.mem.indexOfAny(u8, text, "\n#") == null)
+                    try bc.sink.report(at, "function value is never called; did you mean '{s}{s}'?", .{ text, args })
+                else
+                    try bc.sink.report(at, "function value is never called; add '{s}' to call it", .{args});
+            },
+        }
     }
 
     fn checkStmt(bc: *BodyChecker, stmt_idx: Ast.Index) error{OutOfMemory}!void {
@@ -4769,6 +4804,33 @@ test "Lint.droppedMustUseName suppresses poison and non-must-use, else names the
     try testing.expect(Lint.droppedMustUseName(.unit, .none) == null);
     try testing.expectEqualStrings("Option", Lint.droppedMustUseName(.unit, .option).?);
     try testing.expectEqualStrings("Result", Lint.droppedMustUseName(.unit, .result).?);
+}
+
+test "Lint.uncalledFn flags effect-free fn-typed forms and captures, never a call or poison" {
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+
+    // token 0 is `fn`, token 1 a `_` identifier: a capture lambda sits on the `_`.
+    const toks = [_]Token{ .{ .tag = .kw_fn, .start = 0, .end = 2 }, .{ .tag = .identifier, .start = 3, .end = 4 } };
+    const id = try b.add(.{ .tag = .identifier, .main_token = 1, .lhs = Ast.none, .rhs = Ast.none });
+    const field = try b.add(.{ .tag = .field_access, .main_token = 1, .lhs = id, .rhs = Ast.none });
+    const index = try b.add(.{ .tag = .index, .main_token = 1, .lhs = id, .rhs = id });
+    const call = try b.add(.{ .tag = .call, .main_token = 1, .lhs = id, .rhs = Ast.none });
+    const lam = try b.add(.{ .tag = .lambda, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
+    const cap = try b.add(.{ .tag = .lambda, .main_token = 1, .lhs = Ast.none, .rhs = Ast.none });
+    const tree: Ast.Tree = .{ .nodes = b.nodes.items, .extra = b.extra.items };
+    const f = Type.func(0);
+
+    try testing.expectEqual(@as(?Lint.Uncalled, .value), Lint.uncalledFn(tree, &toks, .unit, id, f));
+    try testing.expectEqual(@as(?Lint.Uncalled, .value), Lint.uncalledFn(tree, &toks, .unit, field, f));
+    try testing.expectEqual(@as(?Lint.Uncalled, .value), Lint.uncalledFn(tree, &toks, .unit, index, f));
+    try testing.expectEqual(@as(?Lint.Uncalled, .lambda), Lint.uncalledFn(tree, &toks, .unit, lam, f));
+    try testing.expectEqual(@as(?Lint.Uncalled, .capture), Lint.uncalledFn(tree, &toks, .unit, cap, f));
+    // A call ran its effects; a non-fn value is not a function; poison stays quiet.
+    try testing.expectEqual(@as(?Lint.Uncalled, null), Lint.uncalledFn(tree, &toks, .unit, call, f));
+    try testing.expectEqual(@as(?Lint.Uncalled, null), Lint.uncalledFn(tree, &toks, .unit, id, .int));
+    try testing.expectEqual(@as(?Lint.Uncalled, null), Lint.uncalledFn(tree, &toks, .invalid, id, f));
+    try testing.expectEqual(@as(?Lint.Uncalled, null), Lint.uncalledFn(tree, &toks, .unit, cap, .invalid));
 }
 
 test "a checker diagnostic spans the node it is about, not just its first token" {

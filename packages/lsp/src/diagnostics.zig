@@ -218,12 +218,22 @@ test "checkBuffer maps a piped T0039 to the |> step and each P0014 to its annota
 }
 
 test "checkBuffer publishes a std-shadowing W0011 as a warning on its annotated line" {
+    try expectWarningsOnAnnotatedLines("tests/corpora/diagnostics/shadows_std_method.toy", "W0011");
+}
+
+test "checkBuffer publishes an uncalled-function W0012 as a warning on its annotated line" {
+    try expectWarningsOnAnnotatedLines("tests/corpora/diagnostics/uncalled_function.toy", "W0012");
+}
+
+/// Every `code` diagnostic of the fixture at `path` is a warning on a line annotated
+/// `#~ WARN [code]`, and each annotation gets one.
+fn expectWarningsOnAnnotatedLines(path: []const u8, code: []const u8) !void {
     const gpa = testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const src = try Io.Dir.cwd().readFileAlloc(io, "tests/corpora/diagnostics/shadows_std_method.toy", gpa, .unlimited);
+    const src = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
     defer gpa.free(src);
 
     var docs: Documents = .{};
@@ -232,6 +242,8 @@ test "checkBuffer publishes a std-shadowing W0011 as a warning on its annotated 
     var mapped = try checkBuffer(gpa, ws, "file:///doc.toy", src);
     defer mapped.deinit();
 
+    var buf: [32]u8 = undefined;
+    const marker = try std.fmt.bufPrint(&buf, "#~ WARN [{s}]", .{code});
     var lines: std.ArrayList([]const u8) = .empty;
     defer lines.deinit(gpa);
     var it = std.mem.splitScalar(u8, src, '\n');
@@ -239,10 +251,10 @@ test "checkBuffer publishes a std-shadowing W0011 as a warning on its annotated 
     var seen: usize = 0;
     for (mapped.items) |d| {
         const c = d.code orelse continue;
-        if (!std.mem.eql(u8, c, "W0011")) continue;
+        if (!std.mem.eql(u8, c, code)) continue;
         seen += 1;
         try testing.expectEqual(protocol.severity.warning, d.severity);
-        try testing.expect(std.mem.indexOf(u8, lines.items[d.range.start.line], "#~ WARN [W0011]") != null);
+        try testing.expect(std.mem.indexOf(u8, lines.items[d.range.start.line], marker) != null);
     }
-    try testing.expectEqual(std.mem.count(u8, src, "#~ WARN [W0011]"), seen);
+    try testing.expectEqual(std.mem.count(u8, src, marker), seen);
 }

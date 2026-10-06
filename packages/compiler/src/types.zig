@@ -10370,7 +10370,7 @@ test "a '?' or jump in a capture's arguments names the capture, not a lambda" {
     }
 }
 
-test "a capture dropped as a statement is W0008, since its call never runs" {
+test "a capture dropped as a statement is W0012, since its call never runs" {
     const gpa = testing.allocator;
     const pre = "fn show(x: int) { _y := x }\nfn add(a: int, b: int) -> int { a + b }\n";
     const msg = "unused '_' capture; the '_' makes the call a function, which is never called; to pass a local named '_', rename it";
@@ -10379,12 +10379,80 @@ test "a capture dropped as a statement is W0008, since its call never runs" {
         pre ++ "fn main() -> int {\n add(1, _)\n return 0\n}\n",
         pre ++ "fn main() {\n add(1, _)\n}\n",
     }) |src| {
-        try expectOnlyDiag(src, .W0008);
-        try expectOneDiag(src, .W0008, msg);
+        try expectOnlyDiag(src, .W0012);
+        try expectOneDiag(src, .W0012, msg);
     }
     var ok = try checkSource(pre ++ "fn main() -> int {\n f := add(1, _)\n 2 |> show(_)\n return f(1)\n}\n");
     defer ok.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), ok.result.diags.len);
+}
+
+test "a function value dropped as a statement is W0012, with the call spelled from the source" {
+    const pre =
+        \\struct C { n: int, f: fn() -> int }
+        \\struct T2(fn(int) -> int)
+        \\impl C {
+        \\ fn bump(mut self) { self.n = self.n + 1 }
+        \\ fn add(self, k: int) -> int { self.n + k }
+        \\}
+        \\fn one() -> int { 1 }
+        \\fn inc(x: int) -> int { x + 1 }
+        \\
+    ;
+    const Case = struct { body: []const u8, want: []const u8 };
+    const cases = [_]Case{
+        .{ .body = "c.bump", .want = "function value is never called; did you mean 'c.bump()'?" },
+        .{ .body = "c.add", .want = "function value is never called; did you mean 'c.add(..)'?" },
+        .{ .body = "one", .want = "function value is never called; did you mean 'one()'?" },
+        .{ .body = "inc", .want = "function value is never called; did you mean 'inc(..)'?" },
+        .{ .body = "c.f", .want = "function value is never called; did you mean 'c.f()'?" },
+        .{ .body = "t.0", .want = "function value is never called; did you mean 't.0(..)'?" },
+        .{ .body = "g := one\n g", .want = "function value is never called; did you mean 'g()'?" },
+        .{ .body = "fn local() -> int { 2 }\n local", .want = "function value is never called; did you mean 'local()'?" },
+        .{ .body = "c.\n  bump", .want = "function value is never called; add '()' to call it" },
+        .{ .body = "fn() { c.bump() }", .want = "lambda is never called, so its body never runs; bind it with ':=' and call it, or write its statements without the lambda" },
+        .{ .body = "if c.n > 0 { one }", .want = "function value is never called; did you mean 'one()'?" },
+        .{ .body = "_r: fn(int) = fn(_v) { c.bump }", .want = "function value is never called; did you mean 'c.bump()'?" },
+    };
+    for (cases) |cs| {
+        const src = try std.fmt.allocPrint(testing.allocator, "{s}fn main() -> int {{\n c := C {{ n: 0, f: one }}\n t := T2(inc)\n {s}\n return c.n + t.0(0)\n}}\n", .{ pre, cs.body });
+        defer testing.allocator.free(src);
+        try expectOnlyDiag(src, .W0012);
+        try expectOneDiag(src, .W0012, cs.want);
+    }
+}
+
+test "a function value that is used, or a call that returns one, is not W0012" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct C { n: int }
+        \\impl C { fn get(self) -> int { self.n } }
+        \\fn one() -> int { 1 }
+        \\fn apply(f: fn() -> int) -> int { f() }
+        \\fn make() -> fn() -> int { one }
+        \\fn tail() -> fn() -> int { one }
+        \\fn ret() -> fn() -> int { return one }
+        \\fn pick(b: bool) -> fn() -> int { if b { one } else { make() } }
+        \\fn main() -> int {
+        \\ c := C { n: 0 }
+        \\ f := c.get
+        \\ g: fn() -> int = make()
+        \\ g = one
+        \\ make()
+        \\ h := { one }
+        \\ k := fn() { one }
+        \\ _m := fn(_v: int) { c.get }
+        \\ return f() + g() + apply(one) + (one |> apply) + h() + k()() + tail()() + ret()() + pick(true)()
+        \\}
+    );
+    defer c.deinit(gpa);
+    for (c.result.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+}
+
+test "W0012 is reported once for a generic fn, and not under a poison return type" {
+    try expectOnlyDiag("fn gen[T](f: fn(T) -> T, x: T) -> T {\n f\n x\n}\nfn main() -> int { gen(fn(x: int) { x }, 0) + gen(fn(s: str) { s }, \"a\").len() }\n", .W0012);
+    try expectOnlyDiag("fn one() -> int { 1 }\nfn f() -> Nope {\n one\n}\nfn main() -> int { 0 }\n", .T0001);
 }
 
 test "a capture's '_' at a mut position is T0019; a piped value there is the caller's place" {
