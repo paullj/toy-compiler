@@ -28,6 +28,7 @@ const position = @import("position.zig");
 const completion = @import("completion.zig");
 const definition = @import("definition.zig");
 const signature = @import("signature.zig");
+const inlay = @import("inlay.zig");
 const Documents = @import("Documents.zig");
 const Workspace = @import("Workspace.zig");
 
@@ -91,6 +92,20 @@ pub const Server = struct {
     }
 
     const Position = struct { uri: []const u8, text: []const u8, line: u32, character: u32 };
+
+    /// The open document and range a `textDocument/inlayHint` request names, or null as
+    /// for `positionAt`.
+    fn rangeAt(self: *Server, root: std.json.Value) ?DocRange {
+        const params = objGet(root, "params") orelse return null;
+        const uri = getStr(objGet(params, "textDocument") orelse return null, "uri") orelse return null;
+        const range = objGet(params, "range") orelse return null;
+        const start = jsonPosition(objGet(range, "start") orelse return null) orelse return null;
+        const end = jsonPosition(objGet(range, "end") orelse return null) orelse return null;
+        const doc = self.docs.get(uri) orelse return null;
+        return .{ .uri = uri, .text = doc.text, .range = .{ .start = start, .end = end } };
+    }
+
+    const DocRange = struct { uri: []const u8, text: []const u8, range: protocol.Range };
 
     /// Serve every framed message in `input`, then return — for a host that pushes messages
     /// in (a browser worker) rather than the server pulling from a pipe. False once `exit`
@@ -274,7 +289,7 @@ pub const Server = struct {
             return true;
         }
 
-        // The four position requests below allocate their answers from the per-message
+        // The position and range requests below allocate their answers from the per-message
         // arena, so nothing needs freeing: the arena reset after dispatch returns does it.
         if (eql(method, "textDocument/hover")) {
             const iv = id orelse return true; // a request must carry an id
@@ -318,6 +333,18 @@ pub const Server = struct {
                 break :blk sh.help;
             };
             try respond(a, writer, iv, result);
+            return true;
+        }
+
+        if (eql(method, "textDocument/inlayHint")) {
+            const iv = id orelse return true;
+            const hints: []const protocol.InlayHint = blk: {
+                const at = self.rangeAt(root) orelse break :blk &.{};
+                const r = inlay.hintsIn(a, self.workspace(), at.text, at.range, at.uri) catch break :blk &.{};
+                break :blk r.hints;
+            };
+            // Always an array: an empty list is a valid "no hints".
+            try protocol.writeResponse(a, writer, iv, hints);
             return true;
         }
 
@@ -448,6 +475,14 @@ fn collectCancel(gpa: std.mem.Allocator, body: []const u8, set: *CancelSet) !voi
     const params = objGet(root, "params") orelse return;
     const id = objGet(params, "id") orelse return;
     try set.add(id);
+}
+
+/// A `{line, character}` object, each coordinate guarded as `coordU32` guards it.
+fn jsonPosition(v: std.json.Value) ?protocol.Position {
+    return .{
+        .line = coordU32(getInt(v, "line")) orelse return null,
+        .character = coordU32(getInt(v, "character")) orelse return null,
+    };
 }
 
 /// An LSP position coordinate -> u32 guarding the whole u32 range; null/negative/over-max
@@ -606,7 +641,7 @@ test "lsp e2e: initialize -> didOpen(diag) -> didChange(clean clears) -> broken(
             var it = caps.object.iterator();
             while (it.next()) |e| {
                 const k = e.key_ptr.*;
-                try testing.expect(eql(k, "positionEncoding") or eql(k, "textDocumentSync") or eql(k, "hoverProvider") or eql(k, "completionProvider") or eql(k, "definitionProvider") or eql(k, "signatureHelpProvider"));
+                try testing.expect(eql(k, "positionEncoding") or eql(k, "textDocumentSync") or eql(k, "hoverProvider") or eql(k, "completionProvider") or eql(k, "definitionProvider") or eql(k, "signatureHelpProvider") or eql(k, "inlayHintProvider"));
             }
         } else if (idv == .integer and idv.integer == 2) {
             saw_shutdown = true;
@@ -1516,4 +1551,105 @@ test "lsp positions: utf-16 unless the client offers utf-8, both directions" {
         const d = objGet(last, "params").?.object.get("diagnostics").?.array.items[0];
         try testing.expectEqual(c.want_char, getInt(field(d, "range", "start").?, "character").?);
     }
+}
+
+test "lsp inlayHint: advertised, answered in range over stdio and through feed alike, [] before didOpen" {
+    const gpa = testing.allocator;
+    const src =
+        \\fn inc(mut n: int) { n = n + 1 }
+        \\fn run(f: fn()) { f() }
+        \\fn main() -> int {
+        \\    c := 1
+        \\    run(fn() { inc(c) })
+        \\    inc(c)
+        \\    return c
+        \\}
+        \\
+    ;
+    const uri = "file:///inlay.toy";
+    const Rng = struct { start: struct { line: i64, character: i64 }, end: struct { line: i64, character: i64 } };
+    const req = struct {
+        fn make(id: i64, u: []const u8, first: i64, last: i64) struct {
+            jsonrpc: []const u8 = "2.0",
+            id: i64,
+            method: []const u8 = "textDocument/inlayHint",
+            params: struct { textDocument: struct { uri: []const u8 }, range: Rng },
+        } {
+            return .{ .id = id, .params = .{ .textDocument = .{ .uri = u }, .range = .{ .start = .{ .line = first, .character = 0 }, .end = .{ .line = last, .character = 0 } } } };
+        }
+    };
+
+    var session: Writer.Allocating = .init(gpa);
+    defer session.deinit();
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 1), .method = "initialize", .params = .{} });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
+    try frameInto(gpa, &session, req.make(2, uri, 0, 9));
+    try frameInto(gpa, &session, .{
+        .jsonrpc = "2.0",
+        .method = "textDocument/didOpen",
+        .params = .{ .textDocument = .{ .uri = uri, .languageId = "toy", .version = @as(i64, 1), .text = src } },
+    });
+    try frameInto(gpa, &session, req.make(3, uri, 0, 9));
+    try frameInto(gpa, &session, req.make(4, uri, 5, 6));
+    // A negative coordinate is malformed: no hints, no crash.
+    try frameInto(gpa, &session, req.make(5, uri, -1, 9));
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 6), .method = "shutdown" });
+    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "exit" });
+
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    var reader = Reader.fixed(session.written());
+    try testing.expectEqual(ExitCode.ok, try serve(gpa, &reader, &out.writer));
+
+    // The wasm build drives the same core through `feed`: the same bytes in, the same out.
+    var fed: Writer.Allocating = .init(gpa);
+    defer fed.deinit();
+    var s = Server.init(gpa);
+    defer s.deinit();
+    try testing.expect(!try s.feed(session.written(), &fed.writer));
+    try testing.expectEqualStrings(out.written(), fed.written());
+
+    var frames = try splitFrames(gpa, out.written());
+    defer {
+        for (frames.items) |b| gpa.free(b);
+        frames.deinit(gpa);
+    }
+    var parse_arena = std.heap.ArenaAllocator.init(gpa);
+    defer parse_arena.deinit();
+    const pa = parse_arena.allocator();
+    var by_id: [8]?std.json.Value = @splat(null);
+    for (frames.items) |body| {
+        const v = try std.json.parseFromSliceLeaky(std.json.Value, pa, body, .{});
+        if (objGet(v, "method") != null) continue;
+        const idv = objGet(v, "id") orelse continue;
+        if (idv == .integer and idv.integer >= 0 and idv.integer < 8) by_id[@intCast(idv.integer)] = v;
+    }
+
+    const ihp = objGet(field(by_id[1].?, "result", "capabilities").?, "inlayHintProvider").?;
+    try testing.expect(ihp == .bool and ihp.bool);
+
+    try testing.expectEqual(@as(usize, 0), resultArr(by_id[2].?).?.len); // before didOpen
+    try testing.expectEqual(@as(usize, 0), resultArr(by_id[5].?).?.len); // malformed range
+
+    const all = resultArr(by_id[3].?).?;
+    try testing.expectEqual(@as(usize, 3), all.len);
+    const Want = struct { line: i64, character: i64, label: []const u8, tooltip: []const u8 };
+    const want = [_]Want{
+        .{ .line = 4, .character = colOf(src, 4, "{ inc"), .label = "captures c (shared)", .tooltip = "c: shared" },
+        .{ .line = 4, .character = colOf(src, 4, "c) })"), .label = "mut", .tooltip = "mutated by inc" },
+        .{ .line = 5, .character = colOf(src, 5, "c)"), .label = "mut", .tooltip = "mutated by inc" },
+    };
+    for (want, all) |w, h| {
+        try testing.expectEqual(w.line, getInt(objGet(h, "position").?, "line").?);
+        try testing.expectEqual(w.character, getInt(objGet(h, "position").?, "character").?);
+        try testing.expectEqualStrings(w.label, getStr(h, "label").?);
+        try testing.expectEqualStrings(w.tooltip, getStr(h, "tooltip").?);
+    }
+    try testing.expectEqual(@as(?i64, protocol.inlay_kind.parameter), getInt(all[1], "kind"));
+    try testing.expect(objGet(all[0], "kind") == null);
+
+    // Lines 5..6 hold only the second `mut` argument.
+    const ranged = resultArr(by_id[4].?).?;
+    try testing.expectEqual(@as(usize, 1), ranged.len);
+    try testing.expectEqual(@as(i64, 5), getInt(objGet(ranged[0], "position").?, "line").?);
 }

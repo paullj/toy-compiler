@@ -1,5 +1,6 @@
 //! textDocument/hover: what the token under the cursor is (see `describe.zig`), rendered as
-//! a ```toy block the client highlights.
+//! a ```toy block the client highlights. A captured name or a `mut` argument also gets a
+//! prose note after the block (see `places.zig`).
 //!
 //! Checks through the same `Workspace` as `diagnostics.checkBuffer`, but instead of mapping
 //! diagnostics it RETAINS the graph/resolve/typecheck results to describe the token, renders
@@ -18,6 +19,7 @@ const toyc = @import("toy_compiler");
 const Workspace = @import("Workspace.zig");
 const position = @import("position.zig");
 const describe = @import("describe.zig");
+const places = @import("places.zig");
 
 const ResolveGraph = toyc.ResolveGraph;
 const TypecheckGraph = toyc.TypecheckGraph;
@@ -73,9 +75,24 @@ pub fn hoverAt(
         arena.deinit();
         return null;
     }
+    var value: std.ArrayList(u8) = .empty;
     // Fenced so the client highlights it as toy source.
-    const value = try std.fmt.allocPrint(d.a, "```toy\n{s}\n```", .{d.buf.items});
-    return .{ .arena = arena, .value = value, .kind = "markdown" };
+    try value.print(d.a, "```toy\n{s}\n```", .{d.buf.items});
+    try appendPlaceNotes(d.a, &value, .{ .graph = &graph, .res = &res, .tc = &tc }, tok);
+    return .{ .arena = arena, .value = value.items, .kind = "markdown" };
+}
+
+/// What the source never spells about the place `tok` names, as prose after the fence:
+/// how a closure holds it, and which call writes it through a `mut` param.
+fn appendPlaceNotes(a: std.mem.Allocator, buf: *std.ArrayList(u8), f: places.Facts, tok: u32) !void {
+    if (f.captureAt(tok)) |h| {
+        try buf.appendSlice(a, "\n\ncaptured");
+        if (h != .unknown) {
+            try buf.appendSlice(a, ": ");
+            try h.append(a, buf);
+        }
+    }
+    if (try f.mutatedBy(a, tok)) |callee| try buf.print(a, "\n\nmutated by {s}", .{callee});
 }
 
 const testing = std.testing;
@@ -432,6 +449,91 @@ test "hover on a callee spells its mut params, a mut self receiver included" {
         };
         defer h.deinit();
         const want = try std.fmt.allocPrint(gpa, "```toy\n{s}\n```", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}
+
+test "hover on a captured name says how its closure holds it" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, k: int) -> int { self.n + k } }
+        \\fn apply(f: fn(int) -> int, v: int) -> int { f(v) }
+        \\fn counter() -> fn() -> int {
+        \\    n := 0
+        \\    fn() {
+        \\        n = n + 1
+        \\        n
+        \\    }
+        \\}
+        \\fn main() -> int {
+        \\    total := 0
+        \\    acc := Acc { n: 2 }
+        \\    r := apply(fn(v) { total = total + v + acc.n }, 5)
+        \\    plus := acc.plus
+        \\    return r + total + counter()() + plus(1)
+        \\}
+        \\
+    ;
+    const test_util = @import("test_util.zig");
+    const cases = [_]struct { at: @import("protocol.zig").Position, want: []const u8 }{
+        .{ .at = test_util.posOf(src, "n = n"), .want = "n: int\n```\n\ncaptured: shared (boxed)" },
+        .{ .at = test_util.posOf(src, "total = total"), .want = "total: int\n```\n\ncaptured: shared" },
+        .{ .at = test_util.posOf(src, "acc.n }"), .want = "acc: Acc\n```\n\ncaptured: copied (8 bytes)" },
+        .{ .at = test_util.posOf(src, "acc.plus"), .want = "acc: Acc\n```\n\ncaptured: copied (8 bytes)" },
+        // The local outside its closure is not a capture.
+        .{ .at = test_util.posOf(src, "total + counter"), .want = "total: int\n```" },
+    };
+    for (cases) |c| {
+        var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse return error.NoHover;
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}
+
+test "hover on a mut argument or a mut self receiver names the call that mutates it" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\struct P { x: int, y: int }
+        \\impl P {
+        \\    fn bump(mut self) { self.x = self.x + 1 }
+        \\}
+        \\fn inc(mut n: int, k: int) { n = n + k }
+        \\fn run(f: fn()) { f() }
+        \\fn main() -> int {
+        \\    c := 1
+        \\    p := P { x: 1, y: 2 }
+        \\    inc(c, 2)
+        \\    inc(p.y, c)
+        \\    p.bump()
+        \\    run(fn() { inc(c, 1) })
+        \\    return c + p.x
+        \\}
+        \\
+    ;
+    const test_util = @import("test_util.zig");
+    const cases = [_]struct { at: @import("protocol.zig").Position, want: []const u8 }{
+        .{ .at = test_util.posOf(src, "c, 2)"), .want = "c: int\n```\n\nmutated by inc" },
+        .{ .at = test_util.posOf(src, "y, c)"), .want = "int\n```\n\nmutated by inc" },
+        .{ .at = test_util.posOf(src, "p.bump"), .want = "p: P\n```\n\nmutated by bump" },
+        // Passed to a `mut` param inside a closure: captured, and boxed as an assigned one is.
+        .{ .at = test_util.posOf(src, "c, 1)"), .want = "c: int\n```\n\ncaptured: shared\n\nmutated by inc" },
+        // A by-value argument says nothing more.
+        .{ .at = test_util.posOf(src, "c)\n    p.bump"), .want = "c: int\n```" },
+    };
+    for (cases) |c| {
+        var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse return error.NoHover;
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}", .{c.want});
         defer gpa.free(want);
         try testing.expectEqualStrings(want, h.value);
     }

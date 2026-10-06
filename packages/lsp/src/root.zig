@@ -19,6 +19,8 @@ test {
     _ = @import("describe.zig");
     _ = @import("render.zig");
     _ = @import("callee_sig.zig");
+    _ = @import("places.zig");
+    _ = @import("inlay.zig");
     _ = @import("position.zig");
     _ = @import("completion.zig");
     _ = @import("definition.zig");
