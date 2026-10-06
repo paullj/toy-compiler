@@ -228,7 +228,11 @@ The names `unwrap`, `unwrap_or`, `is_err` and `map_err` may change; see issue #2
     - The LSP does not know the opt level, so it adds a storage word only where every build agrees: "shared (boxed)" when the local keeps its GC cell even with frame storage (a closure that captures it escapes, a bound method value holds it, or it is over 16 B), and "shared (by address)" for a captured `mut` parameter.
   - An inlay hint before the body of a lambda or a local fn lists its captures, `captures base (copied), total (shared)`, with each one's detail in its tooltip. A `_` capture and a bound method value get none: every local they capture is spelled in the one expression that makes them.
   - A `mut` argument shows "mutated by f" on hover, and a `mut` inlay hint before it, since the call site has no marker. A `mut self` receiver gets the hover only: a receiver stays unmarked, as in Rust and Swift.
-- **LSP function values:** hover and signature help on calls of function-typed values and bound methods.
+- **LSP function values:**
+  - Signature help on a call of a function value (a local or param `f(`, a field `h.run(`, an element `fs[0](`, a call's result `mk()(`) shows the value's type, `fn(int, str) -> bool`. A function type has no parameter names, so each parameter is labelled by its type. The piped value of `x |> f(..)` counts as the first argument, and the help holds while the call is unfinished or has an error.
+  - A local bound once to a named function or a bound method, and never written again (`f := add`, `g := acc.plus`), shows the label a call of that function or method would: `g(` shows `fn plus(int) -> int`. A local fn shows its own name. A local that is assigned or passed to a `mut` parameter shows its type, since its value may come from anywhere.
+  - Hover on the callee shows its type (`g: fn(int) -> int`). Hover on a bound method value (`plus` in `g := acc.plus`) shows the method and adds "bound method of Acc".
+  - Hover on the `_` of a capture adds the function type the capture makes: `_: int`, then "capture: fn(int) -> int".
 
 ## Out of scope
 

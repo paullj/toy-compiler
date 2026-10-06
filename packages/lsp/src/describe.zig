@@ -174,8 +174,9 @@ pub const Describer = struct {
         return true;
     }
 
-    /// The method the call headed by member node `fa` selected, as `function` renders a fn.
-    /// A user protocol's method shows as written, like the protocol-decl hover.
+    /// The method the call headed by member node `fa` selected, or the bound method value
+    /// `fa` binds, as `function` renders a fn. A user protocol's method shows as written,
+    /// like the protocol-decl hover.
     fn callee(d: *Describer, fa: u32) !bool {
         const sig = (try callee_sig.of(d.a, d.graph, d.res, d.tc, d.graph.entry_index, fa)) orelse return false;
         if (callee_sig.spelledFromDecl(d.tc, d.graph.entry_index, fa)) if (sig.decl) |decl| {

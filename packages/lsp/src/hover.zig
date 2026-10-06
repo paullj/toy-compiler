@@ -1,6 +1,6 @@
 //! textDocument/hover: what the token under the cursor is (see `describe.zig`), rendered as
-//! a ```toy block the client highlights. A captured name or a `mut` argument also gets a
-//! prose note after the block (see `places.zig`).
+//! a ```toy block the client highlights. A bound method value, a `_` capture, a captured
+//! name and a `mut` argument also get a prose note after the block (see `places.zig`).
 //!
 //! Checks through the same `Workspace` as `diagnostics.checkBuffer`, but instead of mapping
 //! diagnostics it RETAINS the graph/resolve/typecheck results to describe the token, renders
@@ -20,9 +20,11 @@ const Workspace = @import("Workspace.zig");
 const position = @import("position.zig");
 const describe = @import("describe.zig");
 const places = @import("places.zig");
+const render = @import("render.zig");
 
 const ResolveGraph = toyc.ResolveGraph;
 const TypecheckGraph = toyc.TypecheckGraph;
+const Type = toyc.Typecheck.Type;
 const SourceMap = toyc.term.render.SourceMap;
 
 /// Owns the arena backing `value`. `kind` is a static string. `value` stays valid until
@@ -78,8 +80,37 @@ pub fn hoverAt(
     var value: std.ArrayList(u8) = .empty;
     // Fenced so the client highlights it as toy source.
     try value.print(d.a, "```toy\n{s}\n```", .{d.buf.items});
+    try appendValueNotes(d.a, &value, &graph, &tc, tok);
     try appendPlaceNotes(d.a, &value, .{ .graph = &graph, .res = &res, .tc = &tc }, tok);
     return .{ .arena = arena, .value = value.items, .kind = "markdown" };
+}
+
+/// Which function value `tok` makes, as prose after the fence: the member of a bound method
+/// value names its receiver's type (the fence shows the method), and the `_` of a capture
+/// gives the capture's fn type (the fence shows the `_` itself).
+fn appendValueNotes(a: std.mem.Allocator, buf: *std.ArrayList(u8), graph: *const toyc.Graph.Graph, tc: *const TypecheckGraph.GraphResult, tok: u32) !void {
+    const m = graph.entry();
+    const e = graph.entry_index;
+    const nts = tc.node_types[e];
+    const callees = tc.callees[e];
+    for (m.nodes, 0..) |n, i| {
+        if (n.main_token != tok or i >= nts.len) continue;
+        const ty: Type, const what: []const u8 = switch (n.tag) {
+            .field_access => if (i < callees.len and callees[i].view() == .bound_method and n.lhs.int() < nts.len)
+                .{ nts[n.lhs.int()], "bound method of " }
+            else
+                continue,
+            .lambda => if (toyc.Ast.isCaptureLambda(m.tree(), m.tokens, toyc.Ast.Index.from(@intCast(i))))
+                .{ nts[i], "capture: " }
+            else
+                continue,
+            else => continue,
+        };
+        if (!render.isRenderable(ty)) continue;
+        try buf.print(a, "\n\n{s}", .{what});
+        try render.renderType(a, buf, ty, tc.layouts, tc.enum_layouts);
+        return;
+    }
 }
 
 /// What the source never spells about the place `tok` names, as prose after the fence:
@@ -266,23 +297,129 @@ test "hover on a piped callee shows its signature, also on a leading-pipe line" 
     }
 }
 
-test "hover on a capture's '_' shows the type the call gives it" {
+test "hover on a capture's '_' shows the type the call gives it and the fn type of the capture" {
     const gpa = testing.allocator;
     var docs: @import("Documents.zig") = .{};
     defer docs.deinit(gpa);
     const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
     const src =
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, k: int) -> int { self.n + k } }
+        \\struct Pt(int, str)
         \\fn add(a: int, b: int) -> int { return a + b }
         \\fn main() -> int {
+        \\    acc := Acc { n: 1 }
         \\    inc := add(1, _)
-        \\    return inc(2)
+        \\    p := acc.plus(_)
+        \\    g := acc.plus
+        \\    q := g(_)
+        \\    mk := Pt(_, "s")
+        \\    k := 5 |> add(2, _)
+        \\    return inc(2) + p(3) + q(4) + mk(5).0 + k
         \\}
         \\
     ;
-    const p = @import("test_util.zig").posOf(src, "_)");
-    var h = (try hoverAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse return error.NoHover;
-    defer h.deinit();
-    try testing.expectEqualStrings("```toy\n_: int\n```", h.value);
+    const test_util = @import("test_util.zig");
+    const cases = [_]struct { at: @import("protocol.zig").Position, want: []const u8 }{
+        .{ .at = test_util.posOf(src, "_)\n    p :="), .want = "_: int\n```\n\ncapture: fn(int) -> int" },
+        .{ .at = test_util.posOf(src, "_)\n    g :="), .want = "_: int\n```\n\ncapture: fn(int) -> int" },
+        .{ .at = test_util.posOf(src, "_)\n    mk :="), .want = "_: int\n```\n\ncapture: fn(int) -> int" },
+        .{ .at = test_util.posOf(src, "_, \"s\""), .want = "_: int\n```\n\ncapture: fn(int) -> Pt" },
+    };
+    for (cases) |c| {
+        var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no hover at {d}:{d}\n", .{ c.at.line, c.at.character });
+            return error.NoHover;
+        };
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+    // A pipe fills its `_` with the piped value: a plain call, no capture.
+    const pipe_hole = test_util.posOf(src, "_)\n    return");
+    try testing.expect(try hoverAt(gpa, ws, src, pipe_hole.line, pipe_hole.character, "file:///p/main.toy") == null);
+}
+
+test "hover on a bound method value shows its method and names the receiver's type" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\struct Acc { n: int }
+        \\impl Acc {
+        \\    fn plus(self, k: int) -> int { self.n + k }
+        \\    fn bump(mut self) { self.n = self.n + 1 }
+        \\}
+        \\struct Box[T] { v: T }
+        \\impl Box[T] { fn get(self) -> T { self.v } }
+        \\fn main() -> int {
+        \\    acc := Acc { n: 1 }
+        \\    g := acc.plus
+        \\    b := Box { v: "s" }
+        \\    bg := b.get
+        \\    up := acc.bump
+        \\    up()
+        \\    return g(1) + bg().len() + acc.plus(2)
+        \\}
+        \\
+    ;
+    const test_util = @import("test_util.zig");
+    const cases = [_]struct { at: @import("protocol.zig").Position, want: []const u8 }{
+        .{ .at = test_util.posOf(src, "plus\n"), .want = "fn plus(self: Acc, k: int) -> int\n```\n\nbound method of Acc" },
+        .{ .at = test_util.posOf(src, "get\n"), .want = "fn get(self: Box[str]) -> str\n```\n\nbound method of Box[str]" },
+        .{ .at = test_util.posOf(src, "bump\n"), .want = "fn bump(mut self: Acc) -> ()\n```\n\nbound method of Acc" },
+        // A call of the method is not a value.
+        .{ .at = test_util.posOf(src, "plus(2)"), .want = "fn plus(self: Acc, k: int) -> int\n```" },
+    };
+    for (cases) |c| {
+        var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse return error.NoHover;
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}
+
+test "hover on the callee of a function value's call shows its type" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\import std/vec
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, k: int) -> int { self.n + k } }
+        \\struct H { run: fn(int) -> int }
+        \\fn dbl(x: int) -> int { x * 2 }
+        \\fn apply(f: fn(int) -> int, v: int) -> int { f(v) }
+        \\fn main() -> int {
+        \\    acc := Acc { n: 1 }
+        \\    g := acc.plus
+        \\    h := H { run: dbl }
+        \\    fs := [dbl]
+        \\    return g(1) + h.run(2) + fs[0](3) + apply(g, 4) + 5 |> h.run()
+        \\}
+        \\
+    ;
+    const test_util = @import("test_util.zig");
+    const cases = [_]struct { at: @import("protocol.zig").Position, want: []const u8 }{
+        .{ .at = test_util.posOf(src, "f(v)"), .want = "f: fn(int) -> int" },
+        .{ .at = test_util.posOf(src, "g(1)"), .want = "g: fn(int) -> int" },
+        // A field read shows its type, as any field read does.
+        .{ .at = test_util.posOf(src, "run(2)"), .want = "fn(int) -> int" },
+        .{ .at = test_util.posOf(src, "run()"), .want = "fn(int) -> int" },
+        // An element callee has no name token: its `[` heads it.
+        .{ .at = test_util.posOf(src, "[0](3)"), .want = "fn(int) -> int" },
+    };
+    for (cases) |c| {
+        var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse return error.NoHover;
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}\n```", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
 }
 
 test "hover on a method callee shows the selected method" {

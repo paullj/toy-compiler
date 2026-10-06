@@ -8,25 +8,31 @@
 //! appending its missing closers at EOF (offset-preserving) and resolve/type errors are
 //! tolerated — an arity error on the repaired call must not suppress the declared signature.
 //!
-//! A free fn's signature is read from `resolutions` -> `sigs` (the same path hover uses for
-//! a callee), rendered through `render.bareName` so the module qualifier never leaks. A
-//! method call's comes from the checker's Callee table (`callee_sig`), shown without its
-//! `self`: the receiver is left of the `.`, never inside the parens. Param labels are
-//! [start,end) byte spans into the rendered label.
+//! The call is found by its `(`, so any callee shape gets help. A free fn's signature is
+//! read from `resolutions` -> `sigs` (the same path hover uses for a callee), rendered
+//! through `render.bareName` so the module qualifier never leaks. A method call's comes from
+//! the checker's Callee table (`callee_sig`), shown without its `self`: the receiver is left
+//! of the `.`, never inside the parens. A call of a function value (`f(`, `h.run(`,
+//! `fs[0](`, `mk()(`) shows the value's type, `fn(int) -> int`, whose params are labelled by
+//! type, since a fn type has no param names. A local bound once to a named fn or a bound
+//! method (`f := add`, `g := acc.plus`) shows that fn's or method's label instead, as a call
+//! of it would, and a local fn its own. Param labels are [start,end) byte spans into the
+//! rendered label.
 //!
 //! KNOWN LIMITATIONS (documented, not bugs):
-//!   * A turbofish call `id[int](` or `v.m[int](` — the token before `(` is `]`, not an
-//!     identifier — yields no help. Free fns and module-qualified free fns (`io.f(`) are
-//!     correct.
+//!   * A call with explicit type args (`id[int](`, `v.into[i64](`) yields no help. Free fns
+//!     and module-qualified free fns (`io.f(`) are correct.
+//!   * A local's binding is followed only when nothing writes the local again; any write
+//!     (an assignment, a `mut` argument) leaves its calls labelled by their type. A param, a
+//!     field or an element is always labelled by its type.
 //!   * A builtin method on a concrete receiver inside a bounded template (`(3).eq(`) shows
 //!     no receiver type: the template's node types are scratch, so its param renders `?`.
-//!   * A method call inside a generic body can yield no help at all, and a generic
-//!     protocol's method shows the protocol's own params: see `callee_sig`'s limitations.
+//!   * A method call or a function value's call inside a generic body can yield no help at
+//!     all (issue #33), and a generic protocol's method shows the protocol's own params: see
+//!     `callee_sig`'s limitations.
 //!   * A bare pipe target `x |> f` has no `(`, so it yields no help of its own.
 //!   * A parse error OTHER than the appended closers (or a stray unmatched closer) re-triggers
 //!     discovery's whole-tree discard -> null (the single-edit repair limit, as in completion).
-//!   * Signature help may fire inside a fn DECLARATION's own param parens (`(` preceded by the
-//!     decl name); harmless.
 
 const std = @import("std");
 const toyc = @import("toy_compiler");
@@ -34,8 +40,10 @@ const protocol = @import("protocol.zig");
 const position = @import("position.zig");
 const render = @import("render.zig");
 const callee_sig = @import("callee_sig.zig");
+const places = @import("places.zig");
 const Workspace = @import("Workspace.zig");
 
+const Callee = toyc.Callee;
 const ResolveGraph = toyc.ResolveGraph;
 const TypecheckGraph = toyc.TypecheckGraph;
 const Token = toyc.Token;
@@ -55,31 +63,32 @@ pub const Result = struct {
     }
 };
 
-const Enclosing = struct { callee_start: u32, active: u32 };
+/// `lparen` is the source offset of the call's `(`.
+const Enclosing = struct { lparen: u32, active: u32 };
 
 /// The innermost enclosing call the cursor is inside, or null. A call's `(` is never
 /// preceded by a statement-terminator newline, so the IMMEDIATELY preceding token decides
 /// `is_call` — no newline-skip (that would misread `foo⏎(x)`, two statements, as a call).
-/// An identifier before `(` covers `add(` and the member callee of `recv.f(`. Turbofish
-/// `id[int](` (preceding token `]`) and grouping / `if` / `while` parens are excluded. Only
-/// tokens starting strictly before `off` drive the stack, so a `(` exactly at the cursor is
-/// "not yet entered" and a cursor just before it is outside.
+/// An identifier before `(` covers `add(` and the member callee of `recv.f(`; a `]` or `)`
+/// covers a callee that is an element or a call's result (`fs[0](`, `mk()(`), and a
+/// turbofish. Grouping / `if` / `while` parens are excluded. Only tokens starting strictly
+/// before `off` drive the stack, so a `(` exactly at the cursor is "not yet entered" and a
+/// cursor just before it is outside.
 fn enclosingCall(gpa: std.mem.Allocator, toks: []const Token, off: u32) !?Enclosing {
-    const Frame = struct { is_call: bool, callee_start: u32, lparen_i: usize };
+    const Frame = struct { is_call: bool, lparen_i: usize };
     var stack: std.ArrayList(Frame) = .empty;
     defer stack.deinit(gpa);
     for (toks, 0..) |t, i| {
         if (t.start >= off) break;
         switch (t.tag) {
-            .l_paren => {
-                const is_call = i > 0 and toks[i - 1].tag == .identifier;
-                try stack.append(gpa, .{
-                    .is_call = is_call,
-                    .callee_start = if (is_call) toks[i - 1].start else 0,
-                    .lparen_i = i,
-                });
-            },
-            .l_bracket, .l_brace => try stack.append(gpa, .{ .is_call = false, .callee_start = 0, .lparen_i = i }),
+            .l_paren => try stack.append(gpa, .{
+                .is_call = i > 0 and switch (toks[i - 1].tag) {
+                    .identifier, .r_bracket, .r_paren => true,
+                    else => false,
+                },
+                .lparen_i = i,
+            }),
+            .l_bracket, .l_brace => try stack.append(gpa, .{ .is_call = false, .lparen_i = i }),
             // Pop on any closer regardless of type: a mismatched closer in a broken prefix
             // also fails to re-parse (whole-tree discard -> null), so no extra handling pays.
             .r_paren, .r_bracket, .r_brace => if (stack.items.len > 0) {
@@ -93,7 +102,7 @@ fn enclosingCall(gpa: std.mem.Allocator, toks: []const Token, off: u32) !?Enclos
         k -= 1;
         if (stack.items[k].is_call) {
             const fr = stack.items[k];
-            return .{ .callee_start = fr.callee_start, .active = activeParam(toks, fr.lparen_i, off) };
+            return .{ .lparen = toks[fr.lparen_i].start, .active = activeParam(toks, fr.lparen_i, off) };
         }
     }
     return null;
@@ -206,6 +215,89 @@ fn appendTypeText(a: std.mem.Allocator, buf: *std.ArrayList(u8), pm: *const toyc
     try render.appendCollapsed(a, buf, pm.source[sp.start..sp.end]);
 }
 
+/// What a call reaches, as its label spells it.
+const Hit = union(enum) {
+    /// A free fn: its global id.
+    func: u32,
+    /// A method, and the member node whose Callee selected it (a bound method value's own
+    /// `field_access` for a local bound to one).
+    method: struct { sig: callee_sig.CalleeSig, node: u32 },
+    /// A function value: its type, and the name of the local fn it is, if it is one.
+    value: struct { name: ?[]const u8, sig: toyc.LayoutEngine.FnSig },
+};
+
+/// The call node whose `(` starts at `lparen`: its own main token, or the `(` after the
+/// `|>` of a piped call.
+fn callAt(m: *const toyc.Graph.Module, lparen: u32) ?u32 {
+    for (m.nodes, 0..) |n, i| {
+        if (n.tag != .call or n.lhs == toyc.Ast.none) continue;
+        const open = if (m.tokens[n.main_token].tag == .pipe_gt) toyc.Ast.pipeArgsOpen(m.tokens, n.main_token) orelse continue else n.main_token;
+        if (m.tokens[open].start == lparen) return @intCast(i);
+    }
+    return null;
+}
+
+/// What `call` reaches. A function value's label is its type, which has no parameter
+/// names. A local bound once to a named fn or a bound method (`f := add`, `g := acc.plus`)
+/// is labelled as a call of that fn or method would be, and a local fn by its own name.
+fn hitOf(a: std.mem.Allocator, f: places.Facts, call: u32) !?Hit {
+    const m = f.graph.entry();
+    const entry = f.graph.entry_index;
+    const tree = m.tree();
+    const resolutions = f.res.resolutions[entry];
+    const cn = m.nodes[call];
+    if (cn.lhs.int() < resolutions.len) switch (resolutions[cn.lhs.int()]) {
+        .func => |gid| return if (gid < f.tc.sigs.len) .{ .func = gid } else null,
+        else => {},
+    };
+    if (Callee.memberNode(tree, cn)) |fa| {
+        if (try callee_sig.of(a, f.graph, f.res, f.tc, entry, fa.int())) |ms| return .{ .method = .{ .sig = ms, .node = fa.int() } };
+    }
+    // The callee's type, not the `.value` tag: a call with an argument error, mid-typing,
+    // still has a typed callee.
+    const slot = (Callee.callSlot(tree, cn) orelse return null).int();
+    const nts = f.tc.node_types[entry];
+    if (slot >= nts.len) return null;
+    const fs = render.fnSigOf(nts[slot], f.tc.layouts) orelse return null;
+    if (m.nodes[slot].tag == .identifier) if (try f.soleBinding(a, slot)) |b| {
+        const bn = m.nodes[b];
+        if (bn.tag == .local_fn) return .{ .value = .{ .name = m.tokens[bn.main_token].text(m.source), .sig = fs } };
+        const init = bn.lhs.int();
+        if (init < resolutions.len) switch (resolutions[init]) {
+            .func => |gid| if (gid < f.tc.sigs.len) return .{ .func = gid },
+            else => {},
+        };
+        const callees = f.tc.callees[entry];
+        if (init < callees.len and callees[init].view() == .bound_method) {
+            if (try callee_sig.of(a, f.graph, f.res, f.tc, entry, init)) |ms| return .{ .method = .{ .sig = ms, .node = init } };
+        }
+    };
+    return .{ .value = .{ .name = null, .sig = fs } };
+}
+
+/// A function value's label: its type as `render.renderType` spells it, a unit return
+/// left off, with each param's span.
+fn renderFnTypeLabel(
+    a: std.mem.Allocator,
+    buf: *std.ArrayList(u8),
+    fs: toyc.LayoutEngine.FnSig,
+    layouts: []const Layout,
+    enum_layouts: []const EnumLayout,
+    ranges: *std.ArrayList([2]u32),
+) !void {
+    try buf.appendSlice(a, "fn(");
+    for (fs.params, 0..) |p, i| {
+        if (i != 0) try buf.appendSlice(a, ", ");
+        const s: u32 = @intCast(buf.items.len);
+        try render.renderType(a, buf, p, layouts, enum_layouts);
+        try ranges.append(a, .{ s, @intCast(buf.items.len) });
+    }
+    try buf.append(a, ')');
+    if (fs.ret.kind == .unit) return;
+    try buf.appendSlice(a, " -> ");
+    try render.renderType(a, buf, fs.ret, layouts, enum_layouts);
+}
+
 /// The signature help at (`line`, `character`) in `source`, or null when the cursor is not
 /// inside a resolvable call. Never errors on a compile problem — only a hard I/O / OOM fault
 /// propagates.
@@ -241,27 +333,17 @@ pub fn signatureHelpAt(
 
     const entry = graph.entry_index;
     const m = graph.entry();
-    const resolutions = res.resolutions[entry];
 
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
     const a = arena.allocator();
 
-    // The callee node keys on its identifier token's source start (robust to node/token
-    // reshuffle): a free fn's resolves to `.func`, a method's member node records a Callee.
-    // The call node's own main_token is the `(` (or the `|>` of a piped call), a different
-    // start, so the two never collide.
-    const Hit = union(enum) { func: u32, method: callee_sig.CalleeSig };
-    const hit: ?struct { what: Hit, node: usize } = for (m.nodes, 0..) |n, i| {
-        if (m.tokens[n.main_token].start != enc.callee_start or i >= resolutions.len) continue;
-        if (resolutions[i] == .func and resolutions[i].func < tc.sigs.len) {
-            break .{ .what = .{ .func = resolutions[i].func }, .node = i };
-        }
-        if (n.tag == .field_access and resolutions[i] != .func) {
-            if (try callee_sig.of(a, &graph, &res, &tc, entry, @intCast(i))) |ms| break .{ .what = .{ .method = ms }, .node = i };
-        }
-    } else null;
-    const callee = hit orelse {
+    const call = callAt(m, enc.lparen) orelse {
+        arena.deinit();
+        return null;
+    };
+    const f: places.Facts = .{ .graph = &graph, .res = &res, .tc = &tc };
+    const callee = (try hitOf(a, f, call)) orelse {
         arena.deinit();
         return null;
     };
@@ -271,23 +353,26 @@ pub fn signatureHelpAt(
     // look-back from the callee would miss an `m.f` callee. A value written at a `_` is
     // already counted.
     var active = enc.active;
-    for (m.nodes, 0..) |n, ci| {
-        if (n.tag != .call or n.lhs.int() != callee.node) continue;
-        if (toyc.Ast.pipePrepends(m.tree(), m.tokens, m.source, toyc.Ast.Index.from(@intCast(ci)))) active += 1;
-        break;
-    }
+    if (toyc.Ast.pipePrepends(m.tree(), m.tokens, m.source, toyc.Ast.Index.from(call))) active += 1;
 
     var label: std.ArrayList(u8) = .empty;
     var ranges: std.ArrayList([2]u32) = .empty;
-    switch (callee.what) {
+    switch (callee) {
         .func => |fid| {
             const sig = tc.sigs[fid];
             try renderLabel(a, &label, render.bareName(sig.name), sig.params, sig.mut_mask, sig.ret, tc.layouts, tc.enum_layouts, &.{}, &ranges);
         },
-        .method => |ms| if (ms.decl != null and callee_sig.spelledFromDecl(&tc, entry, @intCast(callee.node)))
-            try renderDeclLabel(a, &label, &graph.modules[ms.decl.?.module], ms.decl.?.node, ms.name, ms.has_self, &ranges)
+        .method => |hm| {
+            const ms = hm.sig;
+            if (ms.decl != null and callee_sig.spelledFromDecl(&tc, entry, hm.node))
+                try renderDeclLabel(a, &label, &graph.modules[ms.decl.?.module], ms.decl.?.node, ms.name, ms.has_self, &ranges)
+            else
+                try renderLabel(a, &label, ms.name, ms.params[@intFromBool(ms.has_self)..], ms.mut_mask >> @intFromBool(ms.has_self), ms.ret, tc.layouts, tc.enum_layouts, ms.var_names, &ranges);
+        },
+        .value => |v| if (v.name) |name|
+            try renderLabel(a, &label, name, v.sig.params, 0, v.sig.ret, tc.layouts, tc.enum_layouts, &.{}, &ranges)
         else
-            try renderLabel(a, &label, ms.name, ms.params[@intFromBool(ms.has_self)..], ms.mut_mask >> @intFromBool(ms.has_self), ms.ret, tc.layouts, tc.enum_layouts, ms.var_names, &ranges),
+            try renderFnTypeLabel(a, &label, v.sig, tc.layouts, tc.enum_layouts, &ranges),
     }
 
     const params = try a.alloc(protocol.ParameterInformation, ranges.items.len);
@@ -345,11 +430,11 @@ test "activeParam: a bracket comma does not count" {
     try testing.expectEqual(@as(u32, 1), activeParam(&toks, 1, 10));
 }
 
-test "enclosingCall: a bare call is entered, callee_start is the identifier" {
+test "enclosingCall: a bare call is entered at its paren" {
     // `add(1)` — add[0,3) ([3,4) 1[4,5) )[5,6)
     const toks = [_]Token{ tok(.identifier, 0, 3), tok(.l_paren, 3, 4), tok(.number, 4, 5), tok(.r_paren, 5, 6) };
     const enc = (try enclosingCall(testing.allocator, &toks, 4)).?;
-    try testing.expectEqual(@as(u32, 0), enc.callee_start);
+    try testing.expectEqual(@as(u32, 3), enc.lparen);
     try testing.expectEqual(@as(u32, 0), enc.active);
 }
 
@@ -361,7 +446,7 @@ test "enclosingCall: the INNERMOST call wins for a nested call" {
         tok(.r_paren, 6, 7),
     };
     const enc = (try enclosingCall(testing.allocator, &toks, 5)).?; // inside the inner call
-    try testing.expectEqual(@as(u32, 2), enc.callee_start); // g, not f
+    try testing.expectEqual(@as(u32, 3), enc.lparen); // g's, not f's
 }
 
 test "enclosingCall: a grouping paren is not a call" {
@@ -382,6 +467,21 @@ test "enclosingCall: a newline before the paren is not a call" {
     try testing.expectEqual(@as(?Enclosing, null), try enclosingCall(testing.allocator, &toks, 5));
 }
 
+test "enclosingCall: an element or a call result before the paren is a callee" {
+    // `fs[0](1)` — fs[0,2) [[2,3) 0[3,4) ][4,5) ([5,6) 1[6,7) )[7,8)
+    const elem = [_]Token{
+        tok(.identifier, 0, 2), tok(.l_bracket, 2, 3), tok(.number, 3, 4),  tok(.r_bracket, 4, 5),
+        tok(.l_paren, 5, 6),    tok(.number, 6, 7),    tok(.r_paren, 7, 8),
+    };
+    try testing.expectEqual(@as(u32, 5), (try enclosingCall(testing.allocator, &elem, 6)).?.lparen);
+    // `mk()(1)` — mk[0,2) ([2,3) )[3,4) ([4,5) 1[5,6) )[6,7)
+    const result = [_]Token{
+        tok(.identifier, 0, 2), tok(.l_paren, 2, 3), tok(.r_paren, 3, 4), tok(.l_paren, 4, 5),
+        tok(.number, 5, 6),     tok(.r_paren, 6, 7),
+    };
+    try testing.expectEqual(@as(u32, 4), (try enclosingCall(testing.allocator, &result, 5)).?.lparen);
+}
+
 test "enclosingCall: an unterminated call at EOF still resolves with the active param" {
     // `add(1, ` — add[0,3) ([3,4) 1[4,5) ,[5,6) eof[7,7)
     const toks = [_]Token{
@@ -389,7 +489,7 @@ test "enclosingCall: an unterminated call at EOF still resolves with the active 
         tok(.comma, 5, 6),      tok(.eof, 7, 7),
     };
     const enc = (try enclosingCall(testing.allocator, &toks, 7)).?;
-    try testing.expectEqual(@as(u32, 0), enc.callee_start);
+    try testing.expectEqual(@as(u32, 3), enc.lparen);
     try testing.expectEqual(@as(u32, 1), enc.active);
 }
 
@@ -725,5 +825,165 @@ test "signatureHelpAt: a mut param's label says mut" {
         };
         defer r.deinit();
         try testing.expectEqualStrings(c.label, r.help.signatures[0].label);
+    }
+}
+
+test "renderFnTypeLabel: spells the type as renderType does and spans each param" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const pair_names = [_][]const u8{ "code", "env" };
+    const pair_types = [_]Type{ Type.int, Type.rawptr };
+    const pair_offs = [_]u32{ 0, 8 };
+    const inner: Layout = .{ .name = "fn$int$int", .field_names = @constCast(&pair_names), .field_types = @constCast(&pair_types), .offsets = @constCast(&pair_offs), .size = 16, .@"align" = 8, .fn_sig = .{ .params = &.{Type.int}, .ret = Type.int } };
+    var outer = inner;
+    outer.name = "fn$s0$int$unit";
+    outer.fn_sig = .{ .params = &.{ Type.structT(0), Type.int }, .ret = Type.unit };
+    const layouts = [_]Layout{ inner, outer };
+    const cases = [_]struct { t: Type, want: []const u8, spans: []const [2]u32 }{
+        .{ .t = Type.structT(0), .want = "fn(int) -> int", .spans = &.{.{ 3, 6 }} },
+        // A unit return is left off; a fn-typed param spans its whole type.
+        .{ .t = Type.structT(1), .want = "fn(fn(int) -> int, int)", .spans = &.{ .{ 3, 17 }, .{ 19, 22 } } },
+    };
+    for (cases) |c| {
+        var label: std.ArrayList(u8) = .empty;
+        var ranges: std.ArrayList([2]u32) = .empty;
+        try renderFnTypeLabel(a, &label, render.fnSigOf(c.t, &layouts).?, &layouts, &.{}, &ranges);
+        var expect: std.ArrayList(u8) = .empty;
+        try render.renderType(a, &expect, c.t, &layouts, &.{});
+        try testing.expectEqualStrings(expect.items, label.items);
+        try testing.expectEqualStrings(c.want, label.items);
+        try testing.expectEqualSlices([2]u32, c.spans, ranges.items);
+    }
+}
+
+/// Signature help just past the last `after` in `src`.
+fn expectHelp(src: []const u8, after: []const u8, label: []const u8, active: u32) !void {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const p = test_util.posAfterLast(src, after);
+    var r = (try signatureHelpAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse {
+        std.debug.print("no signature help after '{s}'\n", .{after});
+        return error.NoSignatureHelp;
+    };
+    defer r.deinit();
+    testing.expectEqualStrings(label, r.help.signatures[0].label) catch |e| {
+        std.debug.print("after '{s}'\n", .{after});
+        return e;
+    };
+    try testing.expectEqual(active, r.help.activeParameter);
+}
+
+/// `expectHelp` at the end of `pre ++ tail`, a buffer the case leaves mid-call.
+fn expectHelpAfter(pre: []const u8, tail: []const u8, label: []const u8, active: u32) !void {
+    const src = try std.mem.concat(testing.allocator, u8, &.{ pre, tail });
+    defer testing.allocator.free(src);
+    try expectHelp(src, tail, label, active);
+}
+
+const value_fixture =
+    \\import std/vec
+    \\struct Acc { n: int }
+    \\impl Acc {
+    \\    fn plus(self, k: int) -> int { self.n + k }
+    \\    fn two(self, a: int, b: str) -> int { self.n + a + b.len() }
+    \\}
+    \\struct H { run: fn(int) -> int, show: fn(str) }
+    \\fn add(a: int, b: int) -> int { a + b }
+    \\fn dbl(x: int) -> int { x * 2 }
+    \\fn say(s: str) { }
+    \\fn mk() -> fn(int, int) -> int { add }
+    \\fn relabel(mut f: fn(int) -> int) { f = dbl }
+    \\fn apply(f: fn(int, int) -> int, v: int) -> int { f(v, 1) }
+    \\fn main() -> int {
+    \\    acc := Acc { n: 1 }
+    \\    other := Acc { n: 2 }
+    \\    g := acc.plus
+    \\    t := acc.two
+    \\    f := add
+    \\    h := H { run: dbl, show: say }
+    \\    fs := [dbl, dbl]
+    \\    i := 0
+    \\    re := acc.plus
+    \\    re = other.plus
+    \\    mu := acc.plus
+    \\    relabel(mu)
+    \\    fn step(k: int) -> int { k + 1 }
+    \\
+;
+
+test "signatureHelpAt: a call of a function value shows its type, params labelled by type" {
+    const cases = [_]struct { tail: []const u8, label: []const u8, active: u32 }{
+        .{ .tail = "    x := h.run(", .label = "fn(int) -> int", .active = 0 },
+        .{ .tail = "    h.show(", .label = "fn(str)", .active = 0 },
+        .{ .tail = "    x := fs[0](", .label = "fn(int) -> int", .active = 0 },
+        .{ .tail = "    x := fs[i](", .label = "fn(int) -> int", .active = 0 },
+        .{ .tail = "    x := mk()(1, ", .label = "fn(int, int) -> int", .active = 1 },
+        // Written after its binding, so its value may come from anywhere.
+        .{ .tail = "    x := re(", .label = "fn(int) -> int", .active = 0 },
+        .{ .tail = "    x := mu(", .label = "fn(int) -> int", .active = 0 },
+        // The piped value is argument 0; the active param stops at the last one.
+        .{ .tail = "    x := 1 |> h.run(", .label = "fn(int) -> int", .active = 0 },
+    };
+    for (cases) |c| try expectHelpAfter(value_fixture, c.tail, c.label, c.active);
+    try expectHelp(value_fixture, "f(v, ", "fn(int, int) -> int", 1);
+    try expectHelp(value_fixture, "f(", "fn(int, int) -> int", 0);
+
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src = value_fixture ++ "    x := fs[0](1)\n";
+    const p = test_util.posAfterLast(src, "fs[0](");
+    var r = (try signatureHelpAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")).?;
+    defer r.deinit();
+    const params = r.help.signatures[0].parameters;
+    try testing.expectEqual(@as(usize, 1), params.len);
+    try testing.expectEqualStrings("int", r.help.signatures[0].label[params[0].label[0]..params[0].label[1]]);
+}
+
+test "signatureHelpAt: a local bound once to a named fn, a bound method or a local fn shows that declaration" {
+    const cases = [_]struct { tail: []const u8, label: []const u8, active: u32 }{
+        .{ .tail = "    x := g(", .label = "fn plus(int) -> int", .active = 0 },
+        .{ .tail = "    x := t(1, ", .label = "fn two(int, str) -> int", .active = 1 },
+        .{ .tail = "    x := f(", .label = "fn add(int, int) -> int", .active = 0 },
+        .{ .tail = "    x := step(", .label = "fn step(int) -> int", .active = 0 },
+        .{ .tail = "    x := 3 |> t(", .label = "fn two(int, str) -> int", .active = 1 },
+        .{ .tail = "    x := 3 |> f(", .label = "fn add(int, int) -> int", .active = 1 },
+        // Captured by a closure, it is still the local it was bound as.
+        .{ .tail = "    x := apply(fn(a, b) { g(", .label = "fn plus(int) -> int", .active = 0 },
+        .{ .tail = "    x := add(g(", .label = "fn plus(int) -> int", .active = 0 },
+    };
+    for (cases) |c| try expectHelpAfter(value_fixture, c.tail, c.label, c.active);
+}
+
+test "signatureHelpAt: a function value's call keeps its help while incomplete or erroneous" {
+    const cases = [_]struct { tail: []const u8, label: []const u8, active: u32 }{
+        .{ .tail = "    x := h.run(1, ", .label = "fn(int) -> int", .active = 0 },
+        .{ .tail = "    x := fs[0](nope, ", .label = "fn(int) -> int", .active = 0 },
+        .{ .tail = "    x := mk()(", .label = "fn(int, int) -> int", .active = 0 },
+        .{ .tail = "    x := g(\"s\", ", .label = "fn plus(int) -> int", .active = 0 },
+        .{ .tail = "    x := t(nope, ", .label = "fn two(int, str) -> int", .active = 1 },
+    };
+    for (cases) |c| try expectHelpAfter(value_fixture, c.tail, c.label, c.active);
+}
+
+test "signatureHelpAt: a paren that opens no call yields null" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\fn add(a: int, b: int) -> int { a + b }
+        \\fn id[T](x: T) -> T { x }
+        \\fn main() -> int { return add(1, 2) + id(3) }
+        \\
+    ;
+    for ([_][]const u8{ "add(a: int, ", "id[T](" }) |after| {
+        const p = test_util.posOf(src, after);
+        const r = try signatureHelpAt(gpa, ws, src, p.line, p.character + @as(u32, @intCast(after.len)), "file:///p/main.toy");
+        try testing.expect(r == null);
     }
 }
