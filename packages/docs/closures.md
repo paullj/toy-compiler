@@ -146,6 +146,7 @@ There is one sharing model, so the `&x` / `*r` operators are removed.
 - For a `mut self` method, the receiver is assigned through the closure, so it is boxed.
 - On a `mut` parameter (`mut self` included), the receiver is held by address, like a lambda's capture of it.
 - `c.bump` alone as a statement is the bound method, dropped before it runs, so it is W0012 ("did you mean 'c.bump()'?"); before bound methods it was T0046, no field.
+- **A field of the same name:** the value `h.run` reads a field named `run` when there is one, and is the bound method only when there is none; a call `h.run(1)` selects the method first and only then a field of function type. With both, `h.run(1)` and `f := h.run; f(1)` call different functions, so a method named like a fn-typed field of its struct is warning W0013 at the method ("'h.run(..)' calls the method and 'h.run' reads the field; rename one"), generic structs and conformance methods included. A field of another type does not warn.
 
 ## `_` capture expressions
 

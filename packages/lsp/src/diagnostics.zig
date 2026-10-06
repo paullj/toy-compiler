@@ -225,6 +225,10 @@ test "checkBuffer publishes an uncalled-function W0012 as a warning on its annot
     try expectWarningsOnAnnotatedLines("tests/corpora/diagnostics/uncalled_function.toy", "W0012");
 }
 
+test "checkBuffer publishes a fn-field and method name clash W0013 as a warning on its annotated line" {
+    try expectWarningsOnAnnotatedLines("tests/corpora/diagnostics/fn_field_method_clash.toy", "W0013");
+}
+
 /// Every `code` diagnostic of the fixture at `path` is a warning on a line annotated
 /// `#~ WARN [code]`, and each annotation gets one.
 fn expectWarningsOnAnnotatedLines(path: []const u8, code: []const u8) !void {
