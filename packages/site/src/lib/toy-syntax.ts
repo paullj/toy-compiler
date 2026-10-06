@@ -24,6 +24,10 @@ export const toyLanguage = StreamLanguage.define<{ afterFn: boolean; depth: numb
 	},
 	token(stream, state) {
 		if (stream.eatSpace()) return null;
+		// Only a word right after `fn` names a function: in a lambda or a fn type a `(`
+		// follows `fn`, and the word after it is a parameter or a type.
+		const afterFn = state.afterFn;
+		state.afterFn = false;
 		if (stream.match(/#.*/)) return 'comment';
 		if (stream.match(/"(?:\\.|[^"\\])*"/)) return 'string';
 		if (stream.match(/'(?:\\.|[^'\\])*'/)) return 'string';
@@ -33,7 +37,6 @@ export const toyLanguage = StreamLanguage.define<{ afterFn: boolean; depth: numb
 		const word = stream.match(/[A-Za-z_][A-Za-z0-9_]*/) as RegExpMatchArray | null;
 		if (word) {
 			const w = word[0];
-			const afterFn = state.afterFn;
 			state.afterFn = w === 'fn';
 			if (KEYWORDS.has(w)) return 'keyword';
 			if (TYPES.has(w)) return 'typeName';

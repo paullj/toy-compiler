@@ -1,6 +1,6 @@
 import { expect, test, type Page } from '@playwright/test';
 
-const BLOCKS = ['order.toy', 'shapes.toy', 'pair.toy', 'area.toy', 'pipeline.toy', 'total.toy'];
+const BLOCKS = ['order.toy', 'shapes.toy', 'pair.toy', 'area.toy', 'pipeline.toy', 'closures.toy', 'total.toy'];
 
 function block(page: Page, file: string) {
 	return page.locator('figure', { has: page.locator('figcaption', { hasText: file }) });
@@ -19,6 +19,27 @@ async function typeAtEndOfLine(page: Page, b: ReturnType<typeof block>, lineText
 	await b.locator('.cm-line', { hasText: lineText }).first().click();
 	await page.keyboard.press('End');
 	await page.keyboard.type(text, { delay });
+}
+
+// The point comes from the rendered text, so it lands on `word` whatever the font's
+// advance width.
+async function hoverWord(page: Page, b: ReturnType<typeof block>, lineText: string, word: string) {
+	const line = b.locator('.cm-line', { hasText: lineText }).first();
+	await line.scrollIntoViewIfNeeded();
+	const at = await line.evaluate((el, word) => {
+		const walk = document.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+		for (let n = walk.nextNode(); n; n = walk.nextNode()) {
+			const i = n.textContent!.indexOf(word);
+			if (i < 0) continue;
+			const r = document.createRange();
+			r.setStart(n, i);
+			r.setEnd(n, i + word.length);
+			const box = r.getBoundingClientRect();
+			return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+		}
+		throw new Error(`no '${word}' on the line`);
+	}, word);
+	await page.mouse.move(at.x, at.y);
 }
 
 test.beforeEach(async ({ page }) => {
@@ -101,6 +122,23 @@ test('signature help counts the piped value as the first argument', async ({ pag
 	const sig = page.locator('.cm-lsp-signature-tooltip');
 	await expect(sig).toContainText('fn tag(int, str) -> int');
 	await expect(sig.locator('.cm-lsp-active-parameter')).toHaveText('str');
+});
+
+test('hover tells how a closure holds a name, what a _ makes, and who mutates an argument', async ({ page }) => {
+	const b = await live(page, 'closures.toy');
+	const tip = page.locator('.cm-lsp-hover-tooltip');
+	const cases = [
+		{ line: 'count = count + 1', word: 'count', note: 'captured: shared' },
+		{ line: '.map(add(10, _))', word: '_', note: 'capture: fn(int) -> int' },
+		{ line: 'bump(count)', word: 'count', note: 'mutated by bump' }
+	];
+	for (const c of cases) {
+		// Off the editor first: a pointer that lands on the last tooltip keeps it open.
+		await page.mouse.move(0, 0);
+		await expect(tip).toHaveCount(0);
+		await hoverWord(page, b, c.line, c.word);
+		await expect(tip).toContainText(c.note);
+	}
 });
 
 test('a diagnostic tooltip links its code and jumps to the related definition', async ({ page }) => {

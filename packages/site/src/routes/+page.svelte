@@ -86,6 +86,28 @@ fn main() -> int {
 }`
 		},
 		{
+			title: 'Closures',
+			blurb: 'A lambda <code class="code">fn(x) { .. }</code> captures the variables it names by reference. <code class="code">add(10, _)</code> is short for a lambda, <code class="code">|> .m()</code> pipes into a method, and a <code class="code">mut</code> parameter writes to the caller\'s variable.',
+			file: 'closures.toy',
+			code: `import std/vec
+
+fn add(a: int, b: int) -> int { a + b }
+fn bump(mut n: int) { n = n + 1 }
+
+fn main() -> int {
+    count := 0
+    total := [5, 1, 4, 2, 3]
+        |> .filter(fn(x) { x > 2 })
+        |> .map(add(10, _))    # fn(x) { add(10, x) }
+        |> .fold(0, fn(sum, x) {
+            count = count + 1  # shared with main, not a copy
+            sum + x
+        })
+    bump(count)                # count is now 4
+    return total + count
+}`
+		},
+		{
 			title: 'No null',
 			blurb: '<code class="code">Option[T]</code> and <code class="code">Result[T, E]</code> are ordinary enums. The postfix <code class="code">?</code> unwraps a value or returns early on the empty case.',
 			file: 'total.toy',
