@@ -216,3 +216,33 @@ test "checkBuffer maps a piped T0039 to the |> step and each P0014 to its annota
         try testing.expectEqual(std.mem.count(u8, src, "#~ ERROR [P0014]"), p0014);
     }
 }
+
+test "checkBuffer publishes a std-shadowing W0011 as a warning on its annotated line" {
+    const gpa = testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const src = try Io.Dir.cwd().readFileAlloc(io, "tests/corpora/diagnostics/shadows_std_method.toy", gpa, .unlimited);
+    defer gpa.free(src);
+
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = io, .docs = &docs, .disk = false };
+    var mapped = try checkBuffer(gpa, ws, "file:///doc.toy", src);
+    defer mapped.deinit();
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    defer lines.deinit(gpa);
+    var it = std.mem.splitScalar(u8, src, '\n');
+    while (it.next()) |l| try lines.append(gpa, l);
+    var seen: usize = 0;
+    for (mapped.items) |d| {
+        const c = d.code orelse continue;
+        if (!std.mem.eql(u8, c, "W0011")) continue;
+        seen += 1;
+        try testing.expectEqual(protocol.severity.warning, d.severity);
+        try testing.expect(std.mem.indexOf(u8, lines.items[d.range.start.line], "#~ WARN [W0011]") != null);
+    }
+    try testing.expectEqual(std.mem.count(u8, src, "#~ WARN [W0011]"), seen);
+}

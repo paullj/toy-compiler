@@ -4,17 +4,19 @@
 //! MODE it runs in, so adding a corpus is a data edit, not a new harness. Two modes:
 //!
 //! `.diagnostics` — the exhaustive two-way `#~ ERROR [CODE] <substr>` matcher.
-//!   Each fixture is a real toy program carrying `#~ ERROR [CODE] <substr>`
-//!   annotations. Because `#` is the toy line-comment character (the lexer skips
-//!   `# ...` to end-of-line) the whole annotation is an ordinary comment the
-//!   compiler ignores; the `~` marker is what THIS harness keys on. An annotation
-//!   applies to the line it sits ON: it expects an error-severity diagnostic on that
-//!   line whose `code == [CODE]` and whose message CONTAINS `<substr>`. The harness
-//!   runs the in-process front-end (`Driver.pipeline` in `.check` mode), maps every
-//!   diagnostic to its 1-based (line, code, message) via `SourceMap`, and matches
-//!   EXHAUSTIVELY in BOTH directions (every annotation claims >=1 diagnostic; every
-//!   emitted error is claimed by some annotation). A diagnostic that moves line,
-//!   changes code, or loses its message trips the harness.
+//!   Each fixture is a real toy program carrying `#~ ERROR [CODE] <substr>` (or
+//!   `#~ WARN [CODE] <substr>`) annotations. Because `#` is the toy line-comment
+//!   character (the lexer skips `# ...` to end-of-line) the whole annotation is an
+//!   ordinary comment the compiler ignores; the `~` marker is what THIS harness keys
+//!   on. An annotation applies to the line it sits ON: it expects an error-severity
+//!   (`ERROR`) or warning-severity (`WARN`) diagnostic on that line whose
+//!   `code == [CODE]` and whose message CONTAINS `<substr>`. The harness runs the
+//!   whole-graph front-end `toy check` runs (discover, so a fixture may import std;
+//!   resolve; typecheck), maps every entry-module diagnostic to its 1-based (line,
+//!   code, message) via `SourceMap`, and matches EXHAUSTIVELY in BOTH directions (every
+//!   annotation claims >=1 diagnostic; every emitted error, and every warning whose
+//!   code some `WARN` annotation names, is claimed by some annotation). A diagnostic
+//!   that moves line, changes code, or loses its message trips the harness.
 //!
 //! `.expect` — the `# expect:` directive harness (ported from the old `check.sh`
 //!   pair). A fixture carries `# expect: exit <N>` / `# expect: stdout "<bytes>"` /
@@ -58,36 +60,39 @@ const testing = std.testing;
 /// clean fixture is counted as covered but its binary is not built.
 const can_exec = builtin.os.tag == .macos and builtin.cpu.arch == .aarch64;
 
-/// One parsed `#~ ERROR [CODE] <substr>` annotation. `line` is 1-based (the line
+/// One parsed `#~ ERROR|WARN [CODE] <substr>` annotation. `line` is 1-based (the line
 /// the comment sits on). `matched` is flipped true when a diagnostic satisfies it.
 const Annotation = struct {
     line: usize,
     code: []const u8,
     substr: []const u8,
+    warn: bool = false,
     matched: bool = false,
 };
 
 /// A diagnostic reduced to what the matcher compares against. `matched` flips true
 /// when an annotation claims it; an unmatched one at the end is a failure.
-const EmittedError = struct {
+const Emitted = struct {
     line: usize,
     code: codes.Code,
     message: []const u8,
+    warn: bool = false,
     matched: bool = false,
 };
 
-/// Parse the `#~ ERROR [CODE] <substr>` annotation out of one source line, or null
-/// if the line carries none. The marker is exactly `#~` (a toy comment `#` plus a
-/// `~`); a plain `#` comment, or a mistyped marker (`#-`, `# ~`, `#~~`), yields no
-/// annotation so a typo can't silently disable an expectation. After the marker the
-/// keyword `ERROR`, then `[CODE]`, then the rest of the line (trimmed) is the
-/// substring the message must contain.
+/// Parse the `#~ ERROR [CODE] <substr>` or `#~ WARN [CODE] <substr>` annotation out of
+/// one source line, or null if the line carries none. The marker is exactly `#~` (a toy
+/// comment `#` plus a `~`); a plain `#` comment, or a mistyped marker (`#-`, `# ~`,
+/// `#~~`), yields no annotation so a typo can't silently disable an expectation. After
+/// the marker the keyword `ERROR` or `WARN`, then `[CODE]`, then the rest of the line
+/// (trimmed) is the substring the message must contain.
 fn parseAnnotation(line_text: []const u8, line_1based: usize) ?Annotation {
     const marker = std.mem.indexOf(u8, line_text, "#~") orelse return null;
     var rest = std.mem.trimStart(u8, line_text[marker + 2 ..], " \t");
-    // Require the exact `ERROR ` keyword (a `~` immediately followed by more `~`,
-    // e.g. `#~~`, leaves `rest` not starting with ERROR -> null, rejecting it).
-    const kw = "ERROR";
+    // Require an exact keyword (a `~` immediately followed by more `~`, e.g. `#~~`,
+    // leaves `rest` starting with neither -> null, rejecting it).
+    const warn = std.mem.startsWith(u8, rest, "WARN");
+    const kw: []const u8 = if (warn) "WARN" else "ERROR";
     if (!std.mem.startsWith(u8, rest, kw)) return null;
     rest = std.mem.trimStart(u8, rest[kw.len..], " \t");
     // `[CODE]`.
@@ -95,7 +100,7 @@ fn parseAnnotation(line_text: []const u8, line_1based: usize) ?Annotation {
     const close = std.mem.indexOfScalar(u8, rest, ']') orelse return null;
     const code = rest[1..close];
     const substr = std.mem.trim(u8, rest[close + 1 ..], " \t\r");
-    return .{ .line = line_1based, .code = code, .substr = substr };
+    return .{ .line = line_1based, .code = code, .substr = substr, .warn = warn };
 }
 
 /// Collect every annotation in `source` (one pass, tracking line numbers by
@@ -112,59 +117,82 @@ fn collectAnnotations(gpa: std.mem.Allocator, source: []const u8) !std.ArrayList
     return list;
 }
 
-/// Run the in-process front-end over `path` and reduce every ERROR-severity
-/// diagnostic to an `EmittedError` (1-based line via `SourceMap`). Parse-tainted
-/// files stop at parse (their `diags`); a clean parse yields resolve then (if
-/// resolve was clean) typecheck diagnostics — we gather whichever are present.
-/// Caller owns the returned list.
-fn collectErrors(
+/// Run the whole-graph front-end `toy check` runs over `path` and reduce every error and
+/// warning to an `Emitted` (1-based line via `SourceMap`). A tainted entry parse stops at
+/// its parse diagnostics; a clean graph yields resolve then (if resolve has no error)
+/// typecheck diagnostics. A structural graph error, or a diagnostic located in an imported
+/// module, fails the fixture: the matcher only sees the entry's lines. Caller owns the
+/// returned list.
+fn collectDiags(
     gpa: std.mem.Allocator,
     io: Io,
     cache: Cache,
     path: []const u8,
-) !std.ArrayList(EmittedError) {
-    var r: Driver.FileResult = .{ .path = path };
-    // A per-file front-end error (e.g. a hard IO failure) would surface as `r.err`;
-    // a diagnostic-bearing file returns normally with the diags populated. We only
-    // care about the collected diagnostics, so ignore the `error.ParseError`/
-    // `.ResolveError`/`.TypeError` sentinels the pipeline stores in `r.err`.
-    Driver.pipeline(gpa, io, cache, .check, "native", &r, 0) catch |e| switch (e) {
-        error.OutOfMemory => return error.OutOfMemory,
-        else => {}, // a compile diagnostic, not a harness failure
-    };
-    defer r.deinit(gpa);
+) !std.ArrayList(Emitted) {
+    var graph = try Graph.discover(gpa, io, cache, "native", path, .{});
+    defer graph.deinit(gpa);
+    const entry = graph.entry();
 
-    var sm = try SourceMap.init(gpa, path, r.source);
+    var sm = try SourceMap.init(gpa, path, entry.source);
     defer sm.deinit(gpa);
 
-    var out: std.ArrayList(EmittedError) = .empty;
-    errdefer out.deinit(gpa);
+    var out: std.ArrayList(Emitted) = .empty;
+    errdefer freeEmitted(gpa, &out);
 
-    const push = struct {
-        fn go(list: *std.ArrayList(EmittedError), a: std.mem.Allocator, s: *const SourceMap, diags: []const Diagnostic, tokens: []const Token, bad_spans: *usize) !void {
+    const Push = struct {
+        list: *std.ArrayList(Emitted),
+        a: std.mem.Allocator,
+        sm: *const SourceMap,
+        tokens: []const Token,
+        entry_index: u32,
+        bad_spans: usize = 0,
+        foreign: usize = 0,
+
+        fn go(self: *@This(), diags: []const Diagnostic) !void {
             for (diags) |d| {
-                if (!checkSpans(s, tokens, d)) bad_spans.* += 1;
-                // Only ERROR-severity diagnostics are matched against `#~ ERROR`
-                // annotations (the stored registry-default severity; the render-time
-                // config never rewrites it).
-                if (d.severity != .err) continue;
-                // Duplicate the borrowed message: `r` is freed on return, but the
+                if (d.scope != toyc.DiagnosticSink.NO_SCOPE and d.scope != self.entry_index) {
+                    std.debug.print("{s}: diagnostic in imported module {d}: {s}\n", .{ self.sm.name, d.scope, d.message });
+                    self.foreign += 1;
+                    continue;
+                }
+                if (!checkSpans(self.sm, self.tokens, d)) self.bad_spans += 1;
+                // The stored registry-default severity: the render-time config never
+                // rewrites it.
+                if (d.severity != .err and d.severity != .warning) continue;
+                // Duplicate the borrowed message: the graph is freed on return, but the
                 // matcher (and any failure message) reads it afterwards.
-                const msg = try a.dupe(u8, d.message);
-                try list.append(a, .{
-                    .line = s.lineIndex(d.byte_offset) + 1, // 0-based -> 1-based
+                const msg = try self.a.dupe(u8, d.message);
+                errdefer self.a.free(msg);
+                try self.list.append(self.a, .{
+                    .line = self.sm.lineIndex(d.byte_offset) + 1, // 0-based -> 1-based
                     .code = d.code,
                     .message = msg,
+                    .warn = d.severity == .warning,
                 });
             }
         }
-    }.go;
+    };
+    var push: Push = .{ .list = &out, .a = gpa, .sm = &sm, .tokens = entry.tokens, .entry_index = graph.entry_index };
 
-    var bad_spans: usize = 0;
-    if (r.diags.len > 0) try push(&out, gpa, &sm, r.diags, r.tokens, &bad_spans);
-    if (r.resolve) |res| try push(&out, gpa, &sm, res.diags, r.tokens, &bad_spans);
-    if (r.typecheck) |tc| try push(&out, gpa, &sm, tc.diags, r.tokens, &bad_spans);
-    if (bad_spans > 0) return error.SpanInvariant;
+    if (graph.err) |ge| {
+        const in_entry = ge.module == null or ge.module == graph.entry_index;
+        if (ge.kind != .parse or !in_entry) {
+            std.debug.print("{s}: {s}\n", .{ path, ge.message });
+            return error.GraphError;
+        }
+        try push.go(ge.parse_diags);
+    } else {
+        var res = try ResolveGraph.resolveGraph(gpa, &graph);
+        defer res.deinit(gpa);
+        try push.go(res.diags);
+        if (countErr(res.diags) == 0) {
+            var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, io, 0);
+            defer tc.deinit(gpa);
+            try push.go(tc.diags);
+        }
+    }
+    if (push.bad_spans > 0) return error.SpanInvariant;
+    if (push.foreign > 0) return error.ImportedModuleDiagnostic;
 
     return out;
 }
@@ -227,25 +255,27 @@ fn checkGraphSpans(gpa: std.mem.Allocator, graph: *const Graph.Graph, diags: []c
     if (bad > 0) return error.SpanInvariant;
 }
 
-fn freeErrors(gpa: std.mem.Allocator, errs: *std.ArrayList(EmittedError)) void {
-    for (errs.items) |e| gpa.free(@constCast(e.message));
-    errs.deinit(gpa);
+fn freeEmitted(gpa: std.mem.Allocator, list: *std.ArrayList(Emitted)) void {
+    for (list.items) |e| gpa.free(@constCast(e.message));
+    list.deinit(gpa);
 }
 
 /// The core exhaustive matcher, factored out so a NEGATIVE unit test can drive it
 /// directly with a mismatched annotation set and assert rejection. Mutates the
 /// `matched` flags in place; returns the first failure message (allocated with
-/// `gpa`) or null on a full two-way match.
+/// `gpa`) or null on a full two-way match. An unclaimed warning fails only when some
+/// `WARN` annotation names its code: error fixtures also trip incidental warnings
+/// (an unused local, say) that they do not test.
 fn matchExhaustive(
     gpa: std.mem.Allocator,
     file: []const u8,
     annotations: []Annotation,
-    errors: []EmittedError,
+    emitted: []Emitted,
 ) !?[]const u8 {
-    // Forward: every annotation must match >=1 emitted error on its line.
+    // Forward: every annotation must match >=1 emitted diagnostic of its severity on its line.
     for (annotations) |*a| {
-        for (errors) |*e| {
-            if (e.line != a.line) continue;
+        for (emitted) |*e| {
+            if (e.line != a.line or e.warn != a.warn) continue;
             const code_str = codes.str(e.code) orelse continue; // uncoded can't match a `[CODE]`
             if (!std.mem.eql(u8, code_str, a.code)) continue;
             if (std.mem.indexOf(u8, e.message, a.substr) == null) continue;
@@ -255,25 +285,32 @@ fn matchExhaustive(
         if (!a.matched) {
             return try std.fmt.allocPrint(
                 gpa,
-                "{s}:{d}: annotation [{s}] \"{s}\" matched no error diagnostic on that line",
-                .{ file, a.line, a.code, a.substr },
+                "{s}:{d}: annotation [{s}] \"{s}\" matched no {s} diagnostic on that line",
+                .{ file, a.line, a.code, a.substr, if (a.warn) "warning" else "error" },
             );
         }
     }
-    // Reverse: every emitted error must have been claimed by some annotation.
-    for (errors) |e| {
+    // Reverse: every emitted error, and every warning of a code some WARN annotation
+    // names, must have been claimed by some annotation.
+    for (emitted) |e| {
         if (e.matched) continue;
         const code_str = codes.str(e.code) orelse "(none)";
+        if (e.warn and !warnAnnotated(annotations, code_str)) continue;
         return try std.fmt.allocPrint(
             gpa,
-            "{s}:{d}: emitted error [{s}] \"{s}\" has no matching #~ ERROR annotation",
-            .{ file, e.line, code_str, e.message },
+            "{s}:{d}: emitted {s} [{s}] \"{s}\" has no matching #~ {s} annotation",
+            .{ file, e.line, if (e.warn) "warning" else "error", code_str, e.message, if (e.warn) "WARN" else "ERROR" },
         );
     }
     return null;
 }
 
-/// Check one fixture end-to-end: collect its annotations + emitted errors and run
+fn warnAnnotated(annotations: []const Annotation, code: []const u8) bool {
+    for (annotations) |a| if (a.warn and std.mem.eql(u8, a.code, code)) return true;
+    return false;
+}
+
+/// Check one fixture end-to-end: collect its annotations + emitted diagnostics and run
 /// the exhaustive two-way match. Returns the failure message (or null on success);
 /// caller frees a non-null message.
 fn checkFixture(
@@ -290,13 +327,13 @@ fn checkFixture(
     // A UI fixture with no annotations is almost certainly a mistake (a silent
     // no-op); require at least one.
     if (anns.items.len == 0) {
-        return try std.fmt.allocPrint(gpa, "{s}: fixture has no #~ ERROR annotations", .{path});
+        return try std.fmt.allocPrint(gpa, "{s}: fixture has no #~ ERROR or #~ WARN annotations", .{path});
     }
 
-    var errs = try collectErrors(gpa, io, cache, path);
-    defer freeErrors(gpa, &errs);
+    var emitted = try collectDiags(gpa, io, cache, path);
+    defer freeEmitted(gpa, &emitted);
 
-    return matchExhaustive(gpa, path, anns.items, errs.items);
+    return matchExhaustive(gpa, path, anns.items, emitted.items);
 }
 
 // ---------------------------------------------------------------------------
@@ -668,7 +705,7 @@ test "corpus: every manifest corpus matches its expectations" {
             // The in-process front-end reads every fixture through
             // `Io.Dir.cwd().readFileAlloc`, which rejects an absolute path
             // (`error.BadPathName`); keep the path cwd-RELATIVE (as the old harnesses
-            // did) so both the diagnostics `pipeline` and the `.expect` discover read
+            // did) so both the diagnostics and the `.expect` discover read
             // it, and so module imports resolve against the entry's relative dir.
             var path_buf: [std.fs.max_path_bytes]u8 = undefined;
             const rel = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ c.path, entry.path });
@@ -710,8 +747,17 @@ test "ui harness: parseAnnotation accepts the exact marker and rejects near-miss
         try testing.expectEqualStrings("R0001", a.code);
         try testing.expectEqualStrings("undeclared identifier 'aaa'", a.substr);
     }
+    // Accepted: a warning annotation.
+    {
+        const a = parseAnnotation("fn each() {  #~ WARN [W0011] shadows", 3).?;
+        try testing.expect(a.warn);
+        try testing.expectEqualStrings("W0011", a.code);
+        try testing.expectEqualStrings("shadows", a.substr);
+        try testing.expect(!parseAnnotation("  #~ ERROR [R0001] x", 1).?.warn);
+    }
     // Rejected: a plain comment (no `~`).
     try testing.expect(parseAnnotation("  # ERROR [R0001] x", 1) == null);
+    try testing.expect(parseAnnotation("  #~ WARNING [W0011] x", 1) == null);
     // Rejected: a mistyped marker.
     try testing.expect(parseAnnotation("  #- ERROR [R0001] x", 1) == null);
     // Rejected: `#~` without the ERROR keyword.
@@ -731,7 +777,7 @@ test "ui harness: the matcher REJECTS a wrong code, a wrong substring, and an un
     //    fails (unmatched annotation).
     {
         var anns = [_]Annotation{.{ .line = 2, .code = "T0004", .substr = "undeclared" }};
-        var errs = [_]EmittedError{.{ .line = 2, .code = .R0001, .message = "undeclared identifier 'x'" }};
+        var errs = [_]Emitted{.{ .line = 2, .code = .R0001, .message = "undeclared identifier 'x'" }};
         const failure = (try matchExhaustive(gpa, "t.toy", &anns, &errs)).?;
         defer gpa.free(failure);
         try testing.expect(std.mem.indexOf(u8, failure, "matched no error diagnostic") != null);
@@ -739,7 +785,7 @@ test "ui harness: the matcher REJECTS a wrong code, a wrong substring, and an un
     // 2) Wrong substring: code matches, message does not contain the substring.
     {
         var anns = [_]Annotation{.{ .line = 2, .code = "R0001", .substr = "TOTALLY WRONG" }};
-        var errs = [_]EmittedError{.{ .line = 2, .code = .R0001, .message = "undeclared identifier 'x'" }};
+        var errs = [_]Emitted{.{ .line = 2, .code = .R0001, .message = "undeclared identifier 'x'" }};
         const failure = (try matchExhaustive(gpa, "t.toy", &anns, &errs)).?;
         defer gpa.free(failure);
         try testing.expect(std.mem.indexOf(u8, failure, "matched no error diagnostic") != null);
@@ -748,7 +794,7 @@ test "ui harness: the matcher REJECTS a wrong code, a wrong substring, and an un
     //    match fails (unmatched diagnostic).
     {
         var anns = [_]Annotation{.{ .line = 2, .code = "R0001", .substr = "aaa" }};
-        var errs = [_]EmittedError{
+        var errs = [_]Emitted{
             .{ .line = 2, .code = .R0001, .message = "undeclared identifier 'aaa'" },
             .{ .line = 3, .code = .R0001, .message = "undeclared identifier 'bbb'" }, // no annotation
         };
@@ -759,8 +805,41 @@ test "ui harness: the matcher REJECTS a wrong code, a wrong substring, and an un
     // 4) A correct pairing yields NO failure (the positive control for the matcher).
     {
         var anns = [_]Annotation{.{ .line = 2, .code = "R0001", .substr = "aaa" }};
-        var errs = [_]EmittedError{.{ .line = 2, .code = .R0001, .message = "undeclared identifier 'aaa'" }};
+        var errs = [_]Emitted{.{ .line = 2, .code = .R0001, .message = "undeclared identifier 'aaa'" }};
         try testing.expect((try matchExhaustive(gpa, "t.toy", &anns, &errs)) == null);
+    }
+}
+
+test "ui harness: WARN annotations match warnings only, and claim every warning of their code" {
+    const gpa = testing.allocator;
+    const shadow = "method 'each' on 'Vec' shadows the one std/vec declares";
+    // A WARN annotation is not satisfied by an error of the same code and line.
+    {
+        var anns = [_]Annotation{.{ .line = 2, .code = "W0011", .substr = "shadows", .warn = true }};
+        var got = [_]Emitted{.{ .line = 2, .code = .W0011, .message = shadow }};
+        const failure = (try matchExhaustive(gpa, "t.toy", &anns, &got)).?;
+        defer gpa.free(failure);
+        try testing.expect(std.mem.indexOf(u8, failure, "matched no warning diagnostic") != null);
+    }
+    // A second warning of an annotated code must be annotated too.
+    {
+        var anns = [_]Annotation{.{ .line = 2, .code = "W0011", .substr = "shadows", .warn = true }};
+        var got = [_]Emitted{
+            .{ .line = 2, .code = .W0011, .message = shadow, .warn = true },
+            .{ .line = 5, .code = .W0011, .message = shadow, .warn = true },
+        };
+        const failure = (try matchExhaustive(gpa, "t.toy", &anns, &got)).?;
+        defer gpa.free(failure);
+        try testing.expect(std.mem.indexOf(u8, failure, "no matching #~ WARN annotation") != null);
+    }
+    // A warning of a code no WARN annotation names is incidental: ignored.
+    {
+        var anns = [_]Annotation{.{ .line = 2, .code = "R0001", .substr = "aaa" }};
+        var got = [_]Emitted{
+            .{ .line = 2, .code = .R0001, .message = "undeclared identifier 'aaa'" },
+            .{ .line = 3, .code = .W0001, .message = "unused variable 'b'", .warn = true },
+        };
+        try testing.expect((try matchExhaustive(gpa, "t.toy", &anns, &got)) == null);
     }
 }
 

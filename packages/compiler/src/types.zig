@@ -2051,6 +2051,8 @@ pub const GraphCtx = struct {
         alias_ids: std.StringHashMapUnmanaged(Type) = .empty,
         /// Served from the embedded std/core, not the program's own files.
         bundled: bool = false,
+        /// The import path (`std/vec`), for diagnostics that name a module.
+        path: []const u8 = "",
     };
 
     /// Resolve an import namespace receiver name in module `mod` to the imported
@@ -2692,6 +2694,9 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // here into the shared diag stream; the final sink.sort() below orders it with
     // every other diagnostic, so it is byte-identical at -j1 and -jN.
     try t.checkMainReturn(entry_mod);
+
+    // Before the derive barrier and the mono tail append method rows no source declares.
+    try t.checkStdShadows();
 
     // WHOLE-PROGRAM COHERENCE: walk every `impl .. has ..`, reject a duplicate
     // (protocol, receiver-ctor) conformance (T0020) — including a retroactive one in a
@@ -3786,6 +3791,44 @@ fn checkPubSignatures(t: *Typecheck, fns: []const GraphFnInput) !void {
             }
         }
     }
+}
+
+/// W0011 at each method the program declares where a bundled module declares one of the
+/// same name on the same type. The program's wins at every call, std's own bodies
+/// included (`Method.bundled`), so std's goes unused. Only modules in the graph put rows in
+/// the tables, so this fires exactly when the std module is part of the program, whether
+/// the program imports it directly or not.
+fn checkStdShadows(t: *Typecheck) !void {
+    for (t.templates.items) |own| {
+        if (own.bundled) continue;
+        for (t.templates.items) |other| {
+            if (!other.bundled or other.recv_ctor != own.recv_ctor or other.recv_is_enum != own.recv_is_enum) continue;
+            if (!std.mem.eql(u8, other.name, own.name)) continue;
+            const ty_name = if (own.recv_is_enum) t.enums.items[own.recv_ctor].name else t.structs.items[own.recv_ctor].name;
+            try t.reportStdShadow(own.fn_id, ty_name, other.fn_id);
+            break;
+        }
+    }
+    for (t.methods.items) |own| {
+        if (own.bundled) continue;
+        for (t.methods.items) |other| {
+            if (!other.bundled or !Type.eql(other.recv, own.recv) or !std.mem.eql(u8, other.name, own.name)) continue;
+            try t.reportStdShadow(own.fn_id, t.typeName(own.recv), other.fn_id);
+            break;
+        }
+    }
+}
+
+fn reportStdShadow(t: *Typecheck, own_fn: u32, ty_name: []const u8, std_fn: u32) !void {
+    const f = t.fns.items[own_fn];
+    const std_path = t.graph.mods[t.fns.items[std_fn].mod].path;
+    _ = t.gphSelect(f.mod);
+    const name_tok = t.tree.nodes[f.decl_node.int()].main_token;
+    try t.sink.report(
+        .{ .span = t.tokSpan(name_tok), .code = .W0011 },
+        "method '{s}' on '{s}' shadows the one in {s}, so every call reaches this one, even in std; rename it to keep both",
+        .{ t.nameText(name_tok), ty_name, std_path },
+    );
 }
 
 /// Emit a coherence error if `ty` is a struct/enum whose declaration is not pub.
