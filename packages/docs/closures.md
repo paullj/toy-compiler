@@ -224,9 +224,10 @@ The names `unwrap`, `unwrap_or`, `is_err` and `map_err` may change; see issue #2
 
 - **Tree-sitter:** lambdas, function types, nested functions, `_` capture and method pipes are in the grammar. Each lands with the syntax that introduces it. A `_` capture and a method pipe parse with the existing call, identifier and variant rules, so highlight queries alone tell them apart.
 - **LSP captures:**
-  - Hover on a captured name says "captured: copied (N bytes)" or "captured: shared (boxed)".
-  - An optional inlay hint on a lambda lists its captures.
-  - A `mut` argument shows "mutated by f".
+  - Hover on a captured name (inside the closure that captures it, or the receiver of a bound method value) adds "captured: copied (N bytes)" for a read-only capture, N being what the copy takes in the env, or "captured: shared" for one that is captured and assigned.
+    - The LSP does not know the opt level, so it adds a storage word only where every build agrees: "shared (boxed)" when the local keeps its GC cell even with frame storage (a closure that captures it escapes, a bound method value holds it, or it is over 16 B), and "shared (by address)" for a captured `mut` parameter.
+  - An inlay hint before the body of a lambda or a local fn lists its captures, `captures base (copied), total (shared)`, with each one's detail in its tooltip. A `_` capture and a bound method value get none: every local they capture is spelled in the one expression that makes them.
+  - A `mut` argument shows "mutated by f" on hover, and a `mut` inlay hint before it, since the call site has no marker. A `mut self` receiver gets the hover only: a receiver stays unmarked, as in Rust and Swift.
 - **LSP function values:** hover and signature help on calls of function-typed values and bound methods.
 
 ## Out of scope

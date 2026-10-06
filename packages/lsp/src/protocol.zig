@@ -73,6 +73,21 @@ pub const completion_kind = struct {
     pub const @"struct": u8 = 22;
 };
 
+/// LSP `InlayHintKind`; a hint of neither kind omits it.
+pub const inlay_kind = struct {
+    pub const parameter: u8 = 2;
+};
+
+/// One inlay hint. Each null optional is omitted from the wire.
+pub const InlayHint = struct {
+    position: Position,
+    label: []const u8,
+    kind: ?u8 = null,
+    tooltip: ?[]const u8 = null,
+    paddingLeft: ?bool = null,
+    paddingRight: ?bool = null,
+};
+
 /// One completion candidate. `detail` (a type / signature) is omitted when absent.
 pub const CompletionItem = struct { label: []const u8, kind: u8, detail: ?[]const u8 = null };
 
@@ -111,6 +126,8 @@ const ServerCapabilities = struct {
         triggerCharacters: []const []const u8 = &.{ "(", "," },
         retriggerCharacters: []const []const u8 = &.{","},
     } = .{},
+    /// `textDocument/inlayHint` is implemented: closure capture lists and `mut` arguments.
+    inlayHintProvider: bool = true,
 };
 
 const ServerInfo = struct { name: []const u8, version: []const u8 };
@@ -175,6 +192,15 @@ test "InitializeResult advertises only the implemented capabilities" {
     try testing.expect(std.mem.indexOf(u8, out, "\"signatureHelpProvider\"") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"triggerCharacters\":[\"(\",\",\"]") != null);
     try testing.expect(std.mem.indexOf(u8, out, "\"retriggerCharacters\":[\",\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"inlayHintProvider\":true") != null);
+}
+
+test "an InlayHint omits the fields it does not set" {
+    var aw: Writer.Allocating = .init(testing.allocator);
+    defer aw.deinit();
+    const h: InlayHint = .{ .position = .{ .line = 1, .character = 4 }, .label = "mut", .kind = inlay_kind.parameter, .paddingRight = true };
+    try std.json.Stringify.value(h, json_opts, &aw.writer);
+    try testing.expectEqualStrings("{\"position\":{\"line\":1,\"character\":4},\"label\":\"mut\",\"kind\":2,\"paddingRight\":true}", aw.written());
 }
 
 test "writeResponse echoes an integer id and omits null optionals in the result" {

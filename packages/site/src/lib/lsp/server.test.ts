@@ -58,6 +58,21 @@ describe('toy-lsp.wasm', () => {
 		expect(items.map((i: CompletionItem) => i.label)).toContain('add');
 	});
 
+	it('answers inlay hints for a closure capture and a mut argument', async () => {
+		const server = await boot();
+		const uri = 'file:///blocks/inlay.toy';
+		const text =
+			'fn inc(mut n: int) { n = n + 1 }\nfn run(f: fn()) { f() }\nfn main() -> int {\n    c := 1\n    run(fn() { c = c + 1 })\n    inc(c)\n    return c\n}\n';
+		const range = { start: { line: 0, character: 0 }, end: { line: 8, character: 0 } };
+		const out = server.send([
+			open(uri, text),
+			{ jsonrpc: '2.0', id: 1, method: 'textDocument/inlayHint', params: { textDocument: { uri }, range } }
+		]);
+		const hints = out.find((m) => m.id === 1).result;
+		expect(hints.map((h: { label: string }) => h.label)).toEqual(['captures c (shared)', 'mut']);
+		expect(hints[1].position).toEqual({ line: 5, character: 8 });
+	});
+
 	it('resolves an import against another open document and bundled std', async () => {
 		const server = await boot();
 		server.send([open('file:///blocks/helper.toy', 'pub fn seven() -> int { return 7 }\n')]);
