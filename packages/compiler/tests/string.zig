@@ -496,3 +496,54 @@ test "string: a program's len and byte_at on str steer its own calls, never trim
     , "abc|\na-b\n100000\n120\n");
 }
 
+test "string: core/text panics on a range outside its str or buffer, at -O0 and -O1" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // std/str computes in-range bounds, so only a program importing core/text itself can
+    // pass a wrong one; each must stop with its message, not read or write past the bytes.
+    const Case = struct { body: []const u8, msg: []const u8 };
+    const cases = [_]Case{
+        .{ .body = "_s := text.slice(\"hello\", 2, 9)", .msg = "str slice out of bounds" },
+        .{ .body = "_s := text.slice(\"hello\", -1, 2)", .msg = "str slice out of bounds" },
+        .{ .body = "_s := text.slice(\"hello\", 3, 2)", .msg = "str slice out of bounds" },
+        .{ .body = "b := text.alloc(4)\n    text.put(b, 2, \"abc\")", .msg = "str buffer write out of bounds" },
+        .{ .body = "b := text.alloc(4)\n    text.put(b, -1, \"a\")", .msg = "str buffer write out of bounds" },
+        .{ .body = "b := text.alloc(4)\n    _s := text.take(b, 5)", .msg = "str buffer read out of bounds" },
+        .{ .body = "_b := text.alloc(-1)", .msg = "str buffer size is negative" },
+    };
+    const dir = ".toy-test-string-text-bounds";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    for (cases, 0..) |c, k| for ([_][]const u8{ "-O0", "-O1" }) |level| {
+        const src = try std.fmt.allocPrint(gpa, "import core/text\nfn main() -> int {{\n    {s}\n    return 0\n}}\n", .{c.body});
+        defer gpa.free(src);
+        const sub = try std.fmt.allocPrint(gpa, "{s}/{d}{s}", .{ dir, k, level[1..] });
+        defer gpa.free(sub);
+        const prog = try harness.compile(gpa, io, sub, src, &.{ "--no-cache", level });
+        defer gpa.free(prog);
+        const run = try harness.runStderr(gpa, io, prog);
+        defer gpa.free(run.err);
+        std.testing.expect(run.term == .exited and run.term.exited == 1 and std.mem.startsWith(u8, run.err, c.msg)) catch |e| {
+            std.debug.print("case {d} at {s}: {any}, stderr: {s}\n", .{ k, level, run.term, run.err });
+            return e;
+        };
+    };
+    // The same parts in range build the str.
+    try harness.expectStdoutAtBothLevels(gpa, io, dir,
+        \\import core/text
+        \\import std/io
+        \\fn main() -> int {
+        \\    b := text.alloc(5)
+        \\    text.put(b, 0, "he")
+        \\    text.put(b, 2, text.slice("ollo", 1, 4))
+        \\    io.println(text.take(b, 5))
+        \\    io.println(text.take(b, 0).len())
+        \\    io.println(text.slice("hello", 5, 5).len())
+        \\    return 0
+        \\}
+        \\
+    , "hello\n0\n0\n");
+}

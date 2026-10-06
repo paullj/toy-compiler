@@ -1,13 +1,16 @@
 # Raw `str` parts for std/str. A str is a `{ptr, len}` pair, so a substring is a new pair
 # into its parent's bytes: no copy. A str built from parts is written into one buffer of
-# its final length, so building it copies each byte once.
+# its final length, so building it copies each byte once. Each part checks its range
+# against a length its caller cannot change, a str's own or the one a buffer records, and
+# panics outside it: wrong arithmetic in a caller stops the program instead of reading or
+# writing past the bytes.
 
 # The bytes [lo, hi) of `s` as a str that shares its buffer: the collector keeps the parent's
 # cell alive through the interior pointer. The cell is allocated before the parent's address
-# is read into an int, so no heap address lives only in an int across an allocation. The
-# caller keeps `0 <= lo <= hi <= s.len()`.
+# is read into an int, so no heap address lives only in an int across an allocation.
 pub fn slice(s: str, lo: int, hi: int) -> str {
-    if hi <= lo { return "" }
+    if lo < 0 || lo > hi || hi > s.len() { panic("str slice out of bounds") }
+    if hi == lo { return "" }
     cell := gc_alloc(16)
     unsafe {
         store(cell, s)
@@ -19,30 +22,38 @@ pub fn slice(s: str, lo: int, hi: int) -> str {
     return r
 }
 
-# A buffer of `n` bytes for a str under construction. A `rawptr` is a root, so the buffer
-# lives while the builder holds it.
+# A buffer of `n` bytes for a str under construction. Its first 8 bytes record `n`, which
+# `put` and `take` check against, and the str's bytes follow. A `rawptr` is a root, so the
+# buffer lives while the builder holds it.
 pub fn alloc(n: int) -> rawptr {
-    return gc_alloc(n)
+    if n < 0 { panic("str buffer size is negative") }
+    buf := gc_alloc(n + 8)
+    unsafe { store(buf, n) }
+    return buf
 }
 
-# Copy the bytes of `s` into `buf` from byte `at`; the caller keeps `at + s.len()` within
-# `buf`.
+# Copy the bytes of `s` into `buf` from byte `at`.
 pub fn put(buf: rawptr, at: int, s: str) {
     n := s.len()
+    cap: int = unsafe { load(buf) }
+    if at < 0 || at > cap - n { panic("str buffer write out of bounds") }
+    p := unsafe { offset(buf, 8 + at) }
     i := 0
     while i < n {
-        unsafe { store_byte(offset(buf, at + i), s.byte_at(i)) }
+        unsafe { store_byte(offset(p, i), s.byte_at(i)) }
         i = i + 1
     }
 }
 
-# The first `n` bytes of `buf` as a str. The str points at `buf`, which the collector then
+# The first `n` bytes of `buf` as a str. The str points into `buf`, which the collector then
 # keeps alive through it.
 pub fn take(buf: rawptr, n: int) -> str {
+    cap: int = unsafe { load(buf) }
+    if n < 0 || n > cap { panic("str buffer read out of bounds") }
     if n == 0 { return "" }
     cell := gc_alloc(16)
     unsafe {
-        store(cell, buf)
+        store(cell, offset(buf, 8))
         store(offset(cell, 8), n)
     }
     r: str = unsafe { load(cell) }

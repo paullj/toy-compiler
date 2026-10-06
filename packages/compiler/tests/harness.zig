@@ -125,6 +125,15 @@ pub fn runStdout(gpa: std.mem.Allocator, io: Io, prog: []const u8) ![]u8 {
     return out;
 }
 
+/// What `prog` wrote to stderr, and how it ended.
+pub fn runStderr(gpa: std.mem.Allocator, io: Io, prog: []const u8) !struct { err: []u8, term: std.process.Child.Term } {
+    var child = try std.process.spawn(io, .{ .argv = &.{prog}, .stdout = .ignore, .stderr = .pipe });
+    var rdr = child.stderr.?.readerStreaming(io, &.{});
+    const err = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+    errdefer gpa.free(err);
+    return .{ .err = err, .term = try child.wait(io) };
+}
+
 /// Build `src` at -O0 and at -O1 into separate dirs under `dir`, run each, and expect
 /// `want` on stdout from both.
 pub fn expectStdoutAtBothLevels(gpa: std.mem.Allocator, io: Io, dir: []const u8, src: []const u8, want: []const u8) !void {
