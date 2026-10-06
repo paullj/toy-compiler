@@ -1,12 +1,11 @@
-# Feature: `Map.keys()` and `Map.values()` (from std/mapvec) return a new `Vec` of the keys or
-# the values in insertion order. Nine keys force a grow, and overwriting the first key keeps it first. The
+# Feature: `Map.keys()` and `Map.values()` return a new `Vec` of the keys or the values in
+# insertion order. Nine keys force a grow, and overwriting the first key keeps it first. The
 # Vecs work with the Vec closure methods: `fold` sums the values (154 + 1), and sorting
 # `keys()` sorts only that Vec, so the Map's own order is unchanged.
 # expect: stdout "2 3 5 7 11 13 17 19 21 \n"
 # expect: exit 155
 import std/io
 import std/map
-import std/mapvec
 import std/vec
 
 fn main() -> int {

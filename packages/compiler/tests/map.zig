@@ -324,7 +324,6 @@ test "map: each, keys and values follow insertion order across a grow" {
     // again: the walks must still follow first-insertion order, with the new values.
     const codes = try harness.exitAtBothLevels(gpa, io, ".toy-test-map-walk-order",
         \\import std/map
-        \\import std/mapvec
         \\import std/vec
         \\fn key(i: int) -> str { "k".concat(((i * 37) % 101).to_string()) }
         \\fn want(i: int) -> int { if i % 3 == 0 { i + 1000 } else { i } }
@@ -375,7 +374,6 @@ test "map: filter and map results keep str keys across a forced collection" {
     // 15 odd hits + 30 tag hits = 45.
     const codes = try harness.exitAtBothLevels(gpa, io, ".toy-test-map-methods-gc",
         \\import std/map
-        \\import std/mapvec
         \\import std/vec
         \\import core/mem_selftest
         \\fn fresh(i: int) -> str { "k".concat(i.to_string()) }
@@ -465,7 +463,6 @@ test "map: Map closure methods are byte-identical at -j1 and -j8" {
     // which Pass C and codegen fan out.
     const src =
         \\import std/map
-        \\import std/mapvec
         \\import std/set
         \\fn main() -> int {
         \\    m := Map[str, int].new()

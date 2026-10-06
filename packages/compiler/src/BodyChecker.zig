@@ -3416,9 +3416,6 @@ pub const BodyChecker = struct {
             .result => .result,
         };
         if (bc.model.prelude) |p| if (p.ref_struct == e.ctor) return .ref;
-        if (e.ctor >= bc.model.structs.len) return null;
-        const sym = bc.model.structs[e.ctor];
-        if (std.mem.eql(u8, sym.name, StdNames.map_struct) and bc.model.graph.mods[sym.mod].bundled) return .map;
         return null;
     }
 
