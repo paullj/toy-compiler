@@ -3,8 +3,8 @@
 //! `Ref` has no in-process observable surface (the child's heap is opaque), so each case
 //! writes a tiny entry program, compiles it with the installed `toy`, runs it, and asserts
 //! the EXIT CODE. The determinism case instead compiles one program at `-j1` and `-j8` and
-//! asserts the two images are byte-identical bar the one-byte code-sign nonce — the
-//! run-order-independence the reify-out-of-App-index design guarantees.
+//! asserts the two images are byte-identical — the run-order-independence the
+//! reify-out-of-App-index design guarantees.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -78,29 +78,10 @@ test "ref: a program building Ref[int] AND Ref[bool] is byte-identical at -j1 an
         \\}
         \\
     ;
-    const dir = ".toy-test-ref-determinism";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
-    defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(p8);
-
-    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
-    defer gpa.free(b1);
-    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
-    defer gpa.free(b8);
-
-    try std.testing.expectEqual(b1.len, b8.len);
     // The reified Ref[int]/Ref[bool] struct ids ride the (depth, structural-key) order, so
-    // codegen is a pure function of source — the two images differ ONLY in the one-byte
-    // code-sign nonce (which is re-randomized every build, never a codegen input).
-    var differing: usize = 0;
-    for (b1, b8) |x, y| {
-        if (x != y) differing += 1;
-    }
-    try std.testing.expect(differing <= 1);
+    // codegen is a pure function of source.
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-ref-determinism", src, &.{}, null);
 }
 
 test "ref: a growable holding Ref[int] elements pushes then reads-back the boxed values" {
@@ -144,26 +125,8 @@ test "ref: a growable of Ref[int] elements is byte-identical at -j1 and -j8" {
         \\}
         \\
     ;
-    const dir = ".toy-test-ref-box-element-determinism";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
-    defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(p8);
-
-    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
-    defer gpa.free(b1);
-    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
-    defer gpa.free(b8);
-
-    try std.testing.expectEqual(b1.len, b8.len);
-    var differing: usize = 0;
-    for (b1, b8) |x, y| {
-        if (x != y) differing += 1;
-    }
-    try std.testing.expect(differing <= 1);
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-ref-box-element-determinism", src, &.{}, null);
 }
 
 test "ref: a derivable + Ref-containing type emits a deterministic trace unit (-j1 == -j8)" {
@@ -177,7 +140,7 @@ test "ref: a derivable + Ref-containing type emits a deterministic trace unit (-
     // producer co-emits a `trace` unit that `bl`s `gc_mark`. Both the trace unit's synthetic
     // name (minted off the reified struct id, which rides the (depth, structural-key) order)
     // and `gc_mark`'s appended body are a pure function of source — so the two images are
-    // byte-identical bar the one-byte code-sign nonce, the spike's determinism guarantee.
+    // byte-identical, the spike's determinism guarantee.
     const src =
         \\import std/ref
         \\struct Node { v: int, next: Ref[int] }
@@ -189,26 +152,8 @@ test "ref: a derivable + Ref-containing type emits a deterministic trace unit (-
         \\}
         \\
     ;
-    const dir = ".toy-test-ref-trace-determinism";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
-    defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(p8);
-
-    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
-    defer gpa.free(b1);
-    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
-    defer gpa.free(b8);
-
-    try std.testing.expectEqual(b1.len, b8.len);
-    var differing: usize = 0;
-    for (b1, b8) |x, y| {
-        if (x != y) differing += 1;
-    }
-    try std.testing.expect(differing <= 1);
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-ref-trace-determinism", src, &.{}, null);
 }
 
 test "ref: a set through a copy of a handle is seen through the original" {

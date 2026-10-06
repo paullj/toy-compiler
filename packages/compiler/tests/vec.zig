@@ -381,29 +381,10 @@ test "vec: a Vec program is byte-identical at -j1 and -j8" {
         \\}
         \\
     ;
-    const dir = ".toy-test-vec-determinism";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
-    defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(p8);
-
-    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
-    defer gpa.free(b1);
-    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
-    defer gpa.free(b8);
-
-    try std.testing.expectEqual(b1.len, b8.len);
     // The reified Vec[int]/GcArray struct ids ride the (depth, structural-key) order, so
-    // codegen is a pure function of source — the two images differ ONLY in the one-byte
-    // code-sign nonce (re-randomized every build, never a codegen input).
-    var differing: usize = 0;
-    for (b1, b8) |x, y| {
-        if (x != y) differing += 1;
-    }
-    try std.testing.expect(differing <= 1);
+    // codegen is a pure function of source.
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-vec-determinism", src, &.{}, null);
 }
 
 test "vec: xs[i].field reads a struct element's field in place (variable index)" {
@@ -709,26 +690,8 @@ test "vec: a nested-generic-container program is byte-identical at -j1 and -j8" 
         \\}
         \\
     ;
-    const dir = ".toy-test-vec-nested-determinism";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
-    defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(p8);
-
-    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
-    defer gpa.free(b1);
-    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
-    defer gpa.free(b8);
-
-    try std.testing.expectEqual(b1.len, b8.len);
-    var differing: usize = 0;
-    for (b1, b8) |x, y| {
-        if (x != y) differing += 1;
-    }
-    try std.testing.expect(differing <= 1);
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-vec-nested-determinism", src, &.{}, null);
 }
 
 test "vec: a .field off a call/method result materializes the aggregate rvalue" {
@@ -953,26 +916,6 @@ test "vec: Vec closure methods are byte-identical at -j1 and -j8" {
         \\}
         \\
     ;
-    const dir = ".toy-test-vec-closure-determinism";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const p1 = try compile(gpa, io, dir ++ "/j1", src, &.{ "--no-cache", "-j1" });
-    defer gpa.free(p1);
-    const p8 = try compile(gpa, io, dir ++ "/j8", src, &.{ "--no-cache", "-j8" });
-    defer gpa.free(p8);
-
-    const b1 = try Io.Dir.cwd().readFileAlloc(io, p1, gpa, .unlimited);
-    defer gpa.free(b1);
-    const b8 = try Io.Dir.cwd().readFileAlloc(io, p8, gpa, .unlimited);
-    defer gpa.free(b8);
-
-    try std.testing.expectEqual(b1.len, b8.len);
-    // Only the one-byte code-sign nonce may differ.
-    var differing: usize = 0;
-    for (b1, b8) |x, y| {
-        if (x != y) differing += 1;
-    }
-    try std.testing.expect(differing <= 1);
-    try std.testing.expectEqual(@as(u8, 49), try harness.runExit(gpa, io, p1));
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-vec-closure-determinism", src, &.{}, 49);
 }

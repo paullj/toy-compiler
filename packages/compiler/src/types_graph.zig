@@ -40,12 +40,23 @@ pub fn checkGraph(
     gpa: std.mem.Allocator,
     graph: *const Graph.Graph,
     res: *const ResolveGraph.GraphResult,
-    /// Pass-C worker pool, or `null` to force serial (see `Typecheck.checkGraph`).
+    /// Pass-C worker pool, or `null` to force serial (see `Typecheck.Jobs.io`).
     /// The single-source path (per-file pipeline + inline test helpers) passes null.
     io: ?std.Io,
     /// The `-j` jobs knob for the Pass-C body fan-out (0 => host cpus). Ignored when
-    /// `io == null`. See `Typecheck.ncpu`.
+    /// `io == null`. See `Typecheck.Jobs.ncpu`.
     ncpu: usize,
+) !GraphResult {
+    return checkGraphWith(gpa, graph, res, .{ .io = io, .ncpu = ncpu });
+}
+
+/// `checkGraph` with every Pass-C dispatch setting spelled out, the fan-out threshold
+/// included.
+pub fn checkGraphWith(
+    gpa: std.mem.Allocator,
+    graph: *const Graph.Graph,
+    res: *const ResolveGraph.GraphResult,
+    jobs: Typecheck.Jobs,
 ) !GraphResult {
     const n = graph.modules.len;
 
@@ -106,7 +117,7 @@ pub fn checkGraph(
         };
     }
 
-    return Typecheck.checkGraph(gpa, &ctx, mods, fns, graph.entry_index, io, ncpu);
+    return Typecheck.checkGraph(gpa, &ctx, mods, fns, graph.entry_index, jobs);
 }
 
 /// Bind module `m`'s import namespaces into `mc.namespaces` (namespace name →
@@ -165,6 +176,44 @@ const Io = std.Io;
 
 const FixtureFile = struct { path: []const u8, source: []const u8 };
 
+/// A fixture program's discovered graph and its resolve result.
+const Fixture = struct {
+    graph: Graph.Graph,
+    res: ResolveGraph.GraphResult,
+
+    /// Write `files` under a fresh `dir_name` (the caller removes it), then discover the
+    /// graph rooted at `entry` and resolve it.
+    fn load(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, files: []const FixtureFile, entry: []const u8) !Fixture {
+        Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+        try Io.Dir.cwd().createDirPath(io, dir_name);
+
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        for (files) |f| {
+            const full = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_name, f.path });
+            if (std.mem.lastIndexOfScalar(u8, full, '/')) |i|
+                try Io.Dir.cwd().createDirPath(io, full[0..i]);
+            try Io.Dir.cwd().writeFile(io, .{ .sub_path = full, .data = f.source });
+        }
+
+        var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cache_dir = try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir_name});
+        const cache = try Cache.init(io, cache_dir);
+
+        var entry_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const entry_path = try std.fmt.bufPrint(&entry_buf, "{s}/{s}", .{ dir_name, entry });
+
+        var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
+        errdefer graph.deinit(gpa);
+        try testing.expect(graph.err == null);
+        return .{ .graph = graph, .res = try ResolveGraph.resolveGraph(gpa, &graph) };
+    }
+
+    fn deinit(f: *Fixture, gpa: std.mem.Allocator) void {
+        f.res.deinit(gpa);
+        f.graph.deinit(gpa);
+    }
+};
+
 /// Write the fixtures, discover the graph, resolve it, typecheck it, and hand
 /// `(graph, resolve_result, type_result)` to `check`.
 fn withCheckedGraph(
@@ -178,36 +227,14 @@ fn withCheckedGraph(
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
-    try Io.Dir.cwd().createDirPath(io, dir_name);
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    var fx = try Fixture.load(gpa, io, dir_name, files, entry);
+    defer fx.deinit(gpa);
 
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    for (files) |f| {
-        const full = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir_name, f.path });
-        if (std.mem.lastIndexOfScalar(u8, full, '/')) |i|
-            try Io.Dir.cwd().createDirPath(io, full[0..i]);
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = full, .data = f.source });
-    }
-
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cache_dir = try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir_name});
-    const cache = try Cache.init(io, cache_dir);
-
-    var entry_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const entry_path = try std.fmt.bufPrint(&entry_buf, "{s}/{s}", .{ dir_name, entry });
-
-    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
-    defer graph.deinit(gpa);
-    try testing.expect(graph.err == null);
-
-    var r = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer r.deinit(gpa);
-
-    var tr = try checkGraph(gpa, &graph, &r, io, 8);
+    var tr = try checkGraph(gpa, &fx.graph, &fx.res, io, 8);
     defer tr.deinit(gpa);
 
-    try check(&graph, &r, &tr);
+    try check(&fx.graph, &fx.res, &tr);
 }
 
 fn modId(g: *const Graph.Graph, path: []const u8) u32 {
@@ -558,46 +585,206 @@ test "single-module graph typechecks like the single-file checker" {
     try withCheckedGraph(".toy-test-typ-solo", files, "solo.toy", Check.run);
 }
 
-/// PARALLEL == SERIAL: discover+resolve ONCE, then type-check the SAME graph
-/// twice — under a `.limited(0)` (serial, the -j1 baseline) pool and under a
-/// multi-worker (`.limited(8)`, the -jN) pool — and assert the diagnostic stream is
-/// IDENTICAL: same count, same (module, byte_offset, message) at every index. A
-/// multi-fn, multi-module reject program with errors in source-disordered fns is the
-/// real test of the stable (module, byte_offset) merge sort vs thread-arrival order.
-fn diagsUnder(
-    gpa: std.mem.Allocator,
-    graph: *const Graph.Graph,
-    res: *ResolveGraph.GraphResult,
-    limit: Io.Limit,
-) ![]Diagnostic {
-    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
-    defer threaded.deinit();
-    var tr = try checkGraph(gpa, graph, res, threaded.io(), 8);
-    defer tr.deinit(gpa);
-    const copy = try gpa.alloc(Diagnostic, tr.diags.len);
-    for (tr.diags, 0..) |d, i| copy[i] = .{
-        .scope = d.scope,
-        .byte_offset = d.byte_offset,
-        .end = d.end,
-        .message = try gpa.dupe(u8, d.message),
-    };
-    return copy;
+/// The workers of the -jN check, and the bodies a determinism program gives them: one each.
+const racers = 8;
+
+/// `racers` copies of `fmt`, its `{[k]d}` the copy's index. Call at comptime.
+fn perRacer(comptime fmt: []const u8) []const u8 {
+    @setEvalBranchQuota(100_000);
+    var s: []const u8 = "";
+    for (0..racers) |k| s = s ++ std.fmt.comptimePrint(fmt, .{ .k = k });
+    return s;
 }
 
-test "parallel Pass-C diagnostics are byte-identical to serial (-j1 == -jN)" {
-    const gpa = testing.allocator;
+/// `std.testing.allocator` captures a stack trace on every allocation, which made each
+/// determinism test take up to minutes (#34). This one still reports every leak, without
+/// the allocation site.
+const LeakCheck = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+
+/// Renders one check's result to bytes, and may assert on it. `expectJobInvariant` runs it on
+/// the -j1 result and on the -jN result alike.
+const Projection = fn (gpa: std.mem.Allocator, g: *const Graph.Graph, tr: *const GraphResult, out: *std.ArrayList(u8)) anyerror!void;
+
+/// PARALLEL == SERIAL: discover + resolve `files` ONCE, then type-check the SAME graph twice —
+/// under a `.limited(0)` pool (serial, the -j1 baseline) and under a `racers`-worker pool
+/// (-jN) — and expect `project` to render both results to the same bytes. The fan-out
+/// threshold is 0, so the bodies of even a small program split across the workers.
+fn expectJobInvariant(dir_name: []const u8, files: []const FixtureFile, comptime project: Projection) !void {
+    var leak_check: LeakCheck = .init;
+    const result = jobInvariant(leak_check.allocator(), dir_name, files, project);
+    const leaked = leak_check.deinit() == .leak;
+    try result;
+    try testing.expect(!leaked);
+}
+
+fn jobInvariant(gpa: std.mem.Allocator, dir_name: []const u8, files: []const FixtureFile, comptime project: Projection) !void {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
 
-    const dir = ".toy-test-typ-s4det";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    try Io.Dir.cwd().createDirPath(io, dir);
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    var fx = try Fixture.load(gpa, io, dir_name, files, "main.toy");
+    defer fx.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), fx.res.diags.len);
 
-    const files = &[_]FixtureFile{
-        // Several fns each carrying ONE error, in deliberately source-disordered
-        // positions so a thread-arrival ordering would scramble the stream.
+    const serial = try projectUnder(gpa, &fx, .limited(0), project);
+    defer gpa.free(serial);
+    const parallel = try projectUnder(gpa, &fx, .limited(racers), project);
+    defer gpa.free(parallel);
+    try testing.expectEqualSlices(u8, serial, parallel);
+}
+
+fn projectUnder(gpa: std.mem.Allocator, fx: *const Fixture, limit: Io.Limit, comptime project: Projection) ![]u8 {
+    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
+    defer threaded.deinit();
+    var tr = try checkGraphWith(gpa, &fx.graph, &fx.res, .{ .io = threaded.io(), .ncpu = racers, .threshold = 0 });
+    defer tr.deinit(gpa);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    try project(gpa, &fx.graph, &tr, &out);
+    return out.toOwnedSlice(gpa);
+}
+
+fn expectNoErrors(tr: *const GraphResult) !void {
+    for (tr.diags) |d| try testing.expect(d.severity != .err);
+}
+
+/// The diagnostic stream: (module, byte_offset, message) at every index. It must also be
+/// (module, byte_offset)-monotone, the stable merge key the parallel path has to reproduce.
+fn diagStream(gpa: std.mem.Allocator, tr: *const GraphResult, out: *std.ArrayList(u8)) !void {
+    for (tr.diags) |d| {
+        try out.appendSlice(gpa, std.mem.asBytes(&d.scope));
+        try out.appendSlice(gpa, std.mem.asBytes(&d.byte_offset));
+        try out.appendSlice(gpa, d.message);
+        try out.append(gpa, 0);
+    }
+    try testing.expect(std.sort.isSorted(Diagnostic, tr.diags, {}, struct {
+        fn lt(_: void, a: Diagnostic, b: Diagnostic) bool {
+            return a.scope < b.scope or (a.scope == b.scope and a.byte_offset < b.byte_offset);
+        }
+    }.lt));
+}
+
+/// Every module's callee slice, then each instance's template id, name and callee slice.
+/// Returns the slots counted by tag.
+fn calleeTables(gpa: std.mem.Allocator, tr: *const GraphResult, out: *std.ArrayList(u8)) !std.EnumArray(Typecheck.Callee.Tag, usize) {
+    var tags: std.EnumArray(Typecheck.Callee.Tag, usize) = .initFill(0);
+    for (tr.callees) |cs| {
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(cs));
+        for (cs) |c| tags.getPtr(c.tag).* += 1;
+    }
+    for (tr.instances) |inst| {
+        try out.appendSlice(gpa, std.mem.asBytes(&inst.template_gid));
+        if (inst.name) |name| try out.appendSlice(gpa, name);
+        try out.append(gpa, 0);
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(inst.callees));
+        for (inst.callees) |c| tags.getPtr(c.tag).* += 1;
+    }
+    return tags;
+}
+
+/// The adapter table: each adapter's key, name and target.
+fn adapterTable(gpa: std.mem.Allocator, tr: *const GraphResult, out: *std.ArrayList(u8)) !void {
+    for (tr.adapters) |a| {
+        try out.appendSlice(gpa, std.mem.asBytes(&a.key));
+        try out.appendSlice(gpa, a.name);
+        try out.append(gpa, 0);
+        try out.appendSlice(gpa, a.target.name);
+        try out.append(gpa, 0);
+    }
+}
+
+/// The reified layout table: every layout's name, then its fn signature's kind/id bytes when
+/// it is a fn pair; then every instance name. Returns the number of fn pairs.
+fn fnLayouts(gpa: std.mem.Allocator, tr: *const GraphResult, out: *std.ArrayList(u8)) !usize {
+    var pairs: usize = 0;
+    for (tr.layouts) |l| {
+        try out.appendSlice(gpa, l.name);
+        try out.append(gpa, 0);
+        if (l.fn_sig) |fs| {
+            pairs += 1;
+            for (fs.params) |p| try p.appendKeyBytes(gpa, out);
+            try fs.ret.appendKeyBytes(gpa, out);
+        }
+    }
+    for (tr.instances) |inst| {
+        try out.appendSlice(gpa, inst.name.?);
+        try out.append(gpa, 0);
+    }
+    return pairs;
+}
+
+fn typeLabel(tr: *const GraphResult, t: Typecheck.Type) []const u8 {
+    return if (t.isStruct()) tr.layouts[t.struct_id].name else @tagName(t.kind);
+}
+
+/// The lambda-unit table (with each frame env's layout name), the owners' unboxable and
+/// escaping sets, and every lambda node's reified type (by layout name). Returns the number
+/// of units with a frame env.
+fn lambdaTables(gpa: std.mem.Allocator, g: *const Graph.Graph, tr: *const GraphResult, out: *std.ArrayList(u8)) !usize {
+    var frame_envs: usize = 0;
+    for (tr.lambda_units) |u| {
+        try out.appendSlice(gpa, u.name);
+        try out.append(gpa, 0);
+        try out.appendSlice(gpa, std.mem.asBytes(&u.node));
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(u.param_slots));
+        for (u.sig.params) |p| try out.appendSlice(gpa, typeLabel(tr, p));
+        try out.appendSlice(gpa, typeLabel(tr, u.sig.ret));
+        try out.appendSlice(gpa, std.mem.asBytes(&u.env_size));
+        for (u.env) |es| {
+            try out.appendSlice(gpa, std.mem.asBytes(&es.slot));
+            try out.appendSlice(gpa, std.mem.asBytes(&es.off));
+            try out.appendSlice(gpa, @tagName(es.mode));
+            try out.appendSlice(gpa, typeLabel(tr, es.ty));
+        }
+        if (u.frame_env) |sid| {
+            try out.appendSlice(gpa, tr.layouts[sid].name);
+            frame_envs += 1;
+        }
+    }
+    for (tr.owner_closures) |oc| {
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(oc.unboxable));
+        try out.append(gpa, 0xff);
+        try out.appendSlice(gpa, std.mem.sliceAsBytes(oc.kept_boxed));
+    }
+    for (g.modules, 0..) |m, mi| for (m.nodes, 0..) |n, k| {
+        if (n.tag != .lambda) continue;
+        const t = tr.node_types[mi][k];
+        if (t.isStruct()) try out.appendSlice(gpa, tr.layouts[t.struct_id].name);
+    };
+    for (tr.instances) |inst| for (g.modules[inst.mod].nodes, 0..) |n, k| {
+        if (n.tag != .lambda) continue;
+        const t = inst.node_types[k];
+        if (t.isStruct()) try out.appendSlice(gpa, tr.layouts[t.struct_id].name);
+    };
+    return frame_envs;
+}
+
+/// Each owner's boxed, unboxable and escaping slots, then each lambda unit's env (slot, mode,
+/// offset) and frame env.
+fn ownerClosures(gpa: std.mem.Allocator, tr: *const GraphResult, out: *std.ArrayList(u8)) !void {
+    for (tr.owner_closures) |oc| {
+        switch (oc.owner) {
+            .base => |gid| try out.print(gpa, "b{d}:", .{gid}),
+            .instance => |k| try out.print(gpa, "i{s}:", .{tr.instances[k].name.?}),
+        }
+        for (oc.boxed) |sl| try out.print(gpa, "{d},", .{sl});
+        try out.appendSlice(gpa, "u");
+        for (oc.unboxable) |sl| try out.print(gpa, "{d},", .{sl});
+        try out.appendSlice(gpa, "e");
+        for (oc.kept_boxed) |sl| try out.print(gpa, "{d},", .{sl});
+    }
+    for (tr.lambda_units) |u| {
+        try out.appendSlice(gpa, u.name);
+        for (u.env) |es| try out.print(gpa, "({d} {s} {d})", .{ es.slot, @tagName(es.mode), es.off });
+        if (u.frame_env) |sid| try out.print(gpa, "[{s}]", .{tr.layouts[sid].name});
+    }
+}
+
+test "parallel Pass-C diagnostics are byte-identical to serial (-j1 == -jN)" {
+    // Several fns each carrying ONE error, in deliberately source-disordered positions so a
+    // thread-arrival ordering would scramble the stream.
+    try expectJobInvariant(".toy-test-typ-s4det", &.{
         .{ .path = "main.toy", .source =
         \\import lib
         \\fn _a() -> int { return true }
@@ -615,140 +802,35 @@ test "parallel Pass-C diagnostics are byte-identical to serial (-j1 == -jN)" {
         \\pub fn g() -> bool { return 1 }
         \\
         },
-    };
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    for (files) |f| {
-        const full = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, f.path });
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = full, .data = f.source });
-    }
-
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cache_dir = try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir});
-    const cache = try Cache.init(io, cache_dir);
-
-    var entry_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const entry_path = try std.fmt.bufPrint(&entry_buf, "{s}/main.toy", .{dir});
-
-    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
-    defer graph.deinit(gpa);
-    try testing.expect(graph.err == null);
-
-    var r = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer r.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), r.diags.len);
-
-    const serial = try diagsUnder(gpa, &graph, &r, .limited(0));
-    defer {
-        for (serial) |d| gpa.free(@constCast(d.message));
-        gpa.free(serial);
-    }
-    const parallel = try diagsUnder(gpa, &graph, &r, .limited(8));
-    defer {
-        for (parallel) |d| gpa.free(@constCast(d.message));
-        gpa.free(parallel);
-    }
-
-    // The four body errors surface (g's `1`-to-bool is in an UNUSED lib fn but still
-    // checked): _a/_b/_c/_d in main + g in lib. Same count, same order, same bytes.
-    try testing.expect(serial.len >= 4);
-    try testing.expectEqual(serial.len, parallel.len);
-    for (serial, parallel) |s, p| {
-        try testing.expectEqual(s.scope, p.scope);
-        try testing.expectEqual(s.byte_offset, p.byte_offset);
-        try testing.expectEqualStrings(s.message, p.message);
-    }
-
-    // And the serial stream is itself (scope, byte_offset)-monotone (the stable
-    // merge key) — the property the parallel path must reproduce.
-    for (serial[1..], serial[0 .. serial.len - 1]) |cur, prev| {
-        try testing.expect(prev.scope < cur.scope or
-            (prev.scope == cur.scope and prev.byte_offset <= cur.byte_offset));
-    }
-}
-
-/// The callee tables of one check of `graph` under a `limit`-worker pool, as raw bytes:
-/// every module slice, then each instance's `template_gid` and slice. `tags` counts
-/// every slot by tag. Requires an error-free check.
-fn calleesUnder(
-    gpa: std.mem.Allocator,
-    graph: *const Graph.Graph,
-    res: *ResolveGraph.GraphResult,
-    limit: Io.Limit,
-    tags: *[@typeInfo(Typecheck.Callee.Tag).@"enum".fields.len]usize,
-) ![]u8 {
-    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
-    defer threaded.deinit();
-    var tr = try checkGraph(gpa, graph, res, threaded.io(), 8);
-    defer tr.deinit(gpa);
-    for (tr.diags) |d| try testing.expect(d.severity != .err);
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    @memset(tags, 0);
-    for (tr.callees) |cs| {
-        try out.appendSlice(gpa, std.mem.sliceAsBytes(cs));
-        for (cs) |c| tags[@intFromEnum(c.tag)] += 1;
-    }
-    for (tr.instances) |inst| {
-        try out.appendSlice(gpa, std.mem.asBytes(&inst.template_gid));
-        try out.appendSlice(gpa, std.mem.sliceAsBytes(inst.callees));
-        for (inst.callees) |c| tags[@intFromEnum(c.tag)] += 1;
-    }
-    return out.toOwnedSlice(gpa);
+    }, struct {
+        fn project(gpa: std.mem.Allocator, _: *const Graph.Graph, tr: *const GraphResult, out: *std.ArrayList(u8)) !void {
+            // The four body errors surface (g's `1`-to-bool is in an UNUSED lib fn but still
+            // checked): _a/_b/_c/_d in main + g in lib.
+            try testing.expect(tr.diags.len >= 4);
+            try diagStream(gpa, tr, out);
+        }
+    }.project);
 }
 
 test "callee tables are byte-identical at -j1 and -jN" {
-    const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const dir = ".toy-test-callees-jn";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    try Io.Dir.cwd().createDirPath(io, dir);
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-
-    // Every Callee shape, plus enough fns (> the Pass-C fan-out threshold) that the
-    // parallel check really splits the bodies across workers.
-    var src: std.Io.Writer.Allocating = .init(gpa);
-    defer src.deinit();
-    try src.writer.writeAll("import std/vec\n");
-    try src.writer.writeAll(Typecheck.dispatch_shapes_src);
-    try src.writer.writeAll(
+    const src = "import std/vec\n" ++ Typecheck.dispatch_shapes_src ++
         \\fn _vecs() -> int {
         \\    v := Vec[int].new()
         \\    v.push(1)
         \\    return v.len()
         \\}
         \\
-    );
-    for (0..70) |k| try src.writer.print("fn _pad{d}(a: Acc) -> int {{ a.plus({d}, 1) + (a |> .plus({d}, 2)) + \"x\".len() + ({d}).hash() }}\n", .{ k, k, k, k });
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const entry_path = try std.fmt.bufPrint(&path_buf, "{s}/main.toy", .{dir});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = entry_path, .data = src.written() });
-
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cache = try Cache.init(io, try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir}));
-
-    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
-    defer graph.deinit(gpa);
-    try testing.expect(graph.err == null);
-    var r = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer r.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), r.diags.len);
-
-    var serial_tags: [@typeInfo(Typecheck.Callee.Tag).@"enum".fields.len]usize = undefined;
-    var parallel_tags: [@typeInfo(Typecheck.Callee.Tag).@"enum".fields.len]usize = undefined;
-    const serial = try calleesUnder(gpa, &graph, &r, .limited(0), &serial_tags);
-    defer gpa.free(serial);
-    const parallel = try calleesUnder(gpa, &graph, &r, .limited(8), &parallel_tags);
-    defer gpa.free(parallel);
-
-    try testing.expectEqualSlices(u8, serial, parallel);
-    try testing.expect(serial_tags[@intFromEnum(Typecheck.Callee.Tag.method)] > 0);
-    try testing.expect(serial_tags[@intFromEnum(Typecheck.Callee.Tag.builtin)] > 0);
-    try testing.expect(serial_tags[@intFromEnum(Typecheck.Callee.Tag.protocol)] > 0);
-    try testing.expectEqual(@as(usize, 0), serial_tags[@intFromEnum(Typecheck.Callee.Tag.pending)]);
+    ++ comptime perRacer("fn _pad{[k]d}(a: Acc) -> int {{ a.plus({[k]d}, 1) + (a |> .plus({[k]d}, 2)) + \"x\".len() + ({[k]d}).hash() }}\n");
+    try expectJobInvariant(".toy-test-callees-jn", &.{.{ .path = "main.toy", .source = src }}, struct {
+        fn project(gpa: std.mem.Allocator, _: *const Graph.Graph, tr: *const GraphResult, out: *std.ArrayList(u8)) !void {
+            try expectNoErrors(tr);
+            const tags = try calleeTables(gpa, tr, out);
+            try testing.expect(tags.get(.method) > 0);
+            try testing.expect(tags.get(.builtin) > 0);
+            try testing.expect(tags.get(.protocol) > 0);
+            try testing.expectEqual(@as(usize, 0), tags.get(.pending));
+        }
+    }.project);
 }
 
 const own_generic_src =
@@ -770,159 +852,58 @@ const own_generic_src =
 ;
 
 test "callee tables with own-generic instances are byte-identical at -j1 and -jN" {
-    const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const dir = ".toy-test-callees-own-jn";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    try Io.Dir.cwd().createDirPath(io, dir);
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-
-    // Enough fns (> the Pass-C fan-out threshold) that the parallel check splits the
-    // bodies, every tenth sealing calls of one method to three instance rows. Discovery
-    // rescans the module once per fn, so each own-generic call here costs ~70 scans
-    // under the test allocator's traced allocations; a call per pad took a minute.
-    var src: std.Io.Writer.Allocating = .init(gpa);
-    defer src.deinit();
-    try src.writer.writeAll(own_generic_src);
-    for (0..70) |k| {
-        if (k % 10 == 0)
-            try src.writer.print("fn _pad{d}(b: Box[int]) -> int {{ b.pick({d}, 1) + (if b.pick(true, false) {{ 1 }} else {{ 0 }}) + b.pick(\"s\", \"t\").len() }}\n", .{ k, k })
-        else
-            try src.writer.print("fn _pad{d}(a: int) -> int {{ a + {d} }}\n", .{ k, k });
-    }
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const entry_path = try std.fmt.bufPrint(&path_buf, "{s}/main.toy", .{dir});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = entry_path, .data = src.written() });
-
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cache = try Cache.init(io, try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir}));
-
-    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
-    defer graph.deinit(gpa);
-    try testing.expect(graph.err == null);
-    var r = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer r.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), r.diags.len);
-
-    var serial_tags: [@typeInfo(Typecheck.Callee.Tag).@"enum".fields.len]usize = undefined;
-    var parallel_tags: [@typeInfo(Typecheck.Callee.Tag).@"enum".fields.len]usize = undefined;
-    const serial = try calleesUnder(gpa, &graph, &r, .limited(0), &serial_tags);
-    defer gpa.free(serial);
-    const parallel = try calleesUnder(gpa, &graph, &r, .limited(8), &parallel_tags);
-    defer gpa.free(parallel);
-
-    try testing.expectEqualSlices(u8, serial, parallel);
-    // Every member call seals to a row: 21 `pick`s over three instances, and 8 in
-    // `_vecs` (no instance body makes a method call).
-    try testing.expectEqual(@as(usize, 29), serial_tags[@intFromEnum(Typecheck.Callee.Tag.method)]);
-    try testing.expectEqual(@as(usize, 0), serial_tags[@intFromEnum(Typecheck.Callee.Tag.pending)]);
-    try testing.expectEqual(@as(usize, 0), parallel_tags[@intFromEnum(Typecheck.Callee.Tag.pending)]);
-}
-
-/// The reified layout table of one check of `graph` under a `limit`-worker pool, as
-/// bytes: every layout's name, then its fn signature's kind/id bytes when it is a fn
-/// pair; then every instance name. Requires an error-free check.
-fn fnLayoutsUnder(
-    gpa: std.mem.Allocator,
-    graph: *const Graph.Graph,
-    res: *ResolveGraph.GraphResult,
-    limit: Io.Limit,
-    pairs: *usize,
-) ![]u8 {
-    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
-    defer threaded.deinit();
-    var tr = try checkGraph(gpa, graph, res, threaded.io(), 8);
-    defer tr.deinit(gpa);
-    for (tr.diags) |d| try testing.expect(d.severity != .err);
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    pairs.* = 0;
-    for (tr.layouts) |l| {
-        try out.appendSlice(gpa, l.name);
-        try out.append(gpa, 0);
-        if (l.fn_sig) |fs| {
-            pairs.* += 1;
-            for (fs.params) |p| try p.appendKeyBytes(gpa, &out);
-            try fs.ret.appendKeyBytes(gpa, &out);
+    // Each body seals calls of one method to three instance rows.
+    const src = own_generic_src ++ comptime perRacer("fn _pad{[k]d}(b: Box[int]) -> int {{ b.pick({[k]d}, 1) + (if b.pick(true, false) {{ 1 }} else {{ 0 }}) + b.pick(\"s\", \"t\").len() }}\n");
+    try expectJobInvariant(".toy-test-callees-own-jn", &.{.{ .path = "main.toy", .source = src }}, struct {
+        fn project(gpa: std.mem.Allocator, _: *const Graph.Graph, tr: *const GraphResult, out: *std.ArrayList(u8)) !void {
+            try expectNoErrors(tr);
+            const tags = try calleeTables(gpa, tr, out);
+            // Every member call seals to a row: three `pick`s per body over three instances,
+            // and 8 in `_vecs` (no instance body makes a method call).
+            try testing.expectEqual(@as(usize, racers * 3 + 8), tags.get(.method));
+            try testing.expectEqual(@as(usize, 0), tags.get(.pending));
         }
-    }
-    for (tr.instances) |inst| {
-        try out.appendSlice(gpa, inst.name.?);
-        try out.append(gpa, 0);
-    }
-    return out.toOwnedSlice(gpa);
+    }.project);
 }
 
 test "fn-type reification is identical at -j1 and -jN" {
-    const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const dir = ".toy-test-fntypes-jn";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    try Io.Dir.cwd().createDirPath(io, dir);
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-
     // Each body interns one distinct and one shared fn type during the parallel Pass C
-    // (inside a `Vec[..]` annotation, so the composite index order depends on which
-    // worker gets there first), across more fns than the fan-out threshold.
-    var src: std.Io.Writer.Allocating = .init(gpa);
-    defer src.deinit();
-    try src.writer.writeAll(
-        \\import std/vec
-        \\pub struct H { id: int, run: fn(str) -> bool }
-        \\pub fn keep(h: H, _g: fn(H) -> int) -> int { h.id }
-        \\
-    );
-    const scalars = [_][]const u8{ "int", "bool", "str" };
-    for (0..70) |k| {
-        try src.writer.print("fn _f{d}() -> int {{\n    v: Vec[fn(", .{k});
-        var rest = k;
-        for (0..4) |i| {
-            if (i != 0) try src.writer.writeAll(", ");
-            try src.writer.writeAll(scalars[rest % 3]);
-            rest /= 3;
-        }
-        try src.writer.writeAll(
-            \\) -> int] = []
-            \\    w: Vec[fn(int) -> Vec[int]] = []
-            \\    return v.len() + w.len()
-            \\}
+    // (inside a `Vec[..]` annotation, so the composite index order depends on which worker
+    // gets there first).
+    const src = comptime blk: {
+        var s: []const u8 =
+            \\import std/vec
+            \\pub struct H { id: int, run: fn(str) -> bool }
+            \\pub fn keep(h: H, _g: fn(H) -> int) -> int { h.id }
             \\
-        );
-    }
-    try src.writer.writeAll("fn main() -> int { return 0 }\n");
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const entry_path = try std.fmt.bufPrint(&path_buf, "{s}/main.toy", .{dir});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = entry_path, .data = src.written() });
-
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cache = try Cache.init(io, try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir}));
-
-    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
-    defer graph.deinit(gpa);
-    try testing.expect(graph.err == null);
-    var r = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer r.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), r.diags.len);
-
-    var serial_pairs: usize = 0;
-    var parallel_pairs: usize = 0;
-    const serial = try fnLayoutsUnder(gpa, &graph, &r, .limited(0), &serial_pairs);
-    defer gpa.free(serial);
-    const parallel = try fnLayoutsUnder(gpa, &graph, &r, .limited(8), &parallel_pairs);
-    defer gpa.free(parallel);
-
-    try testing.expectEqualSlices(u8, serial, parallel);
-    // 70 distinct, the shared one, H's field and keep's param.
-    try testing.expectEqual(@as(usize, 73), serial_pairs);
-    try testing.expectEqual(serial_pairs, parallel_pairs);
+        ;
+        const scalars = [_][]const u8{ "int", "bool", "str" };
+        for (0..racers) |k| {
+            var params: []const u8 = "";
+            var rest = k;
+            for (0..4) |i| {
+                if (i != 0) params = params ++ ", ";
+                params = params ++ scalars[rest % 3];
+                rest /= 3;
+            }
+            s = s ++ std.fmt.comptimePrint(
+                \\fn _f{d}() -> int {{
+                \\    v: Vec[fn({s}) -> int] = []
+                \\    w: Vec[fn(int) -> Vec[int]] = []
+                \\    return v.len() + w.len()
+                \\}}
+                \\
+            , .{ k, params });
+        }
+        break :blk s ++ "fn main() -> int { return 0 }\n";
+    };
+    try expectJobInvariant(".toy-test-fntypes-jn", &.{.{ .path = "main.toy", .source = src }}, struct {
+        fn project(gpa: std.mem.Allocator, _: *const Graph.Graph, tr: *const GraphResult, out: *std.ArrayList(u8)) !void {
+            try expectNoErrors(tr);
+            // One distinct per body, the shared one, H's field and keep's param.
+            try testing.expectEqual(@as(usize, racers + 3), try fnLayouts(gpa, tr, out));
+        }
+    }.project);
 }
 
 test "Vec[fn(int) -> int] mints a trace unit and no hash/eq unit for the pair" {
@@ -955,61 +936,11 @@ test "Vec[fn(int) -> int] mints a trace unit and no hash/eq unit for the pair" {
     }.check);
 }
 
-/// The callee tables plus the adapter table of one check of `graph` under a
-/// `limit`-worker pool, as bytes. Requires an error-free check.
-fn closureTablesUnder(
-    gpa: std.mem.Allocator,
-    graph: *const Graph.Graph,
-    res: *ResolveGraph.GraphResult,
-    limit: Io.Limit,
-    tags: *[@typeInfo(Typecheck.Callee.Tag).@"enum".fields.len]usize,
-    n_adapters: *usize,
-) ![]u8 {
-    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
-    defer threaded.deinit();
-    var tr = try checkGraph(gpa, graph, res, threaded.io(), 8);
-    defer tr.deinit(gpa);
-    for (tr.diags) |d| try testing.expect(d.severity != .err);
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    @memset(tags, 0);
-    for (tr.callees) |cs| {
-        try out.appendSlice(gpa, std.mem.sliceAsBytes(cs));
-        for (cs) |c| tags[@intFromEnum(c.tag)] += 1;
-    }
-    for (tr.instances) |inst| {
-        try out.appendSlice(gpa, inst.name.?);
-        try out.appendSlice(gpa, std.mem.sliceAsBytes(inst.callees));
-        for (inst.callees) |c| tags[@intFromEnum(c.tag)] += 1;
-    }
-    for (tr.adapters) |a| {
-        try out.appendSlice(gpa, std.mem.asBytes(&a.key));
-        try out.appendSlice(gpa, a.name);
-        try out.append(gpa, 0);
-        try out.appendSlice(gpa, a.target.name);
-        try out.append(gpa, 0);
-    }
-    n_adapters.* = tr.adapters.len;
-    return out.toOwnedSlice(gpa);
-}
-
 test "fn_ref/value callee tables and the adapter table are identical at -j1 and -jN" {
-    const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const dir = ".toy-test-fnvalues-jn";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    try Io.Dir.cwd().createDirPath(io, dir);
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-
-    // More bodies than the Pass-C fan-out threshold, each naming a distinct and a
-    // shared fn as a value and calling both; the generic `pass` names one inside its
-    // instance body, so the table also depends on the instance slices.
-    var src: std.Io.Writer.Allocating = .init(gpa);
-    defer src.deinit();
-    try src.writer.writeAll(
+    // Each body names a distinct and a shared fn as a value and calls both; the generic
+    // `pass` names one inside its instance body, so the table also depends on the instance
+    // slices.
+    const src =
         \\import std/vec
         \\fn shared(x: int) -> int { x }
         \\fn pass[T](v: T) -> T {
@@ -1018,121 +949,37 @@ test "fn_ref/value callee tables and the adapter table are identical at -j1 and 
         \\    v
         \\}
         \\
-    );
-    for (0..70) |k| try src.writer.print("fn _t{d}(x: int) -> int {{ x + {d} }}\n", .{ k, k });
-    for (0..70) |k| try src.writer.print(
-        \\fn _u{d}() -> int {{
+    ++ comptime perRacer("fn _t{[k]d}(x: int) -> int {{ x + {[k]d} }}\n") ++ perRacer(
+        \\fn _u{[k]d}() -> int {{
         \\    fs: Vec[fn(int) -> int] = []
-        \\    fs.push(_t{d})
+        \\    fs.push(_t{[k]d})
         \\    g := shared
-        \\    fs[0](1) + g(2) + pass({d})
+        \\    fs[0](1) + g(2) + pass({[k]d})
         \\}}
         \\
-    , .{ k, k, k });
-    try src.writer.writeAll("fn main() -> int { return 0 }\n");
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const entry_path = try std.fmt.bufPrint(&path_buf, "{s}/main.toy", .{dir});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = entry_path, .data = src.written() });
-
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cache = try Cache.init(io, try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir}));
-
-    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
-    defer graph.deinit(gpa);
-    try testing.expect(graph.err == null);
-    var r = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer r.deinit(gpa);
-
-    const n_tags = @typeInfo(Typecheck.Callee.Tag).@"enum".fields.len;
-    var serial_tags: [n_tags]usize = undefined;
-    var parallel_tags: [n_tags]usize = undefined;
-    var serial_n: usize = 0;
-    var parallel_n: usize = 0;
-    const serial = try closureTablesUnder(gpa, &graph, &r, .limited(0), &serial_tags, &serial_n);
-    defer gpa.free(serial);
-    const parallel = try closureTablesUnder(gpa, &graph, &r, .limited(8), &parallel_tags, &parallel_n);
-    defer gpa.free(parallel);
-
-    try testing.expectEqualSlices(u8, serial, parallel);
-    try testing.expectEqual(@as(usize, 71), serial_n);
-    try testing.expectEqual(serial_n, parallel_n);
-    // 70 pushes + 70 `g := shared` + one ref per `pass` instance.
-    try testing.expect(serial_tags[@intFromEnum(Typecheck.Callee.Tag.fn_ref)] >= 141);
-    try testing.expect(serial_tags[@intFromEnum(Typecheck.Callee.Tag.value)] >= 140);
-}
-
-/// The lambda-unit table (with each frame env's layout name), the owners' unboxable and
-/// escaping sets, and every lambda node's reified type (by layout name) of one check of
-/// `graph` under a `limit`-worker pool, as bytes. Requires an error-free check.
-fn lambdaTablesUnder(gpa: std.mem.Allocator, graph: *const Graph.Graph, res: *ResolveGraph.GraphResult, limit: Io.Limit, n_units: *usize, n_stack: *usize) ![]u8 {
-    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
-    defer threaded.deinit();
-    var tr = try checkGraph(gpa, graph, res, threaded.io(), 8);
-    defer tr.deinit(gpa);
-    for (tr.diags) |d| try testing.expect(d.severity != .err);
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    for (tr.lambda_units) |u| {
-        try out.appendSlice(gpa, u.name);
-        try out.append(gpa, 0);
-        try out.appendSlice(gpa, std.mem.asBytes(&u.node));
-        try out.appendSlice(gpa, std.mem.sliceAsBytes(u.param_slots));
-        for (u.sig.params) |p| try out.appendSlice(gpa, if (p.isStruct()) tr.layouts[p.struct_id].name else @tagName(p.kind));
-        try out.appendSlice(gpa, if (u.sig.ret.isStruct()) tr.layouts[u.sig.ret.struct_id].name else @tagName(u.sig.ret.kind));
-        try out.appendSlice(gpa, std.mem.asBytes(&u.env_size));
-        for (u.env) |es| {
-            try out.appendSlice(gpa, std.mem.asBytes(&es.slot));
-            try out.appendSlice(gpa, std.mem.asBytes(&es.off));
-            try out.appendSlice(gpa, @tagName(es.mode));
-            try out.appendSlice(gpa, if (es.ty.isStruct()) tr.layouts[es.ty.struct_id].name else @tagName(es.ty.kind));
+    ) ++ "fn main() -> int { return 0 }\n";
+    try expectJobInvariant(".toy-test-fnvalues-jn", &.{.{ .path = "main.toy", .source = src }}, struct {
+        fn project(gpa: std.mem.Allocator, _: *const Graph.Graph, tr: *const GraphResult, out: *std.ArrayList(u8)) !void {
+            try expectNoErrors(tr);
+            const tags = try calleeTables(gpa, tr, out);
+            try adapterTable(gpa, tr, out);
+            try testing.expectEqual(@as(usize, racers + 1), tr.adapters.len);
+            // A push and a `g := shared` per body, plus one ref per `pass` instance.
+            try testing.expect(tags.get(.fn_ref) >= 2 * racers + 1);
+            try testing.expect(tags.get(.value) >= 2 * racers);
         }
-        if (u.frame_env) |sid| {
-            try out.appendSlice(gpa, tr.layouts[sid].name);
-            n_stack.* += 1;
-        }
-    }
-    for (tr.owner_closures) |oc| {
-        try out.appendSlice(gpa, std.mem.sliceAsBytes(oc.unboxable));
-        try out.append(gpa, 0xff);
-        try out.appendSlice(gpa, std.mem.sliceAsBytes(oc.kept_boxed));
-    }
-    for (graph.modules, 0..) |m, mi| for (m.nodes, 0..) |n, k| {
-        if (n.tag != .lambda) continue;
-        const t = tr.node_types[mi][k];
-        if (t.isStruct()) try out.appendSlice(gpa, tr.layouts[t.struct_id].name);
-    };
-    for (tr.instances) |inst| for (graph.modules[inst.mod].nodes, 0..) |n, k| {
-        if (n.tag != .lambda) continue;
-        const t = inst.node_types[k];
-        if (t.isStruct()) try out.appendSlice(gpa, tr.layouts[t.struct_id].name);
-    };
-    n_units.* = tr.lambda_units.len;
-    return out.toOwnedSlice(gpa);
+    }.project);
 }
 
 test "closure tables and lambda node types are identical at -j1 and -jN" {
-    const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const dir = ".toy-test-lambdas-jn";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    try Io.Dir.cwd().createDirPath(io, dir);
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-
-    // More bodies than the Pass-C fan-out threshold, each with a lambda of a signature of
-    // its own (so fn types intern in racing order) and a nested one that captures through
-    // its parent, plus two `_` captures typed from their calls; the generic `wrap` holds a
-    // capturing lambda, so its units (and their env layouts) follow the instance order.
-    // The generic `keep` pushes its arg, so the lambda each body hands it escapes through
-    // that instance's summary while the others keep frame envs.
-    var src: std.Io.Writer.Allocating = .init(gpa);
-    defer src.deinit();
-    try src.writer.writeAll(
+    // Each body has a lambda of a signature of its own (so fn types intern in racing order)
+    // and a nested one that captures through its parent, plus two `_` captures typed from
+    // their calls; the generic `wrap` holds a capturing lambda, so its units (and their env
+    // layouts) follow the instance order. The generic `keep` pushes its arg, so the lambda
+    // each body hands it escapes through that instance's summary while the others keep
+    // frame envs.
+    const src =
         \\import std/vec
-        \\pub struct S0 { v: int }
         \\pub struct Acc { n: int }
         \\impl Acc { fn plus(self, k: int) -> int { self.n + k } }
         \\fn add(a: int, b: int) -> int { a + b }
@@ -1145,116 +992,42 @@ test "closure tables and lambda node types are identical at -j1 and -jN" {
         \\}
         \\fn keep[T](xs: Vec[T], x: T) { xs.push(x) }
         \\
-    );
-    for (1..70) |k| try src.writer.print("pub struct S{d} {{ v: int }}\n", .{k});
-    for (0..70) |k| try src.writer.print(
-        \\fn _u{d}() -> int {{
-        \\    base := S{d} {{ v: {d} }}
-        \\    f := fn(s: S{d}) -> Vec[S{d}] {{
-        \\        xs: Vec[S{d}] = []
+    ++ comptime perRacer("pub struct S{[k]d} {{ v: int }}\n") ++ perRacer(
+        \\fn _u{[k]d}() -> int {{
+        \\    base := S{[k]d} {{ v: {[k]d} }}
+        \\    f := fn(s: S{[k]d}) -> Vec[S{[k]d}] {{
+        \\        xs: Vec[S{[k]d}] = []
         \\        xs.push(s)
         \\        xs.push(base)
         \\        xs
         \\    }}
         \\    g := fn() -> fn(int) -> int {{ fn(x) {{ x + base.v }} }}
-        \\    acc := Acc {{ n: {d} }}
+        \\    acc := Acc {{ n: {[k]d} }}
         \\    h := add(base.v, _)
         \\    p := acc.plus(_)
         \\    ks: Vec[fn() -> int] = []
         \\    keep(ks, fn() -> int {{ base.v }})
-        \\    f(S{d} {{ v: 1 }}).len() + g()(1) + wrap({d}) + wrap(S{d} {{ v: 2 }}).v + h(1) + p(2) + ks[0]()
+        \\    f(S{[k]d} {{ v: 1 }}).len() + g()(1) + wrap({[k]d}) + wrap(S{[k]d} {{ v: 2 }}).v + h(1) + p(2) + ks[0]()
         \\}}
         \\
-    , .{ k, k, k, k, k, k, k, k, k, k });
-    try src.writer.writeAll("fn main() -> int { return 0 }\n");
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const entry_path = try std.fmt.bufPrint(&path_buf, "{s}/main.toy", .{dir});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = entry_path, .data = src.written() });
-
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cache = try Cache.init(io, try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir}));
-
-    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
-    defer graph.deinit(gpa);
-    try testing.expect(graph.err == null);
-    var r = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer r.deinit(gpa);
-
-    var serial_n: usize = 0;
-    var parallel_n: usize = 0;
-    var serial_stack: usize = 0;
-    var parallel_stack: usize = 0;
-    const serial = try lambdaTablesUnder(gpa, &graph, &r, .limited(0), &serial_n, &serial_stack);
-    defer gpa.free(serial);
-    const parallel = try lambdaTablesUnder(gpa, &graph, &r, .limited(8), &parallel_n, &parallel_stack);
-    defer gpa.free(parallel);
-    try testing.expectEqualSlices(u8, serial, parallel);
-    // Six per `_u` body, plus one per `wrap` instance (int and each S{k}).
-    try testing.expectEqual(@as(usize, 70 * 6 + 71), serial_n);
-    try testing.expectEqual(serial_n, parallel_n);
-    // Per `_u` body every lambda but `g`'s returned one and the kept one; every `id`.
-    try testing.expectEqual(@as(usize, 70 * 4 + 71), serial_stack);
-    try testing.expectEqual(serial_stack, parallel_stack);
-}
-
-fn ownerClosuresUnder(gpa: std.mem.Allocator, graph: *const Graph.Graph, res: *ResolveGraph.GraphResult, limit: Io.Limit, n_owners: *usize) ![]u8 {
-    var threaded = std.Io.Threaded.init(gpa, .{ .concurrent_limit = limit });
-    defer threaded.deinit();
-    var tr = try checkGraph(gpa, graph, res, threaded.io(), 8);
-    defer tr.deinit(gpa);
-    for (tr.diags) |d| try testing.expect(d.severity != .err);
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    for (tr.owner_closures) |oc| {
-        // A `_u` body boxes `total`, `s`, `c` and the for-in `x`, and only `x` is captured
-        // by a closure that escapes (pushed); a `keep` instance boxes its `x` for a called
-        // closure.
-        switch (oc.owner) {
-            .base => |gid| {
-                try testing.expectEqual(@as(usize, 4), oc.boxed.len);
-                try testing.expectEqual(@as(usize, 3), oc.unboxable.len);
-                try testing.expectEqual(@as(usize, 1), oc.kept_boxed.len);
-                try out.print(gpa, "b{d}:", .{gid});
-            },
-            .instance => |k| {
-                try testing.expectEqualSlices(u32, &.{0}, oc.boxed);
-                try testing.expectEqualSlices(u32, &.{0}, oc.unboxable);
-                try out.print(gpa, "i{s}:", .{tr.instances[k].name.?});
-            },
+    ) ++ "fn main() -> int { return 0 }\n";
+    try expectJobInvariant(".toy-test-lambdas-jn", &.{.{ .path = "main.toy", .source = src }}, struct {
+        fn project(gpa: std.mem.Allocator, g: *const Graph.Graph, tr: *const GraphResult, out: *std.ArrayList(u8)) !void {
+            try expectNoErrors(tr);
+            const frame_envs = try lambdaTables(gpa, g, tr, out);
+            // Six per `_u` body, plus one per `wrap` instance (int and each S{k}).
+            try testing.expectEqual(@as(usize, racers * 6 + racers + 1), tr.lambda_units.len);
+            // Per `_u` body every lambda but `g`'s returned one and the kept one; every `id`.
+            try testing.expectEqual(@as(usize, racers * 4 + racers + 1), frame_envs);
         }
-        for (oc.boxed) |sl| try out.print(gpa, "{d},", .{sl});
-        try out.appendSlice(gpa, "u");
-        for (oc.unboxable) |sl| try out.print(gpa, "{d},", .{sl});
-        try out.appendSlice(gpa, "e");
-        for (oc.kept_boxed) |sl| try out.print(gpa, "{d},", .{sl});
-    }
-    for (tr.lambda_units) |u| {
-        try out.appendSlice(gpa, u.name);
-        for (u.env) |es| try out.print(gpa, "({d} {s} {d})", .{ es.slot, @tagName(es.mode), es.off });
-        if (u.frame_env) |sid| try out.print(gpa, "[{s}]", .{tr.layouts[sid].name});
-    }
-    n_owners.* = tr.owner_closures.len;
-    return out.toOwnedSlice(gpa);
+    }.project);
 }
 
 test "owner_closures are identical at -j1 and -jN" {
-    const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-
-    const dir = ".toy-test-owner-closures-jn";
-    Io.Dir.cwd().deleteTree(io, dir) catch {};
-    try Io.Dir.cwd().createDirPath(io, dir);
-    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-
-    // More bodies than the Pass-C fan-out threshold, each boxing through an assignment, a
-    // field store, a `mut self` call and a for-in variable (and copying a read-only
-    // capture); the generic `keep` boxes its param in each instance.
-    var src: std.Io.Writer.Allocating = .init(gpa);
-    defer src.deinit();
-    try src.writer.writeAll(
+    // Each body boxes through an assignment, a field store, a `mut self` call and a for-in
+    // variable (and copies a read-only capture); the generic `keep` boxes its param in each
+    // instance.
+    const src =
         \\import std/vec
         \\pub struct C { n: int }
         \\impl C { fn bump(mut self) { self.n = self.n + 1 } }
@@ -1264,13 +1037,12 @@ test "owner_closures are identical at -j1 and -jN" {
         \\    x
         \\}
         \\
-    );
-    for (0..70) |k| try src.writer.print(
-        \\pub struct S{d} {{ v: int }}
-        \\fn _u{d}() -> int {{
-        \\    total := {d}
+    ++ comptime perRacer(
+        \\pub struct S{[k]d} {{ v: int }}
+        \\fn _u{[k]d}() -> int {{
+        \\    total := {[k]d}
         \\    ro := 1
-        \\    s := S{d} {{ v: 0 }}
+        \\    s := S{[k]d} {{ v: 0 }}
         \\    c := C {{ n: 0 }}
         \\    add := fn(v: int) {{
         \\        total = total + v + ro
@@ -1284,35 +1056,32 @@ test "owner_closures are identical at -j1 and -jN" {
         \\        x
         \\    }}) }}
         \\    add(1)
-        \\    total + s.v + c.n + fs[0]() + keep({d}, 1) + keep(S{d} {{ v: 1 }}, s).v
+        \\    total + s.v + c.n + fs[0]() + keep({[k]d}, 1) + keep(S{[k]d} {{ v: 1 }}, s).v
         \\}}
         \\
-    , .{ k, k, k, k, k, k });
-    try src.writer.writeAll("fn main() -> int { return 0 }\n");
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const entry_path = try std.fmt.bufPrint(&path_buf, "{s}/main.toy", .{dir});
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = entry_path, .data = src.written() });
-
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const cache = try Cache.init(io, try std.fmt.bufPrint(&dir_buf, "{s}/.cache", .{dir}));
-
-    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
-    defer graph.deinit(gpa);
-    try testing.expect(graph.err == null);
-    var r = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer r.deinit(gpa);
-
-    var serial_n: usize = 0;
-    var parallel_n: usize = 0;
-    const serial = try ownerClosuresUnder(gpa, &graph, &r, .limited(0), &serial_n);
-    defer gpa.free(serial);
-    const parallel = try ownerClosuresUnder(gpa, &graph, &r, .limited(8), &parallel_n);
-    defer gpa.free(parallel);
-    try testing.expectEqualSlices(u8, serial, parallel);
-    // Every `_u` body, plus the `keep` instances (int and each S{k}).
-    try testing.expectEqual(@as(usize, 70 + 71), serial_n);
-    try testing.expectEqual(serial_n, parallel_n);
+    ) ++ "fn main() -> int { return 0 }\n";
+    try expectJobInvariant(".toy-test-owner-closures-jn", &.{.{ .path = "main.toy", .source = src }}, struct {
+        fn project(gpa: std.mem.Allocator, _: *const Graph.Graph, tr: *const GraphResult, out: *std.ArrayList(u8)) !void {
+            try expectNoErrors(tr);
+            try ownerClosures(gpa, tr, out);
+            // Every `_u` body, plus the `keep` instances (int and each S{k}).
+            try testing.expectEqual(@as(usize, racers + racers + 1), tr.owner_closures.len);
+            for (tr.owner_closures) |oc| switch (oc.owner) {
+                // A `_u` body boxes `total`, `s`, `c` and the for-in `x`, and only `x` is
+                // captured by a closure that escapes (pushed).
+                .base => {
+                    try testing.expectEqual(@as(usize, 4), oc.boxed.len);
+                    try testing.expectEqual(@as(usize, 3), oc.unboxable.len);
+                    try testing.expectEqual(@as(usize, 1), oc.kept_boxed.len);
+                },
+                // A `keep` instance boxes its `x` for a called closure.
+                .instance => {
+                    try testing.expectEqualSlices(u32, &.{0}, oc.boxed);
+                    try testing.expectEqualSlices(u32, &.{0}, oc.unboxable);
+                },
+            };
+        }
+    }.project);
 }
 
 test "push on a captured Vec is not a mutation" {
