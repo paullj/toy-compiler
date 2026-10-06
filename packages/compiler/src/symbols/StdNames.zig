@@ -178,6 +178,30 @@ test "desugarMethods enumerates each sugar's receiver methods in expansion order
     try std.testing.expectEqual(@as(usize, 0), desugarMethods(.index).len);
 }
 
+test "no bundled module writes a desugared method call" {
+    // Lower resolves a desugar's methods at the program's site (`Typecheck.findMethod`),
+    // so one in std would reach a program's shadowing `push` or `next`; a call written
+    // out in std reaches std's own.
+    const BundledStd = @import("bundled_std");
+    const Lexer = @import("../lex.zig");
+    const Parser = @import("../parse.zig");
+    const gpa = std.testing.allocator;
+    for (BundledStd.modules) |m| {
+        const tokens = try Lexer.tokenize(gpa, m.source);
+        defer gpa.free(tokens);
+        const tree = try Parser.expectTree(gpa, tokens, m.source);
+        defer {
+            gpa.free(tree.nodes);
+            gpa.free(tree.extra);
+            if (tree.pub_bits.len != 0) gpa.free(@constCast(tree.pub_bits));
+        }
+        for (tree.nodes) |n| if (desugarMethods(n.tag).len != 0) {
+            std.debug.print("{s} desugars a '{s}'\n", .{ m.path, @tagName(n.tag) });
+            return error.TestUnexpectedResult;
+        };
+    }
+}
+
 test "importHintFor: exact stdlib names hint; typos, prelude generics, and unknowns do not" {
     const vec = importHintFor("Vec").?;
     try std.testing.expectEqualStrings("vec", vec.module);

@@ -15,15 +15,7 @@ const compile = harness.compile;
 
 const runExit = harness.runExit;
 
-fn runStdout(gpa: std.mem.Allocator, io: Io, prog: []const u8) ![]u8 {
-    var child = try std.process.spawn(io, .{ .argv = &.{prog}, .stdout = .pipe });
-    var rdr = child.stdout.?.readerStreaming(io, &.{});
-    const out = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
-    errdefer gpa.free(out);
-    const term = try child.wait(io);
-    if (term != .exited or term.exited != 0) return error.ChildFailed;
-    return out;
-}
+const runStdout = harness.runStdout;
 
 /// A kind's rendering under `io.print(x)` and `io.print(x.to_string())` must be the identical
 /// bytes — the invariant `io.print(x) ≡ io.print(x.to_string())`, proven per kind against the
@@ -477,3 +469,30 @@ test "string: str methods are byte-identical at -j1 and -j8" {
 
     try harness.expectDeterministicBuild(gpa, io, ".toy-test-string-methods-determinism", src, &.{}, 23);
 }
+
+test "string: a program's len and byte_at on str steer its own calls, never trim, split or join" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // Were std's calls to reach them, `trim` would take 100000 bytes from a 6-byte str and
+    // print the heap past it.
+    try harness.expectStdoutAtBothLevels(gpa, io, ".toy-test-string-shadow-len",
+        \\import std/str
+        \\import std/io
+        \\impl str {
+        \\    fn len(self) -> int { 100000 }
+        \\    fn byte_at(self, _i: int) -> int { 120 }
+        \\}
+        \\fn main() -> int {
+        \\    io.println("  abc ".trim().concat("|"))
+        \\    io.println("-".join("a b".split(" ")))
+        \\    io.println("x".len())
+        \\    io.println("x".byte_at(0))
+        \\    return 0
+        \\}
+        \\
+    , "abc|\na-b\n100000\n120\n");
+}
+

@@ -1165,11 +1165,16 @@ pub const Method = struct {
     /// `Method` (never `Type`), which is never content-cache-memcpy'd, so `@sizeOf(Type)`
     /// is unaffected.
     derive: ?u32 = null,
-    /// Declared in a bundled std/core module. Every lookup takes a method the program
-    /// declares on a type over a bundled one of the same name, in std's own bodies too, so
-    /// the pick never depends on import order and a program keeps its own method when std
-    /// gains one of that name.
+    /// Declared in a bundled std/core module. A call in the program takes a method the
+    /// program declares on a type over a bundled one of the same name, so the pick never
+    /// depends on import order and a program keeps its own method when std gains one of
+    /// that name.
     bundled: bool = false,
+    /// A program's method with the name of a bundled method or a compiler builtin on the
+    /// same receiver (W0011). A call written in a bundled module never selects it: std's
+    /// bounds come from `len`/`byte_at` and its own methods, so a program's `len` reached
+    /// from std would steer std's raw reads.
+    shadows: bool = false,
 };
 
 /// The symbol method row `m` calls: a source-less derive's unit (checked first: a derive
@@ -1218,6 +1223,22 @@ pub const TemplateMethod = struct {
     has_self: bool = true,
     /// Declared in a bundled std/core module (see `Method.bundled`).
     bundled: bool = false,
+    /// See `Method.shadows`.
+    shadows: bool = false,
+};
+
+/// Where a method call is written, which decides between same-named methods. In the
+/// program, its own method wins over a bundled one. In a bundled module, a program's
+/// method that shadows a bundled method or a builtin (`Method.shadows`) is not a
+/// candidate, so std's own method or the builtin is taken; a program's other methods
+/// stay reachable, since they are how its types implement the protocols std calls.
+pub const Site = enum {
+    program,
+    bundled,
+
+    pub fn of(bundled_module: bool) Site {
+        return if (bundled_module) .bundled else .program;
+    }
 };
 
 /// Structural equality of two `Type` vectors: same length and pairwise `Type.eql`.
@@ -1364,13 +1385,16 @@ pub const Prelude = struct {
 ///     dispatch/fingerprint changes;
 ///   * without explicit args and `>= 2` CONFORMANCE methods match: `.ambiguous`;
 ///   * otherwise the first match, a program's own before a bundled one (`Method.bundled`).
+/// At a `.bundled` site a shadowing row (`Method.shadows`) is never a candidate (see `Site`).
 /// `witness_pid` (operator/derive desugaring: `==`/`<`/`+`/`.hash()`/`print`/`?`-widen) keeps
 /// ONLY methods witnessing that SPECIFIC protocol — so a same-named inherent method (no
 /// `protocol_id`) AND a sibling protocol reusing the name are both excluded, and the operator
 /// binds its own protocol's witness or nothing. Those methods stay callable through the
 /// general `v.m(..)` path (`witness_pid == null`).
 pub fn resolveConformanceMethod(methods: []const Method, recv: Type, name: []const u8, witness_pid: ?u32, explicit_args: ?[]const Type) MethodPick {
-    return switch (pickMethodIndex(methods, recv, name, witness_pid, explicit_args)) {
+    // A witness pick serves every site alike: a program's conformance is how its type
+    // implements the protocol, even where its method name shadows another.
+    return switch (pickMethodIndex(methods, recv, name, witness_pid, explicit_args, .program)) {
         .none => .none,
         .one => |i| .{ .one = methods[i] },
         .ambiguous => .ambiguous,
@@ -1382,9 +1406,10 @@ pub fn resolveConformanceMethod(methods: []const Method, recv: Type, name: []con
 /// cannot be told apart from a same-content sibling).
 pub const MethodIndexPick = union(enum) { none, one: u32, ambiguous };
 
-pub fn pickMethodIndex(methods: []const Method, recv: Type, name: []const u8, witness_pid: ?u32, explicit_args: ?[]const Type) MethodIndexPick {
+pub fn pickMethodIndex(methods: []const Method, recv: Type, name: []const u8, witness_pid: ?u32, explicit_args: ?[]const Type, site: Site) MethodIndexPick {
     if (explicit_args) |ea| {
         for (methods, 0..) |m, i| {
+            if (site == .bundled and m.shadows) continue;
             if (Type.eql(m.recv, recv) and std.mem.eql(u8, m.name, name) and
                 m.protocol_id != null and eqlTypeVec(m.protocol_args, ea))
             {
@@ -1399,6 +1424,7 @@ pub fn pickMethodIndex(methods: []const Method, recv: Type, name: []const u8, wi
     var total: usize = 0;
     var conform_count: usize = 0;
     for (methods, 0..) |m, i| {
+        if (site == .bundled and m.shadows) continue;
         if (Type.eql(m.recv, recv) and std.mem.eql(u8, m.name, name)) {
             if (witness_pid) |want| {
                 const got = m.protocol_id orelse continue;
@@ -1463,7 +1489,9 @@ pub fn freeProtocolEntries(gpa: std.mem.Allocator, protocols: []const ProtocolSy
 /// thread order, so every consumer selects the SAME method at any `-jN`. Every entry's
 /// `recv` is a concrete type (generic `impl Box[T]` templates live in `TemplateMethod`,
 /// keyed by ctor int), so this never dereferences a stale check-time `App` — use
-/// `findGenericMethod` for the check-time generic-receiver dispatch instead.
+/// `findGenericMethod` for the check-time generic-receiver dispatch instead. It picks at
+/// the program's site: only lower's desugars (`[..]`, `for`-in) call it, and no bundled
+/// module uses one (pinned by a test beside the bundled sources).
 pub fn findMethod(methods: []const Method, recv: Type, name: []const u8) ?Method {
     var first: ?Method = null;
     for (methods) |mth| {
@@ -1478,11 +1506,13 @@ pub fn findMethod(methods: []const Method, recv: Type, name: []const u8) ?Method
 /// Keys off `recv_ctor`/`recv_is_enum` (plain ints, never a composite deref)
 /// so it is safe while the composite is alive (Pass A / Pass C / the mono tail) and
 /// deterministic at any `-jN`. Returns the first matching template entry, a program's own
-/// before a bundled one (see `Method.bundled`).
-pub fn findGenericMethod(templates: []const TemplateMethod, ctor: u32, is_enum: bool, name: []const u8) ?TemplateMethod {
+/// before a bundled one (see `Method.bundled`); at a `.bundled` site a shadowing entry is
+/// never a candidate (see `Site`).
+pub fn findGenericMethod(templates: []const TemplateMethod, ctor: u32, is_enum: bool, name: []const u8, site: Site) ?TemplateMethod {
     var first: ?TemplateMethod = null;
     for (templates) |tmpl| {
         if (tmpl.recv_ctor != ctor or tmpl.recv_is_enum != is_enum or !std.mem.eql(u8, tmpl.name, name)) continue;
+        if (site == .bundled and tmpl.shadows) continue;
         if (!tmpl.bundled) return tmpl;
         if (first == null) first = tmpl;
     }
@@ -1525,6 +1555,17 @@ pub fn builtinStrMethod(recv: Type, name: []const u8) ?struct { ret: Type, param
     if ((recv.isInteger() or recv.kind == .bool or recv.kind == .unit) and std.mem.eql(u8, name, "to_string"))
         return .{ .ret = Type.str, .params = &.{}, .builtin = .scalar_to_string };
     return null;
+}
+
+/// Whether the compiler provides method `name` on the builtin type `recv`, with no method
+/// row: a scalar's `eq`/`hash`, `str`'s `len`/`byte_at`/`concat`, a scalar's `to_string`,
+/// and `into`/`try_into` on an integer, a float or `char`. The derivable `hash`/`to_string`
+/// of a struct or enum is not counted: a type's own method of that name is how the type
+/// implements it.
+pub fn isBuiltinTypeMethod(recv: Type, name: []const u8, char_id: ?u32) bool {
+    if (builtinScalarMethod(recv, name) != null or builtinStrMethod(recv, name) != null) return true;
+    return (recv.isInteger() or recv.kind == .float or isCharTy(recv, char_id)) and
+        (std.mem.eql(u8, name, "into") or std.mem.eql(u8, name, "try_into"));
 }
 
 /// The kind of a conversion the `Into`/`TryInto` recognizer accepts. `widen`/`narrow`
@@ -2907,6 +2948,7 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
                     .is_static = !tmpl.has_self,
                     .instance = @intCast(i),
                     .bundled = tmpl.bundled,
+                    .shadows = tmpl.shadows,
                 });
                 break;
             }
@@ -2943,6 +2985,7 @@ fn sealCallees(t: *Typecheck) void {
 /// codegen rejects it.
 fn sealSlice(t: *const Typecheck, mod: u32, nts: []const Type, cs: []Callee) void {
     const mc = &t.graph.mods[mod];
+    const site = Site.of(mc.bundled);
     for (cs, 0..) |*c, i| {
         if (c.tag != .pending) continue;
         const fa = mc.tree.nodes[i];
@@ -2951,7 +2994,7 @@ fn sealSlice(t: *const Typecheck, mod: u32, nts: []const Type, cs: []Callee) voi
             c.* = t.pickInstanceRow(mc, nts, fa, member, c.id);
             continue;
         }
-        c.* = switch (pickMethodIndex(t.methods.items, nts[fa.lhs.int()], member, null, null)) {
+        c.* = switch (pickMethodIndex(t.methods.items, nts[fa.lhs.int()], member, null, null, site)) {
             .one => |mi| if (c.sub == Callee.pending_bound.sub) Callee.boundMethod(mi) else Callee.method(mi),
             .none, .ambiguous => .{},
         };
@@ -2960,38 +3003,53 @@ fn sealSlice(t: *const Typecheck, mod: u32, nts: []const Type, cs: []Callee) voi
 
 /// The instance row an own-generic call selects: the first row, in table order, with an
 /// instance, the call's reified receiver and member, whose instance params accept the
-/// call's reified args (`Type.assignable`, as `Mono.findByReifiedParams`). A static row's
-/// params are all value params; an instance method's `params[0]` is `self`. Every row is
-/// matched, never just the only candidate, so a check/discovery disagreement surfaces as
-/// a lowering error rather than a wrong instance. A call whose args did not check picks
-/// no row (another call's instance would show the wrong types) but keeps its template.
+/// call's reified args (`Type.assignable`, as `Mono.findByReifiedParams`). Rows are tried
+/// in the order `findGenericMethod` gives their templates at the call's site. A static
+/// row's params are all value params; an instance method's `params[0]` is `self`. Every
+/// row is matched, never just the only candidate, so a check/discovery disagreement
+/// surfaces as a lowering error rather than a wrong instance. A call whose args did not
+/// check picks no row (another call's instance would show the wrong types) but keeps its
+/// template.
 fn pickInstanceRow(t: *const Typecheck, mc: *const GraphCtx.ModuleCtx, nts: []const Type, fa: Ast.Node, member: []const u8, call: u32) Callee {
     const recv = nts[fa.lhs.int()];
+    const site = Site.of(mc.bundled);
     const args = Ast.rangeSlice(mc.tree, mc.tree.nodes[call].rhs.int());
-    for (args) |a| if (nts[a.int()].kind == .invalid) return t.templateCallee(recv, member);
-    rows: for (t.methods.items, 0..) |m, mi| {
-        const ii = m.instance orelse continue;
-        if (!Type.eql(m.recv, recv) or !std.mem.eql(u8, m.name, member)) continue;
-        const ps = t.mono.items[ii].params;
-        const off: usize = if (m.is_static) 0 else 1;
-        if (ps.len != args.len + off) continue;
-        for (ps[off..], args) |p, a| if (!Type.assignable(p, nts[a.int()])) continue :rows;
-        return Callee.method(@intCast(mi));
+    for (args) |a| if (nts[a.int()].kind == .invalid) return t.templateCallee(recv, member, site);
+    for ([_]u1{ 0, 1 }) |pass| {
+        rows: for (t.methods.items, 0..) |m, mi| {
+            const ii = m.instance orelse continue;
+            if (siteRank(m.bundled, m.shadows, site) != pass) continue;
+            if (!Type.eql(m.recv, recv) or !std.mem.eql(u8, m.name, member)) continue;
+            const ps = t.mono.items[ii].params;
+            const off: usize = if (m.is_static) 0 else 1;
+            if (ps.len != args.len + off) continue;
+            for (ps[off..], args) |p, a| if (!Type.assignable(p, nts[a.int()])) continue :rows;
+            return Callee.method(@intCast(mi));
+        }
     }
-    return t.templateCallee(recv, member);
+    return t.templateCallee(recv, member, site);
+}
+
+/// A method row's place in a lookup at `site`: 0 for the first candidates, 1 for the
+/// fallbacks, null when it is no candidate there (see `Site`).
+fn siteRank(bundled: bool, shadows: bool, site: Site) ?u1 {
+    return switch (site) {
+        .program => if (bundled) 1 else 0,
+        .bundled => if (shadows) null else 0,
+    };
 }
 
 /// `Callee.template` for the generic method `member` of the type `recv` reified from,
 /// else none. Only a call that already failed to check gets here, so the scan of the
 /// reify table is off the hot path.
-fn templateCallee(t: *const Typecheck, recv: Type, member: []const u8) Callee {
+fn templateCallee(t: *const Typecheck, recv: Type, member: []const u8, site: Site) Callee {
     if (recv.kind != .@"struct" and recv.kind != .@"enum") return .{};
     var it = t.reify_map.iterator();
     while (it.next()) |kv| {
         if (!Type.eql(kv.value_ptr.*, recv)) continue;
         const e = t.composite.at(kv.key_ptr.*);
         if (e.is_fn) continue;
-        const m = findGenericMethod(t.templates.items, e.ctor, e.ctor_is_enum, member) orelse return .{};
+        const m = findGenericMethod(t.templates.items, e.ctor, e.ctor_is_enum, member, site) orelse return .{};
         return Callee.template(m.fn_id);
     }
     return .{};
@@ -3178,7 +3236,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
             if (!recv.isApp()) continue;
             const re = t.composite.at(recv.appIdx());
             const member = mc.tokens[callee.main_token].text(mc.source);
-            const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, member) orelse continue;
+            const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, member, Site.of(mc.bundled)) orelse continue;
             const mf = model.fns[m.fn_id];
             const out = (if (hasOwnTypeParams(t.composite, mf))
                 try ownGenericArgs(t.gpa, t.composite, mf, m.has_self, tree, node_types, n, recv)
@@ -3203,7 +3261,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
         if (n.tag != .empty_list) continue;
         for (StdNames.desugarMethods(.empty_list)) |dm| {
             const recv = desugarRecvType(node_types, n, i, dm.recv);
-            try t.discoverRecvMethod(model, recv, dm.name, worklist, seen, .{ .token_of = Ast.Index.from(@intCast(i)) }, mod);
+            try t.discoverRecvMethod(model, recv, dm.name, .program, worklist, seen, .{ .token_of = Ast.Index.from(@intCast(i)) }, mod);
         }
     }
     // A non-empty list literal `[e0, ..]` desugars to `new()` + one `push` per element
@@ -3211,7 +3269,8 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
     // then a loop over `it.next()`: discover the template instances lower will call (the
     // transitive `Vec$T.get`/`mem.ga_*`/`Option$T` follow from re-checking each body).
     // The method set + receiver source come from the shared `desugarMethods` table so
-    // discovery enqueues exactly what lower emits.
+    // discovery enqueues exactly what lower emits. Lower resolves a desugar at the
+    // program's site wherever it is written, so discovery does too.
     for (tree.nodes, 0..) |n, i| {
         switch (n.tag) {
             .list_literal, .for_in_stmt, .for_in2_stmt => {
@@ -3219,7 +3278,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
                     const recv = desugarRecvType(node_types, n, i, dm.recv);
                     // A `for` node is the whole loop, body included; it keeps its token.
                     const at: Anchor = if (n.tag == .list_literal) .{ .node = Ast.Index.from(@intCast(i)) } else .{ .token_of = Ast.Index.from(@intCast(i)) };
-                    try t.discoverRecvMethod(model, recv, dm.name, worklist, seen, at, mod);
+                    try t.discoverRecvMethod(model, recv, dm.name, .program, worklist, seen, at, mod);
                 }
             },
             .index => {
@@ -3246,7 +3305,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
             // instance from its adapter, though no call names it.
             .field_access => if (i < callees.len and std.meta.eql(callees[i], Callee.pending_bound)) {
                 const member = mc.tokens[n.main_token].text(mc.source);
-                try t.discoverRecvMethod(model, node_types[n.lhs.int()], member, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)) }, mod);
+                try t.discoverRecvMethod(model, node_types[n.lhs.int()], member, Site.of(mc.bundled), worklist, seen, .{ .node = Ast.Index.from(@intCast(i)) }, mod);
             },
             else => {},
         }
@@ -3278,10 +3337,10 @@ fn desugarRecvType(node_types: []const Type, n: Ast.Node, i: usize, src: StdName
 /// `App` receiver `recv` (binding the impl's params by matching the template's `Self`
 /// pattern against `recv`'s args — the same `Infer.match` Pass C runs). A miss on any
 /// step (not an App, no such template, non-concrete binding) enqueues nothing.
-fn discoverRecvMethod(t: *Typecheck, model: *const Model, recv: Type, name: []const u8, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void), at: Anchor, mod: u32) !void {
+fn discoverRecvMethod(t: *Typecheck, model: *const Model, recv: Type, name: []const u8, site: Site, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void), at: Anchor, mod: u32) !void {
     if (!recv.isApp()) return;
     const re = t.composite.at(recv.appIdx());
-    const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, name) orelse return;
+    const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, name, site) orelse return;
     const out = (try bindImplParams(t.gpa, t.composite, model.fns[m.fn_id], re.args)) orelse return;
     defer t.gpa.free(out);
     for (out) |ta| if (!isConcreteValue(ta)) return;
@@ -3794,41 +3853,57 @@ fn checkPubSignatures(t: *Typecheck, fns: []const GraphFnInput) !void {
 }
 
 /// W0011 at each method the program declares where a bundled module declares one of the
-/// same name on the same type. The program's wins at every call, std's own bodies
-/// included (`Method.bundled`), so std's goes unused. Only modules in the graph put rows in
-/// the tables, so this fires exactly when the std module is part of the program, whether
-/// the program imports it directly or not.
+/// same name on the same type, or the compiler provides one as a builtin, and the mark that
+/// keeps it out of every bundled module's calls (`Method.shadows`). The program's calls reach
+/// its method; std's reach std's own or the builtin. Only modules in the graph put rows in
+/// the tables, so a std method counts exactly when its module is part of the program,
+/// whether the program imports it directly or not. Runs before the mono tail, which copies
+/// a template's mark onto its instance rows.
 fn checkStdShadows(t: *Typecheck) !void {
-    for (t.templates.items) |own| {
+    const pre = t.prelude;
+    const char_id = if (pre) |p| p.char_struct else null;
+    for (t.templates.items) |*own| {
         if (own.bundled) continue;
-        for (t.templates.items) |other| {
+        const ty_name = if (own.recv_is_enum) t.enums.items[own.recv_ctor].name else t.structs.items[own.recv_ctor].name;
+        const std_fn: ?u32 = for (t.templates.items) |other| {
             if (!other.bundled or other.recv_ctor != own.recv_ctor or other.recv_is_enum != own.recv_is_enum) continue;
-            if (!std.mem.eql(u8, other.name, own.name)) continue;
-            const ty_name = if (own.recv_is_enum) t.enums.items[own.recv_ctor].name else t.structs.items[own.recv_ctor].name;
-            try t.reportStdShadow(own.fn_id, ty_name, other.fn_id);
-            break;
-        }
+            if (std.mem.eql(u8, other.name, own.name)) break other.fn_id;
+        } else null;
+        const fam: LayoutEngine.NativeEnumFamily = if (own.recv_is_enum and pre != null) pre.?.optResultFamily(own.recv_ctor) else .none;
+        if (std_fn == null and optionResultMethod(fam, own.name) == null) continue;
+        own.shadows = true;
+        try t.reportStdShadow(own.fn_id, ty_name, std_fn);
     }
-    for (t.methods.items) |own| {
+    for (t.methods.items) |*own| {
         if (own.bundled) continue;
-        for (t.methods.items) |other| {
-            if (!other.bundled or !Type.eql(other.recv, own.recv) or !std.mem.eql(u8, other.name, own.name)) continue;
-            try t.reportStdShadow(own.fn_id, t.typeName(own.recv), other.fn_id);
-            break;
-        }
+        const std_fn: ?u32 = for (t.methods.items) |other| {
+            if (other.bundled and Type.eql(other.recv, own.recv) and std.mem.eql(u8, other.name, own.name)) break other.fn_id;
+        } else null;
+        if (std_fn == null and !isBuiltinTypeMethod(own.recv, own.name, char_id)) continue;
+        own.shadows = true;
+        try t.reportStdShadow(own.fn_id, t.typeName(own.recv), std_fn);
     }
 }
 
-fn reportStdShadow(t: *Typecheck, own_fn: u32, ty_name: []const u8, std_fn: u32) !void {
+/// `std_fn` is the bundled method shadowed, or null for a builtin.
+fn reportStdShadow(t: *Typecheck, own_fn: u32, ty_name: []const u8, std_fn: ?u32) !void {
     const f = t.fns.items[own_fn];
-    const std_path = t.graph.mods[t.fns.items[std_fn].mod].path;
     _ = t.gphSelect(f.mod);
     const name_tok = t.tree.nodes[f.decl_node.int()].main_token;
-    try t.sink.report(
-        .{ .span = t.tokSpan(name_tok), .code = .W0011 },
-        "method '{s}' on '{s}' shadows the one in {s}, so every call reaches this one, even in std; rename it to keep both",
-        .{ t.nameText(name_tok), ty_name, std_path },
-    );
+    const span = t.tokSpan(name_tok);
+    if (std_fn) |sf| {
+        try t.sink.report(
+            .{ .span = span, .code = .W0011 },
+            "method '{s}' on '{s}' shadows the one in {s}: the program's calls reach this one, std's own calls keep std's; rename it to keep both",
+            .{ t.nameText(name_tok), ty_name, t.graph.mods[t.fns.items[sf].mod].path },
+        );
+    } else {
+        try t.sink.report(
+            .{ .span = span, .code = .W0011 },
+            "method '{s}' on '{s}' shadows the built-in one: the program's calls reach this one, std's own calls keep the built-in; rename it to keep both",
+            .{ t.nameText(name_tok), ty_name },
+        );
+    }
 }
 
 /// Emit a coherence error if `ty` is a struct/enum whose declaration is not pub.
@@ -9457,7 +9532,7 @@ test "pickMethodIndex selects what resolveConformanceMethod returns" {
         .{ .name = "plus", .pid = tag_pid, .want = .none },
     };
     for (cases) |k| {
-        const idx = pickMethodIndex(ms, acc, k.name, k.pid, k.args);
+        const idx = pickMethodIndex(ms, acc, k.name, k.pid, k.args, .program);
         const whole = resolveConformanceMethod(ms, acc, k.name, k.pid, k.args);
         try testing.expectEqual(k.want, std.meta.activeTag(idx));
         switch (idx) {

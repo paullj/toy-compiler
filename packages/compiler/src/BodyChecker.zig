@@ -1111,7 +1111,9 @@ pub const BodyChecker = struct {
     fn resolveIterType(bc: *BodyChecker, recv: Type) ?Type {
         if (!recv.isApp()) return null;
         const e = bc.composite.at(recv.appIdx());
-        const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, StdNames.method_iter) orelse return null;
+        // A desugar resolves at the program's site wherever it is written, as lower and
+        // discovery resolve it (`StdNames.desugarMethods`).
+        const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, StdNames.method_iter, .program) orelse return null;
         const mf = bc.model.fns[m.fn_id];
         if (!m.has_self or mf.params.len != 1) return Type.invalid; // iter(self), no extra args
         const targs = (Typecheck.bindImplParams(bc.gpa, bc.composite, mf, e.args) catch return Type.invalid) orelse return Type.invalid;
@@ -1474,7 +1476,7 @@ pub const BodyChecker = struct {
                     break :blk Type.invalid;
                 }
                 const e = bc.composite.at(exp.appIdx());
-                if (e.ctor_is_enum or Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, StdNames.method_new) == null) {
+                if (e.ctor_is_enum or Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, StdNames.method_new, .program) == null) {
                     try bc.sink.report(.{ .span = bc.spanOf(node_idx) }, "an empty list literal '[]' cannot produce '{s}'", .{bc.typeName(exp)});
                     break :blk Type.invalid;
                 }
@@ -1777,7 +1779,7 @@ pub const BodyChecker = struct {
             if (app_ty.isApp()) {
                 const e = bc.composite.at(app_ty.appIdx());
                 const member = bc.nameText(n.main_token);
-                if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, member)) |m| if (!m.has_self)
+                if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, member, bc.methodSite())) |m| if (!m.has_self)
                     return try bc.reportNotAValue(n, member, "an associated function");
                 try bc.sink.report(.{ .span = bc.spanOf(n.lhs) }, "type '{s}' is not a value", .{bc.typeName(app_ty)});
                 return bc.poison();
@@ -1825,7 +1827,7 @@ pub const BodyChecker = struct {
         if (node_idx == bc.place_target) return null;
         const member = bc.nameText(fa.main_token);
         if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar() or recv_ty.kind == .float) {
-            switch (Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, null)) {
+            switch (Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, null, bc.methodSite())) {
                 .one => |mi| {
                     const m = bc.model.methods[mi];
                     if (m.is_static) return try bc.reportStaticBound(fa, member);
@@ -1849,7 +1851,7 @@ pub const BodyChecker = struct {
         }
         if (recv_ty.isApp()) {
             const e = bc.composite.at(recv_ty.appIdx());
-            if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member)) |m| {
+            if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite())) |m| {
                 if (!m.has_self) return try bc.reportStaticBound(fa, member);
                 const mf = bc.model.fns[m.fn_id];
                 // A method's own `[U]` is fixed per call, which a value could not do.
@@ -1889,10 +1891,8 @@ pub const BodyChecker = struct {
     /// `methods` row: a scalar or `str` builtin, a target-directed conversion, or the
     /// derivable `hash`/`to_string` of a struct or enum.
     fn isBuiltinMethod(bc: *const BodyChecker, recv: Type, member: []const u8) bool {
-        if (Typecheck.builtinScalarMethod(recv, member) != null or Typecheck.builtinStrMethod(recv, member) != null) return true;
         const char_id = if (bc.model.prelude) |p| p.char_struct else null;
-        if ((recv.isInteger() or recv.kind == .float or Typecheck.isCharTy(recv, char_id)) and
-            (std.mem.eql(u8, member, "into") or std.mem.eql(u8, member, "try_into"))) return true;
+        if (Typecheck.isBuiltinTypeMethod(recv, member, char_id)) return true;
         if (recv.kind != .@"struct" and recv.kind != .@"enum") return false;
         const pp = bc.model.preludeProtocols();
         return (std.mem.eql(u8, member, "hash") and pp.hash != null) or (std.mem.eql(u8, member, "to_string") and pp.display != null);
@@ -2902,7 +2902,7 @@ pub const BodyChecker = struct {
         const recv_ty = try bc.typeOfReceiver(fa.lhs); // also populates node_types[recv] for lower
         if (recv_ty.kind == .invalid) return .invalid;
         if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar()) {
-            switch (Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, explicit)) {
+            switch (Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, explicit, bc.methodSite())) {
                 .one => |mi| return try bc.dispatchMethod(node_idx, n, fa, recv_ty, member, mi),
                 else => {
                     try bc.drainArgs(args);
@@ -2945,7 +2945,7 @@ pub const BodyChecker = struct {
         // "no method" would send the user looking for a typo.
         if (recv_ty.isApp()) {
             const e = bc.composite.at(recv_ty.appIdx());
-            if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member) != null) {
+            if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite()) != null) {
                 try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0018 }, "'{s}' on the generic type '{s}' takes no explicit type arguments yet; drop the '[..]'", .{ member, bc.typeName(recv_ty) });
                 try bc.drainRejectedArgs(args);
                 return .invalid;
@@ -3057,7 +3057,7 @@ pub const BodyChecker = struct {
             if (!app_ty.isApp()) return null; // typeFromNode already diagnosed
             const e = bc.composite.at(app_ty.appIdx());
             if (e.ctor_is_enum) return null; // an enum type_app is variant construction
-            const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, member) orelse {
+            const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, member, bc.methodSite()) orelse {
                 // An instance has no methods of its own (`impl Box[int]` is rejected), so a
                 // member no template declares names nothing.
                 try bc.drainArgs(args);
@@ -3091,7 +3091,7 @@ pub const BodyChecker = struct {
             const name = bc.nameText(recv.main_token);
             if (bc.activeStructMap().get(name)) |sid| {
                 if (sid < bc.structSyms().len and bc.structSyms()[sid].is_generic) {
-                    if (Typecheck.findGenericMethod(bc.model.templates, sid, false, member)) |m| {
+                    if (Typecheck.findGenericMethod(bc.model.templates, sid, false, member, bc.methodSite())) |m| {
                         if (try bc.inferAssociatedCall(node_idx, n, callee, m, args)) |t| return t;
                         try bc.drainArgs(args);
                         try bc.reportUninferableAssociated(recv, member);
@@ -3936,7 +3936,7 @@ pub const BodyChecker = struct {
         // `.one` is byte-identical to `findMethod` for every existing program (inherent /
         // single conformance / prelude); `.ambiguous` (a doubly-conforming generic
         // protocol used with no type-args) is T0025 — never an arbitrary pick.
-        switch (Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, null)) {
+        switch (Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, null, bc.methodSite())) {
             .one => |mi| {
                 // An associated (self-less) function must be reached via `Type[..].fn()`,
                 // never on a value receiver.
@@ -4084,7 +4084,7 @@ pub const BodyChecker = struct {
         const member = bc.nameText(callee.main_token);
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         const e = bc.composite.at(recv_ty.appIdx());
-        if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member)) |m| {
+        if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite())) |m| {
             // An associated (self-less) function is not callable on a value receiver —
             // it must be reached via `Type[args].fn()`.
             if (!m.has_self) {
@@ -4648,6 +4648,11 @@ pub const BodyChecker = struct {
             try bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'; did you mean '{s}'?", .{ member, bc.typeName(recv_ty), cand })
         else
             try bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
+    }
+
+    /// Where this body's method calls are written (see `Typecheck.Site`).
+    pub fn methodSite(bc: *const BodyChecker) Typecheck.Site {
+        return Typecheck.Site.of(bc.model.graph.mods[bc.graph_mod].bundled);
     }
 
     pub fn activeStructMap(bc: *const BodyChecker) *const std.StringHashMapUnmanaged(u32) {

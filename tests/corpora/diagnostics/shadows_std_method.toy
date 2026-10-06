@@ -1,7 +1,7 @@
 # A method the program declares with the name of a method a std module declares on the
-# same type wins at every call, std's own bodies included, so it warns W0011 where the
-# program declares it. A name std does not declare, and `each` on the program's own type,
-# shadow nothing.
+# same type wins at the program's calls, while std's own calls keep std's, so it warns
+# W0011 where the program declares it. A name std does not declare, and `each` on the
+# program's own type, shadow nothing.
 import std/vec
 import std/option
 
@@ -24,7 +24,7 @@ impl Vec[T] {
 }
 
 impl Option[T] {
-    fn or_else(self, f: fn() -> T) -> T { f() }  #~ WARN [W0011] 'or_else' on 'Option' shadows the one in std/option, so every call reaches this one, even in std; rename it to keep both
+    fn or_else(self, f: fn() -> T) -> T { f() }  #~ WARN [W0011] 'or_else' on 'Option' shadows the one in std/option: the program's calls reach this one, std's own calls keep std's; rename it to keep both
 }
 
 fn main() -> int {

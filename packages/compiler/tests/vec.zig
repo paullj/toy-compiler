@@ -770,6 +770,49 @@ test "vec: a program's own Vec method wins over std's of the same name, whatever
     }
 }
 
+test "vec: a program's own Vec and Option methods never change what std's methods do" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // std's `split`, `map` and `join` call `push`, `len`, `get` and `unwrap_or`, `sort`
+    // calls `sort_by`, and a `for` walks with `get`: each keeps std's own method or the
+    // builtin. The program's own calls reach its methods: `len` is 99, `get` finds nothing
+    // and `push` drops its element (the `fold` count, which reads std's length, stays 3).
+    try harness.expectStdoutAtBothLevels(gpa, io, ".toy-test-vec-shadow-std",
+        \\import std/vec
+        \\import std/str
+        \\import std/io
+        \\impl Vec[T] {
+        \\    fn len(self) -> int { 99 }
+        \\    fn push(self, _x: T) {}
+        \\    fn get(self, _i: int) -> Option[T] { Option[T].none }
+        \\    fn sort_by(self, _less: fn(T, T) -> bool) {}
+        \\}
+        \\impl Option[T] {
+        \\    fn unwrap_or(self, d: T) -> T { d }
+        \\}
+        \\fn main() -> int {
+        \\    parts := "c a b".split(" ")
+        \\    shout := parts.map(fn(s) { s.concat("!") })
+        \\    parts.sort()
+        \\    io.println(", ".join(parts))
+        \\    io.println("".join(shout))
+        \\    seen := ""
+        \\    for p in parts { seen = seen.concat(p) }
+        \\    io.println(seen)
+        \\    parts.push("z")
+        \\    io.println(parts.fold(0, fn(n, _s) { n + 1 }))
+        \\    io.println(parts.len())
+        \\    io.println(parts.get(0).is_none())
+        \\    io.println(Option.some(5).unwrap_or(6))
+        \\    return 0
+        \\}
+        \\
+    , "a, b, c\nc!a!b!\nabc\n3\n99\ntrue\n6\n");
+}
+
 test "vec: Vec closure methods keep their results across forced collections" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

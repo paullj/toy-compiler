@@ -1,0 +1,29 @@
+# A method the program declares with the name of a compiler builtin on a builtin type
+# (`str`'s `len`, `byte_at`, `concat` and `to_string`, a scalar's `eq`, `hash` and
+# `to_string`, `into`/`try_into` on a number, the native `Option`/`Result` methods) wins
+# at the program's calls, while std's own calls keep the builtin, so it warns W0011 where
+# the program declares it. A builtin type's method with any other name, and a `to_string`
+# on the program's own type, shadow nothing.
+struct Tag { n: int }
+
+impl Tag {
+    fn to_string(self) -> str { "tag" }
+}
+
+impl str {
+    fn len(self) -> int { 3 }  #~ WARN [W0011] method 'len' on 'str' shadows the built-in one: the program's calls reach this one, std's own calls keep the built-in; rename it to keep both
+    fn shout(self) -> str { self.concat("!") }
+}
+
+impl int {
+    fn to_string(self) -> str { "n" }  #~ WARN [W0011] method 'to_string' on 'int' shadows the built-in one
+}
+
+impl Option[T] {
+    fn unwrap_or(self, d: T) -> T { d }  #~ WARN [W0011] method 'unwrap_or' on 'Option' shadows the built-in one
+}
+
+fn main() -> int {
+    t := Tag { n: 1 }
+    return "ab".len() + "x".shout().len() + 7.to_string().len() + t.to_string().len() + t.n + Option.some(4).unwrap_or(5)
+}

@@ -1193,12 +1193,15 @@ test "W0011 fires at a program's method that a std module in the graph also decl
                 try testing.expectEqual(@import("diagnostics/model.zig").Severity.warning, d.severity);
                 try testing.expectEqual(g.entry_index, d.scope);
             }
-            try testing.expectEqualStrings("method 'each' on 'Vec' shadows the one in std/vec, so every call reaches this one, even in std; rename it to keep both", ds[0].message);
-            try testing.expect(std.mem.startsWith(u8, ds[1].message, "method 'or_else' on 'Option' shadows the one in std/option,"));
-            try testing.expect(std.mem.startsWith(u8, ds[2].message, "method 'trim' on 'str' shadows the one in std/str,"));
+            try testing.expectEqualStrings("method 'each' on 'Vec' shadows the one in std/vec: the program's calls reach this one, std's own calls keep std's; rename it to keep both", ds[0].message);
+            try testing.expect(std.mem.startsWith(u8, ds[1].message, "method 'or_else' on 'Option' shadows the one in std/option:"));
+            try testing.expect(std.mem.startsWith(u8, ds[2].message, "method 'trim' on 'str' shadows the one in std/str:"));
             const m = &g.modules[g.entry_index];
             for (ds, [_][]const u8{ "each", "or_else", "trim" }) |d, name|
                 try testing.expectEqualStrings(name, m.source[d.byte_offset..d.end]);
+            for (tr.templates) |tm| try testing.expectEqual(!tm.bundled and !std.mem.eql(u8, tm.name, "total"), tm.shadows);
+            for (tr.methods) |mth| if (mth.instance == null)
+                try testing.expectEqual(!mth.bundled and std.mem.eql(u8, mth.name, "trim"), mth.shadows);
         }
     }.check);
     // With no std/str in the graph, the same `impl str { fn trim }` shadows nothing.
@@ -1211,6 +1214,90 @@ test "W0011 fires at a program's method that a std module in the graph also decl
     }, "main.toy", struct {
         fn check(_: *const Graph.Graph, _: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
             try testing.expectEqual(@as(usize, 0), tr.diags.len);
+        }
+    }.check);
+}
+
+test "W0011 fires at a program's method named like a builtin of a builtin type, whatever the imports" {
+    // `str.len`, `int.to_string` and `Option.unwrap_or` are builtins; `str.shout` is a new
+    // name, and `to_string` on the program's own `Tag` is how `Tag` implements it.
+    try withCheckedGraph(".toy-test-builtin-shadow", &.{
+        .{ .path = "main.toy", .source =
+        \\struct Tag { n: int }
+        \\impl Tag { fn to_string(self) -> str { "tag" } }
+        \\impl str {
+        \\    fn len(self) -> int { 3 }
+        \\    fn shout(self) -> str { self }
+        \\}
+        \\impl int { fn to_string(self) -> str { "n" } }
+        \\impl Option[T] { fn unwrap_or(self, d: T) -> T { d } }
+        \\fn main() -> int {
+        \\    t := Tag { n: 1 }
+        \\    return "ab".len() + "x".shout().len() + 7.to_string().len() + t.to_string().len() + Option.some(4).unwrap_or(5)
+        \\}
+        \\
+        },
+    }, "main.toy", struct {
+        fn check(g: *const Graph.Graph, _: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            errdefer for (tr.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+            const ds = tr.diags;
+            try testing.expectEqual(@as(usize, 3), ds.len);
+            try testing.expectEqualStrings("method 'len' on 'str' shadows the built-in one: the program's calls reach this one, std's own calls keep the built-in; rename it to keep both", ds[0].message);
+            try testing.expect(std.mem.startsWith(u8, ds[1].message, "method 'to_string' on 'int' shadows the built-in one:"));
+            try testing.expect(std.mem.startsWith(u8, ds[2].message, "method 'unwrap_or' on 'Option' shadows the built-in one:"));
+            const m = &g.modules[g.entry_index];
+            for (ds, [_][]const u8{ "len", "to_string", "unwrap_or" }) |d, name| {
+                try testing.expectEqual(@import("diagnostics/codes.zig").Code.W0011, d.code);
+                try testing.expectEqualStrings(name, m.source[d.byte_offset..d.end]);
+            }
+        }
+    }.check);
+}
+
+test "a call in a bundled module never reaches a program's shadowing method; the program's own call does" {
+    // The program's `len` and `byte_at` on `str` and `unwrap_or` on `Option` would steer
+    // `trim`, `split` and `join` if std's calls reached them.
+    try withCheckedGraph(".toy-test-bundled-site", &.{
+        .{ .path = "main.toy", .source =
+        \\import std/str
+        \\impl str {
+        \\    fn len(self) -> int { 100000 }
+        \\    fn byte_at(self, _i: int) -> int { 120 }
+        \\}
+        \\impl Option[T] { fn unwrap_or(self, d: T) -> T { d } }
+        \\fn main() -> int {
+        \\    return "ab".len() + " a ".trim().concat(",".join("a b".split(" "))).byte_at(0) + Option.some(1).unwrap_or(2)
+        \\}
+        \\
+        },
+    }, "main.toy", struct {
+        fn check(g: *const Graph.Graph, _: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            const shadowing = struct {
+                fn any(t: *const GraphResult, cs: []const Typecheck.Callee) bool {
+                    for (cs) |c| switch (c.view()) {
+                        .method, .bound_method => |id| if (t.methods[id].shadows) return true,
+                        else => {},
+                    };
+                    return false;
+                }
+            };
+            var builtin_len: usize = 0;
+            for (g.modules, tr.callees) |mod, cs| {
+                if (!mod.bundled) continue;
+                try testing.expect(!shadowing.any(tr, cs));
+                for (cs) |c| if (std.meta.eql(c.view(), Typecheck.Callee.View{ .builtin = .str_len })) {
+                    builtin_len += 1;
+                };
+            }
+            try testing.expect(builtin_len > 0);
+            for (tr.instances) |inst| if (g.modules[inst.mod].bundled) try testing.expect(!shadowing.any(tr, inst.callees));
+            // The program's calls reach its own `len`, `byte_at` and `unwrap_or`.
+            var own: usize = 0;
+            for (tr.callees[g.entry_index]) |c| switch (c.view()) {
+                .method => |id| own += @intFromBool(tr.methods[id].shadows),
+                else => {},
+            };
+            try testing.expectEqual(@as(usize, 3), own);
         }
     }.check);
 }

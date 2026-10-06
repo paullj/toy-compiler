@@ -267,13 +267,26 @@ impl's (`impl Box[T] { fn conv[T](..) }`), and no fn declares one name twice
 ## Same-named methods
 
 Two modules may declare a method of one name on one type: a program's own
-`impl Vec[T] { fn each .. }` next to the one `std/vec` declares. A method the program
-declares is the one every call reaches, std's own bodies included, so the pick never
-depends on the import order and a program keeps its own method when std gains one of
-that name. Between two of the program's own modules, the first in import order wins.
-Shadowing a std method is warning **W0011** at the program's method. It fires whenever
-the std module is part of the program, imported directly or through another module,
-because only then is there a std method to shadow; renaming the method keeps both.
+`impl Vec[T] { fn each .. }` next to the one `std/vec` declares. Which one a call reaches
+depends on where the call is written. A call in the program reaches the program's
+method, so the pick never depends on the import order and a program keeps its own
+method when std gains one of that name. Between two of the program's own modules, the
+first in import order wins. A call written in a bundled module (`std/*`, `core/*`)
+reaches the bundled method; std's bodies are immune to the program's methods, because
+their bounds and results come from their own methods and the builtins.
+
+A program's method may also take the name of a builtin on a builtin type (`str`'s
+`len`, `byte_at`, `concat` and `to_string`, a scalar's `eq`, `hash` and `to_string`,
+`into`/`try_into` on a number or `char`, a native `Option`/`Result` method). The program's
+calls reach it, and a bundled module's calls keep the builtin. A program's other
+methods stay reachable from std: they are how its types implement the protocols std's
+generic bodies call (`next`, `display`, `cmp`), and a program's `to_string` or `hash` on
+its own type is how that type implements them.
+
+Shadowing a std method or a builtin is warning **W0011** at the program's method. For a
+std method it fires whenever the std module is part of the program, imported directly
+or through another module, because only then is there a std method to shadow; for a
+builtin it always fires. Renaming the method keeps both.
 
 ## Function types
 

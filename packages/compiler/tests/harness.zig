@@ -114,6 +114,36 @@ pub fn runExit(gpa: std.mem.Allocator, io: Io, prog: []const u8) !u8 {
     };
 }
 
+/// The stdout of `prog`, which must exit 0.
+pub fn runStdout(gpa: std.mem.Allocator, io: Io, prog: []const u8) ![]u8 {
+    var child = try std.process.spawn(io, .{ .argv = &.{prog}, .stdout = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const out = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+    errdefer gpa.free(out);
+    const term = try child.wait(io);
+    if (term != .exited or term.exited != 0) return error.ChildFailed;
+    return out;
+}
+
+/// Build `src` at -O0 and at -O1 into separate dirs under `dir`, run each, and expect
+/// `want` on stdout from both.
+pub fn expectStdoutAtBothLevels(gpa: std.mem.Allocator, io: Io, dir: []const u8, src: []const u8, want: []const u8) !void {
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    for ([_][]const u8{ "-O0", "-O1" }) |level| {
+        const sub = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, level[1..] });
+        defer gpa.free(sub);
+        const prog = try compile(gpa, io, sub, src, &.{ "--no-cache", level });
+        defer gpa.free(prog);
+        const out = try runStdout(gpa, io, prog);
+        defer gpa.free(out);
+        std.testing.expectEqualStrings(want, out) catch |e| {
+            std.debug.print("at {s}\n", .{level});
+            return e;
+        };
+    }
+}
+
 /// `compile` + `runExit` in a fresh `dir`, removed afterwards.
 pub fn buildAndRun(gpa: std.mem.Allocator, io: Io, dir: []const u8, src: []const u8) !u8 {
     Io.Dir.cwd().deleteTree(io, dir) catch {};
