@@ -84,4 +84,7 @@ test "docForStr resolves a known code and rejects garbage" {
 
     const w10 = docForStr("W0010") orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.indexOf(u8, w10, "dead store") != null);
+
+    const w11 = docForStr("W0011") orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, w11, "shadows a std method") != null);
 }

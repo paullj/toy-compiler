@@ -271,6 +271,9 @@ Two modules may declare a method of one name on one type: a program's own
 declares is the one every call reaches, std's own bodies included, so the pick never
 depends on the import order and a program keeps its own method when std gains one of
 that name. Between two of the program's own modules, the first in import order wins.
+Shadowing a std method is warning **W0011** at the program's method. It fires whenever
+the std module is part of the program, imported directly or through another module,
+because only then is there a std method to shadow; renaming the method keeps both.
 
 ## Function types
 

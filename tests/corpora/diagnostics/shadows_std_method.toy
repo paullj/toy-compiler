@@ -1,0 +1,36 @@
+# A method the program declares with the name of a method a std module declares on the
+# same type wins at every call, std's own bodies included, so it warns W0011 where the
+# program declares it. A name std does not declare, and `each` on the program's own type,
+# shadow nothing.
+import std/vec
+import std/option
+
+struct Bag { n: int }
+
+impl Bag {
+    fn each(self) -> int { self.n }
+}
+
+impl Vec[T] {
+    fn each(self, f: fn(T)) {  #~ WARN [W0011] method 'each' on 'Vec' shadows the one in std/vec
+        i := self.len() - 1
+        while i >= 0 {
+            f(self.get(i).unwrap())
+            i = i - 1
+        }
+    }
+
+    fn total(self) -> int { self.len() }
+}
+
+impl Option[T] {
+    fn or_else(self, f: fn() -> T) -> T { f() }  #~ WARN [W0011] 'or_else' on 'Option' shadows the one in std/option, so every call reaches this one, even in std; rename it to keep both
+}
+
+fn main() -> int {
+    xs: Vec[int] = [1, 2, 3]
+    first := 0
+    xs.each(fn(v) { if first == 0 { first = v } })
+    b := Bag { n: 1 }
+    return first + xs.total() + b.each()
+}

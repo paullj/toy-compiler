@@ -2705,6 +2705,79 @@ test "`--allow W0010` silences the dead-store warning (exit 0)" {
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
 }
 
+// The std-shadowing warning: a program's method with the name of a method a std module in
+// the program declares on the same type. It warns W0011 and does NOT fail the check (exit
+// 0), is promoted by `--deny-warnings` and `--deny W0011`, silenced by `--allow W0011`, and
+// a later `--warn W0011` keeps it a warning.
+const std_shadow_fixture =
+    "import std/vec\nimpl Vec[T] {\n  fn each(self, f: fn(T)) { f(self.get(0).unwrap()) }\n}\nfn main() -> int {\n  xs: Vec[int] = [4]\n  n := 0\n  xs.each(fn(v) { n = v })\n  return n\n}\n";
+
+test "`toy check` renders W0011 for a method that shadows a std method and exits 0" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0011-shadow";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, std_shadow_fixture, &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0011]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "method 'each' on 'Vec' shadows the one in std/vec") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+}
+
+test "`--deny-warnings` and `--deny W0011` promote W0011 to an error (exit 1)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0011-deny";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const flag_sets = [_][]const []const u8{ &.{ "check", "--deny-warnings" }, &.{ "check", "--deny", "W0011" } };
+    for (flag_sets) |flags| {
+        const res = runToyOnFixture(gpa, io, dir_name, std_shadow_fixture, flags) catch |e| {
+            if (e == error.SkipZigTest) return error.SkipZigTest;
+            return e;
+        };
+        defer gpa.free(res.out);
+        try testing.expect(std.mem.indexOf(u8, res.out, "error[W0011]") != null);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    }
+}
+
+test "`--allow W0011` silences the std-shadowing warning; a later `--warn W0011` restores it (exit 0)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-w0011-allow";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    {
+        const res = runToyOnFixture(gpa, io, dir_name, std_shadow_fixture, &.{ "check", "--allow", "W0011" }) catch |e| {
+            if (e == error.SkipZigTest) return error.SkipZigTest;
+            return e;
+        };
+        defer gpa.free(res.out);
+        try testing.expect(std.mem.indexOf(u8, res.out, "W0011") == null);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    }
+    {
+        const res = runToyOnFixture(gpa, io, dir_name, std_shadow_fixture, &.{ "check", "--deny", "W", "--warn", "W0011" }) catch |e| {
+            if (e == error.SkipZigTest) return error.SkipZigTest;
+            return e;
+        };
+        defer gpa.free(res.out);
+        try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0011]") != null);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    }
+}
+
 test "codegen reports missing main and lowers a simple main" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

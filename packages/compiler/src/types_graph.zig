@@ -68,6 +68,7 @@ pub fn checkGraph(
             .resolutions = res.resolutions[i],
             .closures = if (i < res.closures.len) res.closures[i] else &.{},
             .bundled = m.bundled,
+            .path = m.path,
         };
     }
 
@@ -1380,6 +1381,67 @@ test "fn values in std containers and sinks: Map key and Display are T0023; fs[i
                 calls += 1;
             }
             try testing.expectEqual(@as(usize, 1), calls);
+        }
+    }.check);
+}
+
+test "W0011 fires at a program's method that a std module in the graph also declares, imported directly or not" {
+    // std/str reaches the program only through `lib`, and still owns a `trim` on `str`.
+    // `Vec.each` and `Option.or_else` shadow; `Vec.total` and the program's own `Bag.each`
+    // shadow nothing.
+    try withCheckedGraph(".toy-test-std-shadow", &.{
+        .{ .path = "main.toy", .source =
+        \\import std/vec
+        \\import std/option
+        \\import lib
+        \\struct Bag { n: int }
+        \\impl Bag { fn each(self) -> int { self.n } }
+        \\impl Vec[T] {
+        \\    fn each(self, f: fn(T)) { f(self.get(0).unwrap()) }
+        \\    fn total(self) -> int { self.len() }
+        \\}
+        \\impl Option[T] { fn or_else(self, f: fn() -> T) -> T { f() } }
+        \\impl str { fn trim(self) -> str { self } }
+        \\fn main() -> int {
+        \\    xs: Vec[int] = [1]
+        \\    b := Bag { n: 1 }
+        \\    return xs.total() + b.each() + lib.words("a b".trim())
+        \\}
+        \\
+        },
+        .{ .path = "lib.toy", .source =
+        \\import std/str
+        \\pub fn words(s: str) -> int { s.split(" ").len() }
+        \\
+        },
+    }, "main.toy", struct {
+        fn check(g: *const Graph.Graph, _: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            errdefer for (tr.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+            const ds = tr.diags;
+            try testing.expectEqual(@as(usize, 3), ds.len);
+            for (ds) |d| {
+                try testing.expectEqual(@import("diagnostics/codes.zig").Code.W0011, d.code);
+                try testing.expectEqual(@import("diagnostics/model.zig").Severity.warning, d.severity);
+                try testing.expectEqual(g.entry_index, d.scope);
+            }
+            try testing.expectEqualStrings("method 'each' on 'Vec' shadows the one in std/vec, so every call reaches this one, even in std; rename it to keep both", ds[0].message);
+            try testing.expect(std.mem.startsWith(u8, ds[1].message, "method 'or_else' on 'Option' shadows the one in std/option,"));
+            try testing.expect(std.mem.startsWith(u8, ds[2].message, "method 'trim' on 'str' shadows the one in std/str,"));
+            const m = &g.modules[g.entry_index];
+            for (ds, [_][]const u8{ "each", "or_else", "trim" }) |d, name|
+                try testing.expectEqualStrings(name, m.source[d.byte_offset..d.end]);
+        }
+    }.check);
+    // With no std/str in the graph, the same `impl str { fn trim }` shadows nothing.
+    try withCheckedGraph(".toy-test-std-shadow-none", &.{
+        .{ .path = "main.toy", .source =
+        \\impl str { fn trim(self) -> str { self } }
+        \\fn main() -> int { return "a".trim().len() }
+        \\
+        },
+    }, "main.toy", struct {
+        fn check(_: *const Graph.Graph, _: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), tr.diags.len);
         }
     }.check);
 }

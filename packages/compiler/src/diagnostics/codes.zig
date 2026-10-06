@@ -116,6 +116,7 @@ pub const Code = enum(u16) {
     W0008, // unused-must-use
     W0009, // shadowed-binding
     W0010, // dead-store
+    W0011, // shadows-std-method
 
     _,
 };
@@ -227,6 +228,7 @@ pub const table = [_]Entry{
     .{ .code = .W0008, .str = "W0008", .slug = "unused-must-use", .default_severity = .warning },
     .{ .code = .W0009, .str = "W0009", .slug = "shadowed-binding", .default_severity = .warning, .related = "outer binding declared here" },
     .{ .code = .W0010, .str = "W0010", .slug = "dead-store", .default_severity = .warning },
+    .{ .code = .W0011, .str = "W0011", .slug = "shadows-std-method", .default_severity = .warning },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -490,6 +492,11 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("dead-store", slug(.W0010).?);
     try testing.expectEqual(Severity.warning, defaultSeverity(.W0010));
     try testing.expectEqual(Code.W0010, fromStr("W0010").?);
+
+    try testing.expectEqualStrings("W0011", str(.W0011).?);
+    try testing.expectEqualStrings("shadows-std-method", slug(.W0011).?);
+    try testing.expectEqual(Severity.warning, defaultSeverity(.W0011));
+    try testing.expectEqual(Code.W0011, fromStr("W0011").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {
