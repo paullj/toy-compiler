@@ -152,9 +152,22 @@ pub const Facts = struct {
     }
 };
 
+/// How `factsOf` reads a body.
+pub const Mode = enum {
+    /// A lowered body, with the types and callees its own check recorded: what may escape
+    /// decides storage, so anything the walk cannot follow escapes.
+    lowered,
+    /// A generic template no instance may ever lower, read only to report T0052 once for
+    /// every instance: its nodes have no types and its calls mostly no callee, so a value
+    /// passed where the walk cannot follow it is taken not to escape. What escapes then
+    /// escapes in every instance, so the report is never one an instance would not make.
+    template,
+};
+
 /// Walk the body at `decl` once. `closures` is its lambdas as the resolver saw them;
-/// `view` is as for `callTarget`, plus `.sigs` (see `Modes.argMask`) and `.layouts`. Only a
-/// call that passes a function value is resolved: no other argument can carry a closure.
+/// `view` is as for `callTarget`, plus `.sigs` (see `Modes.argMask`) and `.layouts`. In a
+/// lowered body only a call that passes a function value is resolved: no other argument can
+/// carry a closure.
 pub fn factsOf(
     gpa: std.mem.Allocator,
     src: AstWalk.Source,
@@ -163,12 +176,15 @@ pub fn factsOf(
     decl: Ast.Index,
     nparams: u32,
     closures: ?*const Closure.FnClosures,
+    mode: Mode,
 ) error{OutOfMemory}!Facts {
-    const Role = union(enum) { value_callee, arg: ?Dep, init: u32 };
+    // `opaque_arg`: an argument of a call a template's walk cannot follow.
+    const Role = union(enum) { value_callee, arg: ?Dep, opaque_arg, init: u32 };
     const V = struct {
         gpa: std.mem.Allocator,
         view: @TypeOf(view),
         units: Units,
+        mode: Mode,
         roles: std.AutoHashMapUnmanaged(u32, Role) = .empty,
         escapes: std.DynamicBitSetUnmanaged = .{},
         deps: std.ArrayList(SlotDep) = .empty,
@@ -188,7 +204,7 @@ pub fn factsOf(
         fn roleUse(self: *const @This(), node: Ast.Index) SiteUse {
             const role = self.roles.get(node.int()) orelse return .escapes;
             return switch (role) {
-                .value_callee => .called,
+                .value_callee, .opaque_arg => .called,
                 .arg => |d| if (d) |dep| .{ .arg = dep } else .escapes,
                 .init => |t| .{ .local = t },
             };
@@ -212,6 +228,7 @@ pub fn factsOf(
                     if (Callee.callSlot(tree, n)) |slot| if (slot.int() < self.view.callees.len and self.view.callees[slot.int()].view() == .value)
                         try self.roles.put(self.gpa, n.lhs.int(), .value_callee);
                     const args = Ast.rangeSlice(tree, n.rhs.int());
+                    if (self.mode == .template) return self.templateCall(e.idx, n, args);
                     const passes_fn = for (args) |a| {
                         if (a.int() < self.view.node_types.len and LayoutEngine.isFnStruct(self.view.node_types[a.int()], self.view.layouts)) break true;
                     } else false;
@@ -232,7 +249,7 @@ pub fn factsOf(
                 .identifier => if (self.local(e.idx)) |s| {
                     const role = self.roles.get(e.idx.int()) orelse return self.escape(s);
                     switch (role) {
-                        .value_callee => {},
+                        .value_callee, .opaque_arg => {},
                         .arg => |d| if (d) |dep| try self.deps.append(self.gpa, .{ .slot = s, .dep = dep }) else try self.escape(s),
                         .init => try self.escape(s),
                     }
@@ -247,8 +264,25 @@ pub fn factsOf(
                 else => {},
             }
         }
+
+        /// A template's call: its callee is known only when it names a lowered body
+        /// directly, and a local in callee position is a function value it calls.
+        fn templateCall(self: *@This(), call: Ast.Index, n: Ast.Node, args: []const Ast.Index) error{OutOfMemory}!void {
+            if (self.local(n.lhs) != null) try self.roles.put(self.gpa, n.lhs.int(), .value_callee);
+            const target = try callTarget(self.gpa, self.view, self.units, call);
+            if (target) |t| try self.calls.append(self.gpa, t.unit);
+            const mask = Modes.argMask(self.view, call);
+            for (args, 0..) |a, i| {
+                const role: Role = if (target) |t| blk: {
+                    const p = i + t.self_n;
+                    if (Modes.isMut(mask, i) or p >= 64) break :blk .{ .arg = null };
+                    break :blk .{ .arg = .{ .unit = t.unit, .param = @intCast(p) } };
+                } else .opaque_arg;
+                try self.roles.put(self.gpa, a.int(), role);
+            }
+        }
     };
-    var v: V = .{ .gpa = gpa, .view = view, .units = units };
+    var v: V = .{ .gpa = gpa, .view = view, .units = units, .mode = mode };
     defer v.roles.deinit(gpa);
     errdefer {
         v.escapes.deinit(gpa);
@@ -528,7 +562,7 @@ test "a bound method site takes its use from its position, like a lambda in that
         if (std.mem.eql(u8, f.name, "main.run")) run_gid = @intCast(i);
     }
     const decl = res.fns[main_gid.?].decl_node;
-    var f = try factsOf(gpa, .{ .tree = tree, .tokens = tokens, .source = src }, &view, .{ .is_base = is_base }, decl, 0, Closure.findFn(res.closures[0], decl));
+    var f = try factsOf(gpa, .{ .tree = tree, .tokens = tokens, .source = src }, &view, .{ .is_base = is_base }, decl, 0, Closure.findFn(res.closures[0], decl), .lowered);
     defer f.deinit(gpa);
 
     // Pair each bound site with the lambda in the same position, in source order.

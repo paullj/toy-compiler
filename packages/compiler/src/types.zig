@@ -752,6 +752,12 @@ fn isBaseOwner(f: GraphFnInput, fsym: FnSym) bool {
     return f.decl_node != Ast.none and f.kind == .user_fn and !fsym.isGeneric();
 }
 
+/// Whether global fn `f` is a generic user fn with a body: a template, lowered only
+/// through its instances, of which a program may make none.
+fn isTemplateOwner(f: GraphFnInput, fsym: FnSym) bool {
+    return f.decl_node != Ast.none and f.kind == .user_fn and fsym.isGeneric();
+}
+
 /// The owner-closure table: each lowerable owner with a boxed local, in canonical owner
 /// order (base fns by global id, then instances in instance order), its boxed slots.
 /// Serial over the finished tables, so it is identical at any `-j`.
@@ -863,19 +869,23 @@ fn analyzeEscapes(
     }
     for (0..n_units) |u| {
         const inst: ?*const Mono.Instance = if (u < fns.len) null else &instances[u - fns.len];
-        if (inst == null and !is_base[u]) continue;
+        const template = inst == null and !is_base[u] and isTemplateOwner(fns[u], t.fns.items[u]);
+        if (inst == null and !is_base[u] and !template) continue;
         const mod = if (inst) |i| i.mod else fns[u].module;
         const decl = if (inst) |i| i.decl_node else fns[u].decl_node;
         const mc = &t.graph.mods[mod];
         // Only a body with a closure, a param a closure can be passed to, or a `mut` param a
         // bound method value can hold needs facts.
         const fc = Closure.findFn(mc.closures, decl);
+        const proto = Ast.protoAt(mc.tree, mc.tree.nodes[decl.int()].lhs.int());
+        const has_mut = Modes.ofProto(mc.tree, mc.tokens, proto) != 0;
+        // A template is read for T0052 alone, which needs a closure and a `mut` param.
+        if (template and (fc == null or !has_mut)) continue;
         const params = if (inst) |i| i.params else sigs[u].params;
         const takes_fn = for (params) |p| {
             if (LayoutEngine.isFnStruct(p, layouts)) break true;
         } else false;
-        const proto = Ast.protoAt(mc.tree, mc.tree.nodes[decl.int()].lhs.int());
-        if (fc == null and !takes_fn and Modes.ofProto(mc.tree, mc.tokens, proto) == 0) continue;
+        if (fc == null and !takes_fn and !has_mut) continue;
         const view: EscapeView = .{
             .tree = mc.tree,
             .resolutions = mc.resolutions,
@@ -886,7 +896,7 @@ fn analyzeEscapes(
             .methods = methods,
             .layouts = layouts,
         };
-        facts[u] = try Escape.factsOf(gpa, .{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, &view, units, decl, @intCast(proto.params.len), fc);
+        facts[u] = try Escape.factsOf(gpa, .{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, &view, units, decl, @intCast(proto.params.len), fc, if (template) .template else .lowered);
     }
     var sol = try Escape.solve(gpa, facts);
     defer sol.deinit(gpa);
@@ -941,6 +951,8 @@ fn analyzeEscapes(
             try reported.append(gpa, p);
             try reportEscapingCapture(t, mc, mod, mc.tree.nodes[site.node.int()].lhs);
         }
+        // A template has no storage of its own to decide: only its instances are lowered.
+        if (inst == null and !is_base[u]) continue;
         const fcl = fc orelse continue;
 
         // This owner's units are one run of the (owner, node)-sorted table.
@@ -11084,6 +11096,51 @@ test "a closure or a bound method that escapes cannot capture a mut param" {
         defer gpa.free(bound);
         try expectOneDiag(bound, .T0052, "a closure that escapes cannot capture the 'mut' parameter 'p'; copy it to a local first");
     }
+}
+
+test "a generic fn no caller instantiates still reports a closure that escapes with a mut param" {
+    const gpa = testing.allocator;
+    const pre =
+        \\pub protocol Each { fn each(self, f: fn()) }
+        \\pub struct H { f: fn() -> int }
+        \\pub fn keep(f: fn() -> int) -> H { H { f: f } }
+        \\pub fn run(f: fn() -> int) -> int { f() }
+        \\pub fn grun[U](f: fn() -> U) -> U { f() }
+        \\
+    ;
+    const main_src = "fn main() -> int { return 0 }\n";
+    // What escapes in the template's own text escapes in every instance.
+    const escaping = [_][]const u8{
+        "pub fn f[T](mut n: T) -> fn() -> T {\n fn() -> T { n }\n}\n",
+        "pub fn f[T](mut n: int, _t: T) -> H {\n H { f: fn() -> int { n } }\n}\n",
+        "pub fn f[T](mut n: int, _t: T) -> H {\n keep(fn() -> int { n })\n}\n",
+        "pub fn f[T](mut n: int, _t: T) -> fn() -> int {\n fn g() -> int { n }\n g\n}\n",
+    };
+    for (escaping) |body| {
+        const src = try std.mem.concat(gpa, u8, &.{ pre, body, main_src });
+        defer gpa.free(src);
+        try expectOnlyDiag(src, .T0052);
+    }
+    // A call the template cannot follow (a generic fn, a protocol method) is left to the
+    // instances, so it reports nothing here.
+    const legal = [_][]const u8{
+        "pub fn f[T](mut n: int, _t: T) -> int {\n run(fn() -> int { n })\n}\n",
+        "pub fn f[T](mut n: int, _t: T) -> int {\n grun(fn() -> int { n })\n}\n",
+        "pub fn f[T has Each](mut n: int, t: T) {\n t.each(fn() { n = n + 1 })\n}\n",
+        "pub fn f[T](mut n: int, _t: T) -> int {\n g := fn() -> int { n }\n g() + run(g)\n}\n",
+    };
+    for (legal) |body| {
+        const src = try std.mem.concat(gpa, u8, &.{ pre, body, main_src });
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        for (c.result.diags) |d| if (d.severity == .err) {
+            std.debug.print("source:\n{s}\ngot {s}: {s}\n", .{ src, @tagName(d.code), d.message });
+            return error.TestUnexpectedDiagnostic;
+        };
+    }
+    // An instantiated template reports the capture once, from its text and its instance.
+    try expectOnlyDiag(pre ++ "fn f[T](mut n: T) -> fn() -> T {\n fn() -> T { n }\n}\nfn main() -> int {\n a := 1\n return f(a)()\n}\n", .T0052);
 }
 
 test "a captured mut param is a ref env slot, and a non-escaping capture keeps no box" {
