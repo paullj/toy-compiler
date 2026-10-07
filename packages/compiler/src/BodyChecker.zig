@@ -297,6 +297,10 @@ pub const BodyChecker = struct {
     /// `return` joins its operand into `ret_join` instead of checking it against `cur_ret`.
     ret_infer: bool = false,
     ret_join: Type = .never,
+    /// Inside a lambda whose return type is taken from the fn type expected for it rather
+    /// than written: that fn type, which a mismatched `return` names, since the lambda
+    /// declared nothing.
+    ret_expected: ?Type = null,
     /// The local slots a call writes through: the root of a `mut self` receiver place or
     /// of a `mut` argument. A captured one must be boxed like an assigned one.
     mutated_roots: std.ArrayList(u32) = .empty,
@@ -428,9 +432,55 @@ pub const BodyChecker = struct {
         // structurally return, OR the body's trailing expression has the declared
         // type. `assignable` folds poison/never/eql exactly as before.
         if (want_value and !bc.blockReturns(decl.rhs) and !Type.assignable(f.ret, body_ty)) {
-            try bc.sink.report(.{ .span = bc.tokSpan(decl.main_token), .code = .T0043 }, "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(decl.main_token), bc.typeName(f.ret) });
+            if (!try bc.reportTailMismatch(decl.rhs, body_ty, f.ret))
+                try bc.sink.report(.{ .span = bc.tokSpan(decl.main_token), .code = .T0043 }, "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(decl.main_token), bc.typeName(f.ret) });
         }
         try bc.classifyCaptures(proto);
+    }
+
+    /// The expression whose value a block yields, or null when it ends in a statement.
+    fn blockTail(bc: *const BodyChecker, block_idx: Ast.Index) ?Ast.Index {
+        const stmts = Ast.rangeSlice(bc.tree, (bc.tree.nodes[(block_idx).int()].lhs).int());
+        if (stmts.len == 0) return null;
+        const last = stmts[stmts.len - 1];
+        const n = bc.tree.nodes[last.int()];
+        return switch (n.tag) {
+            .expr_stmt => n.lhs,
+            .block, .if_stmt => last,
+            else => null,
+        };
+    }
+
+    /// A body that ends in a value of a type its declared return type does not take is
+    /// T0042 at that value. Reporting it as a missing return (T0043) would send the user
+    /// looking for a path with no value. False when the body ends with no value, which is
+    /// the caller's T0043.
+    fn reportTailMismatch(bc: *BodyChecker, block_idx: Ast.Index, body_ty: Type, ret: Type) error{OutOfMemory}!bool {
+        if (body_ty.kind == .unit or body_ty.kind == .never or body_ty.kind == .invalid) return false;
+        const tail = bc.blockTail(block_idx) orelse return false;
+        try bc.sink.report(.{ .span = bc.spanOf(tail), .code = .T0042 }, "value {s} does not match declared return type {s}", .{ bc.typeName(body_ty), bc.typeName(ret) });
+        return true;
+    }
+
+    /// `reportTailMismatch` for a lambda whose return type came from the type expected for
+    /// it (`exp`), not from a `-> R`: the message spells the type the lambda really has,
+    /// since nothing it wrote declared the one it is held to.
+    fn reportExpectedTailMismatch(bc: *BodyChecker, block_idx: Ast.Index, params: []const Type, body_ty: Type, exp: Type) error{OutOfMemory}!bool {
+        if (body_ty.kind == .unit or body_ty.kind == .never or body_ty.kind == .invalid) return false;
+        const tail = bc.blockTail(block_idx) orelse return false;
+        const parts = Composite.fnParts(bc.composite.at(exp.funcIdx()));
+        var real: std.ArrayList(u8) = .empty;
+        defer real.deinit(bc.gpa);
+        try real.appendSlice(bc.gpa, "fn(");
+        for (params, 0..) |p, i| {
+            if (i != 0) try real.appendSlice(bc.gpa, ", ");
+            // An open `_` param has no type of its own yet; the expected one stands in.
+            const shown = if (p.kind == .invalid and i < parts.params.len) parts.params[i] else p;
+            try real.appendSlice(bc.gpa, if (shown.kind == .unit) "()" else bc.typeName(shown));
+        }
+        try real.print(bc.gpa, ") -> {s}", .{bc.typeName(body_ty)});
+        try bc.sink.report(.{ .span = bc.spanOf(tail), .code = .T0042 }, "lambda has type {s}, but {s} is expected: its value is {s}, not {s}", .{ real.items, bc.typeName(exp), bc.typeName(body_ty), bc.typeName(parts.ret) });
+        return true;
     }
 
     /// Decide how each captured local is held. A closure copies a capture when it is made,
@@ -527,12 +577,14 @@ pub const BodyChecker = struct {
         const proto = Ast.protoAt(bc.tree, n.lhs.int());
         const capture = Ast.isCaptureLambda(bc.tree, bc.tokens, node_idx);
         var open = false;
+        var exp_fn: ?Type = null;
         var exp_params: []const Type = &.{};
         var exp_ret: ?Type = null;
         var arity_err = false;
         if (bc.expected) |e| if (e.isFunc()) {
             const parts = Composite.fnParts(bc.composite.at(e.funcIdx()));
             if (parts.params.len == proto.params.len) {
+                exp_fn = e;
                 exp_params = parts.params;
                 if (bc.isGround(parts.ret)) exp_ret = parts.ret;
             } else {
@@ -564,12 +616,19 @@ pub const BodyChecker = struct {
                     const hint = if (i < exp_params.len or node_idx == bc.generic_arg) " (no other argument of the generic call fixes its type)" else "";
                     try bc.sink.report(.{ .span = bc.tokSpan(pn.main_token), .code = .T0050 }, "cannot infer the type of lambda parameter '{s}'; annotate it{s}", .{ bc.nameText(pn.main_token), hint });
                 }
-                break :blk bc.poison();
+                // A quiet arg's call reports its own error, possibly only once its args
+                // are typed, so this sink may not hold it yet.
+                break :blk if (node_idx == bc.quiet_arg and !arity_err) Type.invalid else bc.poison();
             };
             if (ty.kind == .invalid and !open) poisoned = true;
             params[i] = ty;
             bc.node_types[p.int()] = ty;
             if (bc.resolutions[p.int()] == .local) try bc.setSlot(bc.resolutions[p.int()].local, ty);
+            // An annotated param the expected type does not have means the lambda does not
+            // fit that type at all, so its return type comes from its own body: the
+            // mismatch then names the type the lambda really has.
+            if (pn.lhs != Ast.none and i < exp_params.len and bc.isGround(exp_params[i]) and
+                ty.kind != .invalid and !Type.eql(ty, exp_params[i])) exp_ret = null;
         }
 
         const frame = bc.enterBody(false);
@@ -577,16 +636,28 @@ pub const BodyChecker = struct {
         if (capture) bc.hole = Ast.captureHole(bc.tree, node_idx);
         const mark = bc.sink.count();
 
-        const declared: ?Type = if (proto.ret_type != Ast.none) bc.typeFromNode(proto.ret_type) else exp_ret;
+        const annotated = proto.ret_type != Ast.none;
+        const declared: ?Type = if (annotated) bc.typeFromNode(proto.ret_type) else exp_ret;
         var ret: Type = undefined;
         if (declared) |r| {
             bc.cur_ret = r;
             bc.ret_infer = false;
+            if (!annotated) bc.ret_expected = exp_fn;
             const want_value = r.kind != .unit and r.kind != .invalid;
             const body_ty = try bc.typeOfBlockExpected(n.rhs, want_value, if (want_value) r else null);
-            if (want_value and !bc.blockReturns(n.rhs) and !Type.assignable(r, body_ty))
-                try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "lambda must return {s} but may fall off the end", .{bc.typeName(r)});
             ret = r;
+            if (want_value and !bc.blockReturns(n.rhs) and !Type.assignable(r, body_ty)) {
+                if (annotated) {
+                    if (!try bc.reportTailMismatch(n.rhs, body_ty, r))
+                        try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "lambda must return {s} but may fall off the end", .{bc.typeName(r)});
+                } else if (try bc.reportExpectedTailMismatch(n.rhs, params, body_ty, exp_fn.?)) {
+                    // Poisoned so the call or binding that expected the type does not report
+                    // the same mismatch again.
+                    ret = .invalid;
+                } else {
+                    try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "lambda must return {s} but may fall off the end", .{bc.typeName(r)});
+                }
+            }
         } else {
             bc.cur_ret = Type.unit;
             bc.ret_infer = true;
@@ -600,7 +671,7 @@ pub const BodyChecker = struct {
             const t: Type = if (bc.resolutions[p.int()] == .local) bc.slotType(bc.resolutions[p.int()].local) else .invalid;
             if (t.kind == .invalid) {
                 poisoned = true;
-                if (!bc.errorsSince(mark))
+                if (!bc.errorsSince(mark) and node_idx != bc.quiet_arg)
                     try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0050 }, "cannot infer the type of '_'; nothing in the call gives it one; write the type arguments, as in f[int](a, _), or a typed lambda, as in fn(v: int) {{ .. }}", .{});
             } else {
                 params[0] = t;
@@ -641,8 +712,10 @@ pub const BodyChecker = struct {
         bc.ret_infer = false;
         const want_value = ret.kind != .unit and ret.kind != .invalid;
         const body_ty = try bc.typeOfBlockExpected(n.rhs, want_value, if (want_value) ret else null);
-        if (want_value and !bc.blockReturns(n.rhs) and !Type.assignable(ret, body_ty))
-            try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(n.main_token), bc.typeName(ret) });
+        if (want_value and !bc.blockReturns(n.rhs) and !Type.assignable(ret, body_ty)) {
+            if (!try bc.reportTailMismatch(n.rhs, body_ty, ret))
+                try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(n.main_token), bc.typeName(ret) });
+        }
     }
 
     /// The per-body state a lambda or local fn body replaces while it is checked.
@@ -650,6 +723,7 @@ pub const BodyChecker = struct {
         cur_ret: Type,
         ret_infer: bool,
         ret_join: Type,
+        ret_expected: ?Type,
         loop_floor: usize,
         floor_is_local_fn: bool,
         expected: ?Type,
@@ -666,6 +740,7 @@ pub const BodyChecker = struct {
             .cur_ret = bc.cur_ret,
             .ret_infer = bc.ret_infer,
             .ret_join = bc.ret_join,
+            .ret_expected = bc.ret_expected,
             .loop_floor = bc.loop_floor,
             .floor_is_local_fn = bc.floor_is_local_fn,
             .expected = bc.expected,
@@ -676,6 +751,7 @@ pub const BodyChecker = struct {
         };
         bc.expected = null;
         bc.expected_soft = false;
+        bc.ret_expected = null;
         bc.hole = Ast.none;
         bc.open_names = &.{};
         bc.open_vars = &.{};
@@ -688,6 +764,7 @@ pub const BodyChecker = struct {
         bc.cur_ret = f.cur_ret;
         bc.ret_infer = f.ret_infer;
         bc.ret_join = f.ret_join;
+        bc.ret_expected = f.ret_expected;
         bc.loop_floor = f.loop_floor;
         bc.floor_is_local_fn = f.floor_is_local_fn;
         bc.expected = f.expected;
@@ -738,7 +815,8 @@ pub const BodyChecker = struct {
         if (tail.kind == .unit) {
             try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "lambda must return {s} but may fall off the end", .{bc.typeName(j)});
         } else {
-            try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0042 }, "lambda's value {s} does not match its return type {s}", .{ bc.typeName(tail), bc.typeName(j) });
+            const at = if (bc.blockTail(n.rhs)) |t| bc.spanOf(t) else bc.tokSpan(n.main_token);
+            try bc.sink.report(.{ .span = at, .code = .T0042 }, "lambda's value {s} does not match its return type {s}", .{ bc.typeName(tail), bc.typeName(j) });
         }
         return .invalid;
     }
@@ -958,7 +1036,11 @@ pub const BodyChecker = struct {
                 // `never` unifies with any declared type — mirrors the trailing-expr
                 // body check above.
                 if (!Type.assignable(bc.cur_ret, ty)) {
-                    try bc.sink.report(.{ .span = bc.spanOf(if (stmt.lhs == Ast.none) stmt_idx else stmt.lhs), .code = .T0042 }, "return type {s} does not match declared {s}", .{ bc.typeName(ty), bc.typeName(bc.cur_ret) });
+                    const at: DiagnosticSink.Report = .{ .span = bc.spanOf(if (stmt.lhs == Ast.none) stmt_idx else stmt.lhs), .code = .T0042 };
+                    if (bc.ret_expected) |e|
+                        try bc.sink.report(at, "return type {s} does not match expected {s} (the lambda is expected to be {s})", .{ bc.typeName(ty), bc.typeName(bc.cur_ret), bc.typeName(e) })
+                    else
+                        try bc.sink.report(at, "return type {s} does not match declared {s}", .{ bc.typeName(ty), bc.typeName(bc.cur_ret) });
                 }
             },
             .expr_stmt => _ = try bc.typeOf(stmt.lhs),
@@ -2586,13 +2668,9 @@ pub const BodyChecker = struct {
     /// Type a failed call's args only for their own diagnostics. With no expectation:
     /// the call's expected type belongs to its result, so passing it down would judge a
     /// literal arg against it (`x: int8 = f(300)` would add a false out-of-range error).
+    /// Every caller has rejected the call (or its callee was already poison), which is why
+    /// nothing types a lambda arg's params: a T0050 there would blame the lambda for it.
     fn drainArgs(bc: *BodyChecker, args: []const Ast.Index) error{OutOfMemory}!void {
-        for (args) |a| _ = try bc.typeOfExpected(a, null);
-    }
-
-    /// `drainArgs` for a call already rejected with its own error, which is why nothing
-    /// types its lambdas' params.
-    fn drainRejectedArgs(bc: *BodyChecker, args: []const Ast.Index) error{OutOfMemory}!void {
         const was = bc.quiet_arg;
         defer bc.quiet_arg = was;
         for (args) |a| {
@@ -2878,7 +2956,7 @@ pub const BodyChecker = struct {
         // instances for the seal to pick from.
         if (mf.isGeneric()) {
             try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0013 }, "'{s}' declares its own type parameters, which a method of the non-generic type '{s}' cannot have yet", .{ member, bc.typeName(recv_ty) });
-            try bc.drainRejectedArgs(args);
+            try bc.drainArgs(args);
             return .invalid;
         }
         if (m.mut_self) {
@@ -2982,7 +3060,7 @@ pub const BodyChecker = struct {
             const e = bc.composite.at(recv_ty.appIdx());
             if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite()) != null) {
                 try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0018 }, "'{s}' on the generic type '{s}' takes no explicit type arguments yet; drop the '[..]'", .{ member, bc.typeName(recv_ty) });
-                try bc.drainRejectedArgs(args);
+                try bc.drainArgs(args);
                 return .invalid;
             }
         }
@@ -3306,6 +3384,15 @@ pub const BodyChecker = struct {
         }
         switch (res) {
             .conflict => |c| {
+                // A var the receiver fixed (`T` of `Vec[int]` in `xs.map(..)`) is no type
+                // parameter the call infers, so an arg that disagrees with it is a plain
+                // argument mismatch, not a conflict between two args.
+                if (recv != null and c.first_pos == 0) {
+                    @memset(bnd, false);
+                    _ = Infer.match(n_gp, params[0..1], arg_types[0..1], targs, bnd, fp, dec);
+                    fillOpen(targs, bnd);
+                    if (try bc.reportMisfit(site, nodes, first, params, arg_types, targs, bnd)) return .failed;
+                }
                 try bc.reportInferConflict(nodes, names, c);
                 return .failed;
             },
@@ -3381,7 +3468,7 @@ pub const BodyChecker = struct {
         defer bc.gpa.free(targs);
         if (args.len != sig.params.len) {
             try bc.reportOwnGenericArity(node_idx, args.len, sig, params[0], recv_ty, targs);
-            try bc.drainRejectedArgs(args);
+            try bc.drainArgs(args);
             return .invalid;
         }
         const nodes = try bc.gpa.alloc(Ast.Index, args.len + 1);

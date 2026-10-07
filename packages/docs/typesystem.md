@@ -235,8 +235,9 @@ legitimately deep-but-finite generic program still compiles.
 A generic call with no explicit type arguments (`id(7)`, `Box.with(3, true)`, a method
 of a generic type `b.map(f)`) infers them by one left-to-right structural match of its
 parameters against its arguments' types (`symbols/Infer.zig`); the first binding of a
-variable wins and a different later one is **T0015**. The arguments are typed in this
-order:
+variable wins and a different later one is **T0015**; one that disagrees with what the
+receiver bound is an argument mismatch (**T0040**) instead, since the call infers none of
+the receiver's variables. The arguments are typed in this order:
 
 1. the receiver, which binds the impl's type parameters (`T` of `impl Box[T]`);
 2. every argument that types itself: a method's argument against its parameter with
@@ -363,7 +364,12 @@ inside a block). It is checked bidirectionally, like a literal:
   (`g: fn(int) -> int = id(fn(x) { x + 1 })`); otherwise it is T0050.
 * The return type is the annotation, else the expected function's, else the join of
   the body's trailing value and its `return`s (`()` when there is none). A declared or
-  expected non-unit return must be produced on every path (T0043).
+  expected non-unit return must be produced on every path (T0043); a trailing value or
+  `return` of another type is **T0042** at that value. A lambda held to an expected
+  return type declared nothing, so that message spells the type the lambda really has
+  ("lambda has type fn(int) -> int, but fn(int) -> bool is expected"). An annotated
+  parameter the expected type does not have means the lambda does not fit it, so its
+  return type comes from its body and the call's mismatch spells the whole type.
 * `return` and `?` exit the lambda: they check against the lambda's return type, and
   `?` needs one that is annotated or expected (T0032 otherwise). A `break`/`continue`
   cannot target a loop or labeled block outside the lambda (**T0051**).
