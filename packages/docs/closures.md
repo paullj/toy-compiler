@@ -117,6 +117,7 @@ bump(count)                          # count changes
 - **The argument must be a mutable place:** a local or a field of one. The error is T0019.
 - **No marker at the call site.** The LSP shows "mutated by bump".
 - **Escaping closures:** a `mut` parameter captured by a closure that escapes is T0052 ("copy it to a local first"), because the address would outlive the caller's frame. A closure that does not escape may capture it, at every opt level: it holds the caller's address, as the parameter does.
+  - A generic fn is checked once on its own text even when nothing instantiates it, so a library reports its own escaping captures. A call whose callee depends on the type arguments (a generic fn, a protocol method of `T`) is taken not to keep the closure there; each instance decides it.
 - **Limits:**
   - **Where `mut` may appear.** On the params of top-level fns and of inherent-impl methods, static (associated) methods included, and on any `self` receiver where `mut self` is allowed today. It is P0006 on a lambda's params, a local fn's params, an `extern` fn's params, a protocol sig's or a conformance method's params after `self`, and any param past the 64th.
   - **The argument.** A local (a param, a forwarded `mut` param, a loop variable and a match binding included) or a field / tuple-field chain rooted at one. Not a place (T0019): a literal, a call result, an index element `xs[i]` or `xs[i].f`, a struct literal or its field, a top-level fn name, a local fn name, a bound method `p.m`.

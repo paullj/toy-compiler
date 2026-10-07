@@ -1,0 +1,37 @@
+# A generic fn is checked for T0052 even when nothing instantiates it: a closure that
+# escapes in its own text escapes in every instance. A call it cannot follow (a generic
+# fn, a protocol method of T) is left to the instances, so it reports nothing here.
+pub struct H { f: fn() -> int }
+
+pub protocol Each {
+    fn each(self, f: fn())
+}
+
+pub fn keep(f: fn() -> int) -> H { H { f: f } }
+pub fn run(f: fn() -> int) -> int { f() }
+pub fn grun[U](f: fn() -> U) -> U { f() }
+
+pub fn leak[T](mut x: T) -> fn() -> T {
+    fn() { x }  #~ ERROR [T0052] a closure that escapes cannot capture the 'mut' parameter 'x'
+}
+
+pub fn stored[T](mut n: int, _t: T) -> H {
+    keep(fn() -> int { n })  #~ ERROR [T0052] a closure that escapes cannot capture the 'mut' parameter 'n'
+}
+
+pub fn named[T](mut n: int, _t: T) -> fn() -> int {
+    fn g() -> int { n }  #~ ERROR [T0052] a closure that escapes cannot capture the 'mut' parameter 'n'
+    return g
+}
+
+pub fn called[T](mut n: int, _t: T) -> int {
+    run(fn() -> int { n }) + grun(fn() -> int { n })
+}
+
+pub fn each_bump[T has Each](mut n: int, t: T) {
+    t.each(fn() { n = n + 1 })
+}
+
+fn main() -> int {
+    return 0
+}
