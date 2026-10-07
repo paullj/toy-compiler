@@ -1,0 +1,27 @@
+# A body that ends in a value of the wrong type is a return type mismatch at that value,
+# not a missing return. A lambda whose return type comes from the type expected for it
+# declared nothing, so the message spells the type it really has; a lambda with a param
+# the expected type does not have keeps its own return type, so the call spells it.
+import std/vec
+
+fn apply(f: fn(int) -> str) -> str {
+    return f(1)
+}
+
+fn flag() -> bool {
+    1  #~ ERROR [T0042] value int does not match declared return type bool
+}
+
+fn main() -> int {
+    xs: Vec[int] = [3, 1, 2]
+    _a := xs.filter(fn(x) { x % 2 })  #~ ERROR [T0042] lambda has type fn(int) -> int, but fn(int) -> bool is expected: its value is int, not bool
+    xs.sort_by(fn(a, b) { a - b })  #~ ERROR [T0042] lambda has type fn(int, int) -> int, but fn(int, int) -> bool is expected
+    _b := xs.filter(fn(x) { return x })  #~ ERROR [T0042] return type int does not match expected bool (the lambda is expected to be fn(int) -> bool)
+    _c := apply(fn(_x: bool) { 1 })  #~ ERROR [T0040] argument 1: expected fn(int) -> str, got fn(bool) -> int
+    _d := fn(x: int) -> bool { x }  #~ ERROR [T0042] value int does not match declared return type bool
+    fn local() -> str {
+        2  #~ ERROR [T0042] value int does not match declared return type str
+    }
+    _e := local()
+    return if flag() { 1 } else { 0 }
+}

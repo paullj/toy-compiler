@@ -11374,6 +11374,81 @@ test "missing return in a local fn is T0043" {
     }
 }
 
+/// The one diagnostic of `src`, with its code, message and the source text it spans.
+fn expectSoleDiagAt(src: []const u8, code: codes.Code, message: []const u8, at: []const u8) !void {
+    const gpa = testing.allocator;
+    var c = try checkSource(src);
+    defer c.deinit(gpa);
+    errdefer for (c.result.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    const d = c.result.diags[0];
+    try testing.expectEqual(code, d.code);
+    try testing.expectEqualStrings(message, d.message);
+    const sp = d.span();
+    try testing.expectEqualStrings(at, src[sp.start..sp.end]);
+}
+
+test "a body ending in a value of the wrong type is T0042 at that value, not a missing return" {
+    // A lambda held to an expected type it does not declare names the type it really has.
+    try expectSoleDiagAt(
+        \\fn keep(p: fn(int) -> bool) -> bool { p(1) }
+        \\fn main() -> int {
+        \\ if keep(fn(x) { x % 2 }) { return 1 }
+        \\ return 0
+        \\}
+        \\
+    , .T0042, "lambda has type fn(int) -> int, but fn(int) -> bool is expected: its value is int, not bool", "x % 2");
+    try expectSoleDiagAt(
+        \\fn main() -> int {
+        \\ f: fn(int, int) -> bool = fn(a, b) { a - b }
+        \\ return if f(1, 2) { 1 } else { 0 }
+        \\}
+        \\
+    , .T0042, "lambda has type fn(int, int) -> int, but fn(int, int) -> bool is expected: its value is int, not bool", "a - b");
+    // Its `return` names the expected type too: the lambda declared nothing.
+    try expectSoleDiagAt(
+        \\fn keep(p: fn(int) -> bool) -> bool { p(1) }
+        \\fn main() -> int {
+        \\ if keep(fn(x) { return x }) { return 1 }
+        \\ return 0
+        \\}
+        \\
+    , .T0042, "return type int does not match expected bool (the lambda is expected to be fn(int) -> bool)", "x");
+    // A param the expected type does not have: the lambda keeps its own return type, so
+    // the call's mismatch spells it.
+    try expectSoleDiagAt(
+        \\fn keep(p: fn(int) -> str) -> str { p(1) }
+        \\fn main() -> int {
+        \\ return keep(fn(_x: bool) { 1 }).len()
+        \\}
+        \\
+    , .T0040, "argument 1: expected fn(int) -> str, got fn(bool) -> int; 'keep' takes (fn(int) -> str)", "fn(_x: bool) { 1 }");
+    // A declared return type: the fn, the local fn and the annotated lambda alike.
+    try expectSoleDiagAt("fn f() -> bool { 1 }\nfn main() -> int { return if f() { 1 } else { 0 } }\n", .T0042, "value int does not match declared return type bool", "1");
+    try expectSoleDiagAt("fn main() -> int {\n fn g() -> bool { 2 }\n return if g() { 1 } else { 0 }\n}\n", .T0042, "value int does not match declared return type bool", "2");
+    try expectSoleDiagAt("fn main() -> int {\n h := fn(x: int) -> bool { x }\n return if h(1) { 1 } else { 0 }\n}\n", .T0042, "value int does not match declared return type bool", "x");
+    // A body that ends with no value still may fall off the end.
+    try expectSoleDiagAt("fn f(b: bool) -> int {\n if b { return 1 }\n}\nfn main() -> int { return f(true) }\n", .T0043, "function 'f' must return int but may fall off the end", "f");
+}
+
+test "the lambda args of a rejected call add no T0050" {
+    // An unknown method, a wrong arg count, and a `_` capture in each.
+    try expectOnlyDiag("fn main() -> int {\n _a := 5.frob(fn(v) { v })\n return 0\n}\n", .T0018);
+    try expectOnlyDiag("fn add(a: int, b: int) -> int { a + b }\nfn main() -> int {\n _a := 5.frob(add(1, _))\n return 0\n}\n", .T0018);
+    try expectOnlyDiag("fn add(a: int, b: int) -> int { a + b }\nfn main() -> int {\n _a := add(fn(v) { v })\n return 0\n}\n", .T0039);
+    try expectOnlyDiag(own_box_pre ++ "fn main() -> int {\n b := Box { v: 2 }\n _c := b.mapp(fn(v) { v + 1 })\n return 0\n}\n", .T0018);
+}
+
+test "a method arg that disagrees with the receiver's type is T0040, not a type-param conflict" {
+    try expectSoleDiagAt(own_box_pre ++
+        \\fn main() -> int {
+        \\ b := Box { v: 2 }
+        \\ return b.map(fn(_x: str) -> int { 1 }).get()
+        \\}
+        \\
+    , .T0040, "argument 1: expected fn(int) -> U, got fn(str) -> int; 'map' takes (fn(int) -> U)", "fn(_x: str) -> int { 1 }");
+}
+
 /// The `nth` (node order) value-position `field_access` spelled `member`: one no call
 /// has as its member.
 fn valueMember(c: *const Checked, member: []const u8, nth: usize) !Ast.Index {

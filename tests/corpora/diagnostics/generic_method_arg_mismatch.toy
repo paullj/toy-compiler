@@ -1,0 +1,11 @@
+# The receiver of `xs.map(..)` fixes the method's `T`, so a lambda whose param is not
+# that type is an argument mismatch (T0040), as it is for a method with no type params
+# of its own; it is not a conflict between two inferred types.
+import std/vec
+
+fn main() -> int {
+    xs: Vec[int] = [1, 2, 3]
+    _a := xs.map(fn(_x: str) -> int { 1 })  #~ ERROR [T0040] argument 1: expected fn(int) -> U, got fn(str) -> int; 'map' takes (fn(int) -> U)
+    _b := xs.filter(fn(_x: str) -> bool { true })  #~ ERROR [T0040] argument 1: expected fn(int) -> bool, got fn(str) -> bool
+    return 0
+}
