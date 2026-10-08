@@ -75,7 +75,7 @@ fn main() -> int {
 - It is named only after its declaration, so two local fns cannot call each other: the earlier one's use of the later one is R0001, which says the later one is declared further down. Make them top-level fns instead.
 - **Recovery:** inside a block, `fn name(` is a nested declaration, so it is no longer a place where a broken block stops.
   - `pub`, `struct`, `enum`, `impl` and `import` still stop a broken block.
-  - To make up for this, a "missing `}`" hint is emitted when EOF is reached inside a function that contains nested functions.
+  - To make up for this, when EOF is reached inside a function, the "missing `}`" error is reported at the first nested function written no further right than that function (a sibling declaration it swallowed), with the enclosing function as a secondary label. With no such function, the error is the plain "expected '}' to close block" at EOF.
 
 ## Capture: by reference, implicit
 
