@@ -1,0 +1,22 @@
+# Type arguments a callee or a protocol does not take, or the wrong number of them, are
+# T0054. A function value (a lambda, a local fn) is never generic.
+protocol Conv[A] {
+    fn conv(self, a: A) -> int
+}
+
+struct K { n: int }
+
+impl K has Conv {  #~ ERROR [T0054] protocol 'Conv' expects 1 type argument(s), got 0
+    fn conv(self, a: int) -> int { a + self.n }
+}
+
+fn add(a: int, b: int) -> int { a + b }
+fn pair[A, B](a: A, _b: B) -> A { a }
+
+fn main() -> int {
+    x := add[int](1, 2)  #~ ERROR [T0054] 'add' is not generic; drop the type arguments
+    y := pair[int](1, true)  #~ ERROR [T0054] expected 2 type argument(s), got 1
+    g := fn(v: int) { v }
+    z := g[int](3)  #~ ERROR [T0054] 'g' is not generic; drop the type arguments
+    return x + y + z
+}

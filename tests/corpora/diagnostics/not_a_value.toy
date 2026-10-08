@@ -1,0 +1,11 @@
+# A type or a module named where a value is wanted is T0056, a pipe's receiver included.
+import std/io
+
+struct Point { x: int, y: int }
+
+fn main() -> int {
+    _p := Point  #~ ERROR [T0056] type 'Point' is not a value
+    _m := io  #~ ERROR [T0056] module 'io' is not a value
+    io |> .println("a")  #~ ERROR [T0056] module 'io' is not a value, so it cannot be piped; use 'io.println' directly
+    return 0
+}

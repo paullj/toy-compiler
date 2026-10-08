@@ -176,6 +176,14 @@ fn collectDiags(
 
     if (graph.err) |ge| {
         const in_entry = ge.module == null or ge.module == graph.entry_index;
+        // A structural error at an import of the entry (a missing module, a cycle) is one
+        // coded diagnostic there, as `toy check` renders it.
+        if (ge.kind != .parse and in_entry and ge.span != null) {
+            const msg = try gpa.dupe(u8, ge.message);
+            errdefer gpa.free(msg);
+            try out.append(gpa, .{ .line = sm.lineIndex(ge.span.?.start) + 1, .code = ge.code(), .message = msg, .warn = false });
+            return out;
+        }
         if (ge.kind != .parse or !in_entry) {
             std.debug.print("{s}: {s}\n", .{ path, ge.message });
             return error.GraphError;

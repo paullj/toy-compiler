@@ -13,6 +13,26 @@
 
 const std = @import("std");
 
+/// Source spelling of a builtin type reference → `Type`. Anything else is unknown (a
+/// struct name, or an error). The unit type `()` is spelled with parens, not an
+/// identifier, so it is NOT here (the checker reads it from `literal_unit`).
+pub const builtin_names = std.StaticStringMap(Type).initComptime(.{
+    .{ "int", Type.int },
+    .{ "uint", Type.uint },
+    .{ "int8", Type.int8 },
+    .{ "int16", Type.int16 },
+    .{ "int32", Type.int32 },
+    .{ "int64", Type.int64 },
+    .{ "uint8", Type.uint8 },
+    .{ "uint16", Type.uint16 },
+    .{ "uint32", Type.uint32 },
+    .{ "uint64", Type.uint64 },
+    .{ "bool", Type.bool },
+    .{ "str", Type.str },
+    .{ "float", Type.float },
+    .{ "rawptr", Type.rawptr },
+});
+
 /// The type kind. `invalid` is the poison/error type: it absorbs further errors
 /// so one mistake produces one diagnostic. `@"struct"` carries a `struct_id`
 /// indexing the per-program struct table.

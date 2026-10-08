@@ -1,0 +1,16 @@
+# A local fn is named only after its declaration, so two local fns cannot call each
+# other. The earlier one's use is R0001 saying when the callee is declared, and the
+# later one is not also an unused function: the one W0003 below is the only one.
+fn spare() {}  #~ WARN [W0003] unused function 'spare'
+
+fn main() -> int {
+    fn even(n: int) -> bool {
+        if n == 0 { return true }
+        return odd(n - 1)  #~ ERROR [R0001] the local function 'odd' is declared later in this block, and a local function can be named only after its declaration
+    }
+    fn odd(n: int) -> bool {
+        if n == 0 { return false }
+        return even(n - 1)
+    }
+    return if even(4) { 1 } else { 0 }
+}

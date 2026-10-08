@@ -1,0 +1,7 @@
+# A variant the enum does not declare is T0061, with the nearest one suggested.
+enum Color { red, green }
+
+fn main() -> int {
+    _c := Color.greem  #~ ERROR [T0061] enum 'Color' has no variant 'greem'; did you mean 'green'?
+    return 0
+}

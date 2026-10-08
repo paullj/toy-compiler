@@ -1,0 +1,9 @@
+# A struct or variant built with the other form than its declaration's is T0063.
+struct Point { x: int, y: int }
+enum Shape { circle(int), rect { w: int, h: int } }
+
+fn main() -> int {
+    _p := Point(1, 2)  #~ ERROR [T0063] use named construction 'Point { ... }', not 'Point(...)'
+    _s := Shape.rect(1, 2)  #~ ERROR [T0063] variant 'Shape.rect' is constructed with the wrong form
+    return 0
+}

@@ -66,6 +66,7 @@ pub fn checkBuffer(
                 try out.append(a, .{
                     .range = position.rangeOf(&sm, span.start, span.end, ws.encoding),
                     .severity = protocol.severity.err,
+                    .code = codes.str(ge.code()),
                     .message = try a.dupe(u8, ge.message),
                 });
             }
@@ -214,6 +215,27 @@ test "checkBuffer maps a piped T0039 to the |> step and each P0014 to its annota
             try testing.expect(std.mem.indexOf(u8, lines.items[d.range.start.line], "#~ ERROR [P0014]") != null);
         }
         try testing.expectEqual(std.mem.count(u8, src, "#~ ERROR [P0014]"), p0014);
+    }
+}
+
+test "checkBuffer codes a missing import and a call of a non-function" {
+    const gpa = testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = io, .docs = &docs, .disk = false };
+    const cases = [_]struct { src: []const u8, code: []const u8, line: u32 }{
+        .{ .src = "import no_such_module\nfn main() -> int { return 0 }\n", .code = "R0003", .line = 0 },
+        .{ .src = "fn main() -> int {\n    x := 1\n    return x(2)\n}\n", .code = "T0055", .line = 2 },
+    };
+    for (cases) |cs| {
+        var mapped = try checkBuffer(gpa, ws, "file:///doc.toy", cs.src);
+        defer mapped.deinit();
+        try testing.expectEqual(@as(usize, 1), mapped.items.len);
+        try testing.expectEqualStrings(cs.code, mapped.items[0].code.?);
+        try testing.expectEqual(cs.line, mapped.items[0].range.start.line);
     }
 }
 

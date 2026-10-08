@@ -23,6 +23,7 @@ const Ast = @import("../ast/Ast.zig");
 const Cache = @import("../query/Cache.zig");
 const Engine = @import("../query/Engine.zig");
 const DiagnosticMod = @import("../diagnostics/Diagnostic.zig");
+const codes = @import("../diagnostics/codes.zig");
 const Span = @import("../diagnostics/model.zig").Span;
 const Diagnostic = DiagnosticMod.Diagnostic;
 const BundledStd = @import("bundled_std");
@@ -125,6 +126,17 @@ pub const Error = struct {
     /// The POD is memcpy-trivial and its `message`s are static, so this dupe borrows
     /// nothing from the freed tree. Empty for the other kinds.
     parse_diags: []const Diagnostic = &.{},
+
+    /// The diagnostic code of a structural error; a parse error's own diagnostics carry
+    /// theirs.
+    pub fn code(e: Error) codes.Code {
+        return switch (e.kind) {
+            // An escaping path names no module of the graph, as a missing one does.
+            .missing, .escape => .R0003,
+            .cycle => .R0012,
+            .parse => .none,
+        };
+    }
 
     fn deinit(e: *Error, gpa: std.mem.Allocator) void {
         gpa.free(e.message);

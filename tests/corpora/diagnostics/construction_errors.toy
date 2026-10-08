@@ -1,0 +1,18 @@
+# Construction errors share the call and binding codes: a constructor's value count is
+# an arity mismatch (T0039), a positional value of the wrong type an argument mismatch
+# (T0040), a named field's value a binding mismatch (T0041); an unknown struct name in a
+# construction is an unknown type (T0001).
+struct Point { x: int, y: int }
+struct Pair(int, str)
+enum Shape { circle(int), rect { w: int, h: int } }
+
+fn main() -> int {
+    _a := Pair(1)  #~ ERROR [T0039] tuple struct 'Pair' expects 2 value(s), got 1
+    _b := Shape.circle(1, 2)  #~ ERROR [T0039] variant 'Shape.circle' expects 1 value(s), got 2
+    _c := Pair(1, 2)  #~ ERROR [T0040] tuple struct 'Pair': expected str, got int
+    _d := Shape.circle("r")  #~ ERROR [T0040] variant 'Shape.circle': expected int, got str
+    _e := Point { x: 1, y: "two" }  #~ ERROR [T0041] field 'y': expected int, got str
+    _f := Shape.rect { w: true, h: 2 }  #~ ERROR [T0041] field 'w': expected int, got bool
+    _g := Pointt { x: 1, y: 2 }  #~ ERROR [T0001] unknown struct type 'Pointt'
+    return 0
+}

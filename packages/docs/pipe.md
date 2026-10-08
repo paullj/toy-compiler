@@ -50,7 +50,8 @@ fn main() -> int {
 
 The callee path is not classified at parse time. `m.f` and `v.push` have the same
 syntax, and the resolver decides later what each one is. So a pipe into a method on
-**another** value works with no special code.
+**another** value works with no special code. A path that names no function is the
+call's own error: `5 |> io` is `io(5)`, T0055 "module 'io' is not a function".
 
 ## Grammar
 
@@ -82,7 +83,7 @@ arg        := expr | "_"                                 # at most one "_"
     explicit type arguments yet").
   - Only a value can be piped, so a module or type name on the left is an error, as it
     is for `io |> f`: `io |> .println(s)` and `Shape |> .circle(1)` report "module 'io'
-    is not a value" and "type 'Shape' is not a value". Write `io.println(s)`.
+    is not a value" and "type 'Shape' is not a value" (T0056). Write `io.println(s)`.
 
 - **Precedence:** lowest of all binary operators (below `||`). `a + b |> f` is `f(a + b)`.
 - **Associativity:** left. `x |> f |> g` is `(x |> f) |> g`.

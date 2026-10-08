@@ -1,0 +1,13 @@
+# The alternatives of an or-pattern share one arm, so each binds the same names with
+# the same types (T0069).
+enum E { a(int), b(str) }
+
+fn f(e: E) -> int {
+    match e {
+        E.a(x) | E.b(x) -> 1  #~ ERROR [T0069] or-pattern alternatives must bind the same names and types
+    }
+}
+
+fn main() -> int {
+    return f(E.a(1))
+}

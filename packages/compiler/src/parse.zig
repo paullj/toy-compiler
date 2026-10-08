@@ -56,7 +56,7 @@ diags: std.ArrayList(Diagnostic),
 no_block: bool = false,
 /// Expression-recursion depth, bumped at the single `parseExpr` chokepoint and
 /// restored on every unwind (via `defer`). Past `MAX_EXPR_DEPTH` the parser emits
-/// one "nested too deeply" diagnostic and returns a bounded `error_node` instead
+/// one "nesting too deep" diagnostic and returns a bounded `error_node` instead
 /// of recursing further — the anti-crash backstop for the project's frame-sizing
 /// SIGBUS hazard on adversarially deep input.
 depth: u16 = 0,
@@ -77,6 +77,8 @@ in_error: bool = false,
 /// (cleared per decl). A block that runs into EOF with one of these may have swallowed
 /// a top-level fn whose enclosing `}` is missing, so its diagnostic points there.
 nested_fns: std.ArrayList(u32) = .empty,
+/// Whether the current top-level decl already reported P0005.
+too_deep: bool = false,
 
 pub const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 
@@ -85,6 +87,11 @@ const Error = error{ OutOfMemory, ParseError };
 /// Cap on `parseExpr` recursion depth. Conservative versus the frame-sizing
 /// SIGBUS hazard; no valid source nests expressions anywhere near this.
 const MAX_EXPR_DEPTH: u16 = 256;
+
+/// The one P0005 message. Blocks, expressions and types share `depth`, so whichever of
+/// them crosses the cap is an accident of where it is crossed (128 nested `fn() -> int {`
+/// cross it in a return type); naming that one would blame the wrong construct.
+const err_too_deep = std.fmt.comptimePrint("nesting too deep: more than {d} levels of blocks, expressions and types", .{MAX_EXPR_DEPTH});
 
 // Recovery lives as comptime `EnumSet(token.Tag)` FIRST sets and FOLLOW-union-
 // ancestor-anchor recovery sets, matklad-style, rather than scattered `!= .x`
@@ -389,6 +396,7 @@ fn parseDecls(p: *Parser, decls: *std.ArrayList(Ast.Index)) error{OutOfMemory}!v
         // Each top-level decl is a fresh recovery unit: clear the cascade latch so
         // an independent error in THIS decl reports even after a prior decl broke.
         p.in_error = false;
+        p.too_deep = false;
         p.nested_fns.clearRetainingCapacity();
         const entry = p.index;
         p.parseDeclRecoverable(decls) catch |err| switch (err) {
@@ -1474,9 +1482,11 @@ fn parseType(p: *Parser) Error!Ast.Index {
     p.depth += 1;
     defer p.depth -= 1;
     if (p.depth > MAX_EXPR_DEPTH) {
-        try p.backstop(p.peek(), .P0005, "type nested too deeply");
+        try p.backstop(p.peek(), .P0005, err_too_deep);
         const et = p.index;
-        while (!p.at(.eof) and !p.at(.r_bracket) and !p.at(.r_paren) and !p.at(.r_brace) and !p.at(.comma) and !p.at(.newline)) p.advance();
+        // A `{` is never part of a type: it opens the body after a return type, which the
+        // block guard then skips whole instead of leaving its braces unbalanced.
+        while (!p.at(.eof) and !p.at(.r_bracket) and !p.at(.r_paren) and !p.at(.r_brace) and !p.at(.l_brace) and !p.at(.comma) and !p.at(.newline)) p.advance();
         return p.addNode(.{ .tag = .error_node, .main_token = et, .lhs = Ast.none, .rhs = Ast.none });
     }
     if (p.at(.kw_fn)) return p.parseFnType();
@@ -1656,7 +1666,7 @@ fn parseBlock(p: *Parser) Error!Ast.Index {
     p.depth += 1;
     defer p.depth -= 1;
     if (p.depth > MAX_EXPR_DEPTH) {
-        try p.backstop(p.peek(), .P0005, "block nested too deeply");
+        try p.backstop(p.peek(), .P0005, err_too_deep);
         const et = p.index;
         // Consume the whole block: a caller that re-parses from the same `{` (a block
         // expression statement) would otherwise hit this guard again forever.
@@ -2055,7 +2065,7 @@ fn parseExpr(p: *Parser, min_bp: u8) Error!Ast.Index {
 /// balanced brackets, so the rest of a chain like `f()()()..` is consumed under the one
 /// diagnostic instead of stopping at its next `)`.
 fn chainTooDeep(p: *Parser) Error!Ast.Index {
-    try p.backstop(p.peek(), .P0005, "expression nested too deeply");
+    try p.backstop(p.peek(), .P0005, err_too_deep);
     p.in_error = true;
     const et = p.index;
     var depth: usize = 0;
@@ -2076,7 +2086,7 @@ fn chainTooDeep(p: *Parser) Error!Ast.Index {
 /// The P0005 backstop for expressions: consume to a boundary so the surrounding
 /// list/infix loop terminates via its anchor/eof guard.
 fn exprTooDeep(p: *Parser) Error!Ast.Index {
-    try p.backstop(p.peek(), .P0005, "expression nested too deeply");
+    try p.backstop(p.peek(), .P0005, err_too_deep);
     const et = p.index;
     while (!p.at(.eof) and !p.at(.r_paren) and !p.at(.r_brace) and !p.at(.comma) and !p.at(.newline)) p.advance();
     return p.addNode(.{ .tag = .error_node, .main_token = et, .lhs = Ast.none, .rhs = Ast.none });
@@ -2831,6 +2841,9 @@ fn prevEnd(p: *const Parser) u32 {
 /// latch either: the ordinary unwind noise (unclosed `}`) is still governed by the
 /// normal `warn` latch, so this collapses to one backstop message plus one closer.
 fn backstop(p: *Parser, tok: Token, code: Code, message: []const u8) error{OutOfMemory}!void {
+    // One per decl: the guards that unwind a deep region each cross the cap again.
+    if (p.too_deep) return;
+    p.too_deep = true;
     try p.diags.append(p.gpa, .{ .byte_offset = tok.start, .end = tok.end, .message = message, .code = code });
 }
 
@@ -4742,7 +4755,7 @@ test "a broken call argument list reports and resyncs without hanging" {
 
 test "deep expression nesting is capped instead of overflowing the stack" {
     // ~300 nested parens (> MAX_EXPR_DEPTH). parse() must RETURN (no SIGBUS) with a
-    // "nested too deeply" diagnostic and a present tree.
+    // "nesting too deep" diagnostic and a present tree.
     const gpa = testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
@@ -4760,7 +4773,7 @@ test "deep expression nesting is capped instead of overflowing the stack" {
     try testing.expect(res.tree.nodes.len > 0);
     var found = false;
     for (res.diags) |d| {
-        if (std.mem.eql(u8, d.message, "expression nested too deeply")) found = true;
+        if (std.mem.eql(u8, d.message, err_too_deep)) found = true;
     }
     try testing.expect(found);
 }
@@ -4768,8 +4781,8 @@ test "deep expression nesting is capped instead of overflowing the stack" {
 test "deep statement nesting is capped instead of overflowing the stack" {
     // Statement-keyword recursion (`while`/`if`) nests through parseBlock, NOT
     // parseExpr, so the parseExpr guard cannot see it. ~2000 unclosed `while true{`
-    // is well above MAX_EXPR_DEPTH: parse() must RETURN (no SIGBUS) with a "nested
-    // too deeply" diagnostic and a present tree. Unclosed braces taint the parse,
+    // is well above MAX_EXPR_DEPTH: parse() must RETURN (no SIGBUS) with a "nesting
+    // too deep" diagnostic and a present tree. Unclosed braces taint the parse,
     // isolating the crash to the parser's recursion.
     const gpa = testing.allocator;
     inline for (.{ "while true{\n", "if a{\n" }) |nest| {
@@ -4786,7 +4799,7 @@ test "deep statement nesting is capped instead of overflowing the stack" {
         try testing.expect(res.tree.nodes.len > 0);
         var found = false;
         for (res.diags) |d| {
-            if (std.mem.eql(u8, d.message, "block nested too deeply")) found = true;
+            if (std.mem.eql(u8, d.message, err_too_deep)) found = true;
         }
         try testing.expect(found);
     }
@@ -4795,7 +4808,7 @@ test "deep statement nesting is capped instead of overflowing the stack" {
 test "deep generic type nesting is capped instead of overflowing the stack" {
     // parseType<->parseTypeApp recurse on nested type-applications without funneling
     // through the parseExpr/parseBlock guards. A `Box[Box[..[int]..]]` far past
-    // MAX_EXPR_DEPTH must RETURN (no SIGBUS) with a "type nested too deeply" diagnostic
+    // MAX_EXPR_DEPTH must RETURN (no SIGBUS) with a "nesting too deep" diagnostic
     // and a present tree.
     const gpa = testing.allocator;
     var buf: std.ArrayList(u8) = .empty;
@@ -4815,7 +4828,7 @@ test "deep generic type nesting is capped instead of overflowing the stack" {
     try testing.expect(res.tree.nodes.len > 0);
     var found = false;
     for (res.diags) |d| {
-        if (d.code == .P0005 and std.mem.eql(u8, d.message, "type nested too deeply")) found = true;
+        if (d.code == .P0005 and std.mem.eql(u8, d.message, err_too_deep)) found = true;
     }
     try testing.expect(found);
 }
@@ -5267,7 +5280,7 @@ test "a self-less method parses with no P0006 in BOTH a conformance and an inher
 test "a nesting-depth backstop carries the P0005 code" {
     const gpa = testing.allocator;
     // Mirror the block-depth fixture (~2000 unclosed `while true{`), which is
-    // known to terminate with a "block nested too deeply" backstop; assert the code.
+    // known to terminate with a "nesting too deep" backstop; assert the code.
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(gpa);
     try buf.appendSlice(gpa, "fn f() -> int {\n");
@@ -5290,6 +5303,8 @@ test "deeply nested block expressions and lambdas end in one P0005" {
     const shapes = [_]struct { open: []const u8, close: []const u8 }{
         .{ .open = "{ ", .close = " }" },
         .{ .open = "fn() { ", .close = " }" },
+        // A return type is where these cross the cap; one message still names nesting.
+        .{ .open = "fn() -> int { ", .close = " }" },
     };
     for (shapes) |sh| {
         var buf: std.ArrayList(u8) = .empty;
@@ -5304,6 +5319,7 @@ test "deeply nested block expressions and lambdas end in one P0005" {
         defer freeTree(gpa, res.tree);
         try testing.expectEqual(@as(usize, 1), res.diags.len);
         try testing.expectEqual(codes.Code.P0005, res.diags[0].code);
+        try testing.expectEqualStrings(err_too_deep, res.diags[0].message);
         // The decl after the deep one still parses.
         const prog = res.tree.nodes[Ast.root(res.tree.nodes).int()];
         try testing.expectEqual(@as(usize, 2), Ast.rangeSlice(res.tree, prog.lhs.int()).len);

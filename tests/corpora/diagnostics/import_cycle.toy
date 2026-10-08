@@ -1,0 +1,7 @@
+# A module that imports itself is the smallest import cycle (R0012), reported at the
+# import that closes it.
+import import_cycle  #~ ERROR [R0012] import cycle detected: import_cycle -> import_cycle
+
+fn main() -> int {
+    return 0
+}

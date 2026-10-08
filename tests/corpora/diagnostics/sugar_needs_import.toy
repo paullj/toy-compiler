@@ -1,0 +1,12 @@
+# A list literal and an index name `Vec` as the module that writes them sees it, so they
+# need `import std/vec` there, even for a `Vec` that came from another module (T0066).
+# A method call needs no import.
+import std/map
+
+fn main() -> int {
+    m := Map[int, int].new()
+    ks := m.keys()
+    a := ks[0]  #~ ERROR [T0066] indexing a 'Vec' needs 'Vec' in scope; add 'import std/vec'
+    _l := [1, 2]  #~ ERROR [T0066] a list literal needs 'Vec' in scope; add 'import std/vec'
+    return a + ks.len()
+}

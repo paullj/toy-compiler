@@ -94,8 +94,8 @@ pub fn renderSinkDiag(out: *Io.Writer, level: Style.ColorLevel, sm: *const Rr.So
 /// and a primary label at `[off, off)` carrying `message`; a non-empty `detail`
 /// becomes a `= note:` footer. With no offset, fall back to `renderPlainError`
 /// (detail inline as `(detail)`), preserving the old no-location shape.
-fn renderLocated(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, name: []const u8, src: []const u8, span: ?Rr.Diagnostic.Span, message: []const u8, detail: []const u8) !void {
-    const primary = span orelse return renderPlainError(out, level, name, message, detail);
+fn renderLocated(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, name: []const u8, src: []const u8, span: ?Rr.Diagnostic.Span, message: []const u8, detail: []const u8, code: ?[]const u8) !void {
+    const primary = span orelse return renderPlainError(out, level, name, message, detail, code);
     var sm = try Rr.SourceMap.init(gpa, name, src);
     defer sm.deinit(gpa);
     var notes_buf: [1]Rr.Diagnostic.Note = undefined;
@@ -108,6 +108,7 @@ fn renderLocated(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLeve
         .message = message,
         .primary = .{ .kind = .primary, .span = primary, .message = message },
         .notes = notes,
+        .code = code,
     };
     try Rr.Renderer.render(d, &sm, out, renderOpts(level));
 }
@@ -116,9 +117,10 @@ fn renderLocated(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLeve
 /// `path: error: msg (detail)` shape with only the `error` word styled at `sty_err`
 /// (bright red 9 bold — matching the Renderer's own header word hue). Gate-safe: at
 /// `.none` `styled` writes only "error".
-fn renderPlainError(out: *Io.Writer, level: Style.ColorLevel, path: []const u8, message: []const u8, detail: []const u8) !void {
+fn renderPlainError(out: *Io.Writer, level: Style.ColorLevel, path: []const u8, message: []const u8, detail: []const u8, code: ?[]const u8) !void {
     try out.print("{s}: ", .{path});
     try sty_err.styled(out, level, "error");
+    if (code) |c| try out.print("[{s}]", .{c});
     try out.print(": {s}", .{message});
     if (detail.len != 0) try out.print(" ({s})", .{detail});
     try out.writeByte('\n');
@@ -200,9 +202,9 @@ pub fn renderGraphError(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.Co
     const has_src = e.module != null or g.modules.len > 0;
     if (e.span != null and has_src) {
         const src: []const u8 = if (e.module) |m| moduleAt(g, m).source else g.entry().source;
-        try renderLocated(gpa, out, level, name, src, e.span, e.message, e.detail);
+        try renderLocated(gpa, out, level, name, src, e.span, e.message, e.detail, codes.str(e.code()));
     } else {
-        try renderPlainError(out, level, name, e.message, e.detail);
+        try renderPlainError(out, level, name, e.message, e.detail, codes.str(e.code()));
     }
 }
 
@@ -211,9 +213,9 @@ pub fn renderGraphError(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.Co
 pub fn renderGraphEmit(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, g: *const Graph.Graph, e: Codegen.EmitError) !void {
     const m = if (e.module) |mi| moduleAt(g, mi) else g.entry();
     if (e.span) |span| {
-        try renderLocated(gpa, out, level, m.path, m.source, span, e.message, "");
+        try renderLocated(gpa, out, level, m.path, m.source, span, e.message, "", null);
     } else {
-        try renderPlainError(out, level, m.path, e.message, "");
+        try renderPlainError(out, level, m.path, e.message, "", null);
     }
 }
 

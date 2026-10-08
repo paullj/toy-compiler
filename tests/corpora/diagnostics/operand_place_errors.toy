@@ -1,0 +1,18 @@
+# Index and range operands are operator operands (T0044); a field of a value that has no
+# fields is no such field (T0046).
+import std/vec
+
+struct P { x: int }
+
+fn main() -> int {
+    xs: Vec[int] = [1, 2]
+    a := xs["0"]  #~ ERROR [T0044] an index must be 'int', got 'str'
+    for i in 0.."3" {  #~ ERROR [T0044] for range bounds must be int
+        a = a + i
+    }
+    n := 5
+    b := n.x  #~ ERROR [T0046] cannot access field 'x' of non-struct type int
+    p := P { x: 1 }
+    c := p.0  #~ ERROR [T0046] '.0' positional access requires a tuple struct, got P
+    return a + b + c
+}

@@ -1,0 +1,13 @@
+# A `break` or `continue` with no loop to act on, or one it cannot act on, is T0060.
+fn main() -> int {
+    c := 3 > 2
+    if c {
+        break  #~ ERROR [T0060] break outside of a loop
+    }
+    while c { break 1 }  #~ ERROR [T0060] cannot break with a value out of a while/for loop
+    @b { continue @b }  #~ ERROR [T0060] cannot continue a labeled block (not a loop)
+    if c {
+        continue  #~ ERROR [T0060] continue outside of a loop
+    }
+    return 0
+}
