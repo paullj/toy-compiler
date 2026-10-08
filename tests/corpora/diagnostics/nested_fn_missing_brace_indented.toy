@@ -1,0 +1,10 @@
+# Every nested fn here is indented, so each is a real local fn: a missing '}' blames
+# none of them, and the error is the plain one at the end of the file.
+fn main() -> int {
+    fn helper() -> int { 3 }
+    x := helper()
+    if x > 0 {
+        return 1
+    return x
+}
+#~ ERROR [P0001] expected '}' to close block

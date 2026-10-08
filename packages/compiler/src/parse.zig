@@ -79,6 +79,9 @@ in_error: bool = false,
 nested_fns: std.ArrayList(u32) = .empty,
 /// Whether the current top-level decl already reported P0005.
 too_deep: bool = false,
+/// The `fn` token of the innermost top-level fn or method being parsed: a nested fn no
+/// further right than it is the likeliest one a missing `}` swallowed.
+outer_fn: ?u32 = null,
 
 pub const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 
@@ -397,6 +400,7 @@ fn parseDecls(p: *Parser, decls: *std.ArrayList(Ast.Index)) error{OutOfMemory}!v
         // an independent error in THIS decl reports even after a prior decl broke.
         p.in_error = false;
         p.too_deep = false;
+        p.outer_fn = null;
         p.nested_fns.clearRetainingCapacity();
         const entry = p.index;
         p.parseDeclRecoverable(decls) catch |err| switch (err) {
@@ -570,9 +574,11 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
         else => false,
     };
 
+    const fn_tok = p.index;
     try p.expect(.kw_fn, "expected 'fn'");
     const name_tok = p.index;
     try p.expect(.identifier, "expected a function name");
+    if (kind != .local) p.outer_fn = fn_tok;
 
     // Optional generic-param list `[T, U]` between the name and the `(`. Its
     // `generic_param` nodes are created here (before the params/body), so they
@@ -1709,37 +1715,47 @@ fn parseBlock(p: *Parser) Error!Ast.Index {
             error.ParseError => p.findNextStmt(),
         };
     }
-    if (p.at(.eof) and p.nested_fns.items.len != 0) return p.failMissingBraceBeforeFn();
+    // Once reported, every enclosing block unwinds through here too; skipping the search
+    // keeps a deep run of unclosed blocks linear.
+    if (p.at(.eof) and !p.in_error) if (p.swallowedFn()) |fn_tok| return p.failMissingBraceBeforeFn(fn_tok);
     try p.expect(.r_brace, "expected '}' to close block");
 
     const header = try p.addRange(stmts.items);
     return p.addNode(.{ .tag = .block, .main_token = lbrace, .lhs = header, .rhs = Ast.none });
 }
 
-/// A block that runs into EOF after a local fn was parsed in this decl: most likely a
-/// `}` is missing before a top-level fn, which then parsed as a nested one. A `fn` in
-/// column 1 is the likeliest such fn, so it is named in preference to an indented one.
-fn failMissingBraceBeforeFn(p: *Parser) Error {
-    var pick = p.nested_fns.items[0];
-    for (p.nested_fns.items) |fn_tok| {
-        const start = p.tokens[fn_tok].start;
-        if (start == 0 or p.src[start - 1] == '\n') {
-            pick = fn_tok;
-            break;
-        }
-    }
-    const tok = p.peek();
-    if (!p.in_error) {
-        p.in_error = true;
-        try p.diags.append(p.gpa, .{
-            .byte_offset = tok.start,
-            .end = tok.end,
-            .code = .P0001,
-            .message = "expected '}' to close block; a 'fn' inside it was parsed as a nested function — is a '}' missing before it?",
-            .related = p.tokens[pick].start,
-            .related_end = p.tokens[pick + 1].end,
-        });
-    }
+/// The nested fn a block that ran into EOF most likely swallowed: the first local fn of
+/// this decl that sits no further right than the fn or method it was parsed in, as a
+/// sibling declaration would. An indented one is a genuine nested fn, so with none at
+/// that column no fn is blamed.
+fn swallowedFn(p: *const Parser) ?u32 {
+    const outer = p.outer_fn orelse return null;
+    const outer_col = p.column(outer);
+    for (p.nested_fns.items) |fn_tok| if (p.column(fn_tok) <= outer_col) return fn_tok;
+    return null;
+}
+
+/// The 0-based byte column of token `tok` on its line.
+fn column(p: *const Parser, tok: u32) u32 {
+    const start = p.tokens[tok].start;
+    const line_start = if (std.mem.lastIndexOfScalar(u8, p.src[0..start], '\n')) |nl| nl + 1 else 0;
+    return start - @as(u32, @intCast(line_start));
+}
+
+/// A block that runs into EOF after swallowing `fn_tok` as a nested fn: most likely a
+/// `}` is missing before it. The error sits on that fn, where the fix goes, and points
+/// back at the fn it was parsed inside.
+fn failMissingBraceBeforeFn(p: *Parser, fn_tok: u32) Error {
+    p.in_error = true;
+    const outer = p.outer_fn.?;
+    try p.diags.append(p.gpa, .{
+        .byte_offset = p.tokens[fn_tok].start,
+        .end = p.tokens[fn_tok + 1].end,
+        .code = .P0001,
+        .message = "expected '}' before this 'fn': it was parsed as a function nested in the block above, which runs to the end of the file",
+        .related = p.tokens[outer].start,
+        .related_end = p.tokens[outer + 1].end,
+    });
     return error.ParseError;
 }
 
@@ -5055,7 +5071,7 @@ test "pub/struct/enum/impl/import still stop a broken block" {
     }
 }
 
-test "EOF inside a fn with a nested fn adds the missing-} hint naming the column-1 fn" {
+test "EOF inside a fn with a nested fn reports the missing } at the column-1 fn" {
     const gpa = testing.allocator;
     const src = "fn main() -> int {\n  fn helper() -> int { 1 }\n  if true {\n    return helper()\n  return 0\n}\n\nfn other() -> int {\n  return 2\n}\n";
     const res = try parseResult(gpa, src);
@@ -5064,20 +5080,34 @@ test "EOF inside a fn with a nested fn adds the missing-} hint naming the column
     try testing.expectEqual(@as(usize, 1), res.diags.len);
     const d = res.diags[0];
     try testing.expectEqual(codes.Code.P0001, d.code);
-    try testing.expectEqualStrings("expected '}' to close block; a 'fn' inside it was parsed as a nested function — is a '}' missing before it?", d.message);
-    try testing.expectEqual(@as(u32, @intCast(src.len)), d.byte_offset);
-    // The column-1 `fn other` is named over the indented `fn helper` before it.
+    try testing.expectEqualStrings("expected '}' before this 'fn': it was parsed as a function nested in the block above, which runs to the end of the file", d.message);
+    // The column-1 `fn other` is the primary range, not the indented `fn helper` before
+    // it nor the end of the file; the enclosing `fn main` is the related one.
     const other: u32 = @intCast(std.mem.indexOf(u8, src, "fn other").?);
-    try testing.expectEqual(other, d.related);
-    try testing.expectEqual(other + @as(u32, "fn other".len), d.related_end);
-    // Without a column-1 fn, the first nested fn is named.
+    try testing.expectEqual(other, d.byte_offset);
+    try testing.expectEqual(other + @as(u32, "fn other".len), d.end);
+    try testing.expectEqual(@as(u32, 0), d.related);
+    try testing.expectEqual(@as(u32, "fn main".len), d.related_end);
+    // Every nested fn indented: each is a real local fn, so none is blamed.
     {
         const src2 = "fn main() {\n  fn a() {}\n  if true {\n    fn b() {}\n";
         const res2 = try parseResult(gpa, src2);
         defer gpa.free(@constCast(res2.diags));
         defer freeTree(gpa, res2.tree);
         try testing.expectEqual(@as(usize, 1), res2.diags.len);
-        try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, src2, "fn a").?)), res2.diags[0].related);
+        try testing.expectEqualStrings("expected '}' to close block", res2.diags[0].message);
+        try testing.expectEqual(@as(u32, @intCast(src2.len)), res2.diags[0].byte_offset);
+        try testing.expect(res2.diags[0].relatedSpan() == null);
+    }
+    // In an impl, a nested fn at the method's own column is the swallowed sibling.
+    {
+        const src5 = "struct C { n: int }\nimpl C {\n    fn a(self) -> int {\n        if true {\n            return 1\n        return 0\n    fn helper(n: int) -> int { n }\n}\n";
+        const res5 = try parseResult(gpa, src5);
+        defer gpa.free(@constCast(res5.diags));
+        defer freeTree(gpa, res5.tree);
+        try testing.expect(res5.diags.len >= 1);
+        try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, src5, "fn helper").?)), res5.diags[0].byte_offset);
+        try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, src5, "fn a").?)), res5.diags[0].related);
     }
     // A missing `}` with no nested fn keeps the plain message and no related span.
     {

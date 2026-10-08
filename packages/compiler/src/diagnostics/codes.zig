@@ -163,7 +163,7 @@ const Entry = struct {
 /// The append-only registry. Every non-`.none` `Code` MUST have exactly one row (the
 /// comptime block below enforces coverage, uniqueness, prefix, and contiguity).
 pub const table = [_]Entry{
-    .{ .code = .P0001, .str = "P0001", .slug = "expected-token", .related = "parsed as a nested function" },
+    .{ .code = .P0001, .str = "P0001", .slug = "expected-token", .related = "nested inside this function" },
     .{ .code = .P0002, .str = "P0002", .slug = "expected-expression" },
     .{ .code = .P0003, .str = "P0003", .slug = "expected-declaration" },
     .{ .code = .P0004, .str = "P0004", .slug = "expected-terminator" },
