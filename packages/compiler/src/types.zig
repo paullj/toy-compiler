@@ -93,25 +93,7 @@ const StructSym = LayoutEngine.StructSym;
 const VariantSym = LayoutEngine.VariantSym;
 const EnumSym = LayoutEngine.EnumSym;
 
-/// Source spelling of a type reference → `Type`. Anything else is unknown (a
-/// struct name, or an error). The unit type `()` is spelled with parens, not an
-/// identifier, so it is NOT here (handled in `typeFromNode` via `literal_unit`).
-pub const type_names = std.StaticStringMap(Type).initComptime(.{
-    .{ "int", Type.int },
-    .{ "uint", Type.uint },
-    .{ "int8", Type.int8 },
-    .{ "int16", Type.int16 },
-    .{ "int32", Type.int32 },
-    .{ "int64", Type.int64 },
-    .{ "uint8", Type.uint8 },
-    .{ "uint16", Type.uint16 },
-    .{ "uint32", Type.uint32 },
-    .{ "uint64", Type.uint64 },
-    .{ "bool", Type.bool },
-    .{ "str", Type.str },
-    .{ "float", Type.float },
-    .{ "rawptr", Type.rawptr },
-});
+pub const type_names = @import("layout/Type.zig").builtin_names;
 
 /// Shared type-reference resolution + token/diagnostic helpers, generic over the
 /// checker (`*Typecheck` for Pass-A or `*BodyChecker` for Pass-C). Both expose the
@@ -4002,13 +3984,20 @@ fn checkMainReturn(t: *Typecheck, entry_mod: u32) !void {
         const main_decl = tree.nodes[f.decl_node.int()];
         const main_tok = main_decl.main_token;
         if (!std.mem.eql(u8, tokens[main_tok].text(source), "main")) continue;
+        const proto = Ast.protoAt(tree, main_decl.lhs.int());
         if (f.ret.kind != .int and f.ret.kind != .unit and f.ret.kind != .invalid) {
             // Select the entry module so the sink stamps this diagnostic with the
             // entry module's scope (gphSelect -> sink.setScope).
             _ = t.gphSelect(entry_mod);
-            const ret_node = Ast.protoAt(tree, main_decl.lhs.int()).ret_type;
-            const at: Span = if (ret_node != Ast.none) t.spanOf(ret_node) else t.tokSpan(main_tok);
+            const at: Span = if (proto.ret_type != Ast.none) t.spanOf(proto.ret_type) else t.tokSpan(main_tok);
             try t.sink.report(.{ .span = at, .code = .T0010 }, "main must return int or ()", .{});
+        }
+        // A program receives no arguments, so nothing could pass one. Codegen refuses it
+        // too; reporting it here makes `toy check` agree with a build.
+        if (proto.params.len > 0) {
+            _ = t.gphSelect(entry_mod);
+            const at: Span = .{ .start = t.spanOf(proto.params[0]).start, .end = t.spanOf(proto.params[proto.params.len - 1]).end };
+            try t.sink.report(.{ .span = at, .code = .T0073 }, "main takes no parameters", .{});
         }
         return; // only the first `main` is the entry
     }
@@ -4211,7 +4200,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                     for (arg_nodes, 0..) |an, k| {
                         const aty = t.typeFromNode(an);
                         if (aty.isApp() or aty.isFunc()) {
-                            try t.sink.report(.{ .span = t.spanOf(an) }, "a generic-protocol bound argument must be a concrete non-composite type (composite protocol args are not yet supported)", .{});
+                            try t.sink.report(.{ .span = t.spanOf(an), .code = .T0013 }, "a generic-protocol bound argument must be a concrete non-composite type (composite protocol args are not yet supported)", .{});
                             av[k] = .invalid;
                         } else av[k] = aty;
                     }
@@ -4265,7 +4254,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                 any_var = true;
             };
             if (!any_var) {
-                try t.sink.report(.{ .span = t.spanOf(recv_type) }, "an inherent 'impl' on a concrete type instance is not yet supported (use 'impl Box[T]')", .{});
+                try t.sink.report(.{ .span = t.spanOf(recv_type), .code = .T0013 }, "an inherent 'impl' on a concrete type instance is not yet supported (use 'impl Box[T]')", .{});
                 return;
             }
             // The impl's params are the pattern's args, in order: a concrete or repeated
@@ -11506,6 +11495,36 @@ test "a method arg that disagrees with the receiver's type is T0040, not a type-
     , .T0040, "argument 1: expected fn(int) -> U, got fn(str) -> int; 'map' takes (fn(int) -> U)", "fn(_x: str) -> int { 1 }");
 }
 
+test "type args on a function value or a plain fn are T0054; on a generic fn value T0049" {
+    try expectSoleDiagAt("fn main() -> int {\n g := fn(v: int) { v }\n return g[int](1)\n}\n", .T0054, "'g' is not generic; drop the type arguments", "[int]");
+    try expectSoleDiagAt("fn add(a: int, b: int) -> int { a + b }\nfn main() -> int {\n _f := add[int]\n return 0\n}\n", .T0054, "'add' is not generic; drop the type arguments", "[int]");
+    try expectSoleDiagAt("fn id[T](x: T) -> T { x }\nfn main() -> int {\n _f := id[int]\n return 0\n}\n", .T0049, "'id' is a generic function and cannot be used as a value", "id");
+}
+
+test "a call of a module or an enum is T0055, not a silent poison" {
+    try expectSoleDiagAt("enum Color { red, green }\nfn main() -> int {\n _c := Color(1)\n return 0\n}\n", .T0055, "enum 'Color' is not a function; construct one of its variants, as in 'Color.v(..)'", "Color");
+}
+
+test "main with parameters is T0073 at check time" {
+    try expectSoleDiagAt("fn main(a: int, b: int) -> int { a + b }\n", .T0073, "main takes no parameters", "a: int, b: int");
+}
+
+test "a call of a function value names it in the signature suffix" {
+    try expectSoleDiagAt("fn add(a: int, b: int) -> int { a + b }\nfn main() -> int {\n f := add\n return f(1)\n}\n", .T0039, "expected 2 argument(s), got 1; 'f' takes (int, int)", "(1)");
+    // An expression callee would quote badly, so it keeps the bare count.
+    try expectSoleDiagAt("fn add(a: int, b: int) -> int { a + b }\nfn mk() -> fn(int, int) -> int { add }\nfn main() -> int {\n return mk()(1)\n}\n", .T0039, "expected 2 argument(s), got 1", "(1)");
+}
+
+test "a pattern qualified by the wrong enum is one error, not also a missing variant" {
+    try expectSoleDiagAt(
+        \\enum Color { red, green }
+        \\enum Size { small, big }
+        \\fn f(c: Color) -> int { match c { Size.small -> 1, _ -> 0 } }
+        \\fn main() -> int { return f(Color.red) }
+        \\
+    , .T0067, "pattern enum 'Size' does not match scrutinee 'Color'", "Size");
+}
+
 /// The `nth` (node order) value-position `field_access` spelled `member`: one no call
 /// has as its member.
 fn valueMember(c: *const Checked, member: []const u8, nth: usize) !Ast.Index {
@@ -11638,7 +11657,7 @@ test "a mut self bound method boxes its local receiver" {
     try testing.expectEqual(Closure.AdapterKind.bound_copy, ro.result.adapters[0].kind);
 }
 
-test "mut self bound on a temporary is T0019, on a field T0052" {
+test "mut self bound on a temporary is T0019, on a field T0072" {
     const pre =
         \\struct C { n: int }
         \\struct H { c: C }
@@ -11650,7 +11669,7 @@ test "mut self bound on a temporary is T0019, on a field T0052" {
         \\
     ;
     try expectOneDiag(pre ++ "fn main() -> int {\n inc := mk().bump\n inc()\n return 0\n}\n", .T0019, "cannot bind mutating method 'bump' to a temporary; the receiver must be a local variable");
-    try expectOneDiag(pre ++ "fn main() -> int {\n h := H { c: C { n: 0 } }\n inc := h.c.bump\n inc()\n return h.c.n\n}\n", .T0052, "binding the 'mut self' method 'bump' needs a local receiver, not a field; bind it on a local variable");
+    try expectOneDiag(pre ++ "fn main() -> int {\n h := H { c: C { n: 0 } }\n inc := h.c.bump\n inc()\n return h.c.n\n}\n", .T0072, "binding the 'mut self' method 'bump' needs a local receiver, not a field; bind it on a local variable");
     // A bound method holds a `mut self` receiver by address, so it must not escape.
     const gpa = testing.allocator;
     var called = try checkSource(pre ++ "impl H {\n fn peek(mut self) -> int {\n  g := self.total\n  g()\n }\n fn total(self) -> int { self.c.n }\n}\nfn main() -> int {\n h := H { c: C { n: 0 } }\n return h.peek()\n}\n");

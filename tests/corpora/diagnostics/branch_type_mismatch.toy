@@ -1,0 +1,8 @@
+# The arms of a value `if` must yield one type (T0058).
+fn pick(c: bool) -> int {
+    if c { 1 } else { "one" }  #~ ERROR [T0058] branches yield different types (int vs str)
+}
+
+fn main() -> int {
+    return pick(true)
+}

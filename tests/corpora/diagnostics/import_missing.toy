@@ -1,0 +1,6 @@
+# An import whose module file does not exist is R0003 at the import.
+import no_such_module  #~ ERROR [R0003] imported module 'no_such_module' not found
+
+fn main() -> int {
+    return 0
+}

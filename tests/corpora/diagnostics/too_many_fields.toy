@@ -1,0 +1,6 @@
+# A tuple struct past the positional field limit (64) is T0071.
+struct Wide(int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int, int)  #~ ERROR [T0071] tuple struct 'Wide' has too many fields (max 64)
+
+fn main() -> int {
+    return 0
+}

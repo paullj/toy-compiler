@@ -1,0 +1,11 @@
+# A list literal whose elements disagree, whose annotation disagrees with them, or that
+# stands where no `Vec` fits, is T0065. An empty `[]` with no annotation is T0016.
+import std/vec
+
+fn main() -> int {
+    _a := [1, "two"]  #~ ERROR [T0065] list element 1: expected 'int', got 'str'
+    _b: Vec[str] = [1, 2]  #~ ERROR [T0065] list element type 'int' does not match the annotation's 'str'
+    _n: int = [1, 2]  #~ ERROR [T0065] a list literal of type 'Vec' cannot produce 'int'
+    _e := []  #~ ERROR [T0016] an empty list literal '[]' requires a type annotation
+    return 0
+}

@@ -15,7 +15,7 @@ fn mk() -> C { C { n: 0 } }
 fn main() -> int {
     _a := mk().bump  #~ ERROR [T0019] cannot bind mutating method 'bump' to a temporary; the receiver must be a local variable
     h := H { c: C { n: 0 } }
-    _b := h.c.bump  #~ ERROR [T0052] binding the 'mut self' method 'bump' needs a local receiver, not a field; bind it on a local variable
+    _b := h.c.bump  #~ ERROR [T0072] binding the 'mut self' method 'bump' needs a local receiver, not a field; bind it on a local variable
     c := C { n: 1 }
     _z := c.zero  #~ ERROR [T0018] 'zero' is an associated function, not a method; it has no receiver to bind
     s := "hi"

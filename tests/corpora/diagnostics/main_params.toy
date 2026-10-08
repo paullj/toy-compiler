@@ -1,0 +1,5 @@
+# A program receives no arguments, so `main` takes no parameters (T0073). `toy check`
+# reports it, as a build does.
+fn main(x: int) -> int {  #~ ERROR [T0073] main takes no parameters
+    return x
+}

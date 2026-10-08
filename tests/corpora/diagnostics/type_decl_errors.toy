@@ -1,0 +1,22 @@
+# Type declaration errors keep the codes of their struct counterparts: an enum named
+# like a builtin type shadows it (T0011), a second type of one name is a duplicate
+# (T0012), and generic forms the checker does not support yet are T0013.
+enum int { a, b }  #~ ERROR [T0011] enum 'int' shadows a builtin type
+struct Twice { x: int }
+enum Twice { a }  #~ ERROR [T0012] duplicate type declaration 'Twice'
+struct Pair[T](T, T)  #~ ERROR [T0013] generic tuple structs are not yet supported
+struct Box[T] { v: T }
+impl Box[int] {  #~ ERROR [T0013] an inherent 'impl' on a concrete type instance is not yet supported
+    fn get(self) -> int { self.v }
+}
+protocol Conv[A] {
+    fn conv(self, a: A) -> int
+}
+struct L { n: int }
+impl L has Conv[fn() -> int] {  #~ ERROR [T0013] a generic-protocol argument must be a concrete non-composite value type
+    fn conv(self, a: fn() -> int) -> int { a() + self.n }
+}
+
+fn main() -> int {
+    return 0
+}

@@ -108,7 +108,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
             // (so a later valid sibling still registers cleanly).
             const arg_nodes = Ast.protocolRefArgs(t.tree, proto_ref);
             if (arg_nodes.len != prot.generic_params.len) {
-                try t.sink.report(.{ .span = t.spanOf(proto_ref) }, "protocol '{s}' expects {d} type argument(s), got {d}", .{ prot.name, prot.generic_params.len, arg_nodes.len });
+                try t.sink.report(.{ .span = t.spanOf(proto_ref), .code = .T0054 }, "protocol '{s}' expects {d} type argument(s), got {d}", .{ prot.name, prot.generic_params.len, arg_nodes.len });
                 continue;
             }
             var pargs_buf: std.ArrayList(Type) = .empty;
@@ -120,7 +120,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
                     .int, .bool, .str, .unit, .@"struct", .@"enum" => {},
                     .invalid => pargs_ok = false, // typeFromNode already emitted T0001
                     else => {
-                        try t.sink.report(.{ .span = t.spanOf(an) }, "a generic-protocol argument must be a concrete non-composite value type (composite protocol args are not yet supported)", .{});
+                        try t.sink.report(.{ .span = t.spanOf(an), .code = .T0013 }, "a generic-protocol argument must be a concrete non-composite value type (composite protocol args are not yet supported)", .{});
                         pargs_ok = false;
                     },
                 }
@@ -242,7 +242,7 @@ fn recordGenericConformance(
 
     const arg_nodes = Ast.protocolRefArgs(t.tree, proto_ref);
     if (arg_nodes.len != prot.generic_params.len) {
-        try t.sink.report(.{ .span = t.spanOf(proto_ref) }, "protocol '{s}' expects {d} type argument(s), got {d}", .{ prot.name, prot.generic_params.len, arg_nodes.len });
+        try t.sink.report(.{ .span = t.spanOf(proto_ref), .code = .T0054 }, "protocol '{s}' expects {d} type argument(s), got {d}", .{ prot.name, prot.generic_params.len, arg_nodes.len });
         return;
     }
     // The protocol-arg PATTERN: an arg naming an impl type-param becomes `type_var(ord)`

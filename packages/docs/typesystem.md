@@ -98,7 +98,7 @@ merge(a, b) :=
    or a == never                   -> b                (never is identity)
    or b == never                   -> a
    or eql(a, b)                    -> a                (agreement)
-   else  emit "branches yield different types (A vs B)" ; invalid
+   else  emit T0058 "branches yield different types (A vs B)" ; invalid
 ```
 
 `merge` stays **verbatim**; `assignable` does not replace it. They share the same
@@ -321,8 +321,11 @@ call `get_op()(2)`, a pipe `x |> g`. The args are checked against the type's par
 their expected types flow in as for a direct call. `recv.m(..)` selects a method first
 and only then a fn-typed field named `m` (the value `recv.m` takes them in the other
 order, see [Bound methods](#bound-methods); a method named like a fn-typed field is
-**W0013**). A call of a non-function is "called value is not a function", whatever the
-callee's shape.
+**W0013**). A call of a non-function is **T0055** "called value is not a function", whatever
+the callee's shape; a call of a module or an enum name (`io(5)`, so `5 |> io` too) is
+T0055 as well. A function value is never generic, so `g[int](1)` is **T0054**, and when
+the call has the wrong arity or argument types the message names the value as written
+("'f' takes (int, int)", "'h.run' takes (int, str)").
 
 An expression statement whose value is a function it never calls does nothing, so it
 is warning **W0012**: a function name (`one`), a bound method (`c.bump`), a field, local,
@@ -463,7 +466,7 @@ value holds its cell, so the value and the function see each other's writes; one
 nothing assigns is copied into the value. Any other receiver (a field `p.inner.m`, a
 call result) is evaluated once, when the value is made, and copied. A `mut self`
 method writes its receiver through the value, so binding one boxes its receiver, which
-must be a local variable: a temporary is **T0019**, a field **T0052**. A method bound
+must be a local variable: a temporary is **T0019**, a field **T0072**. A method bound
 on a `mut` parameter (`mut self` included) holds the caller's variable by address; the
 bound value must not escape (**T0052**). A method with a `mut` parameter after `self` cannot be bound (**T0049**). An
 associated function has no receiver to bind (**T0018**), a generic method has no single

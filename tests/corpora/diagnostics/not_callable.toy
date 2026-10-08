@@ -1,0 +1,14 @@
+# A call of something that is not a function is T0055: a value of another type, a
+# module, an enum. A pipe calls its target, so `5 |> io` is `io(5)`.
+import std/io
+
+enum Color { red, green }
+
+fn main() -> int {
+    x := 1
+    _a := x(2)  #~ ERROR [T0055] called value is not a function
+    _b := io(5)  #~ ERROR [T0055] module 'io' is not a function; call one of its functions, as in 'io.f(..)'
+    _c := Color(1)  #~ ERROR [T0055] enum 'Color' is not a function; construct one of its variants, as in 'Color.v(..)'
+    5 |> io  #~ ERROR [T0055] module 'io' is not a function
+    return 0
+}

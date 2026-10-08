@@ -1,0 +1,9 @@
+# A construction that sets one field twice is T0064.
+struct Point { x: int, y: int }
+enum Shape { rect { w: int, h: int } }
+
+fn main() -> int {
+    p := Point { x: 1, x: 2, y: 3 }  #~ ERROR [T0064] duplicate field 'x' in 'Point'
+    _s := Shape.rect { w: 1, h: 2, w: 3 }  #~ ERROR [T0064] duplicate field 'w' in 'Shape.rect'
+    return p.x
+}

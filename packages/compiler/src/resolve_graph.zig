@@ -54,6 +54,7 @@ const Intrinsic = @import("symbols/Intrinsic.zig");
 const StdNames = @import("symbols/StdNames.zig");
 const Closure = @import("symbols/Closure.zig");
 const Modes = @import("symbols/Modes.zig");
+const builtin_type_names = @import("layout/Type.zig").builtin_names;
 
 /// A graph-global function symbol.
 pub const GlobalFn = struct {
@@ -143,6 +144,10 @@ fn isPreludeName(names: []const []const u8, name: []const u8) bool {
 }
 
 const Local = struct { name_tok: u32, slot: u32, used: bool = false, warn_code: codes.Code = .none, is_fn: bool = false };
+
+/// A local fn of an open block. `named_early`: something named it before its declaration,
+/// which already reported, so it is not also unused.
+const LaterFn = struct { name: []const u8, declared: bool = false, named_early: bool = false };
 /// A lambda or local fn whose body is being resolved: its captures grow as outer locals
 /// are named. A `_` capture's `hole` is the one node that reads its hidden param `hole_slot`.
 const OpenBoundary = struct { node: Ast.Index, rank: u32, slot_floor: u32, label_floor: usize, self_slot: ?u32 = null, captures: std.ArrayList(Closure.Capture) = .empty, hole: Ast.Index = Ast.none, hole_slot: u32 = 0 };
@@ -178,6 +183,10 @@ const GraphResolve = struct {
     /// every fn boundary); any residue is freed at teardown. Never iterated — only
     /// point-ops — so it cannot perturb the source-ordered emission the sink sorts by.
     dead_pending: std.ArrayList(PendingMap) = .empty,
+    /// The local fns of every open block, in source order: one named before its declaration
+    /// is undeclared there, so the error says when it will be declared. Truncated by the
+    /// block that pushed them.
+    later_fns: std.ArrayList(LaterFn) = .empty,
     /// The lambdas around the cursor, innermost last. Empty at every fn boundary.
     open: std.ArrayList(OpenBoundary) = .empty,
     /// This fn's closed lambdas, moved into `closures` when the fn ends.
@@ -694,10 +703,15 @@ const GraphResolve = struct {
     /// body, so the body can call itself, and the rest resolves as a lambda whose
     /// `self_slot` is that local.
     fn resolveLocalFn(g: *GraphResolve, stmt_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!void {
+        const later = g.laterFn(g.nameText(n.main_token));
+        if (later) |lf| lf.declared = true;
         const slot = try g.declare(n.main_token, "redeclaration of '{s}'", .W0003);
         if (slot) |s| {
             g.res(stmt_idx, .{ .local = s });
             g.locals.items[s].is_fn = true;
+            if (later) |lf| if (lf.named_early) {
+                g.locals.items[s].used = true;
+            };
         }
         try g.resolveBoundary(stmt_idx, n, slot);
     }
@@ -808,13 +822,31 @@ const GraphResolve = struct {
         const block = g.nodes()[block_idx.int()];
         try g.pushScope();
         try g.dead_pending.append(g.gpa, .empty);
-        for (Ast.rangeSlice(g.tree(g.cur_mod), block.lhs.int())) |stmt_idx| {
+        const stmts = Ast.rangeSlice(g.tree(g.cur_mod), block.lhs.int());
+        const later_mark = g.later_fns.items.len;
+        defer g.later_fns.shrinkRetainingCapacity(later_mark);
+        for (stmts) |stmt_idx| {
+            const stmt = g.nodes()[stmt_idx.int()];
+            if (stmt.tag == .local_fn) try g.later_fns.append(g.gpa, .{ .name = g.nameText(stmt.main_token) });
+        }
+        for (stmts) |stmt_idx| {
             try g.resolveStmt(stmt_idx); // resolves + taps this statement's reads (all levels)
             try g.deadStoreStep(stmt_idx); // then classify the WRITE / FLUSH
         }
         var m = g.dead_pending.pop().?;
         m.deinit(g.gpa);
         g.popScope();
+    }
+
+    /// The not-yet-declared local fn of an open block named `name`, innermost first.
+    fn laterFn(g: *GraphResolve, name: []const u8) ?*LaterFn {
+        var i = g.later_fns.items.len;
+        while (i > 0) {
+            i -= 1;
+            const lf = &g.later_fns.items[i];
+            if (!lf.declared and std.mem.eql(u8, lf.name, name)) return lf;
+        }
+        return null;
     }
 
     /// Dead-store classification for one just-resolved statement of the current block. Runs
@@ -991,6 +1023,11 @@ const GraphResolve = struct {
                         try g.sink.report(.{ .span = off, .code = .R0001, .scope = g.cur_mod }, "undeclared identifier '_'; '_' makes a capture only as a whole call argument, as in 'f(a, _)' or 'Option[int].some(_)'", .{});
                         return;
                     }
+                    if (g.laterFn(name)) |lf| {
+                        lf.named_early = true;
+                        try g.sink.report(.{ .span = off, .code = .R0001, .scope = g.cur_mod }, "undeclared identifier '{s}'; the local function '{s}' is declared later in this block, and a local function can be named only after its declaration", .{ name, name });
+                        return;
+                    }
                     // An EXACT stdlib name (checked before the fuzzy suggester) means the
                     // import is missing, not that the name is a typo — name the module to
                     // import. Only an exact match hints, so a genuine typo still falls
@@ -1033,7 +1070,7 @@ const GraphResolve = struct {
                     try g.resolveCallee(callee.lhs);
                     if (g.nodes()[callee.lhs.int()].tag == .identifier and
                         symbols_res.leftmostHeadIsValue(g.tree(g.cur_mod), g.resolutions[g.cur_mod], callee.lhs))
-                        for (Ast.rangeSlice(g.tree(g.cur_mod), callee.rhs.int())) |a| try g.resolveExpr(a);
+                        for (Ast.rangeSlice(g.tree(g.cur_mod), callee.rhs.int())) |a| try g.resolveSubscript(a);
                 } else try g.resolveCallee(n.lhs);
                 for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |arg| try g.resolveExpr(arg);
             },
@@ -1061,7 +1098,7 @@ const GraphResolve = struct {
             .type_app => {
                 try g.resolveExpr(n.lhs);
                 if (symbols_res.leftmostHeadIsValue(g.tree(g.cur_mod), g.resolutions[g.cur_mod], n.lhs))
-                    for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |a| try g.resolveExpr(a);
+                    for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |a| try g.resolveSubscript(a);
             },
             // Postfix `?`: resolve the operand's names; the `?` itself binds nothing.
             .try_expr => try g.resolveExpr(n.lhs),
@@ -1070,7 +1107,7 @@ const GraphResolve = struct {
             .list_literal => for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |el| try g.resolveExpr(el),
             .index => {
                 try g.resolveExpr(n.lhs);
-                try g.resolveExpr(n.rhs);
+                try g.resolveSubscript(n.rhs);
             },
             .enum_init_unit => {},
             .enum_init_tuple => for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |a| try g.resolveExpr(a),
@@ -1097,6 +1134,16 @@ const GraphResolve = struct {
             .lambda => try g.resolveLambda(node_idx, n),
             else => {},
         }
+    }
+
+    /// A bracket's content where a value index and type args look alike (`fs[i](x)`,
+    /// `g[int](1)`, `id[int]`): a builtin type name no local shadows is left unresolved,
+    /// for the checker to say the head takes no type args, rather than called undeclared.
+    fn resolveSubscript(g: *GraphResolve, idx: Ast.Index) error{OutOfMemory}!void {
+        const n = g.nodes()[idx.int()];
+        if (n.tag == .identifier and builtin_type_names.has(g.nameText(n.main_token)) and
+            g.lookupName(n.main_token) == .unresolved) return;
+        return g.resolveExpr(idx);
     }
 
     /// A call's callee: a member callee `x.m(..)` is a method call, never a bound value.
@@ -1306,7 +1353,13 @@ const GraphResolve = struct {
         const scope = &g.scopes.items[g.scopes.items.len - 1];
         const gop = try scope.names.getOrPut(g.gpa, name);
         if (gop.found_existing) {
-            try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, name_tok), .code = .none, .scope = g.cur_mod }, dup_fmt, .{name});
+            const at: DiagnosticSink.Report = .{ .span = g.tokSpan(g.cur_mod, name_tok), .code = .R0011, .related = g.tokSpan(g.cur_mod, g.locals.items[gop.value_ptr.*].name_tok), .scope = g.cur_mod };
+            // `_` reads like Rust's ignore-anything pattern, but here it is a name like any
+            // other, so two of them collide.
+            if (std.mem.eql(u8, name, "_"))
+                try g.sink.report(at, dup_fmt ++ "; to ignore several, name each one differently, as in '_a', '_b'", .{name})
+            else
+                try g.sink.report(at, dup_fmt, .{name});
             return null;
         }
         // A shadow-eligible binding (`:=`, for-var, param — `warn_code != .none`) that hides
@@ -1646,6 +1699,7 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
         g.label_stack.deinit(gpa);
         for (g.dead_pending.items) |*m| m.deinit(gpa);
         g.dead_pending.deinit(gpa);
+        g.later_fns.deinit(gpa);
         for (g.open.items) |*o| o.captures.deinit(gpa);
         g.open.deinit(gpa);
         for (g.fn_boundaries.items) |b| gpa.free(b.captures);
@@ -3980,7 +4034,7 @@ test "a local fn is not a global fn (not in fns)" {
     }.run);
 }
 
-test "mutual recursion between local fns is R0001" {
+test "mutual recursion between local fns is R0001 that says when the callee is declared" {
     try withResolvedSource(
         \\fn main() -> int {
         \\ fn a(n: int) -> int { if n <= 0 { 0 } else { b(n - 1) } }
@@ -3991,7 +4045,67 @@ test "mutual recursion between local fns is R0001" {
     , struct {
         fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
             try testing.expectEqual(@as(usize, 1), countCode(r, .R0001));
-            try testing.expectEqualStrings("undeclared identifier 'b'", firstError(r).message);
+            try testing.expectEqualStrings("undeclared identifier 'b'; the local function 'b' is declared later in this block, and a local function can be named only after its declaration", firstError(r).message);
+        }
+    }.run);
+    // The later fn was named, so it is not also unused; a name the block never declares
+    // stays a plain R0001.
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ fn a(n: int) -> int { if n <= 0 { 0 } else { b(n - 1) } }
+        \\ fn b(n: int) -> int { n }
+        \\ return a(3) + c
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 2), countCode(r, .R0001));
+            try testing.expectEqual(@as(usize, 0), countCode(r, .W0003));
+            var plain = false;
+            for (r.diags) |d| if (std.mem.eql(u8, d.message, "undeclared identifier 'c'")) {
+                plain = true;
+            };
+            try testing.expect(plain);
+        }
+    }.run);
+}
+
+test "a duplicate binding is R0011 pointing at the first, with a hint for '_'" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ f := fn(_, _) { 1 }
+        \\ x := 1
+        \\ x := 2
+        \\ return f(1, 2) + x
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, source: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 2), countCode(r, .R0011));
+            for (r.diags) |d| if (d.code == .R0011) {
+                const rel = d.relatedSpan().?;
+                const name = source[rel.start..rel.end];
+                if (std.mem.eql(u8, name, "_"))
+                    try testing.expectEqualStrings("duplicate parameter '_'; to ignore several, name each one differently, as in '_a', '_b'", d.message)
+                else
+                    try testing.expectEqualStrings("redeclaration of 'x'", d.message);
+            };
+        }
+    }.run);
+}
+
+test "a builtin type name in brackets after a value is left for the checker" {
+    try withResolvedSource(
+        \\fn id[T](x: T) -> T { x }
+        \\fn main() -> int {
+        \\ g := fn(v: int) { v }
+        \\ _f := id[int]
+        \\ return g[int](1)
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), countCode(r, .R0001));
         }
     }.run);
 }

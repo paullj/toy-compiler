@@ -1,0 +1,13 @@
+# A call of a function value names it and spells its parameters, as a call of a named
+# function does: "'f' takes (int, int)".
+struct H { run: fn(int, str) -> int }
+
+fn add(a: int, b: int) -> int { a + b }
+
+fn main() -> int {
+    f := add
+    h := H { run: fn(n: int, _s: str) { n } }
+    a := f(1)  #~ ERROR [T0039] expected 2 argument(s), got 1; 'f' takes (int, int)
+    b := h.run(1, 2)  #~ ERROR [T0040] argument 2: expected str, got int; 'h.run' takes (int, str)
+    return a + b
+}

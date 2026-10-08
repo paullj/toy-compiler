@@ -1,0 +1,17 @@
+# A variant named on a type that is not an enum, or a `.v` with no enum to come from,
+# is T0062.
+struct P { x: int }
+enum E { a, b }
+
+fn f(e: E) -> int {
+    match e {
+        P.x -> 1  #~ ERROR [T0062] 'P' is not an enum type
+        _ -> 0
+    }
+}
+
+fn main() -> int {
+    _b := .some  #~ ERROR [T0062] cannot infer the enum type for '.some' here
+    _n: int = .red  #~ ERROR [T0062] '.red' expects an enum type, but int was expected here
+    return f(E.a)
+}

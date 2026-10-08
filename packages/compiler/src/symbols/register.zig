@@ -36,11 +36,11 @@ pub fn registerStructs(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !
         }
         if (decl.tag == .tuple_struct_decl) {
             if (decl.rhs != Ast.none) {
-                try t.sink.report(.{ .span = genericsSpan(t, decl.main_token) }, "generic tuple structs are not yet supported", .{});
+                try t.sink.report(.{ .span = genericsSpan(t, decl.main_token), .code = .T0013 }, "generic tuple structs are not yet supported", .{});
                 continue;
             }
             if (Ast.rangeSlice(t.tree, decl.lhs.int()).len > LayoutEngine.tuple_field_cap) {
-                try t.sink.report(.{ .span = t.spanOf(decl_idx) }, "tuple struct '{s}' has too many fields (max {d})", .{ name, LayoutEngine.tuple_field_cap });
+                try t.sink.report(.{ .span = t.spanOf(decl_idx), .code = .T0071 }, "tuple struct '{s}' has too many fields (max {d})", .{ name, LayoutEngine.tuple_field_cap });
                 // Registered anyway so references resolve; layoutStruct clamps the name
                 // index so the (already-errored, codegen-gated) program never OOBs.
             }
@@ -197,11 +197,11 @@ pub fn registerEnums(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32) !vo
         if (decl.tag != .enum_decl) continue;
         const name = t.nameText(decl.main_token);
         if (type_names.get(name) != null) {
-            try t.sink.report(.{ .span = t.tokSpan(decl.main_token) }, "enum '{s}' shadows a builtin type", .{name});
+            try t.sink.report(.{ .span = t.tokSpan(decl.main_token), .code = .T0011 }, "enum '{s}' shadows a builtin type", .{name});
             continue;
         }
         if (t.activeStructMap().get(name) != null or t.activeEnumMap().get(name) != null) {
-            try t.sink.report(.{ .span = t.tokSpan(decl.main_token) }, "duplicate type declaration '{s}'", .{name});
+            try t.sink.report(.{ .span = t.tokSpan(decl.main_token), .code = .T0012 }, "duplicate type declaration '{s}'", .{name});
             continue;
         }
         // A generic template `enum Either[L,R] { .. }` carries its generic-param run in

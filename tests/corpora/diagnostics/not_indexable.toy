@@ -1,0 +1,11 @@
+# `x[i]` reads a `Vec` element; any other value has no index operator (T0057). A `Map`
+# lookup can miss, so it has `get` instead.
+import std/map
+
+fn main() -> int {
+    n := 5
+    a := n[0]  #~ ERROR [T0057] cannot index a value of type 'int'
+    m := Map[str, int].new()
+    b := m["k"]  #~ ERROR [T0057] Map has no index operator; use .get
+    return a + b
+}

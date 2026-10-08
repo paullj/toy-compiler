@@ -49,6 +49,8 @@ pub const Code = enum(u16) {
     R0008, // duplicate-label
     R0009, // undefined-label
     R0010, // extern-not-in-core (an `extern fn` declared outside a `core/` module)
+    R0011, // duplicate-binding (a name declared twice in one parameter list, pattern or block)
+    R0012, // import-cycle (imports that lead back to a module that is still being imported)
 
     // Type band (T####).
     T0001, // unknown-type
@@ -102,8 +104,28 @@ pub const Code = enum(u16) {
     T0049, // fn-not-a-value (a builtin, extern, generic or `mut`-param function, or a built-in, protocol or `mut`-param method, is named as a value)
     T0050, // lambda-param-type-unknown (an unannotated lambda param with no expected fn type)
     T0051, // jump-across-lambda (break/continue targeting a loop outside the lambda)
-    T0052, // capture-unsupported (a closure that escapes captures a `mut` parameter or `mut self` receiver, or a `mut self` method is bound on a field)
+    T0052, // capture-unsupported (a closure that escapes captures a `mut` parameter or `mut self` receiver)
     T0053, // duplicate-type-param (a fn or method declares a type parameter name twice, or a method reuses its impl's)
+    T0054, // type-arg-count (a call, protocol or intrinsic gets type arguments it does not take, or too few or too many)
+    T0055, // not-callable (a call of a value that is not a function, or of a module or type)
+    T0056, // not-a-value (a type or module name used where a value is wanted)
+    T0057, // not-indexable (`x[i]` on a value that is not a `Vec`)
+    T0058, // branch-type-mismatch (the arms of a value `if` yield different types)
+    T0059, // if-without-else (a value `if` has no `else`)
+    T0060, // misplaced-jump (`break`/`continue` outside a loop, `continue` to a block, a value `break` out of `while`/`for`)
+    T0061, // no-such-variant (an enum has no variant of that name)
+    T0062, // not-an-enum (a variant is named on, or expected from, a type that is not an enum)
+    T0063, // constructor-form (a struct or variant constructed with the other form: `S(..)` for `S { .. }` or back)
+    T0064, // duplicate-field-init (a construction sets the same field twice)
+    T0065, // list-literal-type-mismatch (a list literal's elements disagree, or it cannot produce the expected type)
+    T0066, // sugar-needs-import (a list literal or `xs[i]` with `Vec` not imported)
+    T0067, // pattern-type-mismatch (a match scrutinee or pattern whose type the match cannot test)
+    T0068, // pattern-arity-mismatch (a variant pattern binds a different number of values than the variant holds)
+    T0069, // or-pattern-mismatch (the alternatives of an or-pattern bind different names or types)
+    T0070, // index-element-field-assign (`xs[i].f = v` writes a temporary copy of the element)
+    T0071, // too-many-fields (a tuple struct past the positional field limit)
+    T0072, // bound-receiver-not-local (a `mut self` method bound on a field, not a local)
+    T0073, // main-params (the entry `main` declares parameters)
 
     // Warning band (W####).
     W0001, // unused-variable
@@ -167,6 +189,8 @@ pub const table = [_]Entry{
     .{ .code = .R0008, .str = "R0008", .slug = "duplicate-label" },
     .{ .code = .R0009, .str = "R0009", .slug = "undefined-label" },
     .{ .code = .R0010, .str = "R0010", .slug = "extern-not-in-core" },
+    .{ .code = .R0011, .str = "R0011", .slug = "duplicate-binding", .related = "first declared here" },
+    .{ .code = .R0012, .str = "R0012", .slug = "import-cycle" },
     .{ .code = .T0001, .str = "T0001", .slug = "unknown-type" },
     .{ .code = .T0002, .str = "T0002", .slug = "unknown-module" },
     .{ .code = .T0003, .str = "T0003", .slug = "module-has-no-type" },
@@ -220,6 +244,26 @@ pub const table = [_]Entry{
     .{ .code = .T0051, .str = "T0051", .slug = "jump-across-lambda" },
     .{ .code = .T0052, .str = "T0052", .slug = "capture-unsupported" },
     .{ .code = .T0053, .str = "T0053", .slug = "duplicate-type-param" },
+    .{ .code = .T0054, .str = "T0054", .slug = "type-arg-count" },
+    .{ .code = .T0055, .str = "T0055", .slug = "not-callable" },
+    .{ .code = .T0056, .str = "T0056", .slug = "not-a-value" },
+    .{ .code = .T0057, .str = "T0057", .slug = "not-indexable" },
+    .{ .code = .T0058, .str = "T0058", .slug = "branch-type-mismatch" },
+    .{ .code = .T0059, .str = "T0059", .slug = "if-without-else" },
+    .{ .code = .T0060, .str = "T0060", .slug = "misplaced-jump" },
+    .{ .code = .T0061, .str = "T0061", .slug = "no-such-variant" },
+    .{ .code = .T0062, .str = "T0062", .slug = "not-an-enum" },
+    .{ .code = .T0063, .str = "T0063", .slug = "constructor-form" },
+    .{ .code = .T0064, .str = "T0064", .slug = "duplicate-field-init" },
+    .{ .code = .T0065, .str = "T0065", .slug = "list-literal-type-mismatch" },
+    .{ .code = .T0066, .str = "T0066", .slug = "sugar-needs-import" },
+    .{ .code = .T0067, .str = "T0067", .slug = "pattern-type-mismatch" },
+    .{ .code = .T0068, .str = "T0068", .slug = "pattern-arity-mismatch" },
+    .{ .code = .T0069, .str = "T0069", .slug = "or-pattern-mismatch" },
+    .{ .code = .T0070, .str = "T0070", .slug = "index-element-field-assign" },
+    .{ .code = .T0071, .str = "T0071", .slug = "too-many-fields" },
+    .{ .code = .T0072, .str = "T0072", .slug = "bound-receiver-not-local" },
+    .{ .code = .T0073, .str = "T0073", .slug = "main-params" },
     .{ .code = .W0001, .str = "W0001", .slug = "unused-variable", .default_severity = .warning },
     .{ .code = .W0002, .str = "W0002", .slug = "unused-parameter", .default_severity = .warning },
     .{ .code = .W0003, .str = "W0003", .slug = "unused-function", .default_severity = .warning },
@@ -507,6 +551,13 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqual(Severity.warning, defaultSeverity(.W0012));
     try testing.expectEqual(Code.W0012, fromStr("W0012").?);
 
+    // The codes that gave every former uncoded diagnostic one.
+    try testing.expectEqualStrings("duplicate-binding", slug(.R0011).?);
+    try testing.expectEqual(Code.R0012, fromStr("R0012").?);
+    try testing.expectEqualStrings("type-arg-count", slug(.T0054).?);
+    try testing.expectEqualStrings("main-params", slug(.T0073).?);
+    try testing.expectEqual(Code.T0073, fromStr("T0073").?);
+
     try testing.expectEqualStrings("W0013", str(.W0013).?);
     try testing.expectEqualStrings("fn-field-method-clash", slug(.W0013).?);
     try testing.expectEqual(Severity.warning, defaultSeverity(.W0013));
@@ -548,4 +599,5 @@ test "relatedLabel names what each code's related location is" {
     try testing.expectEqualStrings("defined here", relatedLabel(.T0039));
     try testing.expectEqualStrings("outer binding declared here", relatedLabel(.W0009));
     try testing.expectEqualStrings("field declared here", relatedLabel(.W0013));
+    try testing.expectEqualStrings("first declared here", relatedLabel(.R0011));
 }

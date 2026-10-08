@@ -1,0 +1,10 @@
+# A name declared twice in one parameter list, block or pattern is R0011, pointing at
+# the first. `_` is a name like any other, so `fn(_, _)` declares it twice.
+fn add(a: int, a: int) -> int { a }  #~ ERROR [R0011] duplicate parameter 'a'
+
+fn main() -> int {
+    _f := fn(_, _) { 1 }  #~ ERROR [R0011] duplicate parameter '_'; to ignore several, name each one differently, as in '_a', '_b'
+    x := 1
+    x := 2  #~ ERROR [R0011] redeclaration of 'x'
+    return add(x, 1)
+}

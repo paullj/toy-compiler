@@ -1,0 +1,17 @@
+# A pattern of another type than the scrutinee's, or a scrutinee a match cannot test,
+# is T0067. A wrong enum qualifier is the one error: the variant is not looked up in
+# the scrutinee's enum as well.
+enum Color { red, green }
+enum Size { small, big }
+
+fn f(c: Color, n: int, s: str) -> int {
+    a := match n { true -> 1, _ -> 0 }  #~ ERROR [T0067] literal pattern type bool does not match scrutinee int
+    b := match c { Size.small -> 1, _ -> 0 }  #~ ERROR [T0067] pattern enum 'Size' does not match scrutinee 'Color'
+    d := match n { Color.red -> 1, _ -> 0 }  #~ ERROR [T0067] variant pattern on a non-enum scrutinee int
+    e := match s { _ -> 0 }  #~ ERROR [T0067] match scrutinee must be an enum, int, or bool, got str
+    return a + b + d + e
+}
+
+fn main() -> int {
+    return f(Color.red, 1, "s")
+}

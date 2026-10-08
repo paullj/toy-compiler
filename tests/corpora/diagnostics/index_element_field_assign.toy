@@ -1,0 +1,12 @@
+# `xs[i]` reads a copy of the element, so assigning one of its fields would write the
+# copy and lose the write (T0070).
+import std/vec
+
+struct P { x: int }
+struct H { ps: Vec[P] }
+
+fn main() -> int {
+    h := H { ps: [P { x: 1 }] }
+    h.ps[0].x = 5  #~ ERROR [T0070] cannot assign to a field of an index element
+    return 0
+}
