@@ -4,8 +4,9 @@
 //! argument directly; any other argument (a local holding a function, a field, a call
 //! result) goes through the erased instance.
 //! A peer data module like `Closure`: the driver builds the table (`build`) serially before
-//! codegen, and lower and the fingerprint both pick a call's unit through `select`, so the
-//! call a body makes and the identity its key folds cannot disagree.
+//! codegen, deciding each call's unit once, and lower and the fingerprint both look it up
+//! (`Table.unitAt`), so the call a body makes and the identity its key folds cannot
+//! disagree.
 
 const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
@@ -35,11 +36,18 @@ pub const Unit = struct { inst: u32, name: []const u8, targets: []const Target }
 /// Bit `p` set: param `p` of template `gid` may be specialized.
 pub const TemplateMask = struct { gid: u32, eligible: u64 };
 
+/// A call that goes to a spec unit: the `.call` node `call` in body `owner` (its lambdas
+/// included) runs `units[unit]`.
+pub const Call = struct { owner: Closure.Owner, call: Ast.Index, unit: u32 };
+
 pub const Table = struct {
     /// Sorted by name.
     units: []const Unit = &.{},
     /// Sorted by gid; only templates with an eligible param.
     masks: []const TemplateMask = &.{},
+    /// Every call that goes to a unit, sorted by `(owner, call)`: decided once, when the
+    /// table is built, so lower and the fingerprint look a call's unit up.
+    calls: []const Call = &.{},
 
     pub fn deinit(t: Table, gpa: std.mem.Allocator) void {
         for (t.units) |u| {
@@ -48,6 +56,22 @@ pub const Table = struct {
         }
         gpa.free(t.units);
         gpa.free(t.masks);
+        gpa.free(t.calls);
+    }
+
+    /// The spec unit call `call` in body `owner` goes to, or null for the erased instance.
+    pub fn unitAt(t: Table, owner: ?Closure.Owner, call: Ast.Index) ?*const Unit {
+        const o = owner orelse return null;
+        const Key = struct { owner: u32, call: u32 };
+        const i = std.sort.binarySearch(Call, t.calls, Key{ .owner = o, .call = call.int() }, struct {
+            fn order(k: Key, c: Call) std.math.Order {
+                return switch (std.math.order(k.owner, c.owner)) {
+                    .eq => std.math.order(k.call, c.call.int()),
+                    else => |ord| ord,
+                };
+            }
+        }.order) orelse return null;
+        return &t.units[t.calls[i].unit];
     }
 };
 
@@ -121,7 +145,7 @@ pub fn targetsOf(gpa: std.mem.Allocator, body: Body.BodyView, prog: Body.Program
                 if (arg.int() >= body.callees.len) continue;
                 switch (body.callees[arg.int()].view()) {
                     .fn_ref => |gid| if (gid < prog.names.len) try out.append(gpa, .{ .param = @intCast(p), .kind = .named, .sym = prog.names[gid] }),
-                    .none, .method, .protocol, .builtin, .value, .bound_method => {},
+                    .none, .method, .protocol, .builtin, .value, .bound_method, .direct, .instance, .generic => {},
                 }
             },
             .lambda => {
@@ -165,96 +189,92 @@ pub fn mask(t: Table, gid: u32) u64 {
     return t.masks[i].eligible;
 }
 
-/// The site of method call `call` when its method is one of a generic type's instances
-/// (`b.apply(f)` on a `Box[int]`), or null.
-pub fn methodSite(body: Body.BodyView, prog: Body.ProgramView, call: Ast.Index) ?Site {
-    const fa = Callee.memberNode(body.tree, body.tree.nodes[call.int()]) orelse return null;
-    if (fa.int() >= body.callees.len) return null;
-    const v = body.callees[fa.int()].view();
-    if (v != .method or v.method >= prog.methods.len) return null;
-    const m = prog.methods[v.method];
-    return .{ .ii = m.instance orelse return null, .self_n = @intFromBool(!m.is_static) };
-}
-
-/// The spec unit of `t` generic call `call` at `site` goes to, or null for the erased
-/// instance; the name is borrowed from the table.
-pub fn select(gpa: std.mem.Allocator, t: Table, body: Body.BodyView, prog: Body.ProgramView, lambdas: Lambdas, call: Ast.Index, site: Site) error{OutOfMemory}!?[]const u8 {
-    if (t.units.len == 0) return null;
-    const inst = prog.instances[site.ii];
-    const m = mask(t, inst.template_gid);
-    if (m == 0) return null;
-    var targets: std.ArrayList(Target) = .empty;
-    defer targets.deinit(gpa);
-    try targetsOf(gpa, body, prog, lambdas, call, site, m, &targets);
-    if (targets.items.len == 0) return null;
-    const name = try nameOf(gpa, inst.name.?, targets.items);
-    defer gpa.free(name);
-    const u = find(t, name) orelse return null;
-    return u.name;
-}
-
 /// A spec unit some call site wants, keyed by its template for the cap.
 pub const Candidate = struct { gid: u32, unit: Unit };
 
 /// Record the unit a call of instance `ii` with `targets` would get, unless an equal one is
-/// already in `out`. `targets` is copied.
-pub fn addCandidate(gpa: std.mem.Allocator, out: *std.ArrayList(Candidate), gid: u32, ii: usize, inst_name: []const u8, targets: []const Target) error{OutOfMemory}!void {
+/// already in `out`, and return its index in `out`. `targets` is copied.
+pub fn addCandidate(gpa: std.mem.Allocator, out: *std.ArrayList(Candidate), gid: u32, ii: usize, inst_name: []const u8, targets: []const Target) error{OutOfMemory}!u32 {
     const name = try nameOf(gpa, inst_name, targets);
     errdefer gpa.free(name);
-    for (out.items) |c| if (std.mem.eql(u8, c.unit.name, name)) {
+    for (out.items, 0..) |c, k| if (std.mem.eql(u8, c.unit.name, name)) {
         gpa.free(name);
-        return;
+        return @intCast(k);
     };
     const owned = try gpa.dupe(Target, targets);
     errdefer gpa.free(owned);
     try out.append(gpa, .{ .gid = gid, .unit = .{ .inst = @intCast(ii), .name = name, .targets = owned } });
+    return @intCast(out.items.len - 1);
 }
 
+/// A call `collectCandidates` saw, by the candidate it wants (an index into the candidate
+/// list).
+pub const PendingCall = struct { owner: Closure.Owner, call: Ast.Index, cand: u32 };
+
 /// The table from every candidate: per template, the first `cap_per_template` by name,
-/// then all sorted by name. Consumes `cands` and `masks` (both freed, on error too).
-pub fn finish(gpa: std.mem.Allocator, cands: *std.ArrayList(Candidate), masks: []const TemplateMask) error{OutOfMemory}!Table {
+/// then all sorted by name, and each call's unit (a call whose candidate the cap dropped
+/// takes the erased instance). Consumes `cands` and `masks` (both freed, on error too).
+pub fn finish(gpa: std.mem.Allocator, cands: *std.ArrayList(Candidate), masks: []const TemplateMask, pending: []const PendingCall) error{OutOfMemory}!Table {
     defer cands.deinit(gpa);
     errdefer gpa.free(masks);
-    std.mem.sort(Candidate, cands.items, {}, struct {
-        fn lt(_: void, a: Candidate, b: Candidate) bool {
+    errdefer freeUnits(gpa, cands.items);
+    const n = cands.items.len;
+    const order = try gpa.alloc(u32, n);
+    defer gpa.free(order);
+    for (order, 0..) |*o, k| o.* = @intCast(k);
+    std.mem.sort(u32, order, cands.items, struct {
+        fn lt(cs: []const Candidate, x: u32, y: u32) bool {
+            const a = cs[x];
+            const b = cs[y];
             if (a.gid != b.gid) return a.gid < b.gid;
             return std.mem.order(u8, a.unit.name, b.unit.name) == .lt;
         }
     }.lt);
-    var units = std.ArrayList(Unit).initCapacity(gpa, cands.items.len) catch |e| {
-        freeUnits(gpa, cands.items);
-        return e;
-    };
+    // Per candidate, its unit index once kept; maxInt while dropped.
+    const unit_of = try gpa.alloc(u32, n);
+    defer gpa.free(unit_of);
+    @memset(unit_of, std.math.maxInt(u32));
+    var kept: std.ArrayList(u32) = .empty;
+    defer kept.deinit(gpa);
     var run_gid: u32 = 0;
     var run_len: u32 = 0;
-    for (cands.items, 0..) |c, i| {
+    for (order, 0..) |k, i| {
+        const c = cands.items[k];
         if (i == 0 or c.gid != run_gid) {
             run_gid = c.gid;
             run_len = 0;
         }
-        if (run_len == cap_per_template) {
-            gpa.free(c.unit.name);
-            gpa.free(c.unit.targets);
-            continue;
-        }
+        if (run_len == cap_per_template) continue;
         run_len += 1;
-        units.appendAssumeCapacity(c.unit);
+        try kept.append(gpa, k);
     }
-    cands.clearRetainingCapacity();
-    std.mem.sort(Unit, units.items, {}, struct {
-        fn lt(_: void, a: Unit, b: Unit) bool {
-            return std.mem.order(u8, a.name, b.name) == .lt;
+    std.mem.sort(u32, kept.items, cands.items, struct {
+        fn lt(cs: []const Candidate, x: u32, y: u32) bool {
+            return std.mem.order(u8, cs[x].unit.name, cs[y].unit.name) == .lt;
         }
     }.lt);
-    const out = units.toOwnedSlice(gpa) catch |e| {
-        for (units.items) |u| {
-            gpa.free(u.name);
-            gpa.free(u.targets);
+    for (kept.items, 0..) |k, ui| unit_of[k] = @intCast(ui);
+
+    var calls: std.ArrayList(Call) = .empty;
+    defer calls.deinit(gpa);
+    for (pending) |pc| if (unit_of[pc.cand] != std.math.maxInt(u32))
+        try calls.append(gpa, .{ .owner = pc.owner, .call = pc.call, .unit = unit_of[pc.cand] });
+    std.mem.sort(Call, calls.items, {}, struct {
+        fn lt(_: void, a: Call, b: Call) bool {
+            if (a.owner != b.owner) return a.owner < b.owner;
+            return a.call.int() < b.call.int();
         }
-        units.deinit(gpa);
-        return e;
+    }.lt);
+    const calls_out = try calls.toOwnedSlice(gpa);
+    errdefer gpa.free(calls_out);
+    const units = try gpa.alloc(Unit, kept.items.len);
+    for (kept.items, units) |k, *u| u.* = cands.items[k].unit;
+    for (cands.items, unit_of) |c, ui| if (ui == std.math.maxInt(u32)) {
+        gpa.free(c.unit.name);
+        gpa.free(c.unit.targets);
     };
-    return .{ .units = out, .masks = masks };
+    cands.clearRetainingCapacity();
+    return .{ .units = units, .masks = masks, .calls = calls_out };
 }
 
 /// Free the owned name and targets of each candidate's unit.
@@ -292,13 +312,32 @@ pub fn build(gpa: std.mem.Allocator, src: Source) error{OutOfMemory}!Table {
         return .{};
     }
     var cands: std.ArrayList(Candidate) = .empty;
-    collectCandidates(gpa, src, masks, &cands) catch |e| {
+    var pending: std.ArrayList(PendingCall) = .empty;
+    defer pending.deinit(gpa);
+    collectCandidates(gpa, src, masks, &cands, &pending) catch |e| {
         freeUnits(gpa, cands.items);
         cands.deinit(gpa);
         gpa.free(masks);
         return e;
     };
-    return finish(gpa, &cands, masks);
+    return finish(gpa, &cands, masks, pending.items);
+}
+
+/// The site of generic call `call`, from its callee: a generic fn's instance, or a method
+/// of one of a generic type's instances (`b.apply(f)` on a `Box[int]`). Null for any other
+/// call.
+pub fn siteOf(body: Body.BodyView, prog: Body.ProgramView, call: Ast.Index) ?Site {
+    const slot = Callee.callSlot(body.tree, body.tree.nodes[call.int()]) orelse return null;
+    if (slot.int() >= body.callees.len) return null;
+    return switch (body.callees[slot.int()].view()) {
+        .instance => |ii| .{ .ii = ii, .self_n = 0 },
+        .method => |mi| {
+            if (mi >= prog.methods.len) return null;
+            const m = prog.methods[mi];
+            return .{ .ii = m.instance orelse return null, .self_n = @intFromBool(!m.is_static) };
+        },
+        else => null,
+    };
 }
 
 /// The eligible params of each instantiated template that has one, sorted by gid. Every
@@ -325,7 +364,7 @@ fn templateMasks(gpa: std.mem.Allocator, src: Source) error{OutOfMemory}![]Templ
     return masks.toOwnedSlice(gpa);
 }
 
-fn collectCandidates(gpa: std.mem.Allocator, src: Source, masks: []const TemplateMask, cands: *std.ArrayList(Candidate)) error{OutOfMemory}!void {
+fn collectCandidates(gpa: std.mem.Allocator, src: Source, masks: []const TemplateMask, cands: *std.ArrayList(Candidate), pending: *std.ArrayList(PendingCall)) error{OutOfMemory}!void {
     const V = struct {
         gpa: std.mem.Allocator,
         body: Body.BodyView,
@@ -333,6 +372,7 @@ fn collectCandidates(gpa: std.mem.Allocator, src: Source, masks: []const Templat
         lambdas: Lambdas,
         masks: Table,
         cands: *std.ArrayList(Candidate),
+        pending: *std.ArrayList(PendingCall),
         targets: std.ArrayList(Target) = .empty,
 
         pub fn on(self: *@This(), ev: AstWalk.Event) error{OutOfMemory}!void {
@@ -341,17 +381,15 @@ fn collectCandidates(gpa: std.mem.Allocator, src: Source, masks: []const Templat
                 else => return,
             };
             if (e.tag != .call or self.body.tree.nodes[e.idx.int()].lhs == Ast.none) return;
-            const site: Site = if (try AstWalk.instanceOfCall(self.gpa, self.body, self.prog, e.idx)) |ii|
-                .{ .ii = ii, .self_n = 0 }
-            else
-                methodSite(self.body, self.prog, e.idx) orelse return;
+            const site = siteOf(self.body, self.prog, e.idx) orelse return;
             const inst = self.prog.instances[site.ii];
             const m = mask(self.masks, inst.template_gid);
             if (m == 0) return;
             self.targets.clearRetainingCapacity();
             try targetsOf(self.gpa, self.body, self.prog, self.lambdas, e.idx, site, m, &self.targets);
             if (self.targets.items.len == 0) return;
-            try addCandidate(self.gpa, self.cands, inst.template_gid, site.ii, inst.name.?, self.targets.items);
+            const cand = try addCandidate(self.gpa, self.cands, inst.template_gid, site.ii, inst.name.?, self.targets.items);
+            try self.pending.append(self.gpa, .{ .owner = self.lambdas.owner.?, .call = e.idx, .cand = cand });
         }
     };
     for (src.bodies.items, 0..) |b, i| {
@@ -362,6 +400,7 @@ fn collectCandidates(gpa: std.mem.Allocator, src: Source, masks: []const Templat
             .lambdas = .{ .owner = @intCast(i), .units = src.lambda_units },
             .masks = .{ .masks = masks },
             .cands = cands,
+            .pending = pending,
         };
         defer v.targets.deinit(gpa);
         try AstWalk.walk(src.modules[b.mod], b.decl, &v);
@@ -412,13 +451,19 @@ test "finish caps each template by name and sorts the units by name" {
     const gpa = testing.allocator;
     var cands: std.ArrayList(Candidate) = .empty;
     const lam_names = [_][]const u8{ "m$l9", "m$l3", "m$l0", "m$l7", "m$l1", "m$l8", "m$l2", "m$l6", "m$l5", "m$l4" };
-    for (lam_names) |ln| try addCandidate(gpa, &cands, 4, 0, "g$int", &.{.{ .param = 0, .kind = .lambda, .sym = .{ .kind = .user_fn, .name = ln } }});
+    for (lam_names) |ln| _ = try addCandidate(gpa, &cands, 4, 0, "g$int", &.{.{ .param = 0, .kind = .lambda, .sym = .{ .kind = .user_fn, .name = ln } }});
     // A repeat of an earlier site adds nothing.
-    try addCandidate(gpa, &cands, 4, 0, "g$int", &.{.{ .param = 0, .kind = .lambda, .sym = .{ .kind = .user_fn, .name = "m$l3" } }});
-    try addCandidate(gpa, &cands, 2, 1, "a$int", &.{.{ .param = 0, .kind = .named, .sym = .{ .kind = .user_fn, .name = "m.f" } }});
+    try testing.expectEqual(@as(u32, 1), try addCandidate(gpa, &cands, 4, 0, "g$int", &.{.{ .param = 0, .kind = .lambda, .sym = .{ .kind = .user_fn, .name = "m$l3" } }}));
+    _ = try addCandidate(gpa, &cands, 2, 1, "a$int", &.{.{ .param = 0, .kind = .named, .sym = .{ .kind = .user_fn, .name = "m.f" } }});
     try testing.expectEqual(@as(usize, 11), cands.items.len);
     const masks = try gpa.dupe(TemplateMask, &.{ .{ .gid = 2, .eligible = 1 }, .{ .gid = 4, .eligible = 1 } });
-    const t = try finish(gpa, &cands, masks);
+    // Calls by the candidate they want: `m$l7` (kept), `m$l9` (cut by the cap), `m.f`.
+    const pending = [_]PendingCall{
+        .{ .owner = 3, .call = Ast.Index.from(20), .cand = 3 },
+        .{ .owner = 1, .call = Ast.Index.from(9), .cand = 0 },
+        .{ .owner = 1, .call = Ast.Index.from(4), .cand = 10 },
+    };
+    const t = try finish(gpa, &cands, masks, &pending);
     defer t.deinit(gpa);
     try testing.expectEqual(@as(usize, 1 + cap_per_template), t.units.len);
     for (t.units[1..], t.units[0 .. t.units.len - 1]) |cur, prev| try testing.expect(std.mem.order(u8, prev.name, cur.name) == .lt);
@@ -428,6 +473,11 @@ test "finish caps each template by name and sorts the units by name" {
     try testing.expect(find(t, "g$int$sp0$m$l9") == null);
     try testing.expectEqual(@as(u64, 1), mask(t, 4));
     try testing.expectEqual(@as(u64, 0), mask(t, 3));
+    try testing.expectEqualStrings("g$int$sp0$m$l7", t.unitAt(3, Ast.Index.from(20)).?.name);
+    try testing.expectEqual(@as(?*const Unit, null), t.unitAt(1, Ast.Index.from(9)));
+    try testing.expectEqualStrings("a$int$sp0$m.f", t.unitAt(1, Ast.Index.from(4)).?.name);
+    try testing.expectEqual(@as(?*const Unit, null), t.unitAt(null, Ast.Index.from(4)));
+    try testing.expectEqual(@as(usize, 2), t.calls.len);
 }
 
 /// One module resolved and typechecked, with `names` in global fn-id order, so the spec
@@ -631,7 +681,7 @@ test "a generic method's fn argument is a target at its param, after self and ea
     for (fx.tree.nodes, 0..) |n, i| {
         if (n.tag != .call) continue;
         const call = Ast.Index.from(@intCast(i));
-        const site = methodSite(body, prog, call) orelse continue;
+        const site = siteOf(body, prog, call) orelse continue;
         sites += 1;
         try testing.expectEqual(@as(u32, 1), site.self_n);
         try testing.expectEqualStrings("main.Box.twice$int", fx.tc.instances[site.ii].name.?);

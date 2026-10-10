@@ -35,12 +35,11 @@ pub const Target = struct { unit: u32, self_n: u32 };
 /// The body `call` runs, or null when it is not known here: a call of a function value, a
 /// builtin, a protocol method, a derive, or a fn with no lowered body (an extern, an
 /// intrinsic).
-pub fn callTarget(gpa: std.mem.Allocator, body: Body.BodyView, prog: Body.ProgramView, bodies: Body.List, call: Ast.Index) error{OutOfMemory}!?Target {
+pub fn callTarget(body: Body.BodyView, prog: Body.ProgramView, bodies: Body.List, call: Ast.Index) ?Target {
     const tree = body.tree;
-    const n = tree.nodes[call.int()];
-    const slot = Callee.callSlot(tree, n) orelse return null;
+    const slot = Callee.callSlot(tree, tree.nodes[call.int()]) orelse return null;
     if (slot.int() >= body.callees.len) return null;
-    switch (body.callees[slot.int()].view()) {
+    return switch (body.callees[slot.int()].view()) {
         .method => |mi| {
             if (mi >= prog.methods.len) return null;
             const m = prog.methods[mi];
@@ -49,18 +48,10 @@ pub fn callTarget(gpa: std.mem.Allocator, body: Body.BodyView, prog: Body.Progra
             if (m.instance) |ii| return .{ .unit = bodies.ofInstance(ii), .self_n = self_n };
             return .{ .unit = bodies.ofFn(m.fn_id) orelse return null, .self_n = self_n };
         },
-        .none => {
-            if (try AstWalk.instanceOfCall(gpa, body, prog, call)) |ii| return .{ .unit = bodies.ofInstance(@intCast(ii)), .self_n = 0 };
-            const head_node = tree.nodes[n.lhs.int()];
-            const head = if (head_node.tag == .type_app) head_node.lhs else n.lhs;
-            if (head.int() >= body.resolutions.len) return null;
-            return switch (body.resolutions[head.int()]) {
-                .func => |gid| .{ .unit = bodies.ofFn(gid) orelse return null, .self_n = 0 },
-                else => null,
-            };
-        },
-        .protocol, .builtin, .value, .fn_ref, .bound_method => return null,
-    }
+        .direct => |gid| .{ .unit = bodies.ofFn(gid) orelse return null, .self_n = 0 },
+        .instance => |ii| .{ .unit = bodies.ofInstance(ii), .self_n = 0 },
+        .none, .generic, .protocol, .builtin, .value, .fn_ref, .bound_method => null,
+    };
 }
 
 /// A use that passes a value whole to `param` of body `unit`.
@@ -220,7 +211,7 @@ pub fn factsOf(
                         if (a.int() < self.body.node_types.len and LayoutEngine.isFnStruct(self.body.node_types[a.int()], self.prog.layouts)) break true;
                     } else false;
                     if (!passes_fn) return;
-                    const target = try callTarget(self.gpa, self.body, self.prog, self.bodies, e.idx);
+                    const target = callTarget(self.body, self.prog, self.bodies, e.idx);
                     if (target) |t| try self.calls.append(self.gpa, t.unit);
                     const mask = Modes.argMask(self.body, self.prog, e.idx);
                     for (args, 0..) |a, i| {
@@ -256,7 +247,7 @@ pub fn factsOf(
         /// directly, and a local in callee position is a function value it calls.
         fn templateCall(self: *@This(), call: Ast.Index, n: Ast.Node, args: []const Ast.Index) error{OutOfMemory}!void {
             if (self.local(n.lhs) != null) try self.roles.put(self.gpa, n.lhs.int(), .value_callee);
-            const target = try callTarget(self.gpa, self.body, self.prog, self.bodies, call);
+            const target = callTarget(self.body, self.prog, self.bodies, call);
             if (target) |t| try self.calls.append(self.gpa, t.unit);
             const mask = Modes.argMask(self.body, self.prog, call);
             for (args, 0..) |a, i| {

@@ -15,7 +15,8 @@ pub const Callee = extern struct {
     /// `.protocol`: the method's index within its protocol.
     aux: u16 = 0,
     /// `.method`, `.bound_method`: an index into `GraphResult.methods`. `.protocol`: the
-    /// protocol id. `.fn_ref`: the referenced fn's global id.
+    /// protocol id. `.fn_ref`, `.direct`, `.generic`: the fn's global id. `.instance`: an
+    /// index into `GraphResult.instances`.
     id: u32 = 0,
 
     /// The three `pending_*` tags are checker-internal: the method row only exists once
@@ -29,7 +30,17 @@ pub const Callee = extern struct {
     /// `.template`: a call of a method with its own type params that selected no instance
     /// (its args did not check). It views as `.none`; only `templateFn` reads it, so the
     /// LSP can still show the method a half-typed `xs.map(` names.
-    pub const Tag = enum(u8) { none, method, protocol, builtin, pending_method, pending_bound, pending_call, value, fn_ref, bound_method, template };
+    /// `.direct`: a call naming a non-generic fn (`f(x)`, `mod.f(x)`), builtins included.
+    /// `.instance`: a call of a generic fn (`id(7)`, `id[int](7)`), by the instance it
+    /// runs. `.generic`: a call of a generic fn whose instance is not known here: one in a
+    /// template's own body, or one whose args did not check. The seal records these
+    /// once mono has finished, so every reader shares one selection.
+    /// `.instance_unkeyed`: an `.instance` call its caller's codegen key does not fold: a
+    /// turbofish of a generic fn whose value params name no type param
+    /// (`mem.ga_new[T]()`). The fold never took such a call for a generic one, so a change
+    /// to that instance's signature does not reach the caller's key ([C2]); folding it
+    /// changes every such caller's key, so it is a change of its own. Views as `.instance`.
+    pub const Tag = enum(u8) { none, method, protocol, builtin, pending_method, pending_bound, pending_call, value, fn_ref, bound_method, template, direct, instance, generic, instance_unkeyed };
 
     /// The compiler-provided methods that have no `methods` row. The four `opt_*`
     /// ops mirror `Typecheck.OptResultMethod` (`opt_is_tag0` is `is_some`/`is_ok`);
@@ -60,6 +71,9 @@ pub const Callee = extern struct {
         value,
         fn_ref: u32,
         bound_method: u32,
+        direct: u32,
+        instance: u32,
+        generic: u32,
     };
 
     pub const pending: Callee = .{ .tag = .pending_method };
@@ -100,6 +114,18 @@ pub const Callee = extern struct {
         return if (c.tag == .template) c.id else null;
     }
 
+    pub fn direct(gid: u32) Callee {
+        return .{ .tag = .direct, .id = gid };
+    }
+
+    pub fn instanceCall(ii: u32) Callee {
+        return .{ .tag = .instance, .id = ii };
+    }
+
+    pub fn genericCall(gid: u32) Callee {
+        return .{ .tag = .generic, .id = gid };
+    }
+
     pub fn boundMethod(index: u32) Callee {
         return .{ .tag = .bound_method, .id = index };
     }
@@ -122,6 +148,9 @@ pub const Callee = extern struct {
             .value => .value,
             .fn_ref => .{ .fn_ref = c.id },
             .bound_method => .{ .bound_method = c.id },
+            .direct => .{ .direct = c.id },
+            .instance, .instance_unkeyed => .{ .instance = c.id },
+            .generic => .{ .generic = c.id },
         };
     }
 
@@ -168,6 +197,12 @@ test "view round-trips every constructor" {
         const k: Callee.Builtin = @enumFromInt(f.value);
         try std.testing.expectEqual(Callee.View{ .builtin = k }, Callee.builtinMethod(k).view());
     }
+}
+
+test "view round-trips the free-fn calls" {
+    try std.testing.expectEqual(Callee.View{ .direct = 3 }, Callee.direct(3).view());
+    try std.testing.expectEqual(Callee.View{ .instance = 4 }, Callee.instanceCall(4).view());
+    try std.testing.expectEqual(Callee.View{ .generic = 5 }, Callee.genericCall(5).view());
 }
 
 test "view round-trips value and fn_ref" {

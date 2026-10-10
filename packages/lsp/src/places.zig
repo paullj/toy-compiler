@@ -379,20 +379,16 @@ pub const Facts = struct {
     /// The callee `argMask` read the modes of: a selected method, or a top-level fn.
     fn calleeName(f: Facts, call: Ast.Node) ?[]const u8 {
         const tree = f.module().tree();
-        const e = f.entry();
+        const callees = f.tc.callees[f.entry()];
         const slot = Callee.callSlot(tree, call) orelse return null;
-        if (slot.int() < f.tc.callees[e].len) switch (f.tc.callees[e][slot.int()].view()) {
+        if (slot.int() >= callees.len) return null;
+        const gid = switch (callees[slot.int()].view()) {
             .method => |mi| return if (mi < f.tc.methods.len) f.tc.methods[mi].name else null,
-            .none => {},
+            .direct, .generic => |gid| gid,
+            .instance => |ii| if (ii < f.tc.instances.len) f.tc.instances[ii].template_gid else return null,
             else => return null,
         };
-        const head_node = tree.nodes[call.lhs.int()];
-        const head = if (head_node.tag == .type_app) head_node.lhs else call.lhs;
-        if (head == Ast.none or head.int() >= f.res.resolutions[e].len) return null;
-        return switch (f.res.resolutions[e][head.int()]) {
-            .func => |gid| if (gid < f.tc.sigs.len) render.unmangled(render.bareName(f.tc.sigs[gid].name)) else null,
-            else => null,
-        };
+        return if (gid < f.tc.sigs.len) render.unmangled(render.bareName(f.tc.sigs[gid].name)) else null;
     }
 };
 

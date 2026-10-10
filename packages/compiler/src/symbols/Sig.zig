@@ -22,14 +22,6 @@ pub const Sig = struct {
     /// keys (#25), since it decides how each argument is passed.
     mut_mask: u64 = 0,
 
-    /// True when some param is a check-time `type_var` — i.e. this sig is a generic
-    /// template. The single home for the test the bare-inferred-generic-call sites
-    /// (`lower`, `AstWalk.CallVisitor`, `Mono.callInstanceRef`) gate on.
-    pub fn hasTypeVar(sig: Sig) bool {
-        for (sig.params) |p| if (p.isTypeVar()) return true;
-        return false;
-    }
-
     /// True when this sig is a generic template — some param is a bare `type_var`
     /// (flat generic) OR an `.app`/`.func` (a type-var hidden inside a container or fn
     /// param like `Vec[T]` / `fn(T) -> int`). After reify only a template keeps

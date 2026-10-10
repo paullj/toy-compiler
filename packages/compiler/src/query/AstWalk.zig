@@ -692,61 +692,10 @@ pub const CallVisitor = struct {
                         try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret });
                     },
                     .bound_method => |mi| if (mi < fr.methods.len) try self.foldWitness(fr.methods[mi]),
-                    .none, .method, .protocol, .builtin, .value => {},
+                    .none, .method, .protocol, .builtin, .value, .direct, .instance, .generic => {},
                 }
             },
-            .callee => |c| {
-                // A generic call `id[int](..)`: the callee node is a
-                // `type_app` whose base identifier carries the template's `.func`.
-                // Resolve (template gid + the concrete type-args the checker wrote
-                // into node_types) to the reified instance's mangled name +
-                // substituted sig, so a caller folds the SAME instance identity the
-                // reloc targets. `Mono.find` is a deterministic scan.
-                const cn = self.frozen.tree.nodes[c.idx.int()];
-                if (cn.tag == .type_app) {
-                    // A `type_app` over a `field_access` NOT bound to a `.func` is an
-                    // explicit-protocol-args method call `v.into[int]()` (a qualified generic
-                    // fn binds its field_access to `.func`); anything else is a generic
-                    // FUNCTION call.
-                    if (self.frozen.tree.nodes[cn.lhs.int()].tag == .field_access and
-                        cn.lhs.int() < self.frozen.resolutions.len and self.frozen.resolutions[cn.lhs.int()] != .func)
-                    {
-                        try self.foldCalleeTable(c.call);
-                    } else {
-                        try self.foldInstance(c.call);
-                    }
-                    return;
-                }
-                const res = self.frozen.resolutions[c.idx.int()];
-                // `res.func` indexes BOTH `names` (the resolved SymName{kind,name},
-                // what the .func reloc target carries) and `sigs` (params/ret).
-                // Fold the full identity so a builtin<->user_fn shadow switch flips
-                // the caller's hash.
-                if (res == .func and res.func < self.frozen.sigs.len and res.func < self.frozen.names.len) {
-                    const sig = self.frozen.sigs[res.func];
-                    // A bare inferred generic call `id(7)` OR a qualified `mod.id(7)`:
-                    // the callee (plain identifier, or a field_access `resolveModuleMember`
-                    // bound to this `.func`) resolves to a generic template (its sig params
-                    // carry type_vars). Fold the resolved INSTANCE sig — not the template —
-                    // so the caller folds the SAME identity the reloc targets (mirroring
-                    // the type_app path). Both shapes route through the shared
-                    // `callInstanceRef`, keeping every consumer's instance selection in
-                    // agreement.
-                    const ctag = self.frozen.tree.nodes[c.idx.int()].tag;
-                    if ((ctag == .identifier or ctag == .field_access) and sig.isGenericTemplate()) {
-                        try self.foldInstance(c.call);
-                        return;
-                    }
-                    const nm = self.frozen.names[res.func];
-                    try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret, .mut_mask = sig.mut_mask });
-                    return;
-                }
-                // A method call `recv.m(..)` on a VALUE receiver: the callee is a
-                // `field_access` NOT bound to a `.func`. Fold the selected method's Sig so
-                // editing the method's signature/return flips every caller's fingerprint
-                // (stale-cache soundness — mirrors the plain-func fold above).
-                if (cn.tag == .field_access and res != .func) try self.foldCalleeTable(c.call);
-            },
+            .callee => |c| try self.foldCallee(c.call),
             .operator => |e| {
                 // A desugaring operator on a struct/enum operand desugars to that type's
                 // witness — `==`/`!=` to `Eq::eq` (or, for an Ord-refinement operand with no
@@ -801,6 +750,29 @@ pub const CallVisitor = struct {
         }
     }
 
+    /// Fold call `call`'s callee identity and signature from the checker's table: the fn
+    /// a direct call names, the instance (or its spec unit) a generic call runs, or the
+    /// method a member call selects. A generic call with no instance here folds nothing,
+    /// as does a turbofish intrinsic, which names no code.
+    fn foldCallee(self: *Self, call: Ast.Index) error{OutOfMemory}!void {
+        const fr = self.frozen;
+        const slot = Callee.callSlot(fr.tree, fr.tree.nodes[call.int()]) orelse return;
+        if (slot.int() >= fr.callees.len) return;
+        switch (fr.callees[slot.int()].view()) {
+            // `gid` indexes BOTH `names` (the SymName{kind,name} the reloc target carries)
+            // and `sigs`. Fold the full identity so a builtin<->user_fn shadow switch flips
+            // the caller's hash.
+            .direct => |gid| if (gid < fr.sigs.len and gid < fr.names.len) {
+                const nm = fr.names[gid];
+                const sig = fr.sigs[gid];
+                try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret, .mut_mask = sig.mut_mask });
+            },
+            .instance => |ii| if (ii < fr.instances.len and fr.callees[slot.int()].tag != .instance_unkeyed) try self.foldInstance(call, ii),
+            .method, .builtin => try self.foldCalleeTable(call),
+            .none, .generic, .protocol, .value, .fn_ref, .bound_method => {},
+        }
+    }
+
     /// Fold call `call_idx`'s method callee from the checker's Callee table.
     fn foldCalleeTable(self: *Self, call_idx: Ast.Index) error{OutOfMemory}!void {
         const fr = self.frozen;
@@ -811,13 +783,13 @@ pub const CallVisitor = struct {
         switch (fr.callees[fa.int()].view()) {
             // A value call's code is not known statically; `.fn_ref` and `.bound_method`
             // never sit on a call's slot (they fold at their own node's `.enter`).
-            .none, .protocol, .value, .fn_ref, .bound_method => {},
+            .none, .protocol, .value, .fn_ref, .bound_method, .direct, .instance, .generic => {},
             .method => |i| if (i < fr.methods.len) {
                 // A specialized call relocs to its spec unit, which has the instance's sig.
-                if (Spec.methodSite(fr.bodyView(), fr.programView(), call_idx)) |site| if (site.ii < fr.instances.len) {
-                    if (try Spec.select(self.gpa, fr.closure.specs, fr.bodyView(), fr.programView(), fr.lambdas(), call_idx, site)) |name| {
-                        const inst = fr.instances[site.ii];
-                        return self.out.append(self.gpa, .{ .kind = .user_fn, .name = name, .params = inst.params, .ret = inst.ret, .mut_mask = templateMask(fr.sigs, inst) });
+                if (fr.methods[i].instance) |ii| if (ii < fr.instances.len) {
+                    if (fr.closure.specs.unitAt(fr.closure.owner, call_idx)) |u| {
+                        const inst = fr.instances[ii];
+                        return self.out.append(self.gpa, .{ .kind = .user_fn, .name = u.name, .params = inst.params, .ret = inst.ret, .mut_mask = templateMask(fr.sigs, inst) });
                     }
                 };
                 try self.foldWitness(fr.methods[i]);
@@ -854,52 +826,19 @@ pub const CallVisitor = struct {
         try self.out.append(self.gpa, .{ .kind = sym.kind, .name = sym.name, .params = sig.params, .ret = sig.ret, .mut_mask = sig.mut_mask });
     }
 
-    /// Fold generic call `call_idx`'s reified INSTANCE identity (see `instanceOfCall`), or
-    /// the spec unit's name when the call goes to one (the instance's sig either way). A
-    /// miss (pre-typecheck view, arity/conflict/unbound, or an unminted instance) folds
-    /// nothing, so exactly one-or-zero Sig per call is preserved and the fold tracks the
-    /// SAME `Instance` mono discovery enqueued.
-    fn foldInstance(self: *Self, call_idx: Ast.Index) error{OutOfMemory}!void {
+    /// Fold instance `ii`'s identity, or the spec unit's name when call `call` goes to one
+    /// (the instance's sig either way), tracking the SAME `Instance` the reloc targets.
+    fn foldInstance(self: *Self, call: Ast.Index, ii: u32) error{OutOfMemory}!void {
         const fr = self.frozen;
-        const ii = (try instanceOfCall(self.gpa, fr.bodyView(), fr.programView(), call_idx)) orelse return;
         const inst = fr.instances[ii];
-        const name = (try Spec.select(self.gpa, fr.closure.specs, fr.bodyView(), fr.programView(), fr.lambdas(), call_idx, .{ .ii = ii, .self_n = 0 })) orelse inst.name.?;
-        try self.out.append(self.gpa, .{ .kind = .user_fn, .name = name, .params = inst.params, .ret = inst.ret, .mut_mask = templateMask(self.frozen.sigs, inst) });
+        const name = if (fr.closure.specs.unitAt(fr.closure.owner, call)) |u| u.name else inst.name.?;
+        try self.out.append(self.gpa, .{ .kind = .user_fn, .name = name, .params = inst.params, .ret = inst.ret, .mut_mask = templateMask(fr.sigs, inst) });
     }
 };
 
 /// An instance's modes: its template's, since modes are syntactic.
 fn templateMask(sigs: []const Sig, inst: Mono.Instance) u64 {
     return if (inst.template_gid < sigs.len) sigs[inst.template_gid].mut_mask else 0;
-}
-
-/// The reified instance generic call `call` selects: the template gid and type-args the
-/// SHARED `callInstanceRef` recovers (explicit turbofish or bare inference), found in the
-/// instance table. The composite is gone by now, so `callInstanceRef` returns null for a
-/// pure-container call; that call falls to the FIND regime: match the reified value-arg
-/// types against each instance's reified `params`. Null on a miss (pre-typecheck view,
-/// arity/conflict/unbound, or an unminted instance).
-pub fn instanceOfCall(gpa: std.mem.Allocator, body: Body.BodyView, prog: Body.ProgramView, call: Ast.Index) error{OutOfMemory}!?usize {
-    const call_node = body.tree.nodes[call.int()];
-    const view: Mono.CallView = .{ .tree = body.tree, .resolutions = body.resolutions, .node_types = body.node_types, .templates = .{ .sigs = prog.sigs } };
-    if (try Mono.callInstanceRef(gpa, view, call_node)) |ref| {
-        defer gpa.free(ref.args);
-        if (Mono.find(prog.instances, ref.gid, ref.args)) |ii| return ii;
-    }
-    const bres = body.resolutions[call_node.lhs.int()];
-    if (bres != .func) return null;
-    const value_args = Ast.rangeSlice(body.tree, call_node.rhs.int());
-    // Heap-allocate (not a fixed stack buffer) so a call with any arity still
-    // folds its instance-identity into the fingerprint — a silent skip on a large
-    // arg list would drop the caller's recompile dependency (stale-cache hazard).
-    // Mirrors lower.zig / Mono.callInstanceRef, which alloc the same scratch.
-    const buf = try gpa.alloc(Typecheck.Type, value_args.len);
-    defer gpa.free(buf);
-    for (value_args, 0..) |va, k| {
-        if (va.int() >= body.node_types.len) return null;
-        buf[k] = body.node_types[va.int()];
-    }
-    return Mono.findByReifiedParams(prog.instances, bres.func, buf);
 }
 
 /// Records each touched type's layout in body-walk order: at a `.touch` event the
@@ -2537,7 +2476,13 @@ test "a specialized call site folds the spec unit's name" {
     const owner = for (fx.res.fns, 0..) |gf, i| {
         if (std.mem.eql(u8, gf.name, "main.use_it")) break fx.tc.bodies.ofFn(@intCast(i)).?;
     } else return error.TestExpectedFn;
-    const closure: lower.ClosureInputs = .{ .adapters = &.{}, .specs = .{ .units = &units, .masks = &masks }, .lambda_units = fx.tc.lambda_units, .owner = owner };
+    // The first `apply` call goes to the unit; the lambda's call has none.
+    const first_call = for (fx.tree.nodes, 0..) |n, i| {
+        if (n.tag == .call and fx.tree.nodes[n.lhs.int()].tag == .identifier and
+            std.mem.eql(u8, fx.tokens[fx.tree.nodes[n.lhs.int()].main_token].text(fx.src), "apply")) break Ast.Index.from(@intCast(i));
+    } else return error.TestExpectedCall;
+    const calls = [_]Spec.Call{.{ .owner = owner, .call = first_call, .unit = 0 }};
+    const closure: lower.ClosureInputs = .{ .adapters = &.{}, .specs = .{ .units = &units, .masks = &masks, .calls = &calls }, .lambda_units = fx.tc.lambda_units, .owner = owner };
 
     var sigs: std.ArrayList(Sig) = .empty;
     defer sigs.deinit(gpa);

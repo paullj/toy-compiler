@@ -3,10 +3,10 @@
 //! An `Instance` is one reachable `(generic template, concrete-arg-tuple)` pair
 //! reified to an ordinary concrete per-fn codegen unit. The type checker's serial
 //! monomorphization tail produces the table; codegen enumerates it as extra
-//! lowerable units; `lower`/`Fingerprint`(`CallVisitor`) resolve a generic call
-//! site to its instance through it. This module is the SINGLE home for the
-//! canonical logic (`find`, the sort key, the mangled `SymName`) so the four
-//! consumers cannot drift.
+//! lowerable units; the checker's call seal records each generic call's instance
+//! (`instanceOf`) on its callee slot, and every later reader takes it from there. This
+//! module is the SINGLE home for the canonical logic (`find`, the sort key, the mangled
+//! `SymName`) so the consumers cannot drift.
 //!
 //! Determinism is SACRED: `lessThan` is a total order over `(template gid, arg
 //! bytes)` and `mangle` is a pure function of the template name + the arg tuple,
@@ -136,9 +136,9 @@ pub const CallView = struct {
 pub const CallRef = struct { gid: u32, args: []Type };
 
 /// Recover `(template gid, concrete type-args)` from a `.call` node's callee — the
-/// single arg-extraction both mono discovery (`types.scanCalls`) and the content
-/// fingerprint (`AstWalk.CallVisitor`) walk, so they cannot drift on which
-/// `Instance` a call selects. Two call-shapes:
+/// single arg-extraction both mono discovery (`types.scanCalls`) and the call seal
+/// (`instanceOf`) run, so they cannot drift on which `Instance` a call selects. Two
+/// call-shapes:
 ///   * explicit turbofish `id[int](..)` — the callee is a `type_app`; the type-args
 ///     are read straight from `node_types`.
 ///   * bare inferred `id(7)` — the callee is a plain `identifier`, OR a qualified
@@ -146,8 +146,8 @@ pub const CallRef = struct { gid: u32, args: []Type };
 ///     bound to `.func`; both carry the SAME gid on `call.lhs`, so the type-args are
 ///     inferred from the value-arg `node_types` via `Infer.infer` identically.
 /// The leading `if (bres != .func)` is the discriminator: a value-method field_access
-/// stays `.unresolved` (discovery binds impl params; the fingerprint resolves the
-/// conformance witness — genuinely different leaves) and a same-module `N.V` variant
+/// stays `.unresolved` (discovery binds impl params; the checker records the selected
+/// method — genuinely different leaves) and a same-module `N.V` variant
 /// access is `.unresolved` too, so both still return null here.
 ///
 /// Returns null for any non-generic / non-`.func` / out-of-range / uninferable call; on
@@ -191,6 +191,30 @@ pub fn callInstanceRef(gpa: std.mem.Allocator, view: CallView, call_node: Ast.No
         },
         else => return null,
     }
+}
+
+/// The instance generic call `call` runs, once the check is done: the explicit or inferred
+/// type-args `callInstanceRef` recovers, found in `insts`. The composite is gone by then, so
+/// a pure-container call recovers none; it falls to the instance whose reified params
+/// accept the call's reified args (`findByReifiedParams`). Null when there is none.
+pub fn instanceOf(gpa: std.mem.Allocator, view: CallView, insts: []const Instance, call: Ast.Index) error{OutOfMemory}!?usize {
+    const call_node = view.tree.nodes[call.int()];
+    if (try callInstanceRef(gpa, view, call_node)) |ref| {
+        defer gpa.free(ref.args);
+        if (find(insts, ref.gid, ref.args)) |ii| return ii;
+    }
+    const bres = view.resolutions[call_node.lhs.int()];
+    if (bres != .func) return null;
+    const value_args = Ast.rangeSlice(view.tree, call_node.rhs.int());
+    // Heap scratch, not a fixed stack buffer, so a call of any arity still finds its
+    // instance (a silent miss would drop the caller's recompile dependency).
+    const buf = try gpa.alloc(Type, value_args.len);
+    defer gpa.free(buf);
+    for (value_args, 0..) |va, k| {
+        if (va.int() >= view.node_types.len) return null;
+        buf[k] = view.node_types[va.int()];
+    }
+    return findByReifiedParams(insts, bres.func, buf);
 }
 
 /// Find the instance whose reified value-PARAMS accept the call's reified value-ARG
@@ -358,7 +382,7 @@ test "callInstanceRef returns null for a non-generic or non-func callee" {
     var resolutions = [_]Resolution{.unresolved} ** 3;
     resolutions[0] = .{ .func = 5 };
     const node_types = [_]Type{ Type.invalid, Type.int, Type.invalid };
-    // gen_gid 9 != the callee's gid 5 -> genericTemplate is null -> not a template.
+    // gen_gid 9 != the callee's gid 5 -> no template facts -> not a template.
     var refs: [10]?TemplateRef = undefined;
     const view = fakeView(tree, &resolutions, &node_types, &refs, 9, &.{}, 1);
     try testing.expectEqual(@as(?CallRef, null), try callInstanceRef(gpa, view, nodes[2]));

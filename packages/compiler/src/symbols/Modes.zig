@@ -39,7 +39,7 @@ pub fn argMask(body: Body.BodyView, prog: Body.ProgramView, call: Ast.Index) u64
     const n = tree.nodes[call.int()];
     const slot = Callee.callSlot(tree, n) orelse return 0;
     if (slot.int() >= body.callees.len) return 0;
-    switch (body.callees[slot.int()].view()) {
+    return switch (body.callees[slot.int()].view()) {
         .method => |mi| {
             if (mi >= prog.methods.len) return 0;
             const m = prog.methods[mi];
@@ -49,17 +49,11 @@ pub fn argMask(body: Body.BodyView, prog: Body.ProgramView, call: Ast.Index) u64
             const mask = prog.sigs[m.fn_id].mut_mask;
             return if (m.is_static) mask else mask >> 1;
         },
-        .none => {
-            const head_node = tree.nodes[n.lhs.int()];
-            const head = if (head_node.tag == .type_app) head_node.lhs else n.lhs;
-            if (head == Ast.none or head.int() >= body.resolutions.len) return 0;
-            return switch (body.resolutions[head.int()]) {
-                .func => |gid| if (gid < prog.sigs.len) prog.sigs[gid].mut_mask else 0,
-                else => 0,
-            };
-        },
-        .protocol, .builtin, .value, .fn_ref, .bound_method => return 0,
-    }
+        .direct, .generic => |gid| if (gid < prog.sigs.len) prog.sigs[gid].mut_mask else 0,
+        // An instance's modes are its template's.
+        .instance => |ii| if (ii < prog.instances.len and prog.instances[ii].template_gid < prog.sigs.len) prog.sigs[prog.instances[ii].template_gid].mut_mask else 0,
+        .none, .protocol, .builtin, .value, .fn_ref, .bound_method => 0,
+    };
 }
 
 const testing = std.testing;

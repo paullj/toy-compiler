@@ -42,7 +42,6 @@ const Abi = @import("codegen/abi/Abi.zig");
 const Sig = @import("symbols/Sig.zig").Sig;
 const Mono = @import("symbols/Mono.zig");
 const Derive = @import("symbols/Derive.zig");
-const Infer = @import("symbols/Infer.zig");
 const Intrinsic = @import("symbols/Intrinsic.zig");
 const Modes = @import("symbols/Modes.zig");
 const Body = @import("symbols/Body.zig");
@@ -76,19 +75,10 @@ pub const Inputs = struct {
     /// owning module's id, including a qualified cross-module `b: rect.Rect` resolved
     /// by `Typecheck.typeFromQualified`); `typeFromRef` is only the fallback.
     sig: ?Sig = null,
-    /// The monomorphization instance table. A generic call `id[int](..)` in
-    /// this body resolves its callee to the reified instance's mangled SymName by
-    /// matching `(template gid + the concrete type-args read from node_types)`
-    /// against this table. Empty for a program with no generics. Resolution reads
-    /// only concrete `node_types` — no substitution map is threaded here (the mono
-    /// tail already substituted every `type_var` away before `node_types` froze).
+    /// The monomorphization instance table, which a generic call's `.instance` callee
+    /// indexes. Empty for a program with no generics.
     instances: []const Mono.Instance = &.{},
-    /// Program-wide callee signatures by global fn id. A bare inferred generic
-    /// call `id(7)` resolves its callee to a generic template's `.func`; that is
-    /// detectable because the template's `sigs[func].params` carry `type_var`s. When
-    /// so, `lowerCall` re-runs the shared `Infer` matcher over the value-arg
-    /// `node_types` to select the SAME `Mono.Instance` Pass C created, instead of
-    /// emitting the template symbol. Empty for a program with no generics.
+    /// Program-wide callee signatures by global fn id.
     sigs: []const Sig = &.{},
     /// The program-wide method table. `callees` selects a method call's entry by index;
     /// the operator/derive/`?`-widen witness sites resolve theirs here by protocol.
@@ -126,11 +116,6 @@ pub const Inputs = struct {
 
     pub fn programView(in: *const Inputs) Body.ProgramView {
         return .{ .sigs = in.sigs, .methods = in.methods, .instances = in.instances, .names = in.names, .layouts = in.layouts };
-    }
-
-    /// The lambda units this body's lambda literals lower to.
-    pub fn lambdas(in: *const Inputs) Spec.Lambdas {
-        return .{ .owner = in.closure.owner, .units = in.closure.lambda_units };
     }
 };
 
@@ -2157,25 +2142,6 @@ pub fn lowerCharDisplay(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!Ir.Slot
     return str_slot;
 }
 
-/// True when `sig` is a generic template (some param is a check-time `type_var`).
-/// Bare inferred calls resolve to the template's `.func`; genericness is detected
-/// from the callee sig so `lowerCall` selects the reified instance, not the template.
-fn sigHasTypeVar(sig: Sig) bool {
-    for (sig.params) |p| if (p.isTypeVar()) return true;
-    return false;
-}
-
-/// `1 + max type_var ordinal` over `sig.params` — the generic-param count `Infer.infer`
-/// needs. Equals `generic_params.len` for any bare call that reached lower: such a call
-/// passed Pass C, so every type-var was bound, hence appears in a value param.
-fn genericParamCount(sig: Sig) u32 {
-    var m: u32 = 0;
-    for (sig.params) |p| if (p.isTypeVar() and p.typeVarOrd() > m) {
-        m = p.typeVarOrd();
-    };
-    return m + 1;
-}
-
 fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
     const callee_node = b.in.tree.nodes[(n.lhs).int()];
     var callee: Link.SymName = undefined;
@@ -2193,10 +2159,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             // both (`names[m.fn_id]` would be `names[0]`, a wrong-symbol miscompile).
             const m = b.in.methods[mi];
             callee = witnessCallee(b, m);
-            if (m.instance) |ii| {
-                if (try Spec.select(b.gpa, b.in.closure.specs, b.in.bodyView(), b.in.programView(), b.in.lambdas(), node_idx, .{ .ii = ii, .self_n = @intFromBool(!m.is_static) })) |name|
-                    callee = .{ .kind = .user_fn, .name = name };
-            }
+            if (b.in.closure.specs.unitAt(b.in.closure.owner, node_idx)) |u| callee = .{ .kind = .user_fn, .name = u.name };
             // An associated function (`Vec[int].new()`) takes no `self`: its receiver is a type.
             self_recv = if (m.is_static) Ast.none else b.in.tree.nodes[Callee.memberNode(b.in.tree, n).?.int()].lhs;
             self_mut = m.mut_self;
@@ -2219,206 +2182,25 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             try b.note(n.main_token, "protocol callee in lower");
             return .none;
         },
-        .none => if (callee_node.tag == .type_app) {
-            // `size_of[T]()` / `align_of[T]()`: the base resolves to a core-only builtin.
-            // Fold to a compile-time ABI constant (no call, no reloc). Checked BEFORE the
-            // generic-instance resolution below.
-            {
-                const bres = b.in.resolutions[(callee_node.lhs).int()];
-                if (bres == .func and bres.func < b.in.names.len and b.in.names[bres.func].kind == .builtin) {
-                    const bn = b.in.names[bres.func].name;
-                    const bik = Intrinsic.lookup(bn);
-                    if (bik == .size_of or bik == .align_of) {
-                        const tnodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
-                        const t = b.in.node_types[(tnodes[0]).int()];
-                        const c: u32 = if (bik == .size_of)
-                            Abi.typeSize(t, b.in.layouts, b.in.enum_layouts)
-                        else
-                            Abi.typeAlign(t, b.in.layouts, b.in.enum_layouts);
-                        return .{ .value = try b.emit(.{ .iconst = @intCast(c) }, Typecheck.Type.int) };
-                    }
-                    // `gc_array[T](p)` wraps a raw cell pointer into an 8-byte handle: a
-                    // checker-only type change, so lower yields the pointer operand directly.
-                    if (bik == .gc_array) {
-                        const vargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                        return .{ .value = operandValue(try lowerExpr(b, vargs[0])) };
-                    }
-                    // `descriptor_of[T]()`: materialize the address of T's descriptor entry via
-                    // the reserved-sentinel `cstr_ptr` path (NOT folded to a constant — the
-                    // address is a link-time-resolved reloc, exactly like a string literal ptr).
-                    if (bik == .descriptor_of) {
-                        const tnodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
-                        const t = b.in.node_types[(tnodes[0]).int()];
-                        return .{ .value = try b.emit(.{ .cstr_ptr = try Link.descHash(b.gpa, t) }, Typecheck.Type.rawptr) };
-                    }
-                }
-            }
-            // A generic call `id[int](..)`: the callee is a `type_app` whose base
-            // identifier carries the template gid. Resolve to the reified instance's
-            // mangled SymName by matching (gid + the concrete type-args the checker
-            // wrote into node_types) against the instance table — a pure read of
-            // concrete types, no substitution needed here.
-            const base_res = b.in.resolutions[(callee_node.lhs).int()];
-            if (base_res != .func) {
-                try b.note(n.main_token, "call target unsupported in lower");
-                return .none;
-            }
-            const targ_nodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
-            const targs = try b.gpa.alloc(Typecheck.Type, targ_nodes.len);
-            defer b.gpa.free(targs);
-            for (targ_nodes, 0..) |tn, i| targs[i] = b.in.node_types[(tn).int()];
-            const ii = Mono.find(b.in.instances, base_res.func, targs) orelse {
-                try b.note(callee_node.main_token, "unresolved generic instance in lower");
-                return .none;
-            };
-            callee = .{ .kind = .user_fn, .name = (try Spec.select(b.gpa, b.in.closure.specs, b.in.bodyView(), b.in.programView(), b.in.lambdas(), node_idx, .{ .ii = ii, .self_n = 0 })) orelse b.in.instances[ii].name.? };
-        } else {
-            // The callee identifier resolves to a `.func` index into `names`.
-            const callee_res = b.in.resolutions[(n.lhs).int()];
-            if (callee_res != .func) {
-                try b.note(n.main_token, "call target unsupported in lower");
-                return .none;
-            }
+        .instance => |ii| {
+            const name = if (b.in.closure.specs.unitAt(b.in.closure.owner, node_idx)) |u| u.name else b.in.instances[ii].name.?;
+            callee = .{ .kind = .user_fn, .name = name };
+        },
+        .direct => |gid| {
             // The memory intrinsics (`store`/`load`/`offset`/..., the `call_hash`/`call_eq`
             // indirect-dispatch helpers and the `ref_*` cell ops) have no symbol of their own,
             // so intercept them BEFORE the plain-name resolution below looks for one.
-            if (callee_res.func < b.in.names.len) {
-                const nm = b.in.names[callee_res.func];
-                // Raw-pointer `store`/`load`: lower directly to the IR memory ops (no call,
-                // no reloc). The checker fenced them in `unsafe { }` and typed the rawptr
-                // operand; this milestone reads/writes a 64-bit int through the pointer.
-                if (nm.kind == .builtin) if (Intrinsic.lookup(nm.name)) |ik| switch (ik) {
-                    .store => {
-                        const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                        const vty = b.in.node_types[(sargs[1]).int()];
-                        const addr = operandValue(try lowerExpr(b, sargs[0]));
-                        // A zero-sized value (`()`) occupies no bytes: evaluate the value
-                        // expr for its effects, emit no store (the erased Map's value column
-                        // when V = ()). Also prevents an OOB write — the cell stride is
-                        // size_of[K]+0, so offset(cell, size_of[K]) points past the cell.
-                        if (vty.kind == .unit) {
-                            _ = try lowerExpr(b, sargs[1]);
-                            return .none;
-                        }
-                        if (isAggTy(b, vty)) {
-                            const src = try operandPtr(b, try lowerExpr(b, sargs[1]));
-                            if (src != Ir.none_value) _ = try b.emit(.{ .copy = .{ .dst = addr, .src = src, .ty = vty } }, null);
-                            return .none;
-                        }
-                        const val = operandValue(try lowerExpr(b, sargs[1]));
-                        _ = try b.emit(.{ .store = .{ .addr = addr, .val = val, .ty = vty } }, null);
-                        return .none;
-                    },
-                    .load => {
-                        const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                        const addr = operandValue(try lowerExpr(b, largs[0]));
-                        const lty = b.in.node_types[(node_idx).int()];
-                        // A load typed `()` yields the zero-sized unit value (`.none`): the
-                        // address was already evaluated for effect; read nothing (mp_val_at /
-                        // mp_grow when V = ()).
-                        if (lty.kind == .unit) return .none;
-                        if (isAggTy(b, lty)) {
-                            const slot = try b.addSlot(lty);
-                            const dst = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
-                            _ = try b.emit(.{ .copy = .{ .dst = dst, .src = addr, .ty = lty } }, null);
-                            return .{ .slot = slot };
-                        }
-                        return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = lty } }, lty) };
-                    },
-                    .offset => {
-                        // `offset(base, i)` is a plain 64-bit pointer add: the base's isRefTy
-                        // value already lowers to its 8-byte cell pointer, so no unwrap needed.
-                        const oargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                        const base = operandValue(try lowerExpr(b, oargs[0]));
-                        const idx = operandValue(try lowerExpr(b, oargs[1]));
-                        return .{ .value = try b.emit(.{ .add = .{ .lhs = base, .rhs = idx } }, Typecheck.Type.rawptr) };
-                    },
-                    .call_hash => {
-                        const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                        const fp = operandValue(try lowerExpr(b, a[0]));
-                        const kp = operandValue(try lowerExpr(b, a[1]));
-                        const args = try b.gpa.alloc(Ir.Operand, 1);
-                        args[0] = .{ .value = kp };
-                        return .{ .value = try b.emit(.{ .call_indirect = .{ .target = fp, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.int) };
-                    },
-                    .call_eq => {
-                        const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                        const fp = operandValue(try lowerExpr(b, a[0]));
-                        const ap = operandValue(try lowerExpr(b, a[1]));
-                        const bp = operandValue(try lowerExpr(b, a[2]));
-                        const args = try b.gpa.alloc(Ir.Operand, 2);
-                        args[0] = .{ .value = ap };
-                        args[1] = .{ .value = bp };
-                        return .{ .value = try b.emit(.{ .call_indirect = .{ .target = fp, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.bool) };
-                    },
-                    .store_byte => {
-                        const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                        const addr = operandValue(try lowerExpr(b, sargs[0]));
-                        const val = operandValue(try lowerExpr(b, sargs[1]));
-                        _ = try b.emit(.{ .store_byte = .{ .addr = addr, .val = val } }, null);
-                        return .none;
-                    },
-                    .load_byte => {
-                        const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                        const addr = operandValue(try lowerExpr(b, largs[0]));
-                        return .{ .value = try b.emit(.{ .load_byte = addr }, Typecheck.Type.int) };
-                    },
-                    .ref_new => return try lowerRefNew(b, Ast.rangeSlice(b.in.tree, (n.rhs).int())[0], n.main_token),
-                    .ref_get => {
-                        const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                        const addr = operandValue(try lowerExpr(b, a[0]));
-                        return try lowerRefLoad(b, addr, b.in.node_types[(node_idx).int()], n.main_token);
-                    },
-                    .ref_set => {
-                        const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                        // The cell is evaluated before the value, as every place store is.
-                        const addr = operandValue(try lowerExpr(b, a[0]));
-                        const vty = b.in.node_types[(a[1]).int()];
-                        if (vty.kind == .never) {
-                            _ = try lowerExpr(b, a[1]);
-                        } else try storeThrough(b, addr, a[1], vty, n.main_token);
-                        return .none;
-                    },
-                    else => {},
-                };
-            }
-            if ((callee_node.tag == .identifier or callee_node.tag == .field_access) and
-                callee_res.func < b.in.sigs.len and b.in.sigs[callee_res.func].isGenericTemplate())
-            {
-                // A bare inferred generic call `id(7)` OR a qualified `mod.id(7)`: the callee
-                // (plain identifier, or a field_access `resolveModuleMember` bound to `.func`)
-                // resolves to a generic template (its sig params carry `type_var`s). Re-run
-                // the SHARED matcher over the value-arg node_types to pick the SAME instance
-                // Pass C / scanCalls selected, then use its mangled name (mirroring the
-                // type_app branch). A miss (arity/conflict/unbound/unminted) is an internal
-                // invariant break — Pass C already gated it — so note-and-drop.
-                const sig = b.in.sigs[callee_res.func];
-                const value_args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-                const arg_types = try b.gpa.alloc(Typecheck.Type, value_args.len);
-                defer b.gpa.free(arg_types);
-                for (value_args, 0..) |va, i| arg_types[i] = b.in.node_types[(va).int()];
-                // FIND regime: the composite table is gone, so a container param (`Vec[T]`)
-                // cannot be re-inferred here. The FLAT portion re-runs the shared matcher
-                // (byte-identical to before — pure-flat calls resolve here and never touch
-                // the fallback); a container/mixed call resolves by matching the reified
-                // value-arg types against each instance's already-reified `params`.
-                var ii: ?usize = null;
-                if (sigHasTypeVar(sig)) {
-                    if (try Infer.infer(b.gpa, genericParamCount(sig), sig.params, arg_types, null)) |targs| {
-                        defer b.gpa.free(targs);
-                        ii = Mono.find(b.in.instances, callee_res.func, targs);
-                    }
-                }
-                if (ii == null) ii = Mono.findByReifiedParams(b.in.instances, callee_res.func, arg_types);
-                const inst = ii orelse {
-                    try b.note(callee_node.main_token, "unresolved generic instance in lower");
-                    return .none;
-                };
-                callee = .{ .kind = .user_fn, .name = (try Spec.select(b.gpa, b.in.closure.specs, b.in.bodyView(), b.in.programView(), b.in.lambdas(), node_idx, .{ .ii = inst, .self_n = 0 })) orelse b.in.instances[inst].name.? };
-            } else {
-                callee = b.in.names[callee_res.func];
-            }
+            const nm = b.in.names[gid];
+            if (nm.kind == .builtin) if (Intrinsic.lookup(nm.name)) |ik| if (try lowerIntrinsicCall(b, node_idx, n, ik)) |op| return op;
+            callee = nm;
         },
+        // A miss (arity/conflict/unbound/unminted) is an internal invariant break — Pass C
+        // already gated it — so note-and-drop.
+        .generic => {
+            try b.note(callee_node.main_token, "unresolved generic instance in lower");
+            return .none;
+        },
+        .none => return lowerTypeIntrinsicCall(b, n),
     }
     const result_ty = b.in.node_types[(node_idx).int()];
 
@@ -2461,6 +2243,145 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     }
 
     return try emitCall(b, .{ .direct = callee }, args, result_ty, n.main_token);
+}
+
+/// A call the checker selected no callee for: one of the compile-time intrinsics spelled
+/// with type-args, which name no code; any other cannot lower.
+fn lowerTypeIntrinsicCall(b: *Builder, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
+    const callee_node = b.in.tree.nodes[(n.lhs).int()];
+    const bres: Resolve.Resolution = if (callee_node.tag == .type_app) b.in.resolutions[(callee_node.lhs).int()] else .unresolved;
+    if (bres != .func) {
+        try b.note(n.main_token, "call target unsupported in lower");
+        return .none;
+    }
+    if (bres.func < b.in.names.len and b.in.names[bres.func].kind == .builtin) if (Intrinsic.lookup(b.in.names[bres.func].name)) |bik| switch (bik) {
+        // `size_of[T]()` / `align_of[T]()`: a compile-time ABI constant (no call, no reloc).
+        .size_of, .align_of => {
+            const tnodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
+            const t = b.in.node_types[(tnodes[0]).int()];
+            const c: u32 = if (bik == .size_of)
+                Abi.typeSize(t, b.in.layouts, b.in.enum_layouts)
+            else
+                Abi.typeAlign(t, b.in.layouts, b.in.enum_layouts);
+            return .{ .value = try b.emit(.{ .iconst = @intCast(c) }, Typecheck.Type.int) };
+        },
+        // `gc_array[T](p)` wraps a raw cell pointer into an 8-byte handle: a checker-only
+        // type change, so lower yields the pointer operand directly.
+        .gc_array => {
+            const vargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+            return .{ .value = operandValue(try lowerExpr(b, vargs[0])) };
+        },
+        // `descriptor_of[T]()`: the address of T's descriptor entry, through the
+        // reserved-sentinel `cstr_ptr` path (NOT folded to a constant — the address is a
+        // link-time-resolved reloc, exactly like a string literal ptr).
+        .descriptor_of => {
+            const tnodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
+            const t = b.in.node_types[(tnodes[0]).int()];
+            return .{ .value = try b.emit(.{ .cstr_ptr = try Link.descHash(b.gpa, t) }, Typecheck.Type.rawptr) };
+        },
+        else => {},
+    };
+    try b.note(callee_node.main_token, "unresolved generic instance in lower");
+    return .none;
+}
+
+/// A call of intrinsic `ik` lowered in place, or null for one that is called by its own
+/// symbol (`panic`).
+fn lowerIntrinsicCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node, ik: Intrinsic.Kind) error{OutOfMemory}!?Ir.Operand {
+    switch (ik) {
+        .store => {
+            const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+            const vty = b.in.node_types[(sargs[1]).int()];
+            const addr = operandValue(try lowerExpr(b, sargs[0]));
+            // A zero-sized value (`()`) occupies no bytes: evaluate the value
+            // expr for its effects, emit no store (the erased Map's value column
+            // when V = ()). Also prevents an OOB write — the cell stride is
+            // size_of[K]+0, so offset(cell, size_of[K]) points past the cell.
+            if (vty.kind == .unit) {
+                _ = try lowerExpr(b, sargs[1]);
+                return .none;
+            }
+            if (isAggTy(b, vty)) {
+                const src = try operandPtr(b, try lowerExpr(b, sargs[1]));
+                if (src != Ir.none_value) _ = try b.emit(.{ .copy = .{ .dst = addr, .src = src, .ty = vty } }, null);
+                return .none;
+            }
+            const val = operandValue(try lowerExpr(b, sargs[1]));
+            _ = try b.emit(.{ .store = .{ .addr = addr, .val = val, .ty = vty } }, null);
+            return .none;
+        },
+        .load => {
+            const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+            const addr = operandValue(try lowerExpr(b, largs[0]));
+            const lty = b.in.node_types[(node_idx).int()];
+            // A load typed `()` yields the zero-sized unit value (`.none`): the
+            // address was already evaluated for effect; read nothing (mp_val_at /
+            // mp_grow when V = ()).
+            if (lty.kind == .unit) return .none;
+            if (isAggTy(b, lty)) {
+                const slot = try b.addSlot(lty);
+                const dst = try b.emit(.{ .slot_addr = slot }, Typecheck.Type.int);
+                _ = try b.emit(.{ .copy = .{ .dst = dst, .src = addr, .ty = lty } }, null);
+                return .{ .slot = slot };
+            }
+            return .{ .value = try b.emit(.{ .load = .{ .addr = addr, .ty = lty } }, lty) };
+        },
+        .offset => {
+            // `offset(base, i)` is a plain 64-bit pointer add: the base's isRefTy
+            // value already lowers to its 8-byte cell pointer, so no unwrap needed.
+            const oargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+            const base = operandValue(try lowerExpr(b, oargs[0]));
+            const idx = operandValue(try lowerExpr(b, oargs[1]));
+            return .{ .value = try b.emit(.{ .add = .{ .lhs = base, .rhs = idx } }, Typecheck.Type.rawptr) };
+        },
+        .call_hash => {
+            const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+            const fp = operandValue(try lowerExpr(b, a[0]));
+            const kp = operandValue(try lowerExpr(b, a[1]));
+            const args = try b.gpa.alloc(Ir.Operand, 1);
+            args[0] = .{ .value = kp };
+            return .{ .value = try b.emit(.{ .call_indirect = .{ .target = fp, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.int) };
+        },
+        .call_eq => {
+            const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+            const fp = operandValue(try lowerExpr(b, a[0]));
+            const ap = operandValue(try lowerExpr(b, a[1]));
+            const bp = operandValue(try lowerExpr(b, a[2]));
+            const args = try b.gpa.alloc(Ir.Operand, 2);
+            args[0] = .{ .value = ap };
+            args[1] = .{ .value = bp };
+            return .{ .value = try b.emit(.{ .call_indirect = .{ .target = fp, .args = args, .ret_slot = Ir.none_slot } }, Typecheck.Type.bool) };
+        },
+        .store_byte => {
+            const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+            const addr = operandValue(try lowerExpr(b, sargs[0]));
+            const val = operandValue(try lowerExpr(b, sargs[1]));
+            _ = try b.emit(.{ .store_byte = .{ .addr = addr, .val = val } }, null);
+            return .none;
+        },
+        .load_byte => {
+            const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+            const addr = operandValue(try lowerExpr(b, largs[0]));
+            return .{ .value = try b.emit(.{ .load_byte = addr }, Typecheck.Type.int) };
+        },
+        .ref_new => return try lowerRefNew(b, Ast.rangeSlice(b.in.tree, (n.rhs).int())[0], n.main_token),
+        .ref_get => {
+            const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+            const addr = operandValue(try lowerExpr(b, a[0]));
+            return try lowerRefLoad(b, addr, b.in.node_types[(node_idx).int()], n.main_token);
+        },
+        .ref_set => {
+            const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
+            // The cell is evaluated before the value, as every place store is.
+            const addr = operandValue(try lowerExpr(b, a[0]));
+            const vty = b.in.node_types[(a[1]).int()];
+            if (vty.kind == .never) {
+                _ = try lowerExpr(b, a[1]);
+            } else try storeThrough(b, addr, a[1], vty, n.main_token);
+            return .none;
+        },
+        else => return null,
+    }
 }
 
 /// What a call instruction invokes: a symbol (`bl`), or a computed code address (`blr`).
@@ -7531,7 +7452,7 @@ test "Escape.callTarget names the unit lowerCall calls" {
             if (LayoutEngine.isFnStruct(tc.node_types[0][a.int()], tc.layouts)) break true;
         } else false;
         if (!passes_fn) continue;
-        const target = (try Escape.callTarget(gpa, body, prog, tc.bodies, Ast.Index.from(@intCast(k)))) orelse return error.TestExpectedTarget;
+        const target = Escape.callTarget(body, prog, tc.bodies, Ast.Index.from(@intCast(k))) orelse return error.TestExpectedTarget;
         const sym = tc.bodies.items[target.unit].sig.name;
         var buf: [128]u8 = undefined;
         const call = try std.fmt.bufPrint(&buf, "call @{s}(", .{sym});
