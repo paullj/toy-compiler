@@ -889,7 +889,7 @@ fn unfoldedCalls(gpa: std.mem.Allocator, plan: *const Plan, unfolded: *std.Array
     return calls;
 }
 
-test "every call a body makes relocates to a symbol its key folds, but for unkeyed instances" {
+test "every call a body makes relocates to a symbol its key folds" {
     const gpa = testing.allocator;
     const ck = try Checked.create(gpa,
         \\struct P { x: int, y: int }
@@ -915,9 +915,8 @@ test "every call a body makes relocates to a symbol its key folds, but for unkey
     var unfolded: std.ArrayList([]const u8) = .empty;
     defer unfolded.deinit(gpa);
     try testing.expect(try unfoldedCalls(gpa, &plan, &unfolded) >= 6);
-    // `mk[bool]()` names no type param in its value params, so its key misses it ([C2]).
-    try testing.expectEqual(@as(usize, 1), unfolded.items.len);
-    try testing.expectEqualStrings("main.mk$bool", unfolded.items[0]);
+    // `mk[bool]()` included, though no value param of `mk` names its type param.
+    try testing.expectEqual(@as(usize, 0), unfolded.items.len);
 }
 
 test "the calls a for-in and a try_into make are folded into the body's key (#35)" {

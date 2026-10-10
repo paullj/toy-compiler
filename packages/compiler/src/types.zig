@@ -2247,11 +2247,7 @@ fn sealCalls(
                 const targs = try self.gpa.alloc(Type, targ_nodes.len);
                 defer self.gpa.free(targs);
                 for (targ_nodes, targs) |tn, *ta| ta.* = self.view.node_types[tn.int()];
-                if (Mono.find(self.instances, gid, targs)) |ii| {
-                    var ic = Callee.instanceCall(@intCast(ii));
-                    if (!generic) ic.tag = .instance_unkeyed;
-                    break :blk ic;
-                }
+                if (Mono.find(self.instances, gid, targs)) |ii| break :blk Callee.instanceCall(@intCast(ii));
                 break :blk if (generic) Callee.genericCall(gid) else .{};
             } else if (!generic)
                 Callee.direct(gid)

@@ -38,12 +38,7 @@ pub const Callee = extern struct {
     /// runs. `.generic`: a call of a generic fn whose instance is not known here: one in a
     /// template's own body, or one whose args did not check. The seal records these
     /// once mono has finished, so every reader shares one selection.
-    /// `.instance_unkeyed`: an `.instance` call its caller's codegen key does not fold: a
-    /// turbofish of a generic fn whose value params name no type param
-    /// (`mem.ga_new[T]()`). The fold never took such a call for a generic one, so a change
-    /// to that instance's signature does not reach the caller's key ([C2]); folding it
-    /// changes every such caller's key, so it is a change of its own. Views as `.instance`.
-    pub const Tag = enum(u8) { none, method, protocol, builtin, pending_method, pending_bound, pending_call, value, fn_ref, bound_method, template, direct, instance, generic, instance_unkeyed, pending_template };
+    pub const Tag = enum(u8) { none, method, protocol, builtin, pending_method, pending_bound, pending_call, value, fn_ref, bound_method, template, direct, instance, generic, pending_template };
 
     /// The compiler-provided methods that have no `methods` row. The four `opt_*`
     /// ops mirror `Typecheck.OptResultMethod` (`opt_is_tag0` is `is_some`/`is_ok`);
@@ -157,7 +152,7 @@ pub const Callee = extern struct {
             .fn_ref => .{ .fn_ref = c.id },
             .bound_method => .{ .bound_method = c.id },
             .direct => .{ .direct = c.id },
-            .instance, .instance_unkeyed => .{ .instance = c.id },
+            .instance => .{ .instance = c.id },
             .generic => .{ .generic = c.id },
         };
     }
