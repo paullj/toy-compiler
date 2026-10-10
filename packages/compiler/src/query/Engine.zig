@@ -644,6 +644,48 @@ fn sourceKey(gpa: std.mem.Allocator, target: []const u8, fr: *const Frozen, decl
     return Key.codegen(target, fp, fr.opt, fr.sym);
 }
 
+/// [C2] checked: the first symbol a keyed unit's code `fc` relocates to that its key does
+/// not fold, or null. A miss serves a caller lowered against a stale callee, or one
+/// program's code to another that shares the cache (#35), so `--verify` fails on it.
+/// Exempt are a compiler builtin (its signature is the compiler's), the unit itself, its
+/// own lambdas and the adapters of what its key folds: each is named after the unit or
+/// the folded symbol and lowered fresh every build.
+pub fn uncoveredReloc(gpa: std.mem.Allocator, fr: *const Frozen, fc: *const Link.FnCode) !?[]const u8 {
+    var sigs: std.ArrayList(Fingerprint.Sig) = .empty;
+    defer sigs.deinit(gpa);
+    switch (fr.body) {
+        .source => |src| try AstWalk.walkCalls(gpa, &fr.in, src.decl, fr.in.sig, &sigs),
+        else => {},
+    }
+    for (fc.relocs) |r| {
+        const t: Link.SymName = switch (r.target) {
+            .func, .import => |sn| sn,
+            else => continue,
+        };
+        if (t.kind == .builtin or std.mem.eql(u8, t.name, fr.sym.name)) continue;
+        if (std.mem.startsWith(u8, t.name, fr.sym.name) and std.mem.startsWith(u8, t.name[fr.sym.name.len..], "$l")) continue;
+        const base = for ([_][]const u8{ "$fnval", "$bound", "$boundbox", "$boundref" }) |suf| {
+            if (std.mem.endsWith(u8, t.name, suf)) break t.name[0 .. t.name.len - suf.len];
+        } else t.name;
+        if (folds(fr, sigs.items, base)) continue;
+        return t.name;
+    }
+    return null;
+}
+
+fn folds(fr: *const Frozen, sigs: []const Fingerprint.Sig, name: []const u8) bool {
+    for (sigs) |sg| if (std.mem.eql(u8, sg.name, name)) return true;
+    for (fr.conformances) |rc| for (rc.witness_syms) |ws| if (std.mem.eql(u8, ws, name)) return true;
+    switch (fr.body) {
+        .derive => |d| for (d.field_witnesses) |fw| switch (fw) {
+            .eq_call, .cmp_eq, .cmp_call, .hash_call, .display_call, .trace_call => |n| if (std.mem.eql(u8, n, name)) return true,
+            .inline_kind, .trace_mark => {},
+        },
+        else => {},
+    }
+    return false;
+}
+
 /// The key of a source-less derive unit: a NON-AST fingerprint over the conforming type's
 /// index-free layout (the same descriptor the touched fold builds) and the resolved field
 /// witnesses, so a field-layout edit flips it. `symMix` separates it from every real fn.
@@ -663,7 +705,8 @@ fn deriveKey(gpa: std.mem.Allocator, target: []const u8, fr: *const Frozen, d: *
 ///   * `.verify` — always re-lower fresh and audit the packed bytes against a
 ///     reference (a cache HIT compares the stored blob for cache-soundness; a MISS
 ///     lowers a SECOND time and requires the two fresh lowerings agree, for pure
-///     determinism). The checks are REAL runtime comparisons returning an error on
+///     determinism), and requires its key to fold every symbol its code relocates to
+///     (`uncoveredReloc`). The checks are REAL runtime comparisons returning an error on
 ///     mismatch — NOT `std.debug.assert`, which compiles out under ReleaseFast/Small
 ///     and would make the whole safety net silently no-op in a release build.
 ///   * `.normal` — serve the prior blob on a content-fp cache hit, else lower fresh.
@@ -693,6 +736,7 @@ fn serve(
         const fb = try Link.pack(gpa, fresh);
         defer gpa.free(fb);
 
+        if (try uncoveredReloc(gpa, fr, &fresh) != null) return error.VerifyKeyHole;
         var was_cached = false;
         if (cache.get(u8, gpa, io, key) catch null) |blob| {
             defer gpa.free(blob);
