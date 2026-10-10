@@ -4644,6 +4644,26 @@ test "Modes.argMask agrees with every call shape" {
     }
 }
 
+test "for over an iter(mut self) receiver needs a place (T0019, #29)" {
+    const head =
+        \\protocol Iterator[Item] { fn next(mut self) -> Option[Item] }
+        \\struct Up[T] { i: int }
+        \\impl Up[T] has Iterator[int] { fn next(mut self) -> Option[int] { Option[int].none } }
+        \\impl Up[T] { fn iter(mut self) -> Up[T] { self } }
+        \\struct Down[T] { i: int }
+        \\impl Down[T] has Iterator[int] { fn next(mut self) -> Option[int] { Option[int].none } }
+        \\impl Down[T] { fn iter(self) -> Down[T] { self } }
+        \\struct H { u: Up[int] }
+        \\fn up() -> Up[int] { Up[int] { i: 1 } }
+        \\fn down() -> Down[int] { Down[int] { i: 1 } }
+        \\
+    ;
+    try expectCodeCount(head ++ "fn main() { for x in up() { _ = x } }\n", .T0019, 1);
+    try expectCodeCount(head ++ "fn main() { u := up()\n for x in u { _ = x } }\n", .T0019, 0);
+    try expectCodeCount(head ++ "fn main() { h := H { u: up() }\n for x in h.u { _ = x } }\n", .T0019, 0);
+    try expectCodeCount(head ++ "fn main() { for x in down() { _ = x } }\n", .T0019, 0);
+}
+
 test "a mut-self method on a temporary emits T0019; on a local / a field of a local it does not" {
     const gpa = testing.allocator;
     // On a temporary (the fresh construction): rejected.

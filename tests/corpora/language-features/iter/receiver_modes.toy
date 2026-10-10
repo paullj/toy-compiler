@@ -1,0 +1,123 @@
+# Feature: `for` passes each receiver as its method declares it: `iter(self)` gets a copy and `iter(mut self)` the loop's variable, which must be a place and which the loop changes; `next` takes `mut self` (as `Iterator.next` declares it), so it advances the loop's own iterator; the std iterators (Vec, Map, Set, str chars) and `for k, v` keep working (#29)
+# expect: stdout "10\n2\n10\n10\n6\n6\n9\n6\n3\nabc\n1:x 2:y\n7\n"
+# expect: exit 0
+import std/io
+import std/iter
+import std/vec
+import std/map
+import std/set
+import std/str
+
+# `iter(mut self)` counts the loops over it in the receiver.
+struct Up[T] { i: int, n: int, loops: int }
+
+impl Up[T] has iter.Iterator[int] {
+    fn next(mut self) -> Option[int] {
+        self.i = self.i + 1
+        if self.i > self.n { return Option[int].none }
+        return Option.some(self.i)
+    }
+}
+
+impl Up[T] {
+    fn iter(mut self) -> Up[T] {
+        self.loops = self.loops + 1
+        self
+    }
+}
+
+# `iter(self)` with a `mut self` `next`.
+struct Down[T] { i: int }
+
+impl Down[T] has iter.Iterator[int] {
+    fn next(mut self) -> Option[int] {
+        if self.i == 0 { return Option[int].none }
+        self.i = self.i - 1
+        return Option.some(self.i + 1)
+    }
+}
+
+impl Down[T] {
+    fn iter(self) -> Down[T] { self }
+}
+
+# `for k, v` over a user iterator of `Entry` pairs, with `iter(mut self)`.
+struct Pairs[T] { i: int }
+
+impl Pairs[T] has iter.Iterator[map.Entry[int, str]] {
+    fn next(mut self) -> Option[map.Entry[int, str]] {
+        self.i = self.i + 1
+        if self.i == 1 { return Option.some(map.Entry[int, str] { key: 1, val: "x" }) }
+        if self.i == 2 { return Option.some(map.Entry[int, str] { key: 2, val: "y" }) }
+        return Option[map.Entry[int, str]].none
+    }
+}
+
+impl Pairs[T] {
+    fn iter(mut self) -> Pairs[T] {
+        self.i = 0
+        self
+    }
+}
+
+struct Holder { up: Up[int] }
+
+fn down(i: int) -> Down[int] { Down[int] { i: i } }
+
+fn main() -> int {
+    up := Up[int] { i: 0, n: 4, loops: 0 }
+    t := 0
+    for x in up { t = t + x }
+    io.println(t)
+    for x in up { t = t + x }
+    # The loop's iterator is `iter`'s copy, so `up.i` is still 0 and the second loop ran in full.
+    io.println(up.loops)
+    io.println(t - 10)
+
+    h := Holder { up: Up[int] { i: 0, n: 4, loops: 0 } }
+    s := 0
+    for x in h.up { s = s + x }
+    io.println(s + h.up.loops - 1)
+
+    # A closure reads the variable `for` writes.
+    c := Up[int] { i: 0, n: 3, loops: 0 }
+    seen := fn() { c.loops }
+    u := 0
+    for x in c { u = u + x * seen() }
+    io.println(u)
+
+    d := 0
+    for x in down(3) { d = d + x }
+    io.println(d)
+
+    v := [2, 3, 4]
+    w := 0
+    for x in v { w = w + x }
+    io.println(w)
+    m: Map[int, int] = Map[int, int].new()
+    m.set(1, 5)
+    m.set(2, 1)
+    q := 0
+    for k, val in m { q = q + k * val }
+    io.println(q - 1)
+    st: Set[int] = Set[int].new()
+    st.add(1)
+    st.add(2)
+    st.add(1)
+    r := 0
+    for x in st { r = r + x }
+    io.println(r)
+    out := ""
+    for ch in "abc".chars() { out = out.concat(ch.to_string()) }
+    io.println(out)
+
+    p := Pairs[int] { i: 5 }
+    line := ""
+    for k, val in p {
+        if k > 1 { line = line.concat(" ") }
+        line = line.concat(k.to_string()).concat(":").concat(val)
+    }
+    io.println(line)
+    io.println(p.i + 7)
+    return 0
+}
