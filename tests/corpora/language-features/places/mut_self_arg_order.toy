@@ -1,0 +1,84 @@
+# Feature: a by-value argument is the copy taken where it is evaluated, even when a later argument changes the variable through a `mut self` call (#27)
+# expect: stdout "1\n1\n1\n1\n1\n1\n1\nab\n1\n"
+# expect: exit 0
+import std/io
+
+struct Q1 { x: int }
+struct Q2 { x: int, y: int }
+struct Q3 { x: int, y: int, z: int }
+struct O { q: Q2 }
+struct S { s: str }
+struct G[T] { v: T }
+
+impl Q1 {
+    fn touch(mut self) -> int {
+        self.x = 9
+        0
+    }
+}
+
+impl Q2 {
+    fn touch(mut self) -> int {
+        self.x = 9
+        0
+    }
+
+    fn get(self, _k: int) -> int { self.x }
+
+    # `self` is a place here too: the by-value read copies it first.
+    fn twice(mut self) -> int { h2(self, self.touch()) }
+}
+
+impl Q3 {
+    fn touch(mut self) -> int {
+        self.x = 9
+        0
+    }
+}
+
+impl S {
+    fn grow(mut self) -> int {
+        self.s = self.s.concat("cd")
+        0
+    }
+}
+
+impl G[T] {
+    fn set(mut self, v: T) -> int {
+        self.v = v
+        0
+    }
+}
+
+fn h1(q: Q1, _t: int) -> int { q.x }
+
+fn h2(q: Q2, _t: int) -> int { q.x }
+
+fn h3(q: Q3, _t: int) -> int { q.x }
+
+fn hs(s: S, _t: int) -> str { s.s }
+
+fn hg(g: G[int], _t: int) -> int { g.v }
+
+fn main() -> int {
+    a := Q1 { x: 1 }
+    io.println(h1(a, a.touch()))
+    b := Q2 { x: 1, y: 2 }
+    io.println(h2(b, b.touch()))
+    c := Q3 { x: 1, y: 2, z: 3 }
+    io.println(h3(c, c.touch()))
+    # The receiver of a by-value method is an earlier argument too.
+    d := Q2 { x: 1, y: 2 }
+    io.println(d.get(d.touch()))
+    e := Q2 { x: 1, y: 2 }
+    io.println(h2(e, e |> .touch()))
+    o := O { q: Q2 { x: 1, y: 2 } }
+    io.println(h2(o.q, o.q.touch()))
+    f := Q2 { x: 1, y: 2 }
+    io.println(f.twice())
+    s := S { s: "ab" }
+    io.println(hs(s, s.grow()))
+    g := G[int] { v: 1 }
+    io.println(hg(g, g.set(9)))
+    return 0
+}

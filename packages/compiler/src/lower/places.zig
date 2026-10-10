@@ -9,6 +9,7 @@ const Ast = @import("../ast/Ast.zig");
 const L = @import("../lower.zig");
 const Typecheck = @import("../types.zig");
 const Modes = @import("../symbols/Modes.zig");
+const Callee = @import("../symbols/Callee.zig").Callee;
 const symbols_res = @import("../symbols/Resolution.zig");
 const Walk = @import("../ast/Walk.zig");
 const Ir = @import("../ir/Ir.zig");
@@ -105,7 +106,8 @@ pub fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Va
     }
 }
 
-/// Put each local a call in `body` passes as a `mut` argument into `copy_on_read_roots`.
+/// Put each local a call in `body` passes as a `mut` argument or a `mut self` receiver into
+/// `copy_on_read_roots`.
 pub fn noteMutArgRoots(b: *Builder, body: Ast.Index) error{OutOfMemory}!void {
     const Visitor = struct {
         b: *Builder,
@@ -114,10 +116,18 @@ pub fn noteMutArgRoots(b: *Builder, body: Ast.Index) error{OutOfMemory}!void {
                 .callee => |c| c,
                 else => return,
             };
-            const mask = Modes.argMask(v.b.in.bodyView(), v.b.in.programView(), c.call);
+            const in = v.b.in;
+            const call = in.tree.nodes[c.call.int()];
+            if (Modes.receiverMut(in.bodyView(), in.programView(), c.call)) if (Callee.memberNode(in.tree, call)) |mn|
+                try v.note(in.tree.nodes[mn.int()].lhs);
+            const mask = Modes.argMask(in.bodyView(), in.programView(), c.call);
             if (mask == 0) return;
-            const args = Ast.rangeSlice(v.b.in.tree, v.b.in.tree.nodes[c.call.int()].rhs.int());
-            for (args, 0..) |a, i| if (Modes.isMut(mask, i)) if (symbols_res.placeRoot(v.b.in.tree, v.b.in.resolutions, a)) |li|
+            const args = Ast.rangeSlice(in.tree, call.rhs.int());
+            for (args, 0..) |a, i| if (Modes.isMut(mask, i)) try v.note(a);
+        }
+
+        fn note(v: *@This(), place: Ast.Index) error{OutOfMemory}!void {
+            if (symbols_res.placeRoot(v.b.in.tree, v.b.in.resolutions, place)) |li|
                 try v.b.copy_on_read_roots.put(v.b.gpa, li, {});
         }
     };
