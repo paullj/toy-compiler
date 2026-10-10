@@ -322,7 +322,24 @@ fn recordGenericConformance(
         return;
     }
     gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items);
-    try t.template_conformances.append(t.gpa, .{ .protocol_id = pid, .recv_ctor = e.ctor, .recv_is_enum = e.ctor_is_enum, .protocol_args = try t.gpa.dupe(Type, pargs) });
+    const owned_pargs = try t.gpa.dupe(Type, pargs);
+    t.template_conformances.append(t.gpa, .{ .protocol_id = pid, .recv_ctor = e.ctor, .recv_is_enum = e.ctor_is_enum, .protocol_args = owned_pargs }) catch |err| {
+        t.gpa.free(owned_pargs);
+        return err;
+    };
+    // Stamp each witness template with its conformance, so explicit protocol args on a
+    // call (`b.into[int]()`) pick among the receiver's conformances. In place, before
+    // the Model snapshot, as for a concrete conformance's `Method` row.
+    for (provided) |pn| {
+        for (t.fns.items, 0..) |f, fi| {
+            if (f.mod != mod or f.decl_node != pn) continue;
+            for (t.templates.items) |*tm| if (tm.fn_id == fi) {
+                tm.protocol_id = pid;
+                tm.protocol_args = owned_pargs;
+            };
+            break;
+        }
+    }
 }
 
 /// T0076: the conformance method at `fn_idx` must take its receiver the way protocol

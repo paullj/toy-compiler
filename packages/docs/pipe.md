@@ -78,9 +78,10 @@ arg        := expr | "_"                                 # at most one "_"
     into a constructor, name its type: `5 |> Option.some`.
   - `a + b |> .m()` is `(a + b).m()`, because `|>` binds loosest. Compare `a + b.m()`.
   - A field of function type is called as `x.f()` calls it: `x |> .f()` is `x.f()`.
-  - `x |> .m[T]()` is `x.m[T]()` exactly, with the same errors: on a receiver of a
-    generic type, explicit protocol arguments are T0018 today in both forms ("takes no
-    explicit type arguments yet").
+  - `x |> .m[T]()` is `x.m[T]()` exactly, with the same meaning and errors: on a
+    receiver of a generic type, `[T]` is the method's own type arguments
+    (`b |> .map[str](f)`) or, for a method without its own, protocol arguments
+    (`b |> .into[int]()`).
   - Only a value can be piped, so a module or type name on the left is an error, as it
     is for `io |> f`: `io |> .println(s)` and `Shape |> .circle(1)` report "module 'io'
     is not a value" and "type 'Shape' is not a value" (T0056). Write `io.println(s)`.

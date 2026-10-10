@@ -1,0 +1,69 @@
+# Feature: explicit type args on a method of a generic type (#31). A method's own type params come from the `[..]` (`b.none[int]()`, whose `U` no argument names; `b.pair[str]("x")`; piped as `b |> .pair[int](1)`; `Box[int].with[bool](..)` on the type), the impl's from the receiver; each `[..]` is its own instance. A conformance method takes protocol args, as on a concrete type: `b.into[bool]()` picks `Into[bool]` among the receiver's conformances.
+# expect: stdout "dflt\n7\n21\n7\n14\n9\nq\n1\n40\ntrue\n40\n3\nfalse\n8\n42\n"
+# expect: exit 0
+import std/io
+import std/vec
+
+protocol Into[U] {
+    fn into(self) -> U
+}
+
+struct Box[T] { v: T }
+
+impl Box[T] {
+    fn none[U](self) -> Option[U] { Option[U].none }
+    fn pair[U](self, _u: U) -> T { self.v }
+    fn map[U](self, f: fn(T) -> U) -> Box[U] { Box { v: f(self.v) } }
+    fn put[U](mut self, v: T, u: U) -> U {
+        self.v = v
+        u
+    }
+    fn with[U](v: T, _u: U) -> Box[T] { Box { v: v } }
+    fn get(self) -> T { self.v }
+}
+
+impl Box[T] has Into[int] {
+    fn into(self) -> int { 40 }
+}
+
+impl Box[T] has Into[bool] {
+    fn into(self) -> bool { true }
+}
+
+struct Holder { b: Box[int] }
+
+# `n` sits past the `Option[X]`, whose size `X` sets, so a call that ran another `[..]`'s
+# instance would read it from the wrong offset.
+struct Tail[X] { o: Option[X], n: int }
+
+impl Box[T] {
+    fn tail[U](self, n: int) -> Tail[U] { Tail { o: Option[U].none, n: n } }
+}
+
+# In an instance body the `[..]` names the instance's own type param.
+fn nothing[T](b: Box[T]) -> Option[T] { b.none[T]() }
+
+fn main() -> int {
+    b := Box { v: 7 }
+    io.println(b.none[str]().unwrap_or("dflt"))
+    io.println(b.none[int]().unwrap_or(7).to_string())
+    io.println((b.pair[int](1) + b.pair[bool](true) + (b |> .pair[str]("x"))).to_string())
+    io.println(b.map[str](fn(x) { x.to_string() }).get())
+    io.println((b |> .map[int](fn(x) { x * 2 })).get().to_string())
+    h := Holder { b: Box { v: 0 } }
+    q := h.b.put[str](9, "q")
+    io.println(h.b.v.to_string())
+    io.println(q)
+    io.println(if nothing(b).is_none() && nothing(Box { v: "s" }).is_none() { "1" } else { "0" })
+    io.println(b.into[int]().to_string())
+    io.println(b.into[bool]().to_string())
+    n: int = b.into()
+    io.println(n.to_string())
+    io.println(Box[int].with[bool](3, true).get().to_string())
+    xs := [1, 2, 3]
+    io.println(xs.map[bool](fn(x) { x > 1 }).get(0).unwrap().to_string())
+    f := fn(k: int) -> int { b.pair[bool](false) + k }
+    io.println(f(1).to_string())
+    io.println((b.tail[str](40).n + b.tail[int](2).n).to_string())
+    return 0
+}

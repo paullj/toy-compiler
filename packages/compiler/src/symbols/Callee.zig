@@ -19,11 +19,14 @@ pub const Callee = extern struct {
     /// index into `GraphResult.instances`.
     id: u32 = 0,
 
-    /// The three `pending_*` tags are checker-internal: the method row only exists once
-    /// the mono tail has reified the receiver, so the seal resolves them; no consumer ever
+    /// The `pending_*` tags are checker-internal: the method row only exists once the
+    /// mono tail has reified the receiver, so the seal resolves them; no consumer ever
     /// sees one. `.pending_method` becomes `.method`, `.pending_bound` `.bound_method`,
-    /// and `.pending_call` (a call of a method with its own type params, `id` the call
-    /// node) the `.method` row the call's arg types pick.
+    /// and `.pending_call` (a call of a method with its own type params, or with explicit
+    /// type args, `id` the call node) the `.method` row the call's arg types pick.
+    /// `.pending_template` sits on such a call's own node when its explicit type args
+    /// picked the template (`id`, its fn id; `aux` 1 when the args are the method's own
+    /// type params), which the arg types alone cannot tell apart; the seal clears it.
     /// `.value`: a call of a function-typed value (`f(1)`, `h.run(4)`, `fs[i](x)`).
     /// `.fn_ref`: a named function used as a value (`f := add`), on the name's node.
     /// `.bound_method`: a method used as a value (`f := acc.plus`), on the `field_access`.
@@ -40,7 +43,7 @@ pub const Callee = extern struct {
     /// (`mem.ga_new[T]()`). The fold never took such a call for a generic one, so a change
     /// to that instance's signature does not reach the caller's key ([C2]); folding it
     /// changes every such caller's key, so it is a change of its own. Views as `.instance`.
-    pub const Tag = enum(u8) { none, method, protocol, builtin, pending_method, pending_bound, pending_call, value, fn_ref, bound_method, template, direct, instance, generic, instance_unkeyed };
+    pub const Tag = enum(u8) { none, method, protocol, builtin, pending_method, pending_bound, pending_call, value, fn_ref, bound_method, template, direct, instance, generic, instance_unkeyed, pending_template };
 
     /// The compiler-provided methods that have no `methods` row. The four `opt_*`
     /// ops mirror `Typecheck.OptResultMethod` (`opt_is_tag0` is `is_some`/`is_ok`);
@@ -87,9 +90,14 @@ pub const Callee = extern struct {
         return .{ .tag = .pending_call, .id = call.int() };
     }
 
+    /// The template an explicit-args call picked (see `.pending_template`).
+    pub fn pendingTemplate(gid: u32, own: bool) Callee {
+        return .{ .tag = .pending_template, .aux = @intFromBool(own), .id = gid };
+    }
+
     pub fn isPending(c: Callee) bool {
         return switch (c.tag) {
-            .pending_method, .pending_bound, .pending_call => true,
+            .pending_method, .pending_bound, .pending_call, .pending_template => true,
             else => false,
         };
     }
@@ -141,7 +149,7 @@ pub const Callee = extern struct {
     /// The only way a consumer reads a slot.
     pub fn view(c: Callee) View {
         return switch (c.tag) {
-            .none, .pending_method, .pending_bound, .pending_call, .template => .none,
+            .none, .pending_method, .pending_bound, .pending_call, .pending_template, .template => .none,
             .method => .{ .method = c.id },
             .protocol => .{ .protocol = .{ .protocol = c.id, .method = c.aux } },
             .builtin => .{ .builtin = @enumFromInt(c.sub) },

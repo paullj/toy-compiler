@@ -271,9 +271,18 @@ the receiver's variables. The arguments are typed in this order:
 A method of a generic type may declare type parameters of its own
 (`fn map[U](self, f: fn(T) -> U) -> Box[U]`); they follow the impl's in its generic
 run and bind from the call's arguments, and each instantiation is its own instance. They
-are never written: `b.map[int](..)` is **T0018**, and a generic method is not a value
+may also be written, the impl's coming from the receiver as before: `b.map[str](f)`,
+`b |> .map[str](f)`, `Box[int].with[bool](1, true)` on the type, and
+`b.none[int]()` for a type parameter no argument names (`fn none[U](self) ->
+Option[U]`), which inference cannot reach (**T0016**, whose message shows the explicit
+form). The count must be the method's own (**T0054**), the impl's never written there
+(`Box.with[bool](..)` is **T0016**: write `Box[int].with[bool](..)`). A method without
+type parameters of its own takes protocol args instead, as on a concrete receiver:
+`b.into[bool]()` picks the `impl Box[T] has Into[bool]` conformance among the
+receiver's, and args no conformance has are **T0018**. A generic method is not a value
 (**T0049**). A method of a non-generic type cannot declare its own type parameters yet
-(**T0013** at the call). A method's own type parameter may not reuse a name of its
+(**T0013** at the call): such a method would be a template on a concrete receiver, which
+the method table, discovery, the seal and the LSP all treat as one row per method. A method's own type parameter may not reuse a name of its
 impl's (`impl Box[T] { fn conv[T](..) }`), and no fn declares one name twice
 (**T0053**). An inherent impl's pattern names each type parameter once
 (`impl Pair[A, B]`); a partly concrete or repeated one (`impl Pair[T, int]`,
@@ -611,8 +620,11 @@ receiver conforms to one generic protocol **multiple times** and no protocol typ
 disambiguate, the compiler does **not** pick arbitrarily — it is a use-site error
 **T0025** naming the conflicting conformances in source (fn-id) order (deterministic at
 any `-jN`). An explicit `p.into[int]()` (parsed as `call(type_app(field_access, [int]))`)
-selects the matching conformance. A type conforming **once** (a non-generic protocol OR a
-single generic conformance) resolves with **no** explicit args — byte-identical dispatch
+selects the matching conformance; on a generic receiver (`impl Box[T] has Into[int]`
+and `has Into[bool]`) `b.into[bool]()` selects it the same way, though an inferred
+`b.into()` there takes the first-declared conformance rather than reporting T0025. A
+type conforming **once** (a non-generic protocol OR a single generic conformance)
+resolves with **no** explicit args — byte-identical dispatch
 to the single-conformance path. The single disambiguator `resolveConformanceMethod` is shared by all three
 consumers (BodyChecker types, `lower` symbols, `AstWalk` fingerprint), so they always
 select the identical witness. A `[T has Convert[U]]` bound resolves at the mono worklist
