@@ -272,7 +272,11 @@ pub fn checkOwnGenericCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, c
     switch (try inferArgs(bc, .{ .call = node_idx, .sig = sig }, nodes, params, mf.generic_params, recv_ty, .receiver, arg_types, targs)) {
         .failed => return .invalid,
         .unbound => |ord| {
-            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0016 }, "cannot infer type parameter '{s}' of method '{s}' from its arguments; a method takes no explicit type arguments yet", .{ mf.generic_params[ord], member });
+            const own = mf.generic_params.len - Typecheck.implParamCount(bc.composite, mf);
+            var ints: std.ArrayList(u8) = .empty;
+            defer ints.deinit(bc.gpa);
+            for (0..own) |k| try ints.appendSlice(bc.gpa, if (k == 0) "int" else ", int");
+            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0016 }, "cannot infer type parameter '{s}' of method '{s}' from its arguments; add explicit type arguments, as in '{s}[{s}](..)'", .{ mf.generic_params[ord], member, member, ints.items });
             return .invalid;
         },
         .ok => {},

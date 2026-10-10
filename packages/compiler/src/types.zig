@@ -736,7 +736,8 @@ pub fn witnessSig(m: Method, derives: []const DeriveRecipe, instances: []const M
 /// (plain ints, never a composite deref) via `findGenericMethod`, so it is deterministic at
 /// any `-jN` and safe while the composite is alive (Pass A / Pass C / the mono tail). Read
 /// only during checking; the mono tail turns each reachable `(instance, template)` into a
-/// concrete reified `Method`. `name` is BORROWED from source; the table owns no heap data.
+/// concrete reified `Method`. `name` and `protocol_args` are BORROWED (source, and the
+/// conformance's row in `template_conformances`); the table owns no heap data.
 pub const TemplateMethod = struct {
     recv_ctor: u32,
     recv_is_enum: bool,
@@ -752,6 +753,12 @@ pub const TemplateMethod = struct {
     bundled: bool = false,
     /// See `Method.shadows`.
     shadows: bool = false,
+    /// The generic conformance `impl Box[T] has P[..]` this method witnesses (stamped by
+    /// coherence), or null for an inherent method. `protocol_args` is that conformance's
+    /// arg pattern over the impl's params; explicit args on a call pick among a receiver's
+    /// conformances by it (`pickExplicitTemplate`).
+    protocol_id: ?u32 = null,
+    protocol_args: []const Type = &.{},
 };
 
 /// Where a method call is written, which decides between same-named methods. In the
@@ -1046,6 +1053,52 @@ pub fn findGenericMethod(templates: []const TemplateMethod, ctor: u32, is_enum: 
         if (first == null) first = tmpl;
     }
     return first;
+}
+
+/// What explicit type args select on a call of method `name` on a generic-type receiver
+/// (`b.m[A..](..)`). The checker and discovery both ask, so they pick one instance.
+pub const ExplicitPick = union(enum) {
+    /// `targs` (OWNED by the caller) are every generic param of `m`, the impl's first.
+    /// `own`: the explicit args are the method's own type params, not protocol args.
+    ok: struct { m: TemplateMethod, targs: []Type, own: bool },
+    /// No method of that name.
+    none,
+    /// The method has `want` type params of its own.
+    arity: struct { m: TemplateMethod, want: usize },
+    /// No conformance method of that name has these protocol args.
+    no_conformance,
+};
+
+/// A method with type params of its own (`fn none[U](self) -> Option[U]`) takes the
+/// explicit args as those; the receiver binds the impl's. Any other method is called with
+/// protocol args, as on a concrete receiver: they pick the conformance whose protocol
+/// args, grounded through the receiver's args, equal them. `recv_args` are the receiver
+/// App's args.
+pub fn pickExplicitTemplate(gpa: std.mem.Allocator, composite: *Composite, templates: []const TemplateMethod, fns: []const FnSym, ctor: u32, is_enum: bool, recv_args: []const Type, name: []const u8, site: Site, explicit: []const Type) error{OutOfMemory}!ExplicitPick {
+    const first = findGenericMethod(templates, ctor, is_enum, name, site) orelse return .none;
+    const ff = fns[first.fn_id];
+    const n_impl = implParamCount(composite, ff);
+    if (n_impl < ff.generic_params.len) {
+        const want = ff.generic_params.len - n_impl;
+        if (explicit.len != want) return .{ .arity = .{ .m = first, .want = want } };
+        const targs = (try bindImplParamsPrefix(gpa, composite, ff, recv_args, n_impl)) orelse return .none;
+        @memcpy(targs[n_impl..], explicit);
+        return .{ .ok = .{ .m = first, .targs = targs, .own = true } };
+    }
+    var grounded: std.ArrayList(Type) = .empty;
+    defer grounded.deinit(gpa);
+    for ([_]u1{ 0, 1 }) |pass| {
+        for (templates) |tm| {
+            if (tm.recv_ctor != ctor or tm.recv_is_enum != is_enum or !std.mem.eql(u8, tm.name, name)) continue;
+            if (siteRank(tm.bundled, tm.shadows, site) != pass or tm.protocol_id == null) continue;
+            grounded.clearRetainingCapacity();
+            for (tm.protocol_args) |pa| try grounded.append(gpa, try conform.substPattern(composite, gpa, pa, recv_args));
+            if (!eqlTypeVec(grounded.items, explicit)) continue;
+            const targs = (try bindImplParams(gpa, composite, fns[tm.fn_id], recv_args)) orelse continue;
+            return .{ .ok = .{ .m = tm, .targs = targs, .own = false } };
+        }
+    }
+    return .no_conformance;
 }
 
 /// A builtin scalar protocol-method recognizer: the pure, table-free source
@@ -2615,11 +2668,12 @@ fn sealSlice(t: *const Typecheck, mod: u32, nts: []const Type, cs: []Callee) voi
     const mc = &t.graph.mods[mod];
     const site = Site.of(mc.bundled);
     for (cs, 0..) |*c, i| {
-        if (!c.isPending()) continue;
+        if (!c.isPending() or c.tag == .pending_template) continue;
         const fa = mc.tree.nodes[i];
         const member = mc.tokens[fa.main_token].text(mc.source);
         if (c.tag == .pending_call) {
-            c.* = t.pickInstanceRow(mc, nts, fa, member, c.id);
+            const crumb = cs[c.id];
+            c.* = t.pickInstanceRow(mc, nts, fa, member, c.id, if (crumb.tag == .pending_template) crumb else null);
             continue;
         }
         c.* = switch (pickMethodIndex(t.methods.items, nts[fa.lhs.int()], member, null, null, site)) {
@@ -2627,6 +2681,9 @@ fn sealSlice(t: *const Typecheck, mod: u32, nts: []const Type, cs: []Callee) voi
             .none, .ambiguous => .{},
         };
     }
+    for (cs) |*c| if (c.tag == .pending_template) {
+        c.* = .{};
+    };
 }
 
 /// The instance row an own-generic call selects: the first row, in table order, with an
@@ -2637,17 +2694,26 @@ fn sealSlice(t: *const Typecheck, mod: u32, nts: []const Type, cs: []Callee) voi
 /// row is matched, never just the only candidate, so a check/discovery disagreement
 /// surfaces as a lowering error rather than a wrong instance. A call whose args did not
 /// check picks no row (another call's instance would show the wrong types) but keeps its
-/// template.
-fn pickInstanceRow(t: *const Typecheck, mc: *const GraphCtx.ModuleCtx, nts: []const Type, fa: Ast.Node, member: []const u8, call: u32) Callee {
+/// template. A call with explicit type args (`crumb`) takes only its template's rows, and
+/// when the args are the method's own, the row whose instance has them: a type param
+/// that no value param names (`fn none[U](self) -> Option[U]`) leaves the arg types alike.
+fn pickInstanceRow(t: *const Typecheck, mc: *const GraphCtx.ModuleCtx, nts: []const Type, fa: Ast.Node, member: []const u8, call: u32, crumb: ?Callee) Callee {
     const recv = nts[fa.lhs.int()];
     const site = Site.of(mc.bundled);
-    const args = Ast.rangeSlice(mc.tree, mc.tree.nodes[call].rhs.int());
+    const call_node = mc.tree.nodes[call];
+    const args = Ast.rangeSlice(mc.tree, call_node.rhs.int());
     for (args) |a| if (nts[a.int()].kind == .invalid) return t.templateCallee(recv, member, site);
+    const explicit: []const Ast.Index = if (crumb != null and crumb.?.aux == 1) Ast.rangeSlice(mc.tree, mc.tree.nodes[call_node.lhs.int()].rhs.int()) else &.{};
     for ([_]u1{ 0, 1 }) |pass| {
         rows: for (t.methods.items, 0..) |m, mi| {
             const ii = m.instance orelse continue;
             if (siteRank(m.bundled, m.shadows, site) != pass) continue;
             if (!Type.eql(m.recv, recv) or !std.mem.eql(u8, m.name, member)) continue;
+            if (crumb) |cr| {
+                const inst = t.mono.items[ii];
+                if (inst.template_gid != cr.id or inst.args.len < explicit.len) continue;
+                for (inst.args[inst.args.len - explicit.len ..], explicit) |ia, e| if (!Type.eql(ia, nts[e.int()])) continue :rows;
+            }
             const ps = t.mono.items[ii].params;
             const off: usize = if (m.is_static) 0 else 1;
             if (ps.len != args.len + off) continue;
@@ -2757,6 +2823,27 @@ pub fn bindImplParams(gpa: std.mem.Allocator, composite: *Composite, mf: FnSym, 
     }
 }
 
+/// `bindImplParams` for a method with type params of its own: the receiver binds the
+/// first `n_impl` (the impl's); the rest of the returned slice (OWNED by the caller) is
+/// left for the caller to fill.
+fn bindImplParamsPrefix(gpa: std.mem.Allocator, composite: *Composite, mf: FnSym, recv_args: []const Type, n_impl: u32) error{OutOfMemory}!?[]Type {
+    const pat: []const Type = if (mf.self_type.isApp()) composite.at(mf.self_type.appIdx()).args else &.{};
+    if (pat.len != recv_args.len) return null;
+    const out = try gpa.alloc(Type, mf.generic_params.len);
+    errdefer gpa.free(out);
+    const bnd = try gpa.alloc(bool, n_impl);
+    defer gpa.free(bnd);
+    const fp = try gpa.alloc(usize, n_impl);
+    defer gpa.free(fp);
+    switch (Infer.match(n_impl, pat, recv_args, out[0..n_impl], bnd, fp, composite.decomposer())) {
+        .ok => return out,
+        else => {
+            gpa.free(out);
+            return null;
+        },
+    }
+}
+
 /// The impl's own type params at the front of `mf.generic_params` (the parser puts them
 /// first): one past the largest `type_var` ordinal among the `Self` pattern's args, 0
 /// when the `Self` type is not an `App`. Any params past it are the method's own.
@@ -2830,6 +2917,31 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
             continue;
         }
         const callee = tree.nodes[n.lhs.int()];
+        // A method call with explicit type args on a generic-type instance (`b.none[int]()`,
+        // `b.into[int]()`): the args pick the template and fill its params as the checker's
+        // `pickExplicitTemplate` did.
+        if (callee.tag == .type_app and tree.nodes[callee.lhs.int()].tag == .field_access) {
+            const fa = tree.nodes[callee.lhs.int()];
+            const recv = node_types[fa.lhs.int()];
+            if (!recv.isApp()) continue;
+            const re = t.composite.at(recv.appIdx());
+            const targ_nodes = Ast.rangeSlice(tree, callee.rhs.int());
+            const explicit = try t.gpa.alloc(Type, targ_nodes.len);
+            defer t.gpa.free(explicit);
+            for (targ_nodes, explicit) |tn, *e| e.* = node_types[tn.int()];
+            const member = mc.tokens[fa.main_token].text(mc.source);
+            switch (try pickExplicitTemplate(t.gpa, t.composite, model.templates, model.fns, re.ctor, re.ctor_is_enum, re.args, member, Site.of(mc.bundled), explicit)) {
+                .ok => |p| {
+                    defer t.gpa.free(p.targs);
+                    const conc = for (p.targs) |ta| {
+                        if (!isConcreteValue(ta)) break false;
+                    } else true;
+                    if (conc) try t.enqueueInstance(model, p.m.fn_id, p.targs, worklist, seen, call_at, mod);
+                },
+                else => {},
+            }
+            continue;
+        }
         if (callee.tag == .field_access) {
             // A method call on a generic-type instance `b.get()`: the receiver
             // types to an `App` (reify runs later in this tail), whose ctor selects the
@@ -8164,21 +8276,68 @@ test "a mut self method pipe needs a place and marks it mutated" {
     try testing.expectEqualSlices(u32, &.{0}, try expectBoxedOnce(&c, 1));
 }
 
-test "a method pipe's turbofish on a generic receiver is T0018, as the written call is" {
+test "protocol args on a generic receiver pick its conformance, written or piped" {
+    const gpa = testing.allocator;
     const pre =
         \\struct Box[T] { v: T }
         \\protocol Scale[U] { fn scale(self, k: U) -> U }
         \\impl Box[T] has Scale[int] { fn scale(self, k: int) -> int { k * 2 } }
+        \\impl Box[T] has Scale[bool] { fn scale(self, k: bool) -> bool { k } }
         \\
     ;
     for ([_][]const u8{
-        pre ++ "fn main() -> int {\n b := Box { v: 1 }\n return b |> .scale[int](3)\n}\n",
-        pre ++ "fn main() -> int {\n b := Box { v: 1 }\n return b.scale[int](3)\n}\n",
+        pre ++ "fn main() -> int {\n b := Box { v: 1 }\n return if b.scale[bool](true) { b |> .scale[int](3) } else { 0 }\n}\n",
+        pre ++ "fn main() -> int {\n b := Box { v: 1 }\n return if b |> .scale[bool](true) { b.scale[int](3) } else { 0 }\n}\n",
     }) |src| {
-        try expectOnlyDiag(src, .T0018);
-        try expectOneDiag(src, .T0018, "'scale' on the generic type 'Box' takes no explicit type arguments yet; drop the '[..]'");
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        try expectOwnGenericOk(&c);
+        const first = try instanceNameOf(&c, "scale", 0);
+        const second = try instanceNameOf(&c, "scale", 1);
+        try testing.expect(std.mem.indexOf(u8, first, "Scale$bool") != null);
+        try testing.expect(std.mem.indexOf(u8, second, "Scale$int") != null);
     }
     try expectOneDiag(pre ++ "fn main() -> int {\n b := Box { v: 1 }\n return b |> .nope[int](3)\n}\n", .T0018, "no method 'nope' on type 'Box'");
+    try expectOneDiag(pre ++ "fn main() -> int {\n b := Box { v: 1 }\n return b.scale[str](3)\n}\n", .T0018, "no method 'scale' on type 'Box' for the given protocol type arguments");
+}
+
+test "explicit own type args on a generic receiver pick one instance per call" {
+    const gpa = testing.allocator;
+    var c = try checkSource(own_box_pre ++
+        \\fn main() -> int {
+        \\ b := Box { v: 20 }
+        \\ return b.tag[bool]() + b.tag[int]() + b.pick[str]("a", "b").len() + Box[int].with[bool](1, true).get()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try expectOwnGenericOk(&c);
+    // `U` appears in no value param of `tag`, so only the explicit args tell its calls apart.
+    try testing.expect(std.mem.endsWith(u8, try instanceNameOf(&c, "tag", 0), "Box.tag$int$bool"));
+    try testing.expect(std.mem.endsWith(u8, try instanceNameOf(&c, "tag", 1), "Box.tag$int$int"));
+    try testing.expect(std.mem.endsWith(u8, try instanceNameOf(&c, "pick", 0), "Box.pick$int$str"));
+    try testing.expect(std.mem.endsWith(u8, try instanceNameOf(&c, "with", 0), "Box.with$int$bool"));
+    try testing.expect((try calleeMethod(&c, "with", 0)).is_static);
+}
+
+test "explicit type args a method cannot take are each one error" {
+    const pre = own_box_pre ++ "struct K { v: int }\nimpl K { fn make() -> K { K { v: 1 } } }\nfn main() -> int {\n b := Box { v: 2 }\n";
+    const cases = [_]struct { body: []const u8, code: codes.Code, want: []const u8 }{
+        .{ .body = "return b.tag[int, bool]()", .code = .T0054, .want = "'tag' takes 1 type argument(s) of its own, got 2" },
+        .{ .body = "return b.get[int]()", .code = .T0018, .want = "no method 'get' on type 'Box' for the given protocol type arguments" },
+        .{ .body = "return b.with[int](1, 2).get()", .code = .T0018, .want = "'with' is an associated function; call it as 'Box[..].with(..)'" },
+        .{ .body = "return Box.with[bool](1, true).get()", .code = .T0016, .want = "cannot infer type parameter for 'Box.with'; add explicit type arguments, e.g. Box[int].with" },
+        .{ .body = "return Box[int].tag[int]()", .code = .T0018, .want = "'tag' is an instance method, not an associated function; call it on a value" },
+        .{ .body = "return K.make[int]().v", .code = .T0054, .want = "'make' is not generic; drop the type arguments" },
+        .{ .body = "return b.pick[str](\"a\", 2).len()", .code = .T0040, .want = "argument 2: expected str, got int; 'pick' takes (str, str)" },
+    };
+    for (cases) |case| {
+        const src = try std.fmt.allocPrint(testing.allocator, "{s} {s}\n}}\n", .{ pre, case.body });
+        defer testing.allocator.free(src);
+        errdefer std.debug.print("case: {s}\n", .{case.body});
+        try expectOnlyDiag(src, case.code);
+        try expectOneDiag(src, case.code, case.want);
+    }
 }
 
 test "a method pipe from a type name is one 'not a value' error" {
@@ -9869,10 +10028,14 @@ test "a call's expected fn type still types a lambda no other arg fixes" {
     try testing.expect(Type.eql(Type.int, lambdaParamType(&c, try nthLambda(&c, 0), 0)));
 }
 
-test "a method's own type param no arg fixes is T0016" {
+test "a method's own type param no arg fixes is T0016, and explicit args fix it" {
+    const gpa = testing.allocator;
     const src = own_box_pre ++ "fn main() -> int {\n b := Box { v: 20 }\n return b.tag()\n}\n";
     try expectOnlyDiag(src, .T0016);
-    try expectOneDiag(src, .T0016, "cannot infer type parameter 'U' of method 'tag' from its arguments; a method takes no explicit type arguments yet");
+    try expectOneDiag(src, .T0016, "cannot infer type parameter 'U' of method 'tag' from its arguments; add explicit type arguments, as in 'tag[int](..)'");
+    var c = try checkSource(own_box_pre ++ "fn main() -> int {\n b := Box { v: 20 }\n return b.tag[int]()\n}\n");
+    defer c.deinit(gpa);
+    try expectOwnGenericOk(&c);
 }
 
 test "conflicting own-param args are one T0015 naming both" {
@@ -10018,7 +10181,7 @@ test "the args of a call rejected for its type params add no T0050" {
         \\}
         \\
     , .T0013);
-    try expectOnlyDiag(own_box_pre ++ "fn main() -> int {\n b := Box { v: 2 }\n return b.map[int](fn(x) { x }).get()\n}\n", .T0018);
+    try expectOnlyDiag(own_box_pre ++ "fn main() -> int {\n b := Box { v: 2 }\n return b.map[int, int](fn(x) { x }).get()\n}\n", .T0054);
 }
 
 test "a type param that repeats a name is an error at its declaration" {
