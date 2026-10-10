@@ -209,7 +209,7 @@ pub const CallVisitor = struct {
                 const sig = fr.sigs[gid];
                 try self.out.append(self.gpa, .{ .kind = nm.kind, .name = nm.name, .params = sig.params, .ret = sig.ret, .mut_mask = sig.mut_mask });
             },
-            .instance => |ii| if (ii < fr.instances.len and fr.callees[slot.int()].tag != .instance_unkeyed) try self.foldInstance(call, ii),
+            .instance => |ii| if (ii < fr.instances.len) try self.foldInstance(call, ii),
             .method, .builtin => try self.foldCalleeTable(call),
             .none, .generic, .protocol, .value, .fn_ref, .bound_method => {},
         }

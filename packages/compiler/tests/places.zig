@@ -126,6 +126,27 @@ test "warm cache: an imported fn's x->mut x flip rebuilds the caller" {
     );
 }
 
+test "warm cache: an instance whose type param no value param names flips its caller's key" {
+    // No value param of `bump` names `T` (as with `mem.ga_new[T]()` in every Vec), yet the
+    // caller passes `c` as the instance declares it, so the instance's modes are in its key.
+    const main_src =
+        \\import lib
+        \\fn main() -> int {
+        \\    c := 1
+        \\    lib.bump[bool](c)
+        \\    return c
+        \\}
+        \\
+    ;
+    try flip(
+        ".toy-test-places-turbofish",
+        &.{ .{ .name = "main.toy", .src = main_src }, .{ .name = "lib.toy", .src = "pub fn bump[T](n: int) { n = n + 1 }\n" } },
+        1,
+        &.{.{ .name = "lib.toy", .src = "pub fn bump[T](mut n: int) { n = n + 1 }\n" }},
+        2,
+    );
+}
+
 test "warm cache: a mode flip with an unchanged body plus a caller edit serves no stale callee (#25 callee half)" {
     const lib_v1 =
         \\pub struct P { x: int }
