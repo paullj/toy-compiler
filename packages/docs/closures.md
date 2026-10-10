@@ -1,6 +1,6 @@
 # Closures, function values and places
 
-Status: **spec, not implemented**. Decisions were locked in a /grill-me pass on 2026-09-29. The roadmap is `ROADMAP.md`.
+Status: **implemented**. This page describes the language as it is now: lexer, parser, type checker, lowering, both opt levels, std, tree-sitter and LSP. The design was locked in a /grill-me pass on 2026-09-29; the defaults later chosen by ruling are stated where they apply. What does not work yet is under [Known limitations](#known-limitations). Run examples: `tests/corpora/language-features/closures/`, `places/` and `vec/`.
 
 ## Summary
 
@@ -38,6 +38,7 @@ fn main() -> int {
 - **Equality:** `==` is identity: it compares the code pointer and the environment pointer.
   - A named function equals itself.
   - Two evaluations of the same lambda are equal only if it captures nothing: its environment is then null. A capturing lambda gets a new environment each time, so its evaluations are not equal.
+  - Two different lambdas are never equal, even with the same text: each has its own code. A bound method value is never equal to another evaluation of it either (see [Bound methods](#bound-methods)).
 - **Protocols:** function values do not conform to `Hash` or `Display` (see issue #22).
 - **Dropped:** an expression statement that is a function value it never calls (a fn name `one`, a bound method `c.bump`, a fn-typed field, local or element, a lambda, a `_` capture) does nothing, so it is warning W0012, which spells the call: "function value is never called; did you mean 'c.bump()'?" (`(..)` when the function takes arguments). A value that is bound, assigned, passed, returned, piped or is a used block value does not warn, and neither does a call that returns a function: the call runs.
 
@@ -97,6 +98,12 @@ fn main() -> int {
   - `env` is null for a named function and for a lambda that captures nothing, so a named function as a value costs no allocation.
   - At `-O1`, a closure that does not escape keeps its env in a slot of the frame that makes it (see Escape analysis).
 - **Calling a function value** is a `call_indirect`, with `env` as a hidden first argument.
+- **Units:** each lambda and local fn is its own function, `<owner>$l<rank>`. A named function used as a value gets a thunk `<fn>$fnval` that drops the env, and a bound method an adapter (`$bound`, `$boundbox`). A specialized call (see Generics) gets a copy of its instance, `<instance>$sp<p>$<target>`.
+- **Incremental builds:** lambda units, specialized copies and adapters are never cached; every build lowers them again, while the other units are reused by their content fingerprint.
+  - A lambda's body is part of its owner's fingerprint, so a changed lambda already makes its owner's key change. Its own unit is lowered under the owner's tables (its captures, boxes and storage), and it has no key of its own.
+  - A specialized copy is its instance's body with some value calls made direct. Each caller's key folds the copy's name.
+  - Adapters and thunks are a few instructions each.
+  - The cost: a rebuild with no edit of `closures/escape_std_methods.toy` lowers 91 of its 152 units again. Keying these units on their owner's fingerprint plus their place in it would make them cacheable.
 
 ## Generics
 
@@ -104,7 +111,8 @@ fn main() -> int {
 
 - **Known at compile time:** when the argument is a lambda literal or a named function, the call site gets its own instance. The call is then direct and can be inlined.
 - **A function value:** a variable, a field or a return value goes through an erased instance, keyed only on `T, U`, with the fat pair and `call_indirect`.
-- **A cap per generic function** on specialized instances limits code size. Past the cap, calls use the erased instance.
+- **A cap per generic function** on specialized instances limits code size: 8 copies over all its instances, the first 8 by name, so the choice does not depend on the order the compiler visits calls. Past the cap, calls use the erased instance. `toy build --no-specialize` sends every call through the erased instance; it changes the code, never the behavior.
+- **What is not specialized:** an argument that is a local holding a function, a local fn, a field, a call result or a bound method; a parameter its function assigns; and every parameter of a generic function that contains a lambda or a local fn.
 - **Methods with their own type parameters:** a method of a generic type can declare its own (`impl Box[T] { fn map[U](self, f: fn(T) -> U) -> Box[U] }`), and so can an associated fn (`fn with[U](v: T, tag: U)`). They are inferred from the arguments, never written (`b.map[int](..)` stays T0018), and each instantiation is its own instance. On a non-generic type they are T0013 for now. A method's own parameter may not reuse a name of its impl's (`fn conv[T]` in `impl Box[T]` is T0053). A lambda of the wrong shape is reported as itself, T0039 for a wrong parameter count or T0040 for a wrong type (`expected fn(int) -> U, got fn(int, int) -> int`), not as a parameter nothing could infer.
 
 ## `mut` parameters
@@ -125,11 +133,11 @@ bump(count)                          # count changes
   - **Captures.** A lambda, a local fn, a `_` capture or a bound method may capture a `mut` param (`mut self` included) when it does not escape; one that escapes is T0052.
   - **Not a value.** A fn with any `mut` param, or a method with a `mut` param after `self`, cannot be used as a value: T0049. A call through a function value passes every argument by value.
   - **Boxing.** A caller local passed as a `mut` argument counts as assigned, so if a closure captures it, it is boxed.
-  - **Aliasing** is allowed: `swap(x, x)`, and `f(x, x)` with one `mut` and one by-value param. A by-value argument is the copy taken where it is evaluated, so a later argument that writes the variable through a `mut` param (`f(q, touch(q))`) does not change it. An assignment through a `mut` param builds the whole value before it writes any of it, so `a = P { x: b.y, y: b.x }` is right when `a` and `b` name one variable.
+  - **Aliasing** is allowed: `swap(x, x)`, and `f(x, x)` with one `mut` and one by-value param. A by-value argument is the copy taken where it is evaluated, so a later argument that writes the variable through a `mut` param (`f(q, touch(q))`) does not change it. An assignment through a `mut` param builds the whole value before it writes any of it, so `a = P { x: b.y, y: b.x }` is right when `a` and `b` name one variable. [Known limitations](#known-limitations) lists the cases outside `mut` params that these rules do not cover yet.
 
-## `Ref[T]` becomes a plain library type
+## `Ref[T]` is a plain library type
 
-There is one sharing model, so the `&x` / `*r` operators are removed.
+There is one sharing model, so the `&x` / `*r` operators were removed.
 
 - **What stays:** a shared mutable cell that you store in a data structure. It is an ordinary std type, and its API is in `std/ref` (`import std/ref`):
   - `Ref.new(v)` makes one. It infers `T` from `v`; `Ref[T].new(v)` pins it.
@@ -182,7 +190,7 @@ There is one sharing model, so the `&x` / `*r` operators are removed.
 - **`mut self`:** the piped value must be a place, as for `x.m()`: `mk() |> .bump()` is T0019. The call counts as a mutation of the receiver, so a closure that runs `c |> .bump()` boxes `c`.
 - **No `_`:** the piped value already fills the receiver, so a `_` in the arguments is P0016.
 
-## Standard library additions
+## Standard library
 
 | Type | Methods |
 |---|---|
@@ -221,7 +229,7 @@ The names `unwrap`, `unwrap_or`, `is_err` and `map_err` may change; see issue #2
   - a non-escaping env goes in the frame of the body that makes it, up to 256 B per function;
   - past that, or when the frame would exceed codegen's limit, it goes in a GC cell;
   - a captured-and-mutated local of 16 B or less that only non-escaping closures capture is not boxed: those closures hold its address;
-  - bound values keep heap envs, and a bound receiver stays boxed.
+  - a bound method value always gets a heap env, even when it does not escape, and its receiver stays boxed. This is the chosen default, not a limit of the analysis.
 - **`-O0`:** every env and box is on the heap. A captured `mut` param's address is a plain word in the env cell.
 - **Gate:** an `-O0` against `-O1` differential run of the corpus (same exit code and stdout).
 
@@ -238,6 +246,22 @@ The names `unwrap`, `unwrap_or`, `is_err` and `map_err` may change; see issue #2
   - A local bound once to a named function or a bound method, and never written again (`f := add`, `g := acc.plus`), shows the label a call of that function or method would: `g(` shows `fn plus(int) -> int`. A local fn shows its own name. A local that is assigned or passed to a `mut` parameter shows its type, since its value may come from anywhere.
   - Hover on the callee shows its type (`g: fn(int) -> int`). Hover on a bound method value (`plus` in `g := acc.plus`) shows the method and adds "bound method of Acc".
   - Hover on the `_` of a capture adds the function type the capture makes: `_: int`, then "capture: fn(int) -> int".
+
+## Known limitations
+
+Open issues that touch this page. Each has a repro.
+
+- **Aliasing outside `mut` params** ([#26](https://github.com/paullj/toy-compiler/issues/26), [#27](https://github.com/paullj/toy-compiler/issues/27)): the staging rules under `mut` parameters hold only when a non-`self` `mut` param is involved. A plain local, `self = ..` or a field store whose right side reads its own destination (`p = P { x: p.y, y: p.x }`) writes a field before it reads it, and a later argument's `mut self` call (`hq(q, q.touch())`) changes an earlier by-value argument.
+- **`mut self` through a desugar** ([#28](https://github.com/paullj/toy-compiler/issues/28)): a `mut self` witness reached through `==`, `<`, `+`, `io.println` or a `Map` key crashes; the desugar passes `self` by value.
+- **`for` over a user iterator** ([#29](https://github.com/paullj/toy-compiler/issues/29)): `for x in it` passes `iter`'s receiver by value and `next`'s by address, whatever the methods declare.
+- **An enum type name as a value** ([#30](https://github.com/paullj/toy-compiler/issues/30)): `x := Shape` passes `toy check` and fails in lowering.
+- **Turbofish on a generic type's method** ([#31](https://github.com/paullj/toy-compiler/issues/31)): `b.map[int](..)` and `x |> .m[int]()` are T0018, so a method whose type parameter appears only in its return type cannot be called.
+- **Frame size** ([#32](https://github.com/paullj/toy-compiler/issues/32)): a function frame over 4095 bytes fails to build, about 57 int locals or 13 `str` `==` at `-O0`.
+- **LSP in generic bodies** ([#33](https://github.com/paullj/toy-compiler/issues/33)): no hover, definition or signature help on a method call inside a generic body.
+- **Warm cache and `for`** ([#35](https://github.com/paullj/toy-compiler/issues/35)): two programs in one directory with the same `for`-in `main` body share the `.toy` cache, and the second build fails with "unresolved symbol after codegen".
+- **`core/*` is importable** ([#36](https://github.com/paullj/toy-compiler/issues/36)): a program can import `core/mem` and call its unchecked primitives, which std calls only after a bounds check.
+- **`_` in a bounded template:** a `_` whose position wants the template's own `T` is a false T0050 (see `_` capture expressions).
+- **Uncached closure units:** see Representation.
 
 ## Out of scope
 
