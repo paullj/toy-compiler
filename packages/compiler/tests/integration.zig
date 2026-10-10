@@ -17,7 +17,6 @@ test {
     _ = @import("driver.zig");
     _ = @import("check.zig");
     _ = @import("differential.zig");
-    _ = @import("corpus.zig");
     _ = @import("heap.zig");
     _ = @import("closures.zig");
     _ = @import("places.zig");

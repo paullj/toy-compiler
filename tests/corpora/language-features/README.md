@@ -44,6 +44,9 @@ result so the example is self-documenting.
 The manifest-driven corpus harness (`packages/compiler/tests/corpus.zig`, enumerated
 by `corpus_manifest.zon`) compiles each example (and, for non-error cases, runs it)
 and verifies every `# expect:` directive in-process. It runs under `zig build test`
-(or `zig build test-bin` then `./zig-out/bin/toy-integration-test`); the single-file
-examples here and the multi-file programs under `modules/` are both covered. A moved,
-renamed, or mis-annotated fixture fails the suite.
+(or `zig build test-bin` then `./zig-out/bin/toy-corpus-test`); the single-file
+examples here and the multi-file programs under `modules/` are both covered. It reports
+every failing fixture, and `TOY_CORPUS=<path substring>` runs only the matching ones
+(`TOY_CORPUS=closures/capture_loop ./zig-out/bin/toy-corpus-test`). The manifest holds
+each corpus's exact fixture count, so adding or removing a fixture means updating it,
+and a fixture that goes missing fails the suite.

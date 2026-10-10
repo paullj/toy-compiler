@@ -28,20 +28,21 @@
 //!   and multi-file module graphs. Codegen+exec is gated on macOS/aarch64; off that
 //!   target a clean front-end counts as covered but does not run the binary.
 //!
-//! Each corpus asserts a `min_count` floor so a moved/renamed/removed fixture (or a
-//! silently-inert walk) fails the suite, and the whole harness asserts it covered
-//! SOMETHING. `diff.sh` (byte-identity) and `incremental.sh` (cache-cutoff) test
-//! compiler invariants, not corpus expectations, and stay as standalone scripts.
+//! Each corpus states its exact fixture `count`, so a moved, renamed or removed
+//! fixture (or a silently inert walk) fails the suite, and adding one means editing
+//! the manifest. The fixtures run in parallel, each worker with its own cache
+//! directory, and every failing fixture is reported, not only the first.
 //!
-//! Run: `zig build test`, or `zig build test-bin` then
-//! `./zig-out/bin/toy-integration-test`.
+//! This file is its own test binary, `toy-corpus-test`. Run it under `zig build test`,
+//! or `zig build test-bin` then `./zig-out/bin/toy-corpus-test`. `TOY_CORPUS=<substr>`
+//! runs only the fixtures whose path contains it:
+//! `TOY_CORPUS=closures/capture_loop ./zig-out/bin/toy-corpus-test`.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const toyc = @import("toy_compiler");
 
-const Driver = toyc.Driver;
 const Graph = toyc.Graph;
 const ResolveGraph = toyc.ResolveGraph;
 const TypecheckGraph = toyc.TypecheckGraph;
@@ -358,10 +359,9 @@ const Corpus = struct {
     path: []const u8,
     mode: Mode,
     unit: Unit,
-    /// The floor of fixtures this corpus must contribute. A moved/renamed/removed
-    /// fixture drops the count below the floor and fails the suite; `0` tolerates a
-    /// declared-but-empty corpus (the regression placeholder) without going inert.
-    min_count: usize,
+    /// How many fixtures the walk must find. Exact rather than a floor: a floor goes
+    /// stale as fixtures are added, and then losing one no longer fails.
+    count: usize,
     /// First-path-component names to skip during a `single_file` walk (e.g. the
     /// `modules` subtree lives under `language-features` but is its own corpus).
     prune: []const []const u8 = &.{},
@@ -671,33 +671,26 @@ fn checkExpectFixture(
     return judge(gpa, entry, e, r);
 }
 
-test "corpus: every manifest corpus matches its expectations" {
-    const gpa = testing.allocator;
-    var threaded = std.Io.Threaded.init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    // `openCache` writes the cache dir into `dir_buf` and returns a `Cache` that
-    // BORROWS it, so the buffer must outlive every `cache` use — keep it on THIS
-    // frame (a helper that owns the buffer would return a dangling `.dir`).
-    var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
-    const cache = try Driver.openCache(io, &dir_buf);
+/// One fixture: its cwd-relative path (owned) and how its corpus checks it.
+const Fixture = struct { path: []const u8, mode: Mode };
 
-    // Emitted binaries land here (relative to cwd), so duplicate fixture basenames
-    // across the corpus can't clobber each other.
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var out_dir_buf: [64]u8 = undefined;
-    const out_dir = std.fmt.bufPrint(&out_dir_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+fn freeFixtures(gpa: std.mem.Allocator, list: *std.ArrayList(Fixture)) void {
+    for (list.items) |f| gpa.free(f.path);
+    list.deinit(gpa);
+}
 
-    var global_total: usize = 0;
-    var bin_index: usize = 0;
+/// Every fixture of every manifest corpus, sorted by path so the report reads the same on
+/// every file system. A corpus whose walk finds other than its manifest `count` fails here.
+fn collectFixtures(gpa: std.mem.Allocator, io: Io) !std.ArrayList(Fixture) {
+    var list: std.ArrayList(Fixture) = .empty;
+    errdefer freeFixtures(gpa, &list);
+    var miscounted = false;
     for (manifest) |c| {
         var count: usize = 0;
         var root = try Io.Dir.cwd().openDir(io, c.path, .{ .iterate = true });
         defer root.close(io);
         var walker = try root.walk(gpa);
         defer walker.deinit();
-
         while (try walker.next(io)) |entry| {
             if (entry.kind != .file) continue;
             switch (c.unit) {
@@ -709,42 +702,135 @@ test "corpus: every manifest corpus matches its expectations" {
                     if (!std.mem.eql(u8, std.fs.path.basename(entry.path), "main.toy")) continue;
                 },
             }
-
-            // The in-process front-end reads every fixture through
-            // `Io.Dir.cwd().readFileAlloc`, which rejects an absolute path
-            // (`error.BadPathName`); keep the path cwd-RELATIVE (as the old harnesses
-            // did) so both the diagnostics and the `.expect` discover read
-            // it, and so module imports resolve against the entry's relative dir.
-            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-            const rel = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ c.path, entry.path });
-
+            // The in-process front-end reads every fixture through `Io.Dir.cwd()`, which
+            // rejects an absolute path, and module imports resolve against the entry's
+            // relative dir, so the path stays cwd-relative.
+            const rel = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ c.path, entry.path });
+            errdefer gpa.free(rel);
+            try list.append(gpa, .{ .path = rel, .mode = c.mode });
             count += 1;
-            const failure = switch (c.mode) {
-                .diagnostics => try checkFixture(gpa, io, cache, rel),
-                .expect => blk: {
-                    const out_name = try std.fmt.allocPrint(gpa, "{s}/f{d}", .{ out_dir, bin_index });
-                    defer gpa.free(out_name);
-                    bin_index += 1;
-                    break :blk try checkExpectFixture(gpa, io, cache, rel, out_name);
-                },
-            };
-            if (failure) |msg| {
-                defer gpa.free(msg);
-                std.debug.print("corpus mismatch [{s}]: {s}\n", .{ c.path, msg });
-                return error.CorpusMismatch;
-            }
         }
-
-        // A corpus that should be non-empty must contribute its floor: a fixture that
-        // was moved, renamed, or deleted drops the count and fails here.
-        if (count < c.min_count) {
-            std.debug.print("corpus [{s}]: found {d} fixtures, expected >= {d}\n", .{ c.path, count, c.min_count });
-            return error.CorpusUndercount;
+        if (count != c.count) {
+            std.debug.print("corpus [{s}]: found {d} fixtures, corpus_manifest.zon says {d}; update its count if the change is intended\n", .{ c.path, count, c.count });
+            miscounted = true;
         }
-        global_total += count;
     }
-    // No manifest edit can leave the whole harness silently inert.
-    try testing.expect(global_total > 0);
+    if (miscounted) return error.CorpusMiscount;
+    std.mem.sort(Fixture, list.items, {}, struct {
+        fn lessThan(_: void, a: Fixture, b: Fixture) bool {
+            return std.mem.lessThan(u8, a.path, b.path);
+        }
+    }.lessThan);
+    return list;
+}
+
+/// The fixtures, a shared cursor into them, and one result slot per fixture. Workers
+/// claim fixtures in order, so a slow one never holds back the rest.
+const Run = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    fixtures: []const Fixture,
+    /// Per fixture, its failure message (owned) or null.
+    failures: []?[]const u8,
+    /// Where `.expect` fixtures write their binaries, one name per fixture index.
+    out_dir: []const u8,
+    next: std.atomic.Value(usize) = .init(0),
+
+    fn work(run: *Run, cache: Cache) void {
+        while (true) {
+            const i = run.next.fetchAdd(1, .monotonic);
+            if (i >= run.fixtures.len) return;
+            const f = run.fixtures[i];
+            run.failures[i] = run.check(cache, i) catch |e| blk: {
+                const msg: []const u8 = std.fmt.allocPrint(run.gpa, "{s}: {t}", .{ f.path, e }) catch @panic("OOM");
+                break :blk msg;
+            };
+        }
+    }
+
+    fn check(run: *Run, cache: Cache, i: usize) !?[]const u8 {
+        const f = run.fixtures[i];
+        return switch (f.mode) {
+            .diagnostics => checkFixture(run.gpa, run.io, cache, f.path),
+            .expect => {
+                const out_name = try std.fmt.allocPrint(run.gpa, "{s}/f{d}", .{ run.out_dir, i });
+                defer run.gpa.free(out_name);
+                return checkExpectFixture(run.gpa, run.io, cache, f.path, out_name);
+            },
+        };
+    }
+};
+
+test "corpus: every manifest corpus matches its expectations" {
+    var leak_check: LeakCheck = .init;
+    const result = runCorpus(leak_check.allocator());
+    const leaked = leak_check.deinit() == .leak;
+    try result;
+    try testing.expect(!leaked);
+}
+
+/// `std.testing.allocator` captures a stack trace on every allocation, which costs more
+/// than the compiles; this one still fails the test on a leak, without its site.
+const LeakCheck = std.heap.DebugAllocator(.{ .stack_trace_frames = 0 });
+
+fn runCorpus(gpa: std.mem.Allocator) !void {
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var all = try collectFixtures(gpa, io);
+    defer freeFixtures(gpa, &all);
+    try testing.expect(all.items.len > 0);
+
+    var picked: std.ArrayList(Fixture) = .empty;
+    defer picked.deinit(gpa);
+    const filter: ?[]const u8 = if (testing.environ.getPosix("TOY_CORPUS")) |sub| (if (sub.len == 0) null else sub) else null;
+    for (all.items) |f| {
+        if (filter == null or std.mem.indexOf(u8, f.path, filter.?) != null) try picked.append(gpa, f);
+    }
+    if (filter) |sub| {
+        std.debug.print("corpus: {d} of {d} fixtures match TOY_CORPUS={s}\n", .{ picked.items.len, all.items.len, sub });
+        if (picked.items.len == 0) return error.NoFixtureMatches;
+    }
+
+    // Emitted binaries and the per-worker caches land here, relative to cwd, so duplicate
+    // fixture basenames can't clobber each other.
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var out_dir_buf: [64]u8 = undefined;
+    const out_dir = std.fmt.bufPrint(&out_dir_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path}) catch unreachable;
+
+    const failures = try gpa.alloc(?[]const u8, picked.items.len);
+    defer gpa.free(failures);
+    @memset(failures, null);
+    var run: Run = .{ .gpa = gpa, .io = io, .fixtures = picked.items, .failures = failures, .out_dir = out_dir };
+
+    // A cache per worker: two workers writing one entry at once would share its temp file.
+    const workers = @min(picked.items.len, std.Thread.getCpuCount() catch 1);
+    const dirs = try gpa.alloc([80]u8, workers);
+    defer gpa.free(dirs);
+    const threads = try gpa.alloc(std.Thread, workers);
+    defer gpa.free(threads);
+    {
+        var spawned: usize = 0;
+        defer for (threads[0..spawned]) |t| t.join();
+        for (dirs, 0..) |*buf, w| {
+            const cache = try Cache.init(io, std.fmt.bufPrint(buf, "{s}/cache{d}", .{ out_dir, w }) catch unreachable);
+            threads[w] = try std.Thread.spawn(.{}, Run.work, .{ &run, cache });
+            spawned += 1;
+        }
+    }
+
+    var failed: usize = 0;
+    for (failures) |msg| if (msg) |m| {
+        failed += 1;
+        std.debug.print("corpus mismatch: {s}\n", .{m});
+        gpa.free(m);
+    };
+    if (failed > 0) {
+        std.debug.print("corpus: {d} of {d} fixtures failed\n", .{ failed, picked.items.len });
+        return error.CorpusMismatch;
+    }
 }
 
 test "ui harness: parseAnnotation accepts the exact marker and rejects near-misses" {
