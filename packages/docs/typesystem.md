@@ -1,9 +1,12 @@
 # Type system
 
 The reference for `toyc`'s type checker (`src/types.zig`), run after name
-resolution. Inference is **bidirectional and local over concrete types**: there
-are no type variables, no polymorphism, no generics. Every expression has a
-fully concrete `Type` the moment it is checked.
+resolution. Inference is **bidirectional and local**, with no HM-style unification:
+a generic call binds its type parameters by one structural match against its
+arguments (see [Generic calls](#generic-calls-inference-order)), and a lambda's
+parameters take the function type expected where it is written (see
+[Lambdas](#lambdas)). Outside a generic template every expression has a fully
+concrete `Type` the moment it is checked.
 
 ## Types
 
@@ -125,10 +128,12 @@ from two angles — assignability is directional (want ← got), join is symmetr
 * **Parameters must be user-typed** — `fn f(x: int)`. *(documented existing.)*
   The parser enforces this: `parseFnDecl` does `expect(.colon, ...)` then
   `parseType()` for every parameter (`src/parse.zig`), so a typeless parameter is
-  a parse error, never reaching the checker.
-* **Return type — unit sugar.** Omitting `-> T` is **sugar for `-> ()`**. There is
-  no return-type inference: a function with no arrow returns unit, and any
-  non-unit return value must be annotated. *(`decodeFnSig` defaults a missing
+  a parse error, never reaching the checker. A lambda's parameter may leave its type
+  out (see [Lambdas](#lambdas)); a local function's may not.
+* **Return type — unit sugar.** Omitting `-> T` is **sugar for `-> ()`**. A declared
+  function has no return-type inference: one with no arrow returns unit, and any
+  non-unit return value must be annotated. A lambda's return type is inferred from
+  its body (see [Lambdas](#lambdas)). *(`decodeFnSig` defaults a missing
   return-type node to `Type.unit`.)*
 * **`mut` parameters** — `fn bump(mut n: int)` takes the caller's place by address,
   like a `mut self` receiver, and its writes reach the caller's variable. The
@@ -175,12 +180,10 @@ These rules are unchanged by the formalization and remain authoritative:
 ## Generics syntax reservation
 
 The generics front-end (`fn f[T, U](..)`, `struct Box[T]`, `enum E[T]`, a type
-application `Box[int]`, explicit call type-args `f[int](..)`) landed append-only. Generic **functions** and generic **structs** now have semantics (see
-below); only a generic **enum** decl still emits **T0013 "generics not yet
-supported"**.
+application `Box[int]`, explicit call type-args `f[int](..)`) landed append-only. Generic **functions**, **structs** and **enums** now have semantics
+(see below).
 
-The `[..]` bracket is disambiguated by **position**, and this rule is reserved so a
-future value-index never collides:
+The `[..]` bracket is disambiguated by **position**:
 
 * **type position** — a trailing `[..]` on a type-ref is a **type application**
   (`x: Box[int]`, `mod.Box[int]`);
@@ -188,9 +191,11 @@ future value-index never collides:
   `mod.fn` callee is **explicit type-arguments** (`id[int](7)`); it wraps only that
   callee, and the following `(..)` forms the call.
 
-**Value indexing `v[i]` is deliberately NOT parsed** — it is reserved to a distinct
-future form so it can never collide with type-application. Only an `identifier` or a
-`field_access` base is wrapped; any other `[..]` is a syntax error today.
+**Value indexing `v[i]`** shares the bracket. The parser looks past the `]`: a `(`,
+`{` or `.` after it makes a type application (only on an `identifier` or `field_access`
+base), and any other token a value index (`xs[i]`). A type application whose base is a
+value is read as an index by the checker, so `fs[i](x)` calls the element and
+`xs[i].f` reads its field.
 
 A third `[..]` position is **construction position** — a `[..]` on a name
 followed by `{ .. }` (`Box[int]{ v: 1 }`) builds a `struct_init` whose lhs is the
