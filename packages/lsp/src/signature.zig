@@ -211,7 +211,7 @@ fn renderDeclLabel(
 }
 
 fn appendTypeText(a: std.mem.Allocator, buf: *std.ArrayList(u8), pm: *const toyc.Graph.Module, ty: toyc.Ast.Index) !void {
-    const sp = toyc.AstWalk.nodeSpan(.{ .tree = pm.tree(), .tokens = pm.tokens, .source = pm.source }, ty);
+    const sp = toyc.Walk.nodeSpan(.{ .tree = pm.tree(), .tokens = pm.tokens, .source = pm.source }, ty);
     try render.appendCollapsed(a, buf, pm.source[sp.start..sp.end]);
 }
 

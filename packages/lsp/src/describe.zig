@@ -269,7 +269,7 @@ pub const Describer = struct {
     }
 
     fn appendNodeText(d: *Describer, m: *const Graph.Module, i: u32) !void {
-        const sp = toyc.AstWalk.nodeSpan(.{ .tree = m.tree(), .tokens = m.tokens, .source = m.source }, Ast.Index.from(i));
+        const sp = toyc.Walk.nodeSpan(.{ .tree = m.tree(), .tokens = m.tokens, .source = m.source }, Ast.Index.from(i));
         try render.appendCollapsed(d.a, &d.buf, m.source[sp.start..sp.end]);
     }
 

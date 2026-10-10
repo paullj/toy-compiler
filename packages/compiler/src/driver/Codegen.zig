@@ -23,6 +23,7 @@ const lower = @import("../lower.zig");
 const Closure = @import("../symbols/Closure.zig");
 const Spec = @import("../symbols/Spec.zig");
 const AstWalk = @import("../query/AstWalk.zig");
+const Walk = @import("../ast/Walk.zig");
 const Fingerprint = @import("../query/Fingerprint.zig");
 const Link = @import("../link/Link.zig");
 const link = @import("../link/emit.zig");
@@ -219,7 +220,7 @@ const Plan = struct {
     res: *const ResolveGraph.GraphResult,
     tc: *const Typecheck.GraphResult,
     /// Each module's tree, tokens and source, by module id. Owned.
-    modules: []AstWalk.Source,
+    modules: []Walk.Source,
     /// One SymName per global fn id, parallel to `tc.sigs`. Owned.
     names: []Link.SymName,
     /// Owned.
@@ -234,7 +235,7 @@ const Plan = struct {
     o: Options,
 
     fn init(gpa: std.mem.Allocator, graph: *const Graph.Graph, res: *const ResolveGraph.GraphResult, tc: *const Typecheck.GraphResult, o: Options) !Plan {
-        const modules = try gpa.alloc(AstWalk.Source, graph.modules.len);
+        const modules = try gpa.alloc(Walk.Source, graph.modules.len);
         errdefer gpa.free(modules);
         for (graph.modules, modules) |*m, *ms| ms.* = .{ .tree = m.tree(), .tokens = m.tokens, .source = m.source };
         const names = try buildGraphNames(gpa, res.fns, tc.sigs);
@@ -411,7 +412,7 @@ const Plan = struct {
         };
     }
 
-    /// Each body's closure facts, indexed like the body list: `Closure.ownerFacts` of the
+    /// Each body's closure facts, indexed like the body list: `Fingerprint.ownerFacts` of the
     /// closure tables its lowering gets (`closureFor`), so its key and its code read one
     /// storage. Serial, once per body. Empty when there is no lambda unit and no boxed local.
     fn ownerClosureFacts(p: *const Plan, gpa: std.mem.Allocator) ![]const []const u8 {
@@ -421,7 +422,7 @@ const Plan = struct {
         errdefer freeClosureFacts(gpa, facts);
         for (facts, 0..) |*f, i| {
             const c = p.closureFor(@intCast(i), &.{});
-            f.* = try Closure.ownerFacts(gpa, Closure.ownerUnits(c.lambda_units, c.owner.?), c.storage, c.frame_envs);
+            f.* = try Fingerprint.ownerFacts(gpa, Closure.ownerUnits(c.lambda_units, c.owner.?), c.storage, c.frame_envs);
         }
         return facts;
     }

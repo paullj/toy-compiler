@@ -97,7 +97,7 @@ pub fn hintsIn(
 
     for (try f.mutArgs(a)) |ma| {
         if (ma.receiver) continue;
-        const off = toyc.AstWalk.nodeSpan(.{ .tree = m.tree(), .tokens = m.tokens, .source = m.source }, toyc.Ast.Index.from(ma.node)).start;
+        const off = toyc.Walk.nodeSpan(.{ .tree = m.tree(), .tokens = m.tokens, .source = m.source }, toyc.Ast.Index.from(ma.node)).start;
         if (off < lo or off > hi) continue;
         try found.append(a, .{ .off = off, .hint = .{
             .position = position.offsetToPosition(&sm, off, ws.encoding),

@@ -51,6 +51,7 @@ pub const DeriveEmit = @import("lower/derive_emit.zig");
 pub const AdapterEmit = @import("lower/adapter_emit.zig");
 pub const Fingerprint = @import("query/Fingerprint.zig");
 pub const AstWalk = @import("query/AstWalk.zig");
+pub const Walk = @import("ast/Walk.zig");
 pub const Link = @import("link/Link.zig");
 pub const MachO = @import("link/MachO.zig");
 pub const CodeSign = @import("link/CodeSign.zig");
@@ -114,6 +115,7 @@ test {
     _ = AdapterEmit;
     _ = Fingerprint;
     _ = AstWalk;
+    _ = Walk;
     _ = Link;
     _ = MachO;
     _ = CodeSign;

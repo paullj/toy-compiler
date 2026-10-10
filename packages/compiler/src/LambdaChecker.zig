@@ -1,0 +1,342 @@
+const std = @import("std");
+const Ast = @import("ast/Ast.zig");
+const Closure = @import("symbols/Closure.zig");
+const Modes = @import("symbols/Modes.zig");
+const Composite = @import("symbols/Composite.zig");
+const Type = @import("layout/Type.zig").Type;
+
+// The lambda and local fn subsystem, carved out of `BodyChecker` as free functions over a
+// `*BodyChecker` (the `PatternChecker` pattern): typing a lambda or local fn body, the
+// per-body state it swaps in, the jumps that may not leave it, and how each captured
+// local is held.
+const BC = @import("BodyChecker.zig");
+const Typecheck = @import("types.zig");
+const BodyChecker = BC.BodyChecker;
+const refs = Typecheck.refs;
+
+/// `reportTailMismatch` for a lambda whose return type came from the type expected for
+/// it (`exp`), not from a `-> R`: the message spells the type the lambda really has,
+/// since nothing it wrote declared the one it is held to.
+fn reportExpectedTailMismatch(bc: *BodyChecker, block_idx: Ast.Index, params: []const Type, body_ty: Type, exp: Type) error{OutOfMemory}!bool {
+    if (body_ty.kind == .unit or body_ty.kind == .never or body_ty.kind == .invalid) return false;
+    const tail = bc.blockTail(block_idx) orelse return false;
+    const parts = Composite.fnParts(bc.composite.at(exp.funcIdx()));
+    var real: std.ArrayList(u8) = .empty;
+    defer real.deinit(bc.gpa);
+    try real.appendSlice(bc.gpa, "fn(");
+    for (params, 0..) |p, i| {
+        if (i != 0) try real.appendSlice(bc.gpa, ", ");
+        // An open `_` param has no type of its own yet; the expected one stands in.
+        const shown = if (p.kind == .invalid and i < parts.params.len) parts.params[i] else p;
+        try real.appendSlice(bc.gpa, if (shown.kind == .unit) "()" else bc.typeName(shown));
+    }
+    try real.print(bc.gpa, ") -> {s}", .{bc.typeName(body_ty)});
+    try bc.sink.report(.{ .span = bc.spanOf(tail), .code = .T0042 }, "lambda has type {s}, but {s} is expected: its value is {s}, not {s}", .{ real.items, bc.typeName(exp), bc.typeName(body_ty), bc.typeName(parts.ret) });
+    return true;
+}
+
+/// Decide how each captured local is held. A closure copies a capture when it is made,
+/// which is sound only for a local that nothing assigns; a captured local that is
+/// assigned (`x = ..`, a place store rooted at it, a `mut self` call on it, a `mut`
+/// argument rooted at it) is boxed instead, into `bc.boxed`. A bound method value
+/// captures its local receiver the same way. A `mut` param's slot (`mut self`
+/// included) holds the caller's address, not a value a cell could hold, so it is never
+/// boxed: the closure holds the address, which is legal only if the closure never
+/// outlives the call. That depends on other fns' bodies, so the serial escape pass
+/// decides it (T0052), not this per-body check. A bounded template's abstract check
+/// skips this: each instance re-check decides for itself.
+pub fn classifyCaptures(bc: *BodyChecker, place_params: u64) error{OutOfMemory}!void {
+    if (bc.abstract_template) return;
+    if (bc.closures == null and bc.bound_roots.items.len == 0) return;
+    // Params are resolver slots 0..n-1, so a param's slot is its index, and a mask bit
+    // is set only below the param count.
+    std.mem.sort(u32, bc.mutated_roots.items, {}, std.sort.asc(u32));
+    const assigned = sortedSet(bc.assigned_roots.items);
+    var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen.deinit(bc.gpa);
+    if (bc.closures) |fc| {
+        // Boundaries are in node order, where a nested lambda precedes its parent; the
+        // rank is source (pre-) order, so the first boundary by rank holds a slot's first use.
+        const by_rank = try bc.gpa.alloc(u32, fc.boundaries.len);
+        defer bc.gpa.free(by_rank);
+        for (fc.boundaries, 0..) |b, i| by_rank[b.rank] = @intCast(i);
+        for (by_rank) |bi| for (fc.boundaries[bi].captures) |c| {
+            if (Modes.isMut(place_params, c.slot)) continue;
+            if ((try seen.getOrPut(bc.gpa, c.slot)).found_existing) continue;
+            if (Closure.contains(assigned, c.slot) or Closure.contains(bc.mutated_roots.items, c.slot)) {
+                try bc.boxed.append(bc.gpa, c.slot);
+            }
+        };
+    }
+    for (bc.bound_roots.items) |slot| {
+        if (Modes.isMut(place_params, slot)) continue;
+        if ((try seen.getOrPut(bc.gpa, slot)).found_existing) continue;
+        if (Closure.contains(assigned, slot) or Closure.contains(bc.mutated_roots.items, slot)) {
+            try bc.boxed.append(bc.gpa, slot);
+        }
+    }
+    std.mem.sort(u32, bc.boxed.items, {}, std.sort.asc(u32));
+}
+
+/// Sort `items` in place and drop repeats, returning the deduped prefix.
+fn sortedSet(items: []u32) []const u32 {
+    std.mem.sort(u32, items, {}, std.sort.asc(u32));
+    var n: usize = 0;
+    for (items) |x| {
+        if (n > 0 and items[n - 1] == x) continue;
+        items[n] = x;
+        n += 1;
+    }
+    return items[0..n];
+}
+
+/// The local whose own storage a place `x`, `x.f` or `x.0` names. Null for a place
+/// rooted anywhere else (an index, a call): a store there does not write a local.
+fn placeRoot(bc: *const BodyChecker, place: Ast.Index) ?u32 {
+    var cur = place;
+    while (true) {
+        const nn = bc.tree.nodes[cur.int()];
+        switch (nn.tag) {
+            .field_access, .tuple_field => cur = nn.lhs,
+            .identifier => return switch (bc.resolutions[cur.int()]) {
+                .local => |slot| slot,
+                else => null,
+            },
+            else => return null,
+        }
+    }
+}
+
+/// Record the local an assignment to `place` writes.
+pub fn noteAssignedRoot(bc: *BodyChecker, place: Ast.Index) error{OutOfMemory}!void {
+    if (placeRoot(bc, place)) |slot| try bc.assigned_roots.append(bc.gpa, slot);
+}
+
+/// Record the local a call writes through: the root of a `mut self` receiver place or
+/// of a `mut` argument.
+pub fn noteMutatedRoot(bc: *BodyChecker, place: Ast.Index) error{OutOfMemory}!void {
+    if (placeRoot(bc, place)) |slot| try bc.mutated_roots.append(bc.gpa, slot);
+}
+
+/// `fn(params) -> R { body }`: a value of type `fn(P..) -> R`. A param's type is its
+/// annotation, else the expected fn type's; the return type is the annotation, else the
+/// expected fn type's, else the join of the body's value and its `return`s. `return`
+/// and `?` exit the lambda, and no jump leaves it. A part of the expected type that
+/// still holds a type variable (a generic callee) provides nothing. A `_` capture's
+/// param with no expected type stays open until its hole's call position types it
+/// (`adoptHole`), and is T0050 only when the body reported no error.
+pub fn typeOfLambda(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
+    const proto = Ast.protoAt(bc.tree, n.lhs.int());
+    const capture = Ast.isCaptureLambda(bc.tree, bc.tokens, node_idx);
+    var open = false;
+    var exp_fn: ?Type = null;
+    var exp_params: []const Type = &.{};
+    var exp_ret: ?Type = null;
+    var arity_err = false;
+    if (bc.expectedTy()) |e| if (e.isFunc()) {
+        const parts = Composite.fnParts(bc.composite.at(e.funcIdx()));
+        if (parts.params.len == proto.params.len) {
+            exp_fn = e;
+            exp_params = parts.params;
+            if (bc.isGround(parts.ret)) exp_ret = parts.ret;
+        } else {
+            var shown: std.ArrayList(u8) = .empty;
+            defer shown.deinit(bc.gpa);
+            try bc.writeTypeNamed(&shown, e, bc.body.open_names, bc.body.open_vars);
+            if (capture)
+                try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0039 }, "a '_' capture takes 1 parameter, but the expected type {s} takes {d}", .{ shown.items, parts.params.len })
+            else
+                try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0039 }, "lambda takes {d} parameter(s), but the expected type {s} takes {d}", .{ proto.params.len, shown.items, parts.params.len });
+            arity_err = true;
+        }
+    };
+    const params = try bc.gpa.alloc(Type, proto.params.len);
+    defer bc.gpa.free(params);
+    var poisoned = arity_err;
+    for (proto.params, 0..) |p, i| {
+        const pn = bc.tree.nodes[p.int()];
+        const ty: Type = if (pn.lhs != Ast.none)
+            bc.typeFromNode(pn.lhs)
+        else if (i < exp_params.len and bc.isGround(exp_params[i]))
+            exp_params[i]
+        else if (capture and !arity_err) blk: {
+            open = true;
+            break :blk Type.invalid;
+        } else blk: {
+            // After an arity error no expected type lines up with the params.
+            if (!arity_err and node_idx != bc.quiet_arg) {
+                const hint = if (i < exp_params.len or node_idx == bc.generic_arg) " (no other argument of the generic call fixes its type)" else "";
+                try bc.sink.report(.{ .span = bc.tokSpan(pn.main_token), .code = .T0050 }, "cannot infer the type of lambda parameter '{s}'; annotate it{s}", .{ bc.nameText(pn.main_token), hint });
+            }
+            // A quiet arg's call reports its own error, possibly only once its args
+            // are typed, so this sink may not hold it yet.
+            break :blk if (node_idx == bc.quiet_arg and !arity_err) Type.invalid else bc.poison();
+        };
+        if (ty.kind == .invalid and !open) poisoned = true;
+        params[i] = ty;
+        bc.node_types[p.int()] = ty;
+        if (bc.resolutions[p.int()] == .local) try bc.setSlot(bc.resolutions[p.int()].local, ty);
+        // An annotated param the expected type does not have means the lambda does not
+        // fit that type at all, so its return type comes from its own body: the
+        // mismatch then names the type the lambda really has.
+        if (pn.lhs != Ast.none and i < exp_params.len and bc.isGround(exp_params[i]) and
+            ty.kind != .invalid and !Type.eql(ty, exp_params[i])) exp_ret = null;
+    }
+
+    const frame = enterBody(bc, false);
+    defer leaveBody(bc, frame);
+    if (capture) bc.body.hole = Ast.captureHole(bc.tree, node_idx);
+    const mark = bc.sink.count();
+
+    const annotated = proto.ret_type != Ast.none;
+    const declared: ?Type = if (annotated) bc.typeFromNode(proto.ret_type) else exp_ret;
+    var ret: Type = undefined;
+    if (declared) |r| {
+        bc.body.cur_ret = r;
+        bc.body.ret_infer = false;
+        if (!annotated) bc.body.ret_expected = exp_fn;
+        const want_value = r.kind != .unit and r.kind != .invalid;
+        const body_ty = try bc.typeOfBlockExpected(n.rhs, want_value, if (want_value) r else null);
+        ret = r;
+        if (want_value and !bc.blockReturns(n.rhs) and !Type.assignable(r, body_ty)) {
+            if (annotated) {
+                if (!try bc.reportTailMismatch(n.rhs, body_ty, r))
+                    try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "lambda must return {s} but may fall off the end", .{bc.typeName(r)});
+            } else if (try reportExpectedTailMismatch(bc, n.rhs, params, body_ty, exp_fn.?)) {
+                // Poisoned so the call or binding that expected the type does not report
+                // the same mismatch again.
+                ret = .invalid;
+            } else {
+                try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "lambda must return {s} but may fall off the end", .{bc.typeName(r)});
+            }
+        }
+    } else {
+        bc.body.cur_ret = Type.unit;
+        bc.body.ret_infer = true;
+        bc.body.ret_join = .never;
+        const body_ty = try bc.typeOfBlockExpected(n.rhs, true, null);
+        const tail: Type = if (bc.blockDiverges(n.rhs)) .never else body_ty;
+        ret = try joinLambdaTail(bc, n, tail);
+    }
+    if (open) {
+        const p = proto.params[0];
+        const t: Type = if (bc.resolutions[p.int()] == .local) bc.slotType(bc.resolutions[p.int()].local) else .invalid;
+        if (t.kind == .invalid) {
+            poisoned = true;
+            if (!bc.errorsSince(mark) and node_idx != bc.quiet_arg)
+                try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0050 }, "cannot infer the type of '_'; nothing in the call gives it one; write the type arguments, as in f[int](a, _), or a typed lambda, as in fn(v: int) {{ .. }}", .{});
+        } else {
+            params[0] = t;
+            bc.node_types[p.int()] = t;
+        }
+    }
+    if (ret.kind == .invalid) poisoned = true;
+    const ty: Type = if (poisoned) .invalid else refs.internFn(bc, params, ret);
+    bc.node_types[node_idx.int()] = ty;
+    return ty;
+}
+
+/// `fn name(params) -> R { body }` in a block: a value of type `fn(P..) -> R` (a missing
+/// `-> R` is unit), bound to `name` before the body is checked so the body can call
+/// itself. The body checks like an annotated lambda's: `return` exits the local fn and
+/// no jump leaves it.
+pub fn checkLocalFn(bc: *BodyChecker, idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!void {
+    const proto = Ast.protoAt(bc.tree, n.lhs.int());
+    const params = try bc.gpa.alloc(Type, proto.params.len);
+    defer bc.gpa.free(params);
+    var poisoned = false;
+    for (proto.params, params) |p, *pty| {
+        const ty = bc.typeFromNode(bc.tree.nodes[p.int()].lhs);
+        if (ty.kind == .invalid) poisoned = true;
+        pty.* = ty;
+        bc.node_types[p.int()] = ty;
+        if (bc.resolutions[p.int()] == .local) try bc.setSlot(bc.resolutions[p.int()].local, ty);
+    }
+    const ret = bc.typeFromNode(proto.ret_type);
+    if (ret.kind == .invalid) poisoned = true;
+    const ty: Type = if (poisoned) .invalid else refs.internFn(bc, params, ret);
+    bc.node_types[idx.int()] = ty;
+    if (bc.resolutions[idx.int()] == .local) try bc.setSlot(bc.resolutions[idx.int()].local, ty);
+
+    const frame = enterBody(bc, true);
+    defer leaveBody(bc, frame);
+    bc.body.cur_ret = ret;
+    bc.body.ret_infer = false;
+    const want_value = ret.kind != .unit and ret.kind != .invalid;
+    const body_ty = try bc.typeOfBlockExpected(n.rhs, want_value, if (want_value) ret else null);
+    if (want_value and !bc.blockReturns(n.rhs) and !Type.assignable(ret, body_ty)) {
+        if (!try bc.reportTailMismatch(n.rhs, body_ty, ret))
+            try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(n.main_token), bc.typeName(ret) });
+    }
+}
+
+/// Enter a lambda or local fn body: no expected type flows in and no jump leaves it.
+/// The caller sets the return state; `leaveBody` restores the enclosing body's.
+fn enterBody(bc: *BodyChecker, is_local_fn: bool) BC.BodyCtx {
+    const saved = bc.body;
+    bc.body = .{ .loop_floor = bc.loop_stack.items.len, .floor_is_local_fn = is_local_fn };
+    return saved;
+}
+
+fn leaveBody(bc: *BodyChecker, saved: BC.BodyCtx) void {
+    bc.body = saved;
+}
+
+/// Give the open capture param the type an argument loop wants at its hole. Only
+/// argument loops pass the hole a want, so `want` is the callee's param type; never
+/// adopt from the expected type, which inside the capture body is unrelated to the hole.
+pub fn adoptHole(bc: *BodyChecker, want: Type) error{OutOfMemory}!void {
+    const r = bc.resolutions[bc.body.hole.int()];
+    if (r != .local) return;
+    if (bc.slotType(r.local).kind != .invalid) return;
+    if (want.kind == .invalid or !bc.isGround(want)) return;
+    try bc.setSlot(r.local, want);
+}
+
+/// Join a `return` operand into the inferred lambda return type.
+pub fn joinLambdaReturn(bc: *BodyChecker, at: Ast.Index, ty: Type) error{OutOfMemory}!void {
+    const j = bc.body.ret_join;
+    if (j.kind == .invalid or ty.kind == .invalid) {
+        bc.body.ret_join = .invalid;
+    } else if (j.kind == .never) {
+        bc.body.ret_join = ty;
+    } else if (ty.kind != .never and !Type.eql(j, ty)) {
+        try bc.sink.report(.{ .span = bc.spanOf(at), .code = .T0042 }, "return type {s} does not match the lambda's earlier return type {s}", .{ bc.typeName(ty), bc.typeName(j) });
+        bc.body.ret_join = .invalid;
+    }
+}
+
+/// The inferred return type: the `return`s' join with the body's trailing value (`never`
+/// when the body diverges). A lambda that never yields a value returns `()`.
+fn joinLambdaTail(bc: *BodyChecker, n: Ast.Node, tail: Type) error{OutOfMemory}!Type {
+    const j = bc.body.ret_join;
+    if (j.kind == .invalid or tail.kind == .invalid) return .invalid;
+    if (j.kind == .never) return if (tail.kind == .never) Type.unit else tail;
+    if (tail.kind == .never or Type.eql(j, tail)) return j;
+    if (tail.kind == .unit) {
+        try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "lambda must return {s} but may fall off the end", .{bc.typeName(j)});
+    } else {
+        const at = if (bc.blockTail(n.rhs)) |t| bc.spanOf(t) else bc.tokSpan(n.main_token);
+        try bc.sink.report(.{ .span = at, .code = .T0042 }, "lambda's value {s} does not match its return type {s}", .{ bc.typeName(tail), bc.typeName(j) });
+    }
+    return .invalid;
+}
+
+pub fn jumpFloorName(bc: *const BodyChecker) []const u8 {
+    if (bc.body.floor_is_local_fn) return "local function";
+    return if (bc.body.hole != Ast.none) "'_' capture" else "lambda";
+}
+
+/// A `break`/`continue` at `stmt_idx` whose target lies outside the innermost lambda:
+/// its label names a construct below `loop_floor`, or (bare) a loop is open below it.
+pub fn jumpLeavesLambda(bc: *const BodyChecker, stmt_idx: Ast.Index) bool {
+    if (bc.body.loop_floor == 0) return false;
+    const outer = bc.loop_stack.items[0..bc.body.loop_floor];
+    if (bc.resolutions[(stmt_idx).int()] == .label) {
+        const target = bc.resolutions[(stmt_idx).int()].label;
+        for (outer) |c| if (c.construct_node == target) return true;
+        return false;
+    }
+    for (outer) |c| if (c.kind != .labeled_block) return true;
+    return false;
+}

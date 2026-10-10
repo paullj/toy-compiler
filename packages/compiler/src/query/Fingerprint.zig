@@ -34,7 +34,9 @@ const Token = @import("../ast/Token.zig").Token;
 const Ast = @import("../ast/Ast.zig");
 const Typecheck = @import("../types.zig");
 const AstWalk = @import("AstWalk.zig");
+const Walk = @import("../ast/Walk.zig");
 const Derive = @import("../symbols/Derive.zig");
+const Closure = @import("../symbols/Closure.zig");
 
 /// The callee identity-and-signature datum (`symbols/Sig.zig`); the `(b)` fold
 /// site in `fingerprint` below is the home for why its `kind` is load-bearing.
@@ -123,7 +125,7 @@ pub fn fingerprint(
     var hv = AstWalk.HashVisitor{ .h = &h };
     // HashVisitor folds into the Wyhash (no allocation), so its error set is empty
     // and this walk is infallible.
-    AstWalk.walk(.{ .tree = tree, .tokens = tokens, .source = source }, fn_decl, &hv) catch unreachable;
+    Walk.walk(.{ .tree = tree, .tokens = tokens, .source = source }, fn_decl, &hv) catch unreachable;
 
     // (b) callee identities + signatures, in walk order. The callee's resolved
     // SymName{kind,name} is folded BEFORE its sig: it is what the `.func` reloc
@@ -186,10 +188,74 @@ pub fn fingerprint(
     return h.final();
 }
 
+/// The closure facts an owner's own code depends on that its body walk cannot see: the
+/// owner's slots in a cell under `st`, then per lambda unit (in rank order) its rank, env
+/// size, frame-env bit (with `frame_envs`) and env slots, then `st.frame_addrs` when it is
+/// not empty. Index-free bytes for the owner's fingerprint; empty when there is no env slot
+/// and no cell, so a body without captures keeps its key. `units` are the owner's, and
+/// `st` and `frame_envs` are what its lowering gets.
+pub fn ownerFacts(gpa: std.mem.Allocator, units: []const Closure.LambdaUnit, st: Closure.Storage, frame_envs: bool) error{OutOfMemory}![]const u8 {
+    var n_cells: u32 = 0;
+    for (st.boxed) |s| n_cells += @intFromBool(st.hold(s) == .cell);
+    const any_env = for (units) |u| {
+        if (u.env.len != 0) break true;
+    } else false;
+    if (!any_env and n_cells == 0) return &.{};
+
+    const order = try gpa.alloc(u32, units.len);
+    defer gpa.free(order);
+    for (order, 0..) |*o, i| o.* = @intCast(i);
+    std.mem.sort(u32, order, units, struct {
+        fn lt(us: []const Closure.LambdaUnit, a: u32, b: u32) bool {
+            return us[a].rank < us[b].rank;
+        }
+    }.lt);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    const w = struct {
+        fn u32le(o: *std.ArrayList(u8), g: std.mem.Allocator, v: u32) error{OutOfMemory}!void {
+            var buf: [4]u8 = undefined;
+            std.mem.writeInt(u32, &buf, v, .little);
+            try o.appendSlice(g, &buf);
+        }
+    }.u32le;
+    try w(&out, gpa, n_cells);
+    for (st.boxed) |s| if (st.hold(s) == .cell) try w(&out, gpa, s);
+    try w(&out, gpa, @intCast(units.len));
+    for (order) |i| {
+        const u = units[i];
+        try w(&out, gpa, u.rank);
+        try w(&out, gpa, u.env_size);
+        // A frame env changes the owner's code but not its body, and whether the closure
+        // escapes is a fact about its callees' bodies.
+        if (frame_envs) try out.append(gpa, @intFromBool(u.frame_env != null));
+        try w(&out, gpa, @intCast(u.env.len));
+        for (u.env) |es| {
+            try w(&out, gpa, es.slot);
+            // The word's kind, with a frame address spelled as the cell it replaces, which
+            // `frame_addrs` below tells apart: keys written before frame storage stay valid.
+            try out.append(gpa, switch (st.hold(es.slot)) {
+                .copy => 0,
+                .cell, .frame_addr => 1,
+                .param_addr => 2,
+            });
+            try w(&out, gpa, es.off);
+        }
+    }
+    // Last, and only when there is one, so every other owner keeps its key: the stream
+    // before it is self-delimiting.
+    if (st.frame_addrs.len != 0) {
+        try w(&out, gpa, @intCast(st.frame_addrs.len));
+        for (st.frame_addrs) |s| try w(&out, gpa, s);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 /// The distinct seed for an owner's closure-facts fold.
 const closure_seed: u64 = 0x43_4c_4f_53; // "CLOS"
 
-/// Fold an owner body's closure facts (`Closure.ownerFacts`: its boxed slots and its
+/// Fold an owner body's closure facts (`ownerFacts`: its boxed slots and its
 /// lambdas' env layouts, which its own code writes but its body walk does not see) into
 /// its fingerprint `body_fp`. The identity on empty facts, so a body with no env slot and no
 /// boxed local keeps its key.
@@ -252,6 +318,8 @@ pub fn deriveFingerprint(
 // Tests — the cheapest proofs of the miscompile-class ledger.
 
 const testing = std.testing;
+const LayoutEngine = @import("../layout/Engine.zig");
+const Type = @import("../layout/Type.zig").Type;
 const Lexer = @import("../lex.zig");
 const Parser = @import("../parse.zig");
 
@@ -889,22 +957,97 @@ test "foldClosure is the identity on empty facts" {
 
 test "a changed capture offset flips the fold" {
     const gpa = testing.allocator;
-    const Closure = @import("../symbols/Closure.zig");
-    const Type = @import("../layout/Type.zig").Type;
-    const sig: @import("../layout/Engine.zig").FnSig = .{ .params = &.{}, .ret = Type.int };
+    const sig: LayoutEngine.FnSig = .{ .params = &.{}, .ret = Type.int };
     const env_a = [_]Closure.EnvSlot{ .{ .slot = 0, .ty = Type.int, .off = 0 }, .{ .slot = 1, .ty = Type.str, .off = 8 } };
     const env_b = [_]Closure.EnvSlot{ .{ .slot = 0, .ty = Type.int, .off = 0 }, .{ .slot = 1, .ty = Type.str, .off = 16 } };
     const unit: Closure.LambdaUnit = .{ .owner = 0, .mod = 0, .fn_node = Ast.Index.from(9), .node = Ast.Index.from(4), .rank = 0, .name = "f$l0", .sig = sig, .param_slots = &.{}, .env = &env_a, .env_size = 24 };
     var moved = unit;
     moved.env = &env_b;
     moved.env_size = 32;
-    const fa = try Closure.ownerFacts(gpa, &.{unit}, .{}, false);
+    const fa = try ownerFacts(gpa, &.{unit}, .{}, false);
     defer gpa.free(fa);
-    const fb = try Closure.ownerFacts(gpa, &.{moved}, .{}, false);
+    const fb = try ownerFacts(gpa, &.{moved}, .{}, false);
     defer gpa.free(fb);
-    const fa2 = try Closure.ownerFacts(gpa, &.{unit}, .{}, false);
+    const fa2 = try ownerFacts(gpa, &.{unit}, .{}, false);
     defer gpa.free(fa2);
     const h: u64 = 0x1234;
     try testing.expect(foldClosure(h, fa) != foldClosure(h, fb));
     try testing.expectEqual(foldClosure(h, fa), foldClosure(h, fa2));
+}
+
+test "ownerFacts is empty with no env slot and no boxed slot" {
+    const gpa = testing.allocator;
+    const idx = Ast.Index.from;
+    const sig: LayoutEngine.FnSig = .{ .params = &.{}, .ret = Type.unit };
+    const bare = [_]Closure.LambdaUnit{
+        .{ .owner = 1, .mod = 0, .fn_node = idx(50), .node = idx(3), .rank = 1, .name = "", .sig = sig, .param_slots = &.{} },
+        .{ .owner = 1, .mod = 0, .fn_node = idx(50), .node = idx(7), .rank = 0, .name = "", .sig = sig, .param_slots = &.{} },
+    };
+    try testing.expectEqual(@as(usize, 0), (try ownerFacts(gpa, &bare, .{}, false)).len);
+    try testing.expectEqual(@as(usize, 0), (try ownerFacts(gpa, &.{}, .{}, false)).len);
+
+    const env = [_]Closure.EnvSlot{.{ .slot = 2, .ty = Type.int, .off = 0 }};
+    var with_env = bare;
+    with_env[1].env = &env;
+    with_env[1].env_size = 8;
+    const f1 = try ownerFacts(gpa, &with_env, .{}, false);
+    defer gpa.free(f1);
+    try testing.expect(f1.len != 0);
+    const f2 = try ownerFacts(gpa, &bare, .{ .boxed = &.{3} }, false);
+    defer gpa.free(f2);
+    try testing.expect(f2.len != 0);
+    try testing.expect(!std.mem.eql(u8, f1, f2));
+    // Rank order, not table order: the rank-0 unit (the capturing one) folds first.
+    try testing.expectEqual(@as(u32, 0), std.mem.readInt(u32, f1[8..12], .little));
+    try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, f1[12..16], .little));
+}
+
+test "ownerFacts folds each unit's frame-env bit only with frame storage" {
+    const gpa = testing.allocator;
+    const sig: LayoutEngine.FnSig = .{ .params = &.{}, .ret = Type.unit };
+    const env = [_]Closure.EnvSlot{.{ .slot = 2, .ty = Type.int, .off = 0 }};
+    var u: Closure.LambdaUnit = .{ .owner = 1, .mod = 0, .fn_node = Ast.Index.from(50), .node = Ast.Index.from(3), .rank = 0, .name = "", .sig = sig, .param_slots = &.{}, .env = &env, .env_size = 8 };
+    const heap_o0 = try ownerFacts(gpa, &.{u}, .{}, false);
+    defer gpa.free(heap_o0);
+    const heap_o1 = try ownerFacts(gpa, &.{u}, .{}, true);
+    defer gpa.free(heap_o1);
+    u.frame_env = 12;
+    const frame_o0 = try ownerFacts(gpa, &.{u}, .{}, false);
+    defer gpa.free(frame_o0);
+    const frame_o1 = try ownerFacts(gpa, &.{u}, .{}, true);
+    defer gpa.free(frame_o1);
+    try testing.expectEqualSlices(u8, heap_o0, frame_o0);
+    try testing.expect(!std.mem.eql(u8, heap_o1, frame_o1));
+    try testing.expectEqual(@as(usize, 0), (try ownerFacts(gpa, &.{}, .{}, true)).len);
+}
+
+test "ownerFacts folds which boxes a lowering keeps and which it unboxes" {
+    const gpa = testing.allocator;
+    const sig: LayoutEngine.FnSig = .{ .params = &.{}, .ret = Type.unit };
+    const env = [_]Closure.EnvSlot{
+        .{ .slot = 2, .ty = Type.int, .off = 0 },
+        .{ .slot = 3, .ty = Type.int, .off = 8 },
+    };
+    const u: Closure.LambdaUnit = .{ .owner = 1, .mod = 0, .fn_node = Ast.Index.from(50), .node = Ast.Index.from(3), .rank = 0, .name = "", .sig = sig, .param_slots = &.{}, .env = &env, .env_size = 16 };
+    const boxed = [_]u32{ 2, 3 };
+    const cells = try ownerFacts(gpa, &.{u}, .{ .boxed = &boxed }, true);
+    defer gpa.free(cells);
+    const one = try ownerFacts(gpa, &.{u}, .{ .boxed = &boxed, .frame_addrs = &.{3} }, true);
+    defer gpa.free(one);
+    const other = try ownerFacts(gpa, &.{u}, .{ .boxed = &boxed, .frame_addrs = &.{2} }, true);
+    defer gpa.free(other);
+    const none = try ownerFacts(gpa, &.{u}, .{ .boxed = &boxed, .frame_addrs = &boxed }, true);
+    defer gpa.free(none);
+    const all = [_][]const u8{ cells, one, other, none };
+    for (all, 0..) |a, i| for (all[i + 1 ..]) |b| try testing.expect(!std.mem.eql(u8, a, b));
+    // The cells lead; each env word is spelled 0 copy, 1 cell or frame address, 2 place.
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, one[0..4], .little));
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, one[4..8], .little));
+    const ref = try ownerFacts(gpa, &.{u}, .{ .places = 0b1100 }, false);
+    defer gpa.free(ref);
+    const words = [_]usize{ 4 + 4 + 4 + 4 + 4 + 4, 4 + 4 + 4 + 4 + 4 + 4 + 1 + 4 + 4 };
+    for (words) |at| {
+        try testing.expectEqual(@as(u8, 2), ref[at]);
+        try testing.expectEqual(@as(u8, 1), none[at + 1]);
+    }
 }

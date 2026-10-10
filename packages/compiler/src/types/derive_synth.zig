@@ -4,7 +4,7 @@
 //! `monomorphize`; the rest are its resolver/fixpoint helpers.
 
 const std = @import("std");
-const AstWalk = @import("../query/AstWalk.zig");
+const Walk = @import("../ast/Walk.zig");
 const Typecheck = @import("../types.zig");
 const Type = Typecheck.Type;
 const Method = Typecheck.Method;
@@ -591,7 +591,7 @@ fn emitRefHash(t: *Typecheck, site: ?Typecheck.DeriveSite, container: Type, ft: 
     const scope = if (site) |s| s.scope else sym.mod;
     const m = &t.graph.mods[scope];
     const span = if (site) |s|
-        AstWalk.nodeSpan(.{ .tree = m.tree, .tokens = m.tokens, .source = m.source }, s.node)
+        Walk.nodeSpan(.{ .tree = m.tree, .tokens = m.tokens, .source = m.source }, s.node)
     else
         Typecheck.refs.tokSpan(m, m.tree.nodes[sym.decl_node.int()].main_token);
     try t.sink.report(.{ .span = span, .code = .T0030, .scope = scope }, "cannot derive 'Hash' for '{s}': Ref-containing type has no auto Hash", .{t.typeName(container)});
