@@ -811,6 +811,7 @@ pub const BodyChecker = struct {
                 break :blk Type.invalid;
             };
         bc.node_types[(stmt_idx).int()] = iter_ty;
+        if (iter_ty.kind != .invalid and bc.iterTakesMutSelf(recv)) try bc.checkMutReceiver(stmt.rhs, StdNames.method_iter);
         if (bc.resolutions[(stmt_idx).int()] == .local) try bc.setSlot(bc.resolutions[(stmt_idx).int()].local, item);
         try bc.loop_stack.append(bc.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
         _ = try bc.checkBlock(stmt.lhs, false);
@@ -849,6 +850,7 @@ pub const BodyChecker = struct {
             try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0023 }, "'for k, v' requires an iterator over 'Entry' pairs", .{});
         }
         bc.node_types[stmt_idx.int()] = iter_ty;
+        if (iter_ty.kind != .invalid and bc.iterTakesMutSelf(recv)) try bc.checkMutReceiver(stmt.rhs, StdNames.method_iter);
         if (bc.resolutions[stmt_idx.int()] == .local) try bc.setSlot(bc.resolutions[stmt_idx.int()].local, kty);
         if (bc.resolutions[h.val_leaf.int()] == .local) try bc.setSlot(bc.resolutions[h.val_leaf.int()].local, vty);
         try bc.loop_stack.append(bc.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
@@ -872,6 +874,15 @@ pub const BodyChecker = struct {
         const targs = (Typecheck.bindImplParams(bc.gpa, bc.composite, mf, e.args) catch return Type.invalid) orelse return Type.invalid;
         defer bc.gpa.free(targs);
         return substTy(bc, mf.ret, targs);
+    }
+
+    /// Whether `recv`'s `iter()` takes `mut self`: `for` then passes the receiver's
+    /// address, so it must be a place, and the loop writes it.
+    fn iterTakesMutSelf(bc: *BodyChecker, recv: Type) bool {
+        if (!recv.isApp()) return false;
+        const e = bc.composite.at(recv.appIdx());
+        const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, StdNames.method_iter, .program) orelse return false;
+        return m.mut_self;
     }
 
     fn checkLabeled(bc: *BodyChecker, idx: Ast.Index, want_value: bool) error{OutOfMemory}!Type {

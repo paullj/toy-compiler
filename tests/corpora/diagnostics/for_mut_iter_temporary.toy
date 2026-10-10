@@ -1,0 +1,26 @@
+import std/iter
+
+# `for` passes the receiver of an `iter(mut self)` by address, so it must be a place (#29).
+struct Up[T] { i: int, n: int }
+
+impl Up[T] has iter.Iterator[int] {
+    fn next(mut self) -> Option[int] {
+        self.i = self.i + 1
+        if self.i > self.n { return Option[int].none }
+        return Option.some(self.i)
+    }
+}
+
+impl Up[T] {
+    fn iter(mut self) -> Up[T] { self }
+}
+
+fn up(n: int) -> Up[int] { Up[int] { i: 0, n: n } }
+
+fn main() -> int {
+    t := 0
+    for x in up(3) { t = t + x }  #~ ERROR [T0019] cannot call mutating method 'iter' on a temporary
+    u := up(3)
+    for x in u { t = t + x }
+    return t
+}

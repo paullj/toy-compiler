@@ -3818,13 +3818,42 @@ fn lowerFor(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMem
     b.switchTo(done);
 }
 
+/// `iter()` on a for-in's receiver `recv`, its result into `it_slot`. The receiver goes as
+/// `iter` declares it: by value, or for `mut self` the place's address (the checker made it
+/// a place, T0019). False when that fails to lower (a note is out).
+fn emitForIter(b: *Builder, recv: Ast.Index, iter_m: Typecheck.Method, it_slot: Ir.SlotId) error{OutOfMemory}!bool {
+    const self0: Ir.Operand = if (iter_m.mut_self) blk: {
+        const addr = try places.lowerPlaceAddr(b, recv);
+        if (addr == Ir.none_value) {
+            try b.note(b.in.tree.nodes[recv.int()].main_token, "for-in: mut-self 'iter' receiver is not a place in lower");
+            return false;
+        }
+        break :blk .{ .value = addr };
+    } else try lowerExpr(b, recv);
+    const args = try b.gpa.alloc(Ir.Operand, 1);
+    errdefer b.gpa.free(args);
+    args[0] = self0;
+    _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, iter_m), .args = args, .ret_slot = it_slot } }, null);
+    return true;
+}
+
+/// `next()` on the iterator in `it_slot`, its `Option` into `opt_slot`. The iterator goes
+/// as `next` declares it: `Iterator.next` declares `mut self` and T0076 holds every witness
+/// to that, so it is the slot's address, and a by-value `next` would get the slot's value.
+fn emitForNext(b: *Builder, next_m: Typecheck.Method, it_slot: Ir.SlotId, opt_slot: Ir.SlotId) error{OutOfMemory}!void {
+    const args = try b.gpa.alloc(Ir.Operand, 1);
+    errdefer b.gpa.free(args);
+    args[0] = if (next_m.mut_self) .{ .value = try b.emit(.{ .slot_addr = it_slot }, Typecheck.Type.int) } else .{ .slot = it_slot };
+    _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, next_m), .args = args, .ret_slot = opt_slot } }, null);
+}
+
 /// `for x in xs { body }`: the structural iterator desugar, composing the existing
 /// loop + Option-tag primitives (never touches `lowerFor`, so range-for stays
 /// byte-identical). Lowers to:
 ///   `it := xs.iter()`                         (a fresh iterator in a mutable slot)
 ///   header: `opt := it.next()`; branch on the tag  (some -> body, none -> done)
 ///   body:   copy Some's payload into `x`; run the loop body; back-edge to header
-/// `next` is `mut self`, so its receiver is passed BY ADDRESS (the iterator slot).
+/// Each receiver goes as its method declares it (`emitForIter`, `emitForNext`).
 /// break -> done, continue -> header.
 fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMemory}!void {
     const stmt = b.in.tree.nodes[(stmt_idx).int()];
@@ -3843,13 +3872,7 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
     };
     const iter_ty = b.in.instances[ii].ret;
     const it_slot = try b.addSlot(iter_ty);
-    {
-        const self0 = try lowerExpr(b, stmt.rhs);
-        const args = try b.gpa.alloc(Ir.Operand, 1);
-        errdefer b.gpa.free(args);
-        args[0] = self0;
-        _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, iter_m), .args = args, .ret_slot = it_slot } }, null);
-    }
+    if (!try emitForIter(b, stmt.rhs, iter_m, it_slot)) return;
 
     const next_m = Typecheck.findMethod(b.in.methods, iter_ty, dm[1].name) orelse {
         try b.note(stmt.main_token, "for-in: no reified 'next' method in lower");
@@ -3878,11 +3901,7 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
     try brTo(b, header, .none);
     b.switchTo(header);
     {
-        const it_addr = try b.emit(.{ .slot_addr = it_slot }, int_ty);
-        const args = try b.gpa.alloc(Ir.Operand, 1);
-        errdefer b.gpa.free(args);
-        args[0] = .{ .value = it_addr }; // mut self: by address
-        _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, next_m), .args = args, .ret_slot = opt_slot } }, null);
+        try emitForNext(b, next_m, it_slot, opt_slot);
         const base = try b.emit(.{ .slot_addr = opt_slot }, int_ty);
         const tag = try b.emit(.{ .get_tag = base }, int_ty);
         const zero = try b.emit(.{ .iconst = 0 }, int_ty);
@@ -3929,13 +3948,7 @@ fn lowerForIn2(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOf
     };
     const iter_ty = b.in.instances[ii].ret;
     const it_slot = try b.addSlot(iter_ty);
-    {
-        const self0 = try lowerExpr(b, stmt.rhs);
-        const args = try b.gpa.alloc(Ir.Operand, 1);
-        errdefer b.gpa.free(args);
-        args[0] = self0;
-        _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, iter_m), .args = args, .ret_slot = it_slot } }, null);
-    }
+    if (!try emitForIter(b, stmt.rhs, iter_m, it_slot)) return;
 
     const next_m = Typecheck.findMethod(b.in.methods, iter_ty, dm[1].name) orelse {
         try b.note(stmt.main_token, "for-in2: no reified 'next' method in lower");
@@ -3967,11 +3980,7 @@ fn lowerForIn2(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOf
     try brTo(b, header, .none);
     b.switchTo(header);
     {
-        const it_addr = try b.emit(.{ .slot_addr = it_slot }, int_ty);
-        const args = try b.gpa.alloc(Ir.Operand, 1);
-        errdefer b.gpa.free(args);
-        args[0] = .{ .value = it_addr }; // mut self: by address
-        _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, next_m), .args = args, .ret_slot = opt_slot } }, null);
+        try emitForNext(b, next_m, it_slot, opt_slot);
         const base = try b.emit(.{ .slot_addr = opt_slot }, int_ty);
         const tag = try b.emit(.{ .get_tag = base }, int_ty);
         const zero = try b.emit(.{ .iconst = 0 }, int_ty);
@@ -5992,6 +6001,48 @@ test "lower-aggregates: aggregate identifier copy-into emits a copy" {
 
 test "lower-diagnostics: an unknown string escape fails to lower" {
     try expectLowerDiag("fn f() {\n s := \"\\q\"\n}\n", "f");
+}
+
+test "for passes each receiver as its method declares it (#29)" {
+    const gpa = testing.allocator;
+    const src =
+        \\protocol Iterator[Item] { fn next(mut self) -> Option[Item] }
+        \\struct Up[T] { i: int }
+        \\impl Up[T] has Iterator[int] {
+        \\ fn next(mut self) -> Option[int] {
+        \\  self.i = self.i - 1
+        \\  if self.i < 0 { return Option[int].none }
+        \\  return Option.some(self.i)
+        \\ }
+        \\}
+        \\impl Up[T] { fn iter(mut self) -> Up[T] { self } }
+        \\struct Down[T] { i: int }
+        \\impl Down[T] has Iterator[int] {
+        \\ fn next(mut self) -> Option[int] {
+        \\  self.i = self.i - 1
+        \\  if self.i < 0 { return Option[int].none }
+        \\  return Option.some(self.i)
+        \\ }
+        \\}
+        \\impl Down[T] { fn iter(self) -> Down[T] { self } }
+        \\fn main() -> int {
+        \\ u := Up[int] { i: 3 }
+        \\ d := Down[int] { i: 3 }
+        \\ t := 0
+        \\ for x in u { t = t + x }
+        \\ for x in d { t = t + x }
+        \\ return t
+        \\}
+        \\
+    ;
+    const ir = try renderUnit(gpa, src, "main", .{});
+    defer gpa.free(ir);
+    // `iter(mut self)` gets the local's address, `iter(self)` the local's slot.
+    try testing.expect(std.mem.indexOf(u8, ir, "  %9 = slot_addr s0\n  call @main.Up.iter$int(%9 -> s3)\n") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "  call @main.Down.iter$int(s1 -> s6)\n") != null);
+    // `next(mut self)` gets the iterator slot's address each time round.
+    try testing.expect(std.mem.indexOf(u8, ir, "  %10 = slot_addr s3\n  call @main.Up.next$Iterator$int$int(%10 -> s4)\n") != null);
+    try testing.expect(std.mem.indexOf(u8, ir, "  %25 = slot_addr s6\n  call @main.Down.next$Iterator$int$int(%25 -> s7)\n") != null);
 }
 
 test "a mut-self method body loads self through the pointer slot (s0:int)" {
