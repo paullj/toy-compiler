@@ -53,77 +53,92 @@ pub fn deinitFnClosures(gpa: std.mem.Allocator, list: []const FnClosures) void {
 /// (`Body.List`): a base fn or a generic instance.
 pub const Owner = Body.Index;
 
-/// An owner's boxed locals: the slots a closure captures and something assigns, which
-/// live in a GC cell for their whole lifetime. Recorded only for an owner with one.
+/// The escape pass's storage decision for one owner with a boxed local. Recorded only for
+/// an owner whose body boxes a local.
 pub const OwnerClosure = struct {
     owner: Owner,
-    /// Ascending; owned.
-    boxed: []const u32,
-    /// The boxed slots that only closures which never outlive their maker capture, and
-    /// that no bound method value holds: such a closure can hold the slot's address
-    /// instead of a cell. Ascending; owned.
+    /// The boxed slots that frame storage takes out of their cells: only closures which
+    /// never outlive their maker capture them, no bound method value holds them, and they
+    /// are at most `Escape.unbox_max` bytes. Ascending; owned.
     unboxable: []const u32 = &.{},
-    /// `boxed` without `unboxable`: the slots that keep their cell under frame storage,
-    /// because a closure that escapes or a bound method value holds them, or because they
-    /// are bigger than `Escape.unbox_max`. Ascending; owned.
-    kept_boxed: []const u32 = &.{},
 };
 
 pub fn freeOwnerClosures(gpa: std.mem.Allocator, list: []const OwnerClosure) void {
-    for (list) |oc| {
-        gpa.free(oc.boxed);
-        gpa.free(oc.unboxable);
-        gpa.free(oc.kept_boxed);
-    }
+    for (list) |oc| gpa.free(oc.unboxable);
     gpa.free(list);
 }
 
-/// How one lowering stores an owner's captured locals: `boxed` in cells, `unboxed` in
-/// their own slots, held by address by the closures that capture them.
-pub const Storage = struct { boxed: []const u32 = &.{}, unboxed: []const u32 = &.{} };
+/// How one lowering of an owner holds a local that its closures (or a bound method value)
+/// capture. `copy` is the local's value, taken when the closure is made, which is sound
+/// only while nothing assigns the local. `cell` is the GC cell the local lives in for its
+/// whole lifetime, shared with its owner and every closure that captures it. `frame_addr`
+/// is the address of the owner's own slot, for a boxed local that frame storage takes out
+/// of its cell because no closure capturing it outlives the owner. `param_addr` is the
+/// caller's place of a `mut` param (`mut self` included), which a closure can hold only
+/// because it never outlives the call that lent it.
+pub const Hold = enum(u8) { copy, cell, frame_addr, param_addr };
 
-/// `owner`'s storage, by binary search over `list` (sorted by owner); empty for an owner
-/// with no record. With `frame` (frame storage, which the driver turns on with any opt
-/// pass), the `unboxable` slots leave their cells and the closures that capture them hold
-/// their address; without it, every box stays.
-pub fn ownerStorage(list: []const OwnerClosure, owner: Owner, frame: bool) Storage {
+/// One lowering's storage for an owner's captured locals: the one answer the env layout,
+/// lower, the adapters, the fingerprint and the LSP read.
+pub const Storage = struct {
+    /// The owner's boxed locals, ascending: each in a cell unless in `frame_addrs`.
+    boxed: []const u32 = &.{},
+    /// The boxed locals this lowering keeps in the owner's frame, ascending.
+    frame_addrs: []const u32 = &.{},
+    /// The owner's `mut` params, `mut self` first (its sig's `mut_mask`).
+    places: u64 = 0,
+
+    pub fn hold(st: Storage, slot: u32) Hold {
+        if (Modes.isMut(st.places, slot)) return .param_addr;
+        if (!contains(st.boxed, slot)) return .copy;
+        return if (contains(st.frame_addrs, slot)) .frame_addr else .cell;
+    }
+};
+
+/// Body `b`'s storage with every box in its cell: what typecheck lays the envs and the
+/// bound adapters out against, and what a lowering without frame storage gets.
+pub fn heapStorage(b: Body) Storage {
+    return .{ .boxed = b.boxed, .places = b.sig.mut_mask };
+}
+
+/// `owner`'s storage in one lowering. With `frame` (frame storage, which the driver turns
+/// on with any opt pass) the owner's `unboxable` slots (`list`, sorted by owner) leave
+/// their cells; without it, every box stays.
+pub fn ownerStorage(bodies: Body.List, list: []const OwnerClosure, owner: Owner, frame: bool) Storage {
+    var st = heapStorage(bodies.items[owner]);
+    if (!frame) return st;
     const i = std.sort.binarySearch(OwnerClosure, list, owner, struct {
         fn order(key: Owner, oc: OwnerClosure) std.math.Order {
             return std.math.order(key, oc.owner);
         }
-    }.order) orelse return .{};
-    const oc = list[i];
-    return if (frame) .{ .boxed = oc.kept_boxed, .unboxed = oc.unboxable } else .{ .boxed = oc.boxed };
+    }.order) orelse return st;
+    st.frame_addrs = list[i].unboxable;
+    return st;
 }
 
-/// Whether any of `owner`'s lambda units keeps its env in a frame slot. `units` is sorted
-/// by `(owner, node)`, so the owner's units are one run of it.
+/// Whether any of `owner`'s lambda units keeps its env in a frame slot.
 pub fn ownerHasFrameEnv(units: []const LambdaUnit, owner: Owner) bool {
-    var i = std.sort.lowerBound(LambdaUnit, units, owner, struct {
+    return for (ownerUnits(units, owner)) |u| {
+        if (u.frame_env != null) break true;
+    } else false;
+}
+
+/// `owner`'s lambda units: one run of `units`, which is sorted by `(owner, node)`.
+pub fn ownerUnits(units: []const LambdaUnit, owner: Owner) []const LambdaUnit {
+    const lo = std.sort.lowerBound(LambdaUnit, units, owner, struct {
         fn order(key: Owner, u: LambdaUnit) std.math.Order {
             return std.math.order(key, u.owner);
         }
     }.order);
-    while (i < units.len and units[i].owner == owner) : (i += 1) {
-        if (units[i].frame_env != null) return true;
-    }
-    return false;
+    var hi = lo;
+    while (hi < units.len and units[hi].owner == owner) hi += 1;
+    return units[lo..hi];
 }
 
-/// How a closure holds a captured local: `copy` is the local's value, taken when the
-/// closure is made, which is sound only while nothing assigns the local; `box` is a
-/// pointer to the GC cell the local lives in, shared with its owner and every other
-/// closure that captures it.
-/// `ref` is the address of the captured storage: a `mut` param's place, which the closure
-/// can hold only because it never outlives the call that lent it. Under frame storage a
-/// `box` capture of a slot in `Storage.unboxed` is lowered the way `ref` is: the word holds
-/// the address of the owner's own slot, since no closure capturing it outlives the owner.
-pub const CaptureMode = enum(u8) { copy, box, ref };
-
-/// One captured local's place in its closure's env cell: owner slot, type, mode and byte
-/// offset. The creating body writes it there and the lambda unit reads it back, both from
-/// this one record.
-pub const EnvSlot = struct { slot: u32, ty: Type, mode: CaptureMode, off: u32 };
+/// One captured local's place in its closure's env cell: owner slot, type and byte offset.
+/// The creating body writes it there and the lambda unit reads it back, both from this one
+/// record, holding the local as the owner's `Storage` says.
+pub const EnvSlot = struct { slot: u32, ty: Type, off: u32 };
 
 /// A lambda's or local fn's own codegen unit: one per lambda per lowerable owner, so a
 /// lambda inside a generic fn gets one unit per instance (each instance types the body
@@ -183,17 +198,18 @@ pub fn envLayout(sizes: []const u32, aligns: []const u32, out_offs: []u32) u32 {
 }
 
 /// The closure facts an owner's own code depends on that its body walk cannot see: the
-/// owner's boxed slots under `st`, then per lambda unit (in rank order) its rank, env size,
-/// frame-env bit (with `frame`) and env slots, then `st.unboxed` when it is not empty.
-/// Index-free bytes for the owner's fingerprint; empty when there is no env slot and no
-/// boxed slot, so a body without captures keeps its key. `units` are the owner's, and `st`
-/// is `ownerStorage(.., frame)`, the same storage its lowering gets.
-pub fn ownerFacts(gpa: std.mem.Allocator, units: []const LambdaUnit, st: Storage, frame: bool) error{OutOfMemory}![]const u8 {
-    const boxed = st.boxed;
+/// owner's slots in a cell under `st`, then per lambda unit (in rank order) its rank, env
+/// size, frame-env bit (with `frame_envs`) and env slots, then `st.frame_addrs` when it is
+/// not empty. Index-free bytes for the owner's fingerprint; empty when there is no env slot
+/// and no cell, so a body without captures keeps its key. `units` are the owner's, and
+/// `st` and `frame_envs` are what its lowering gets.
+pub fn ownerFacts(gpa: std.mem.Allocator, units: []const LambdaUnit, st: Storage, frame_envs: bool) error{OutOfMemory}![]const u8 {
+    var n_cells: u32 = 0;
+    for (st.boxed) |s| n_cells += @intFromBool(st.hold(s) == .cell);
     const any_env = for (units) |u| {
         if (u.env.len != 0) break true;
     } else false;
-    if (!any_env and boxed.len == 0) return &.{};
+    if (!any_env and n_cells == 0) return &.{};
 
     const order = try gpa.alloc(u32, units.len);
     defer gpa.free(order);
@@ -213,8 +229,8 @@ pub fn ownerFacts(gpa: std.mem.Allocator, units: []const LambdaUnit, st: Storage
             try o.appendSlice(g, &buf);
         }
     }.u32le;
-    try w(&out, gpa, @intCast(boxed.len));
-    for (boxed) |s| try w(&out, gpa, s);
+    try w(&out, gpa, n_cells);
+    for (st.boxed) |s| if (st.hold(s) == .cell) try w(&out, gpa, s);
     try w(&out, gpa, @intCast(units.len));
     for (order) |i| {
         const u = units[i];
@@ -222,27 +238,33 @@ pub fn ownerFacts(gpa: std.mem.Allocator, units: []const LambdaUnit, st: Storage
         try w(&out, gpa, u.env_size);
         // A frame env changes the owner's code but not its body, and whether the closure
         // escapes is a fact about its callees' bodies.
-        if (frame) try out.append(gpa, @intFromBool(u.frame_env != null));
+        if (frame_envs) try out.append(gpa, @intFromBool(u.frame_env != null));
         try w(&out, gpa, @intCast(u.env.len));
         for (u.env) |es| {
             try w(&out, gpa, es.slot);
-            try out.append(gpa, @intFromEnum(es.mode));
+            // The word's kind, with a frame address spelled as the cell it replaces, which
+            // `frame_addrs` below tells apart: keys written before frame storage stay valid.
+            try out.append(gpa, switch (st.hold(es.slot)) {
+                .copy => 0,
+                .cell, .frame_addr => 1,
+                .param_addr => 2,
+            });
             try w(&out, gpa, es.off);
         }
     }
     // Last, and only when there is one, so every other owner keeps its key: the stream
     // before it is self-delimiting.
-    if (st.unboxed.len != 0) {
-        try w(&out, gpa, @intCast(st.unboxed.len));
-        for (st.unboxed) |s| try w(&out, gpa, s);
+    if (st.frame_addrs.len != 0) {
+        try w(&out, gpa, @intCast(st.frame_addrs.len));
+        for (st.frame_addrs) |s| try w(&out, gpa, s);
     }
     return out.toOwnedSlice(gpa);
 }
 
 /// `unit`'s env as a struct, for a frame slot the precise root map can read: each copy is
-/// typed as the capture, a cell pointer as `rawptr`, and an address (a `ref`, or a box in
-/// `unboxable`) as `int`, so a frame address is never a root.
-pub fn envStruct(gpa: std.mem.Allocator, unit: LambdaUnit, unboxable: []const u32) error{OutOfMemory}!LayoutEngine.Layout {
+/// typed as the capture, a cell pointer as `rawptr`, and an address as `int`, so a frame
+/// address is never a root. `st` is its owner's frame storage.
+pub fn envStruct(gpa: std.mem.Allocator, unit: LambdaUnit, st: Storage) error{OutOfMemory}!LayoutEngine.Layout {
     const name = try std.mem.concat(gpa, u8, &.{ "env$", unit.name });
     errdefer gpa.free(name);
     const names = try gpa.alloc([]const u8, unit.env.len);
@@ -260,10 +282,10 @@ pub fn envStruct(gpa: std.mem.Allocator, unit: LambdaUnit, unboxable: []const u3
     const offs = try gpa.alloc(u32, unit.env.len);
     for (unit.env, tys, offs) |es, *t, *o| {
         o.* = es.off;
-        t.* = switch (es.mode) {
+        t.* = switch (st.hold(es.slot)) {
             .copy => es.ty,
-            .box => if (contains(unboxable, es.slot)) Type.int else Type.rawptr,
-            .ref => Type.int,
+            .cell => Type.rawptr,
+            .frame_addr, .param_addr => Type.int,
         };
     }
     return .{ .name = name, .field_names = @ptrCast(names), .field_types = tys, .offsets = offs, .size = unit.env_size, .@"align" = 8 };
@@ -316,7 +338,22 @@ pub fn contains(sorted: []const u32, x: u32) bool {
     }.order) != null;
 }
 
-pub const AdapterKind = enum(u8) { fn_value, bound_copy, bound_box, bound_ref };
+pub const AdapterKind = enum(u8) {
+    fn_value,
+    bound_copy,
+    bound_box,
+    bound_ref,
+
+    /// How a bound adapter's env holds the receiver.
+    pub fn recvHold(k: AdapterKind) Hold {
+        return switch (k) {
+            .bound_copy => .copy,
+            .bound_box => .cell,
+            .bound_ref => .param_addr,
+            .fn_value => unreachable,
+        };
+    }
+};
 
 /// A source-less unit that turns a named callee into the `(env, params..)` shape every
 /// function value is called with. `.fn_value` is the thunk a named fn taken as a value
@@ -354,14 +391,19 @@ pub fn adapterName(gpa: std.mem.Allocator, target_sym: []const u8, kind: Adapter
     return std.mem.concat(gpa, u8, &.{ target_sym, suffix });
 }
 
-/// The adapter a bound method value goes through: the receiver's address when it is one
-/// of the owner's `mut` params (`places`, its body's `sig.mut_mask`), the receiver's cell when it
-/// is a local its owner boxes (the closure then sees later writes to it), else a copy of
-/// the receiver taken when the value is made.
-pub fn boundKind(recv_local: ?u32, boxed: []const u32, places: u64) AdapterKind {
+/// The adapter a bound method value goes through: it holds a bare local receiver as the
+/// owner's storage `st` holds it (a `mut` param's address, a boxed local's cell, so the
+/// value and its owner see each other's writes, or a copy), and any other receiver as a
+/// copy taken when the value is made. The adapter table is minted once, from the heap
+/// storage, so frame storage never takes a bound receiver's cell away (`analyzeEscapes`).
+pub fn boundKind(recv_local: ?u32, st: Storage) AdapterKind {
     const slot = recv_local orelse return .bound_copy;
-    if (Modes.isMut(places, slot)) return .bound_ref;
-    return if (contains(boxed, slot)) .bound_box else .bound_copy;
+    return switch (st.hold(slot)) {
+        .copy => .bound_copy,
+        .cell => .bound_box,
+        .param_addr => .bound_ref,
+        .frame_addr => unreachable,
+    };
 }
 
 /// The slot of bound method `fa`'s receiver when it is a bare local (`acc` in
@@ -393,6 +435,7 @@ pub fn findAdapter(ads: []const Adapter, kind: AdapterKind, key: u32) ?u32 {
 }
 
 const testing = std.testing;
+const Sig = @import("Sig.zig").Sig;
 
 test "adapterName appends the kind suffix" {
     const nm = try adapterName(testing.allocator, "geometry/rect.area", .fn_value);
@@ -433,20 +476,41 @@ test "lambda and adapter names never equal a generic-instance mangle or each oth
 }
 
 test "boundKind boxes only a boxed local receiver" {
-    try testing.expectEqual(AdapterKind.bound_box, boundKind(3, &.{ 1, 3 }, 0));
-    try testing.expectEqual(AdapterKind.bound_copy, boundKind(2, &.{ 1, 3 }, 0));
-    try testing.expectEqual(AdapterKind.bound_copy, boundKind(null, &.{ 1, 3 }, 0));
-    try testing.expectEqual(AdapterKind.bound_copy, boundKind(1, &.{}, 0));
+    const st: Storage = .{ .boxed = &.{ 1, 3 } };
+    try testing.expectEqual(AdapterKind.bound_box, boundKind(3, st));
+    try testing.expectEqual(AdapterKind.bound_copy, boundKind(2, st));
+    try testing.expectEqual(AdapterKind.bound_copy, boundKind(null, st));
+    try testing.expectEqual(AdapterKind.bound_copy, boundKind(1, .{}));
 }
 
 test "boundKind holds a mut param receiver by address, else as before" {
     const places: u64 = 0b101;
-    try testing.expectEqual(AdapterKind.bound_ref, boundKind(0, &.{}, places));
-    try testing.expectEqual(AdapterKind.bound_ref, boundKind(2, &.{2}, places));
-    try testing.expectEqual(AdapterKind.bound_copy, boundKind(1, &.{}, places));
-    try testing.expectEqual(AdapterKind.bound_box, boundKind(3, &.{3}, places));
-    try testing.expectEqual(AdapterKind.bound_copy, boundKind(null, &.{}, places));
-    try testing.expectEqual(AdapterKind.bound_copy, boundKind(70, &.{}, ~@as(u64, 0)));
+    try testing.expectEqual(AdapterKind.bound_ref, boundKind(0, .{ .places = places }));
+    try testing.expectEqual(AdapterKind.bound_ref, boundKind(2, .{ .boxed = &.{2}, .places = places }));
+    try testing.expectEqual(AdapterKind.bound_copy, boundKind(1, .{ .places = places }));
+    try testing.expectEqual(AdapterKind.bound_box, boundKind(3, .{ .boxed = &.{3}, .places = places }));
+    try testing.expectEqual(AdapterKind.bound_copy, boundKind(null, .{ .places = places }));
+    try testing.expectEqual(AdapterKind.bound_copy, boundKind(70, .{ .places = ~@as(u64, 0) }));
+    for ([_]AdapterKind{ .bound_copy, .bound_box, .bound_ref }) |k| {
+        const st: Storage = .{ .boxed = &.{1}, .places = 0b100 };
+        const slot: u32 = switch (k.recvHold()) {
+            .copy => 0,
+            .cell => 1,
+            .param_addr => 2,
+            .frame_addr => unreachable,
+        };
+        try testing.expectEqual(k, boundKind(slot, st));
+    }
+}
+
+test "hold: a mut param by address, a boxed local in its cell or frame, any other a copy" {
+    const st: Storage = .{ .boxed = &.{ 2, 4, 5 }, .frame_addrs = &.{4}, .places = 0b1 };
+    try testing.expectEqual(Hold.param_addr, st.hold(0));
+    try testing.expectEqual(Hold.copy, st.hold(1));
+    try testing.expectEqual(Hold.cell, st.hold(2));
+    try testing.expectEqual(Hold.frame_addr, st.hold(4));
+    try testing.expectEqual(Hold.cell, st.hold(5));
+    try testing.expectEqual(Hold.copy, st.hold(70));
 }
 
 test "ownerHasFrameEnv reads only the owner's own run" {
@@ -553,7 +617,7 @@ test "ownerFacts is empty with no env slot and no boxed slot" {
     try testing.expectEqual(@as(usize, 0), (try ownerFacts(gpa, &bare, .{}, false)).len);
     try testing.expectEqual(@as(usize, 0), (try ownerFacts(gpa, &.{}, .{}, false)).len);
 
-    const env = [_]EnvSlot{.{ .slot = 2, .ty = Type.int, .mode = .copy, .off = 0 }};
+    const env = [_]EnvSlot{.{ .slot = 2, .ty = Type.int, .off = 0 }};
     var with_env = bare;
     with_env[1].env = &env;
     with_env[1].env_size = 8;
@@ -569,46 +633,46 @@ test "ownerFacts is empty with no env slot and no boxed slot" {
     try testing.expectEqual(@as(u32, 8), std.mem.readInt(u32, f1[12..16], .little));
 }
 
-test "ownerStorage finds an owner's record and is empty for an owner without one" {
+test "ownerStorage keeps every box without frame storage and moves the unboxable ones with it" {
+    const sig: Sig = .{ .kind = .user_fn, .name = "f", .params = &.{}, .ret = Type.unit };
+    const mut_sig: Sig = .{ .kind = .user_fn, .name = "g", .params = &.{}, .ret = Type.unit, .mut_mask = 0b1 };
+    const body = struct {
+        fn f(s: Sig, boxed: []const u32) Body {
+            return .{ .of = .{ .base = 0 }, .mod = 0, .decl = Ast.none, .sig = s, .node_types = &.{}, .callees = &.{}, .boxed = boxed };
+        }
+    }.f;
+    const items = [_]Body{ body(sig, &.{ 2, 5 }), body(mut_sig, &.{3}), body(sig, &.{}) };
+    const bodies: Body.List = .{ .items = &items, .n_base = 3 };
     const ocs = [_]OwnerClosure{
-        .{ .owner = 3, .boxed = &.{ 1, 4 } },
-        .{ .owner = 9, .boxed = &.{0} },
-        .{ .owner = 102, .boxed = &.{ 2, 5, 6 } },
+        .{ .owner = 0, .unboxable = &.{5} },
+        .{ .owner = 1, .unboxable = &.{} },
     };
-    try testing.expectEqualSlices(u32, &.{ 1, 4 }, ownerStorage(&ocs, 3, false).boxed);
-    try testing.expectEqualSlices(u32, &.{0}, ownerStorage(&ocs, 9, false).boxed);
-    try testing.expectEqualSlices(u32, &.{ 2, 5, 6 }, ownerStorage(&ocs, 102, false).boxed);
-    try testing.expectEqual(@as(usize, 0), ownerStorage(&ocs, 2, false).boxed.len);
-    try testing.expectEqual(@as(usize, 0), ownerStorage(&ocs, 103, false).boxed.len);
-    try testing.expectEqual(@as(usize, 0), ownerStorage(&.{}, 3, false).boxed.len);
-}
-
-test "ownerStorage keeps every box without frame storage and only the kept ones with it" {
-    const ocs = [_]OwnerClosure{
-        .{ .owner = 1, .boxed = &.{ 2, 5 }, .unboxable = &.{5}, .kept_boxed = &.{2} },
-        .{ .owner = 100, .boxed = &.{3}, .unboxable = &.{}, .kept_boxed = &.{3} },
-    };
-    const off = ownerStorage(&ocs, 1, false);
+    const off = ownerStorage(bodies, &ocs, 0, false);
     try testing.expectEqualSlices(u32, &.{ 2, 5 }, off.boxed);
-    try testing.expectEqualSlices(u32, &.{}, off.unboxed);
-    const on = ownerStorage(&ocs, 1, true);
-    try testing.expectEqualSlices(u32, &.{2}, on.boxed);
-    try testing.expectEqualSlices(u32, &.{5}, on.unboxed);
-    try testing.expectEqualSlices(u32, &.{3}, ownerStorage(&ocs, 100, true).boxed);
-    try testing.expectEqual(@as(usize, 0), ownerStorage(&ocs, 7, true).boxed.len);
+    try testing.expectEqualSlices(u32, &.{}, off.frame_addrs);
+    try testing.expectEqual(Hold.cell, off.hold(5));
+    const on = ownerStorage(bodies, &ocs, 0, true);
+    try testing.expectEqualSlices(u32, &.{ 2, 5 }, on.boxed);
+    try testing.expectEqualSlices(u32, &.{5}, on.frame_addrs);
+    try testing.expectEqual(Hold.cell, on.hold(2));
+    try testing.expectEqual(Hold.frame_addr, on.hold(5));
+    try testing.expectEqual(Hold.param_addr, ownerStorage(bodies, &ocs, 1, true).hold(0));
+    try testing.expectEqual(Hold.cell, ownerStorage(bodies, &ocs, 1, true).hold(3));
+    try testing.expectEqual(@as(usize, 0), ownerStorage(bodies, &ocs, 2, true).boxed.len);
+    try testing.expectEqual(@as(usize, 0), ownerStorage(bodies, &.{}, 0, true).frame_addrs.len);
 }
 
 test "envStruct types a copy as its capture, a cell as rawptr and an address as int" {
     const gpa = testing.allocator;
     const sig: LayoutEngine.FnSig = .{ .params = &.{}, .ret = Type.unit };
     const env = [_]EnvSlot{
-        .{ .slot = 1, .ty = Type.str, .mode = .copy, .off = 0 },
-        .{ .slot = 2, .ty = Type.int, .mode = .box, .off = 16 },
-        .{ .slot = 3, .ty = Type.int, .mode = .box, .off = 24 },
-        .{ .slot = 0, .ty = Type.int, .mode = .ref, .off = 32 },
+        .{ .slot = 1, .ty = Type.str, .off = 0 },
+        .{ .slot = 2, .ty = Type.int, .off = 16 },
+        .{ .slot = 3, .ty = Type.int, .off = 24 },
+        .{ .slot = 0, .ty = Type.int, .off = 32 },
     };
     const u: LambdaUnit = .{ .owner = 0, .mod = 0, .fn_node = Ast.Index.from(9), .node = Ast.Index.from(4), .rank = 0, .name = "m.f$l0", .sig = sig, .param_slots = &.{}, .env = &env, .env_size = 40 };
-    const l = try envStruct(gpa, u, &.{3});
+    const l = try envStruct(gpa, u, .{ .boxed = &.{ 2, 3 }, .frame_addrs = &.{3}, .places = 0b1 });
     defer freeEnvStruct(gpa, l);
     try testing.expectEqualStrings("env$m.f$l0", l.name);
     try testing.expectEqualSlices(Type, &.{ Type.str, Type.rawptr, Type.int, Type.int }, l.field_types);
@@ -620,7 +684,7 @@ test "envStruct types a copy as its capture, a cell as rawptr and an address as 
 test "ownerFacts folds each unit's frame-env bit only with frame storage" {
     const gpa = testing.allocator;
     const sig: LayoutEngine.FnSig = .{ .params = &.{}, .ret = Type.unit };
-    const env = [_]EnvSlot{.{ .slot = 2, .ty = Type.int, .mode = .copy, .off = 0 }};
+    const env = [_]EnvSlot{.{ .slot = 2, .ty = Type.int, .off = 0 }};
     var u: LambdaUnit = .{ .owner = 1, .mod = 0, .fn_node = Ast.Index.from(50), .node = Ast.Index.from(3), .rank = 0, .name = "", .sig = sig, .param_slots = &.{}, .env = &env, .env_size = 8 };
     const heap_o0 = try ownerFacts(gpa, &.{u}, .{}, false);
     defer gpa.free(heap_o0);
@@ -640,18 +704,29 @@ test "ownerFacts folds which boxes a lowering keeps and which it unboxes" {
     const gpa = testing.allocator;
     const sig: LayoutEngine.FnSig = .{ .params = &.{}, .ret = Type.unit };
     const env = [_]EnvSlot{
-        .{ .slot = 2, .ty = Type.int, .mode = .box, .off = 0 },
-        .{ .slot = 3, .ty = Type.int, .mode = .box, .off = 8 },
+        .{ .slot = 2, .ty = Type.int, .off = 0 },
+        .{ .slot = 3, .ty = Type.int, .off = 8 },
     };
     const u: LambdaUnit = .{ .owner = 1, .mod = 0, .fn_node = Ast.Index.from(50), .node = Ast.Index.from(3), .rank = 0, .name = "", .sig = sig, .param_slots = &.{}, .env = &env, .env_size = 16 };
-    const cells = try ownerFacts(gpa, &.{u}, .{ .boxed = &.{ 2, 3 } }, true);
+    const boxed = [_]u32{ 2, 3 };
+    const cells = try ownerFacts(gpa, &.{u}, .{ .boxed = &boxed }, true);
     defer gpa.free(cells);
-    const one = try ownerFacts(gpa, &.{u}, .{ .boxed = &.{2}, .unboxed = &.{3} }, true);
+    const one = try ownerFacts(gpa, &.{u}, .{ .boxed = &boxed, .frame_addrs = &.{3} }, true);
     defer gpa.free(one);
-    const other = try ownerFacts(gpa, &.{u}, .{ .boxed = &.{3}, .unboxed = &.{2} }, true);
+    const other = try ownerFacts(gpa, &.{u}, .{ .boxed = &boxed, .frame_addrs = &.{2} }, true);
     defer gpa.free(other);
-    const none = try ownerFacts(gpa, &.{u}, .{ .unboxed = &.{ 2, 3 } }, true);
+    const none = try ownerFacts(gpa, &.{u}, .{ .boxed = &boxed, .frame_addrs = &boxed }, true);
     defer gpa.free(none);
     const all = [_][]const u8{ cells, one, other, none };
     for (all, 0..) |a, i| for (all[i + 1 ..]) |b| try testing.expect(!std.mem.eql(u8, a, b));
+    // The cells lead; each env word is spelled 0 copy, 1 cell or frame address, 2 place.
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, one[0..4], .little));
+    try testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, one[4..8], .little));
+    const ref = try ownerFacts(gpa, &.{u}, .{ .places = 0b1100 }, false);
+    defer gpa.free(ref);
+    const words = [_]usize{ 4 + 4 + 4 + 4 + 4 + 4, 4 + 4 + 4 + 4 + 4 + 4 + 1 + 4 + 4 };
+    for (words) |at| {
+        try testing.expectEqual(@as(u8, 2), ref[at]);
+        try testing.expectEqual(@as(u8, 1), none[at + 1]);
+    }
 }

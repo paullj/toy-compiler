@@ -91,7 +91,7 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
             if (gt.kind != .invalid and gt.kind != .bool)
                 try bc.sink.report(.{ .span = bc.spanOf(h.guard), .code = .T0045 }, "match guard must be bool, got {s}", .{bc.typeName(gt)});
         }
-        const body_ty0 = try bc.typeOfExpected(h.body, bc.expected);
+        const body_ty0 = try bc.typeOfExpected(h.body, bc.expectedTy());
         const body_ty: Type = if (armDiverges(bc, h.body)) Type.never else body_ty0;
         result = try bc.merge(n.main_token, result, body_ty);
     }
