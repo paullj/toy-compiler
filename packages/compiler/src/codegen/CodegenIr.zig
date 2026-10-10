@@ -44,6 +44,11 @@ const EnumLayout = Typecheck.EnumLayout;
 const S0: u32 = 9;
 const S1: u32 = 10;
 const S2: u32 = 11;
+// Frame-address scratch GPRs: a frame offset past an instruction's immediate is reached
+// through a base `sp + (off rounded down to 4 KiB)` built here first. Two, so a copy
+// between two far frame cells keeps both bases; no other code uses them.
+const FA: u32 = 12;
+const FB: u32 = 13;
 
 // Scratch D-registers (SIMD&FP file, caller-saved) for the float load/compute/store
 // pattern. Distinct index space from the GPR scratch above; D-regs appear ONLY in
@@ -157,21 +162,53 @@ const Gen = struct {
 
     /// Load a scalar SSA value into `reg`.
     fn loadValue(g: *Gen, reg: u32, vid: Ir.ValueId) error{OutOfMemory}!void {
-        try g.emit(Aarch64.ldrSp(reg, g.valueOff(vid)));
+        try g.spMem(.ldr, reg, g.valueOff(vid));
     }
     /// Store `reg` into a scalar SSA value's cell.
     fn storeValue(g: *Gen, reg: u32, vid: Ir.ValueId) error{OutOfMemory}!void {
         if (vid == Ir.none_value) return;
-        try g.emit(Aarch64.strSp(reg, g.valueOff(vid)));
+        try g.spMem(.str, reg, g.valueOff(vid));
     }
     /// Load a float SSA value's cell into D-register `d`.
     fn loadFpValue(g: *Gen, d: u32, vid: Ir.ValueId) error{OutOfMemory}!void {
-        try g.emit(Aarch64.ldrFpSp(d, g.valueOff(vid)));
+        try g.spMem(.ldr_fp, d, g.valueOff(vid));
     }
     /// Store D-register `d` into a float SSA value's cell.
     fn storeFpValue(g: *Gen, d: u32, vid: Ir.ValueId) error{OutOfMemory}!void {
         if (vid == Ir.none_value) return;
-        try g.emit(Aarch64.strFpSp(d, g.valueOff(vid)));
+        try g.spMem(.str_fp, d, g.valueOff(vid));
+    }
+
+    const MemOp = enum { ldr, str, ldr_fp, str_fp };
+
+    /// A 64-bit load or store of `rt` at `[sp, #off]`, for any frame offset. One
+    /// instruction while the scaled imm12 reaches `off`, so a frame that fits it keeps its
+    /// bytes; past it, the 4 KiB-aligned part goes into FA first.
+    fn spMem(g: *Gen, op: MemOp, rt: u32, off: u32) error{OutOfMemory}!void {
+        const direct = off / 8 <= Aarch64.max_scaled;
+        const base: u32 = if (direct) Aarch64.SP else FA;
+        const rest: u32 = if (direct) off else off & 0xFFF;
+        if (!direct) try g.emit(Aarch64.addImmLsl12(FA, Aarch64.SP, @intCast(off >> 12)));
+        try g.emit(switch (op) {
+            .ldr => Aarch64.ldrRegUoff(rt, base, rest),
+            .str => Aarch64.strRegUoff(rt, base, rest),
+            .ldr_fp => Aarch64.ldrFpRegUoff(rt, base, rest),
+            .str_fp => Aarch64.strFpRegUoff(rt, base, rest),
+        });
+    }
+
+    /// `rd = sp + off` for any frame offset.
+    fn spAddr(g: *Gen, rd: u32, off: u32) error{OutOfMemory}!void {
+        return g.regAddr(rd, Aarch64.SP, off);
+    }
+
+    /// `rd = base + off` for an offset below 16 MiB: `add rd, base, #off` while it fits
+    /// the unshifted imm12, else the 4 KiB pages then the rest.
+    fn regAddr(g: *Gen, rd: u32, base: u32, off: u32) error{OutOfMemory}!void {
+        std.debug.assert(rd != Aarch64.SP);
+        if (off <= 0xFFF) return g.emit(Aarch64.addImm(rd, base, @intCast(off)));
+        try g.emit(Aarch64.addImmLsl12(rd, base, @intCast(off >> 12)));
+        if (off & 0xFFF != 0) try g.emit(Aarch64.addImm(rd, rd, @intCast(off & 0xFFF)));
     }
 };
 
@@ -329,14 +366,12 @@ fn genBody(g: *Gen) error{OutOfMemory}!void {
 
     try g.emit(Aarch64.stpFpLrPre); // stp x29,x30,[sp,#-16]!
     try g.emit(Aarch64.movFpSp); // mov x29, sp
-    if (g.fl.frame > 0) {
-        try g.emit(Aarch64.subImm(Aarch64.SP, Aarch64.SP, @intCast(g.fl.frame)));
-    }
+    try openFrame(g);
     try zeroContainerRoots(g);
     // sret: save the incoming x8 (caller's result buffer) once up front — body
     // calls clobber x8.
     if (g.fl.sret_save_off != FrameLayout.NO_SRET) {
-        try g.emit(Aarch64.strSp(8, g.fl.sret_save_off));
+        try g.spMem(.str, 8, g.fl.sret_save_off);
     }
 
     try marshalParams(g);
@@ -352,6 +387,21 @@ fn genBody(g: *Gen) error{OutOfMemory}!void {
     try g.resolveFixups();
 }
 
+/// `sub sp, sp, #frame`. A frame past the imm12 is opened a 4 KiB page at a time, storing
+/// to each page as it goes, so a stack that overflows faults on its guard page rather than
+/// stepping over it into other memory; then the rest.
+fn openFrame(g: *Gen) error{OutOfMemory}!void {
+    const frame = g.fl.frame;
+    if (frame == 0) return;
+    if (frame <= 0xFFF) return g.emit(Aarch64.subImm(Aarch64.SP, Aarch64.SP, @intCast(frame)));
+    try g.emit(Aarch64.movz(FA, @intCast(frame >> 12), 0));
+    try g.emit(Aarch64.subImmLsl12(Aarch64.SP, Aarch64.SP, 1));
+    try g.emit(Aarch64.strSp(Aarch64.XZR, 0));
+    try g.emit(Aarch64.subsImm(FA, FA, 1));
+    try g.emit(Aarch64.bCond(.ne, -3));
+    if (frame & 0xFFF != 0) try g.emit(Aarch64.subImm(Aarch64.SP, Aarch64.SP, @intCast(frame & 0xFFF)));
+}
+
 /// Clear each frame word the roots tag as a container header. A collection at a call
 /// walks such a word as a `gc_array` header, and a cell not written yet still holds
 /// whatever an earlier frame left there, which may point into any live cell.
@@ -361,7 +411,7 @@ fn zeroContainerRoots(g: *Gen) error{OutOfMemory}!void {
         const seen = for (g.roots[0..i]) |o| {
             if (o.off == r.off and o.tag == .container) break true;
         } else false;
-        if (!seen) try g.emit(Aarch64.strSp(Aarch64.XZR, r.off));
+        if (!seen) try g.spMem(.str, Aarch64.XZR, r.off);
     }
 }
 
@@ -378,13 +428,13 @@ fn marshalParams(g: *Gen) error{OutOfMemory}!void {
                 // each incoming GPR into the slot's consecutive words.
                 var k: u32 = 0;
                 while (k < r.count) : (k += 1) {
-                    try g.emit(Aarch64.strSp(r.first + k, off + k * 8));
+                    try g.spMem(.str, r.first + k, off + k * 8);
                 }
             },
             .fpr => |v| {
                 // An incoming bare float in v`v` (a D-register): store it into the
                 // slot's 8-byte cell.
-                try g.emit(Aarch64.strFpSp(v, off));
+                try g.spMem(.str_fp, v, off);
             },
             .gpr_ptr => |r| {
                 // An indirect (>16B) aggregate: r holds a pointer to the caller's
@@ -397,7 +447,7 @@ fn marshalParams(g: *Gen) error{OutOfMemory}!void {
                 var k: u32 = 0;
                 while (k < s.bytes) : (k += 8) {
                     try g.emit(Aarch64.ldrFp(S0, 16 + s.nsaa_off + k));
-                    try g.emit(Aarch64.strSp(S0, off + k));
+                    try g.spMem(.str, S0, off + k);
                 }
             },
             .stack_ptr => |nsaa_off| {
@@ -415,10 +465,29 @@ fn marshalParams(g: *Gen) error{OutOfMemory}!void {
 /// through S2. A TIGHT loop with NO intervening branch (preserves the sret/copy
 /// no-`bl` adjacency invariant). The two base regs must differ from S2.
 fn copyBytes(g: *Gen, dst_reg: u32, dst_off: u32, src_reg: u32, src_off: u32, size: u32) error{OutOfMemory}!void {
+    if (size == 0) return;
+    const last = (size - 1) / 8 * 8;
+    if ((dst_off + last) / 8 <= Aarch64.max_scaled and (src_off + last) / 8 <= Aarch64.max_scaled) {
+        var o: u32 = 0;
+        while (o < size) : (o += 8) {
+            try g.emit(Aarch64.ldrRegUoff(S2, src_reg, src_off + o));
+            try g.emit(Aarch64.strRegUoff(S2, dst_reg, dst_off + o));
+        }
+        return;
+    }
+    // Past the scaled imm12: walk FA (destination) and FB (source) a 32 KiB window at a
+    // time, each window's words within the immediate.
+    const window: u32 = (Aarch64.max_scaled + 1) * 8;
+    try g.regAddr(FA, dst_reg, dst_off);
+    try g.regAddr(FB, src_reg, src_off);
     var o: u32 = 0;
     while (o < size) : (o += 8) {
-        try g.emit(Aarch64.ldrRegUoff(S2, src_reg, src_off + o));
-        try g.emit(Aarch64.strRegUoff(S2, dst_reg, dst_off + o));
+        if (o != 0 and o % window == 0) {
+            try g.emit(Aarch64.addImmLsl12(FA, FA, window >> 12));
+            try g.emit(Aarch64.addImmLsl12(FB, FB, window >> 12));
+        }
+        try g.emit(Aarch64.ldrRegUoff(S2, FB, o % window));
+        try g.emit(Aarch64.strRegUoff(S2, FA, o % window));
     }
 }
 
@@ -504,12 +573,12 @@ fn genInstr(g: *Gen, ins: Ir.Instr) error{OutOfMemory}!void {
             try g.storeValue(S0, ins.result);
         },
         .slot_addr => |sid| {
-            try g.emit(Aarch64.addImm(S0, Aarch64.SP, @intCast(g.slotOff(sid))));
+            try g.spAddr(S0, g.slotOff(sid));
             try g.storeValue(S0, ins.result);
         },
         .field_addr => |f| {
             try g.loadValue(S0, f.base);
-            if (f.off != 0) try g.emit(Aarch64.addImm(S0, S0, @intCast(f.off)));
+            if (f.off != 0) try g.regAddr(S0, S0, f.off);
             try g.storeValue(S0, ins.result);
         },
         .load => |l| {
@@ -751,14 +820,14 @@ fn marshalArgs(g: *Gen, args: []const Ir.Operand, plan: Abi.CallPlan) error{OutO
                         const off = g.valueOff(v);
                         var k: u32 = 0;
                         while (k < r.count) : (k += 1) {
-                            try g.emit(Aarch64.ldrSp(r.first + k, off + k * 8));
+                            try g.spMem(.ldr, r.first + k, off + k * 8);
                         }
                     },
                     .slot => |s| {
                         const off = g.slotOff(s);
                         var k: u32 = 0;
                         while (k < r.count) : (k += 1) {
-                            try g.emit(Aarch64.ldrSp(r.first + k, off + k * 8));
+                            try g.spMem(.ldr, r.first + k, off + k * 8);
                         }
                     },
                     .none => {},
@@ -773,7 +842,7 @@ fn marshalArgs(g: *Gen, args: []const Ir.Operand, plan: Abi.CallPlan) error{OutO
                     .slot => |s| g.slotOff(s),
                     .none => continue,
                 };
-                try g.emit(Aarch64.ldrFpSp(v, off));
+                try g.spMem(.ldr_fp, v, off);
             },
             .gpr_ptr => |r| {
                 // Indirect (>16B) aggregate: pass a pointer to its frame cell
@@ -783,7 +852,7 @@ fn marshalArgs(g: *Gen, args: []const Ir.Operand, plan: Abi.CallPlan) error{OutO
                     .value => |v| g.valueOff(v),
                     .none => continue,
                 };
-                try g.emit(Aarch64.addImm(r, Aarch64.SP, @intCast(base)));
+                try g.spAddr(r, base);
             },
             .stack => |st| {
                 // Scalar / reg-pair aggregate placed wholly on the outgoing stack.
@@ -796,8 +865,8 @@ fn marshalArgs(g: *Gen, args: []const Ir.Operand, plan: Abi.CallPlan) error{OutO
                 };
                 var k: u32 = 0;
                 while (k < st.bytes) : (k += 8) {
-                    try g.emit(Aarch64.ldrSp(S0, base + k));
-                    try g.emit(Aarch64.strSp(S0, st.nsaa_off + k));
+                    try g.spMem(.ldr, S0, base + k);
+                    try g.spMem(.str, S0, st.nsaa_off + k);
                 }
             },
             .stack_ptr => |nsaa_off| {
@@ -806,8 +875,8 @@ fn marshalArgs(g: *Gen, args: []const Ir.Operand, plan: Abi.CallPlan) error{OutO
                     .value => |v| g.valueOff(v),
                     .none => continue,
                 };
-                try g.emit(Aarch64.addImm(S0, Aarch64.SP, @intCast(base)));
-                try g.emit(Aarch64.strSp(S0, nsaa_off));
+                try g.spAddr(S0, base);
+                try g.spMem(.str, S0, nsaa_off);
             },
             // A zero-sized arg (`()`): no register/stack move; its operand is `.none`.
             .zero => {},
@@ -828,7 +897,7 @@ fn placeResult(g: *Gen, result: Ir.ValueId, ret_slot: Ir.SlotId, ret_ty: Type) e
                 const off = g.slotOff(ret_slot);
                 var k: u32 = 0;
                 while (k < r.regs) : (k += 1) {
-                    try g.emit(Aarch64.strSp(@intCast(k), off + k * 8));
+                    try g.spMem(.str, k, off + k * 8);
                 }
             } else {
                 // Scalar result in x0 → its value cell.
@@ -849,7 +918,7 @@ fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
     // disturbed by arg marshalling reading sp).
     if (pr.plan.sret_in_x8) {
         std.debug.assert(c.ret_slot != Ir.none_slot);
-        try g.emit(Aarch64.addImm(8, Aarch64.SP, @intCast(g.slotOff(c.ret_slot))));
+        try g.spAddr(8, g.slotOff(c.ret_slot));
     }
 
     // An `extern` callee (`.import`) is a bare dyld symbol reached through its own
@@ -882,7 +951,7 @@ fn genCallIndirect(g: *Gen, result: Ir.ValueId, c: Ir.CallIndirect) error{OutOfM
 
     if (pr.plan.sret_in_x8) {
         std.debug.assert(c.ret_slot != Ir.none_slot);
-        try g.emit(Aarch64.addImm(8, Aarch64.SP, @intCast(g.slotOff(c.ret_slot))));
+        try g.spAddr(8, g.slotOff(c.ret_slot));
     }
 
     // Load the target AFTER args + sret so x16 (never an arg reg, never the marshal
@@ -996,7 +1065,7 @@ fn writeOperandTo(g: *Gen, pvid: Ir.ValueId, pty: Type, arg: Ir.Operand) error{O
         },
         .slot => |s| {
             // A scalar carried by slot (unusual): load the word, store to the cell.
-            try g.emit(Aarch64.ldrSp(S0, g.slotOff(s)));
+            try g.spMem(.ldr, S0, g.slotOff(s));
             try g.storeValue(S0, pvid);
         },
         .none => {}, // unit merge: nothing to store.
@@ -1023,7 +1092,7 @@ fn placeReturn(g: *Gen, o: Ir.Operand) error{OutOfMemory}!void {
             };
             var k: u32 = 0;
             while (k < r.regs) : (k += 1) {
-                try g.emit(Aarch64.ldrSp(@intCast(k), off + k * 8));
+                try g.spMem(.ldr, k, off + k * 8);
             }
         },
         .fp_reg => {
@@ -1033,7 +1102,7 @@ fn placeReturn(g: *Gen, o: Ir.Operand) error{OutOfMemory}!void {
                 .slot => |s| g.slotOff(s),
                 .none => return,
             };
-            try g.emit(Aarch64.ldrFpSp(V0, off));
+            try g.spMem(.ldr_fp, V0, off);
         },
         .sret => {
             // Large aggregate: copy the result bytes through the saved x8 buffer.
@@ -1045,14 +1114,16 @@ fn placeReturn(g: *Gen, o: Ir.Operand) error{OutOfMemory}!void {
                 .slot => |s| g.slotOff(s),
                 .none => return,
             };
-            try g.emit(Aarch64.ldrSp(S0, g.fl.sret_save_off)); // S0 = caller buffer
+            try g.spMem(.ldr, S0, g.fl.sret_save_off); // S0 = caller buffer
             try copyBytes(g, S0, 0, Aarch64.SP, src_off, g.typeSize(ret_ty));
         },
     }
 }
 
 fn emitEpilogue(g: *Gen) error{OutOfMemory}!void {
-    if (g.fl.frame > 0) {
+    if (g.fl.frame > 0xFFF) {
+        try g.emit(Aarch64.addImm(Aarch64.SP, Aarch64.FP, 0)); // mov sp, x29
+    } else if (g.fl.frame > 0) {
         try g.emit(Aarch64.addImm(Aarch64.SP, Aarch64.SP, @intCast(g.fl.frame)));
     }
     try g.emit(Aarch64.ldpFpLrPost);
@@ -1267,10 +1338,10 @@ test "ir-codegen: the prologue zeroes a frame env's container word" {
     try testing.expect(!codeHasWord(fc, Aarch64.strSp(Aarch64.XZR, env + 16)));
 }
 
-test "ir-codegen: frameFits is false past 4095 bytes" {
+test "ir-codegen: frameFits is false only past FrameLayout.MAX_FRAME" {
     const gpa = testing.allocator;
-    const small = [_]Layout{.{ .name = "S", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = 4000, .@"align" = 8 }};
-    const big = [_]Layout{.{ .name = "B", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = 4096, .@"align" = 8 }};
+    const small = [_]Layout{.{ .name = "S", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = 4096, .@"align" = 8 }};
+    const big = [_]Layout{.{ .name = "B", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = FrameLayout.MAX_FRAME + 1, .@"align" = 8 }};
     var func = try slotsOnlyFn(gpa, &.{Type.structT(0)});
     defer func.deinit(gpa);
     try testing.expect(try frameFits(gpa, &func, &small, &.{}));
@@ -1566,11 +1637,109 @@ fn lowerAddOfWidth(gpa: std.mem.Allocator, ty: Type) !Link.FnCode {
 }
 
 fn codeHasWord(fc: Link.FnCode, w: u32) bool {
+    return codeHasWords(fc, &.{w});
+}
+
+/// Whether `ws` appear in `fc`'s code as consecutive words.
+fn codeHasWords(fc: Link.FnCode, ws: []const u32) bool {
     var i: usize = 0;
-    while (i + 4 <= fc.code.len) : (i += 4) {
-        if (std.mem.readInt(u32, fc.code[i..][0..4], .little) == w) return true;
+    outer: while (i + 4 * ws.len <= fc.code.len) : (i += 4) {
+        for (ws, 0..) |w, k| {
+            if (std.mem.readInt(u32, fc.code[i + 4 * k ..][0..4], .little) != w) continue :outer;
+        }
+        return true;
     }
     return false;
+}
+
+test "ir-codegen: a frame past the immediates opens a page at a time and reaches far cells through a page base (#32)" {
+    const gpa = testing.allocator;
+    // struct 0 = 40 KiB of filler, struct 1 = a gc_array box (a container root past it).
+    const layouts = [_]Layout{
+        .{ .name = "F", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = 40960, .@"align" = 8 },
+        .{ .name = "V", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = 8, .@"align" = 8, .native_family = .gc_array },
+    };
+    var func = try slotsOnlyFn(gpa, &.{ Type.structT(0), Type.structT(1) });
+    defer func.deinit(gpa);
+    var fl = try FrameLayout.compute(gpa, &func, &layouts, &.{});
+    defer fl.deinit(gpa);
+    try testing.expectEqual(@as(u32, 40976), fl.frame);
+    try testing.expectEqual(@as(u32, 40960), fl.slot_off[1]);
+
+    var diags: std.ArrayList(Diagnostic) = .empty;
+    defer diags.deinit(gpa);
+    var fc = try lowerIr(gpa, &func, &layouts, &.{}, false, &diags);
+    defer fc.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), diags.items.len);
+    // Ten 4 KiB pages, each stored to as sp reaches it, then the last 16 bytes.
+    try testing.expect(codeHasWords(fc, &.{
+        Aarch64.movz(FA, 10, 0),
+        Aarch64.subImmLsl12(Aarch64.SP, Aarch64.SP, 1),
+        Aarch64.strSp(Aarch64.XZR, 0),
+        Aarch64.subsImm(FA, FA, 1),
+        Aarch64.bCond(.ne, -3),
+        Aarch64.subImm(Aarch64.SP, Aarch64.SP, 16),
+    }));
+    // The container word at 40960 is past the scaled imm12, so its clear goes through FA.
+    try testing.expect(codeHasWords(fc, &.{ Aarch64.addImmLsl12(FA, Aarch64.SP, 10), Aarch64.strRegUoff(Aarch64.XZR, FA, 0) }));
+    try testing.expect(codeHasWords(fc, &.{ Aarch64.addImm(Aarch64.SP, Aarch64.FP, 0), Aarch64.ldpFpLrPost, Aarch64.ret }));
+}
+
+test "ir-codegen: spMem, spAddr and copyBytes keep one-instruction forms within the immediates" {
+    const gpa = testing.allocator;
+    var func = try slotsOnlyFn(gpa, &.{Type.int});
+    defer func.deinit(gpa);
+    var fl = try FrameLayout.compute(gpa, &func, &.{}, &.{});
+    defer fl.deinit(gpa);
+    var g: Gen = .{ .gpa = gpa, .func = &func, .layouts = &.{}, .enum_layouts = &.{}, .is_entry = false, .fl = fl, .params = undefined, .block_labels = &.{} };
+    defer g.code.deinit(gpa);
+    try g.spMem(.ldr, S0, 32760);
+    try g.spMem(.str, S0, 32768);
+    try g.spAddr(S1, 4095);
+    try g.spAddr(S1, 4096);
+    try g.spAddr(S1, 0x12345 & ~@as(u32, 7));
+    try copyBytes(&g, Aarch64.SP, 32752, Aarch64.SP, 0, 16);
+    const want = [_]u32{
+        Aarch64.ldrSp(S0, 32760),
+        Aarch64.addImmLsl12(FA, Aarch64.SP, 8),
+        Aarch64.strRegUoff(S0, FA, 0),
+        Aarch64.addImm(S1, Aarch64.SP, 4095),
+        Aarch64.addImmLsl12(S1, Aarch64.SP, 1),
+        Aarch64.addImmLsl12(S1, Aarch64.SP, 0x12),
+        Aarch64.addImm(S1, S1, 0x340),
+        // The copy's last destination word (32760) is still within reach: no base.
+        Aarch64.ldrRegUoff(S2, Aarch64.SP, 0),
+        Aarch64.strRegUoff(S2, Aarch64.SP, 32752),
+        Aarch64.ldrRegUoff(S2, Aarch64.SP, 8),
+        Aarch64.strRegUoff(S2, Aarch64.SP, 32760),
+    };
+    try testing.expectEqual(want.len * 4, g.code.items.len);
+    for (want, 0..) |w, i| try testing.expectEqual(w, std.mem.readInt(u32, g.code.items[i * 4 ..][0..4], .little));
+}
+
+test "ir-codegen: copyBytes past the immediate walks FA and FB a 32 KiB window at a time" {
+    const gpa = testing.allocator;
+    var func = try slotsOnlyFn(gpa, &.{Type.int});
+    defer func.deinit(gpa);
+    var fl = try FrameLayout.compute(gpa, &func, &.{}, &.{});
+    defer fl.deinit(gpa);
+    var g: Gen = .{ .gpa = gpa, .func = &func, .layouts = &.{}, .enum_layouts = &.{}, .is_entry = false, .fl = fl, .params = undefined, .block_labels = &.{} };
+    defer g.code.deinit(gpa);
+    try copyBytes(&g, S0, 0, Aarch64.SP, 0x10000, 32768 + 8);
+    const words = g.code.items.len / 4;
+    try testing.expectEqual(@as(usize, 2 + 2 * 4097 + 2), words);
+    const at = struct {
+        fn f(code: []const u8, i: usize) u32 {
+            return std.mem.readInt(u32, code[i * 4 ..][0..4], .little);
+        }
+    }.f;
+    try testing.expectEqual(Aarch64.addImm(FA, S0, 0), at(g.code.items, 0));
+    try testing.expectEqual(Aarch64.addImmLsl12(FB, Aarch64.SP, 0x10), at(g.code.items, 1));
+    try testing.expectEqual(Aarch64.ldrRegUoff(S2, FB, 32760), at(g.code.items, 2 + 2 * 4095));
+    try testing.expectEqual(Aarch64.addImmLsl12(FA, FA, 8), at(g.code.items, 2 + 2 * 4096));
+    try testing.expectEqual(Aarch64.addImmLsl12(FB, FB, 8), at(g.code.items, 3 + 2 * 4096));
+    try testing.expectEqual(Aarch64.ldrRegUoff(S2, FB, 0), at(g.code.items, 4 + 2 * 4096));
+    try testing.expectEqual(Aarch64.strRegUoff(S2, FA, 0), at(g.code.items, 5 + 2 * 4096));
 }
 
 test "ir-codegen: genArith width-normalizes narrow results (and platform int does not)" {

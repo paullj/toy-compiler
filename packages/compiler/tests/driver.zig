@@ -4765,12 +4765,18 @@ test "a codegen diagnostic is printed with its text" {
     try Io.Dir.cwd().createDirPath(io, dir_name);
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    // Enough struct locals to overflow the frame codegen can address.
+    // A local past the 16 MiB frame codegen can address: an enum whose one variant holds
+    // 16 MiB, built as its other variant so nothing copies it.
     var src: std.Io.Writer.Allocating = .init(gpa);
     defer src.deinit();
-    try src.writer.writeAll("struct Big { a: int, b: int, c: int, d: int, e: int, f: int, g: int, h: int }\nfn main() -> int {\n");
-    for (0..700) |k| try src.writer.print("    v{d} := Big {{ a: {d}, b: 1, c: 2, d: 3, e: 4, f: 5, g: 6, h: 7 }}\n", .{ k, k });
-    try src.writer.writeAll("    return v0.a + v699.b\n}\n");
+    try src.writer.writeAll("struct A { a0: int, a1: int, a2: int, a3: int, a4: int, a5: int, a6: int, a7: int }\n");
+    const nest = [_][2][]const u8{ .{ "B", "A" }, .{ "C", "B" }, .{ "D", "C" }, .{ "E", "D" }, .{ "F", "E" }, .{ "G", "F" } };
+    for (nest) |pair| {
+        try src.writer.print("struct {s} {{ ", .{pair[0]});
+        for (0..8) |i| try src.writer.print("{s}x{d}: {s}, ", .{ pair[0], i, pair[1] });
+        try src.writer.writeAll("}\n");
+    }
+    try src.writer.writeAll("enum H { Small, Huge(G) }\nfn main() -> int {\n    h := H.Small\n    return match h { H.Small -> 1, H.Huge(_) -> 2 }\n}\n");
     const path = dir_name ++ "/big.toy";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src.written() });
 
@@ -4780,7 +4786,7 @@ test "a codegen diagnostic is printed with its text" {
     try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
     try testing.expect(std.mem.indexOf(u8, res.out, "function frame too large for codegen") != null);
     // The diagnostic has no position of its own; it points at the function to split.
-    try testing.expect(std.mem.indexOf(u8, res.out, "--> big:2:4") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "--> big:9:4") != null);
     try testing.expect(std.mem.indexOf(u8, res.out, "CodegenDiagnostic") == null);
     try testing.expect(std.mem.indexOf(u8, res.err, "CodegenDiagnostic") == null);
 }

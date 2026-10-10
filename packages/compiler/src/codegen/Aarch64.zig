@@ -18,6 +18,8 @@
 const std = @import("std");
 
 pub const XZR: u32 = 31;
+/// The widest scaled imm12 of a load/store: past it the offset bits spill into the opcode.
+pub const max_scaled: u32 = 4095;
 pub const SP: u32 = 31;
 pub const FP: u32 = 29;
 pub const LR: u32 = 30;
@@ -50,6 +52,21 @@ pub fn addImm(rd: u32, rn: u32, imm12: u12) u32 {
 /// sub rd, rn, #imm12. sub sp,sp,#16 → 0xD10043FF.
 pub fn subImm(rd: u32, rn: u32, imm12: u12) u32 {
     return 0xD1000000 | (@as(u32, imm12) << 10) | (rn << 5) | rd;
+}
+
+/// add rd, rn, #imm12, lsl #12 — adds imm12 × 4096. add x12,sp,#1,lsl #12 → 0x914007EC.
+pub fn addImmLsl12(rd: u32, rn: u32, imm12: u12) u32 {
+    return 0x91400000 | (@as(u32, imm12) << 10) | (rn << 5) | rd;
+}
+
+/// sub rd, rn, #imm12, lsl #12 — subtracts imm12 × 4096. sub sp,sp,#1,lsl #12 → 0xD14007FF.
+pub fn subImmLsl12(rd: u32, rn: u32, imm12: u12) u32 {
+    return 0xD1400000 | (@as(u32, imm12) << 10) | (rn << 5) | rd;
+}
+
+/// subs rd, rn, #imm12 — subtract and set flags. subs x12,x12,#1 → 0xF100058C.
+pub fn subsImm(rd: u32, rn: u32, imm12: u12) u32 {
+    return 0xF1000000 | (@as(u32, imm12) << 10) | (rn << 5) | rd;
 }
 
 /// add rd, rn, rm. add x0,x0,x1 → 0x8B010000.
@@ -177,6 +194,7 @@ pub fn csel(rd: u32, rn: u32, rm: u32, c: Cond) u32 {
 pub fn strSp(rt: u32, byteOff: u32) u32 {
     std.debug.assert(byteOff % 8 == 0);
     const scaled: u32 = byteOff / 8;
+    std.debug.assert(scaled <= max_scaled);
     return 0xF9000000 | (scaled << 10) | (SP << 5) | rt;
 }
 
@@ -185,6 +203,7 @@ pub fn strSp(rt: u32, byteOff: u32) u32 {
 pub fn ldrSp(rt: u32, byteOff: u32) u32 {
     std.debug.assert(byteOff % 8 == 0);
     const scaled: u32 = byteOff / 8;
+    std.debug.assert(scaled <= max_scaled);
     return 0xF9400000 | (scaled << 10) | (SP << 5) | rt;
 }
 
@@ -194,6 +213,7 @@ pub fn ldrSp(rt: u32, byteOff: u32) u32 {
 pub fn ldrFp(rt: u32, byteOff: u32) u32 {
     std.debug.assert(byteOff % 8 == 0);
     const scaled: u32 = byteOff / 8;
+    std.debug.assert(scaled <= max_scaled);
     return 0xF9400000 | (scaled << 10) | (FP << 5) | rt;
 }
 
@@ -238,6 +258,7 @@ pub fn adr(rd: u32, imm21: i21) u32 {
 pub fn ldrRegUoff(rt: u32, rn: u32, byteOff: u32) u32 {
     std.debug.assert(byteOff % 8 == 0);
     const scaled: u32 = byteOff / 8;
+    std.debug.assert(scaled <= max_scaled);
     return 0xF9400000 | (scaled << 10) | (rn << 5) | rt;
 }
 
@@ -255,6 +276,7 @@ pub fn ldrbRegUoff(rt: u32, rn: u32, byteOff: u12) u32 {
 pub fn ldrwRegUoff(rt: u32, rn: u32, byteOff: u32) u32 {
     std.debug.assert(byteOff % 4 == 0);
     const scaled: u32 = byteOff / 4;
+    std.debug.assert(scaled <= max_scaled);
     return 0xB9400000 | (scaled << 10) | (rn << 5) | rt;
 }
 
@@ -265,6 +287,7 @@ pub fn ldrwRegUoff(rt: u32, rn: u32, byteOff: u32) u32 {
 pub fn strRegUoff(rt: u32, rn: u32, byteOff: u32) u32 {
     std.debug.assert(byteOff % 8 == 0);
     const scaled: u32 = byteOff / 8;
+    std.debug.assert(scaled <= max_scaled);
     return 0xF9000000 | (scaled << 10) | (rn << 5) | rt;
 }
 
@@ -525,15 +548,25 @@ pub fn fcmp(dn: u32, dm: u32) u32 {
 /// ldr dt, [sp, #byteOff] — 64-bit FP load; byteOff a multiple of 8 (scaled
 /// imm12). ldr d16,[sp,#8] → 0xFD4007F0.
 pub fn ldrFpSp(dt: u32, byteOff: u32) u32 {
-    std.debug.assert(byteOff % 8 == 0);
-    return 0xFD400000 | ((byteOff / 8) << 10) | (SP << 5) | dt;
+    return ldrFpRegUoff(dt, SP, byteOff);
 }
 
 /// str dt, [sp, #byteOff] — 64-bit FP store; byteOff a multiple of 8. str
 /// d16,[sp,#8] → 0xFD0007F0.
 pub fn strFpSp(dt: u32, byteOff: u32) u32 {
-    std.debug.assert(byteOff % 8 == 0);
-    return 0xFD000000 | ((byteOff / 8) << 10) | (SP << 5) | dt;
+    return strFpRegUoff(dt, SP, byteOff);
+}
+
+/// ldr dt, [rn, #byteOff] — 64-bit FP load, arbitrary base. ldr d16,[x12,#8] → 0xFD400590.
+pub fn ldrFpRegUoff(dt: u32, rn: u32, byteOff: u32) u32 {
+    std.debug.assert(byteOff % 8 == 0 and byteOff / 8 <= max_scaled);
+    return 0xFD400000 | ((byteOff / 8) << 10) | (rn << 5) | dt;
+}
+
+/// str dt, [rn, #byteOff] — 64-bit FP store, arbitrary base. str d17,[x12,#4088] → 0xFD07FD91.
+pub fn strFpRegUoff(dt: u32, rn: u32, byteOff: u32) u32 {
+    std.debug.assert(byteOff % 8 == 0 and byteOff / 8 <= max_scaled);
+    return 0xFD000000 | ((byteOff / 8) << 10) | (rn << 5) | dt;
 }
 
 /// SCVTF Dd, Xn — signed 64-bit int in a GPR → f64 in a D reg (round-to-nearest-even, FPCR default).
@@ -583,6 +616,22 @@ test "move-wide immediates" {
     try testing.expectEqual(@as(u32, 0xF2FFFFE0), movk(0, 0xFFFF, 3));
     try testing.expectEqual(@as(u32, 0x92800004), movn(4, 0, 0)); // movn x4,#0 (→ -1)
     try testing.expectEqual(@as(u32, 0x92800000), movn(0, 0, 0)); // movn x0,#0
+}
+
+test "large-offset frame encoders (assembler-verified)" {
+    try std.testing.expectEqual(@as(u32, 0x914007EC), addImmLsl12(12, SP, 1));
+    try std.testing.expectEqual(@as(u32, 0x917FFFEC), addImmLsl12(12, SP, 4095));
+    try std.testing.expectEqual(@as(u32, 0x91400BE9), addImmLsl12(9, SP, 2));
+    try std.testing.expectEqual(@as(u32, 0xD14007FF), subImmLsl12(SP, SP, 1));
+    try std.testing.expectEqual(@as(u32, 0xD17FFFFF), subImmLsl12(SP, SP, 4095));
+    try std.testing.expectEqual(@as(u32, 0xF100058C), subsImm(12, 12, 1));
+    try std.testing.expectEqual(@as(u32, 0x910003BF), addImm(SP, FP, 0)); // mov sp, x29
+    try std.testing.expectEqual(@as(u32, 0xFD400590), ldrFpRegUoff(16, 12, 8));
+    try std.testing.expectEqual(@as(u32, 0xFD07FD91), strFpRegUoff(17, 12, 4088));
+    try std.testing.expectEqual(@as(u32, 0xF947FD80), ldrRegUoff(0, 12, 4088));
+    try std.testing.expectEqual(@as(u32, 0xF90003FF), strSp(XZR, 0));
+    try std.testing.expectEqual(@as(u32, 0xF900099F), strRegUoff(XZR, 12, 16));
+    try std.testing.expectEqual(@as(u32, 0x54000001), bCond(.ne, 0));
 }
 
 test "add/sub immediate" {

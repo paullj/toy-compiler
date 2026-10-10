@@ -22,6 +22,7 @@ either runs cleanly or, under `errors/`, fails compilation on purpose.
 | `map/`          | `Map[K, V]` from `std/map`: `set` / `get`, `for k, v`, and the closure methods `each`, `filter`, `map` (the values), plus `keys()` / `values()` as a `Vec`, all in insertion order |
 | `set/`          | `Set[T]` from `std/set`: `add` / `contains`, `for x`, and the closure methods `each`, `filter`, `map`, in insertion order |
 | `string/`       | the prelude `str`: `concat`, `to_string`, and the methods from `std/str`: `split`, `join`, `trim`, `contains`, `starts_with`, `ends_with`, `replace`, and `chars()` (UTF-8 decoding, U+FFFD for invalid input) |
+| `frames/`       | function frames past the 4 KiB a single instruction addresses (about 5 KiB, 40 KiB and 1 MiB), with heap roots at the far end across collections |
 | `errors/`       | programs that are *supposed* to fail to compile           |
 
 ## Annotation convention

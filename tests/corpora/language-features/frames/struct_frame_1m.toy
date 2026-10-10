@@ -1,0 +1,44 @@
+# Feature: frames of about 1 MiB build and run at -O0 and -O1: `e` builds a 256 KiB struct from eight 32 KiB ones, and `main` holds two of them and their call results; every cell past the first 4 KiB is reached through a base built from its 4 KiB pages, the prologue touches each page as it opens the frame, and the heap roots at the far end (a `str`, a `Vec`, a struct's `str` field) survive collections while the frame is live (#32)
+# expect: stdout "15\nfar\n9\nend\n"
+# expect: exit 0
+import std/io
+import std/vec
+
+struct A { a0: int, a1: int, a2: int, a3: int, a4: int, a5: int, a6: int, a7: int }
+struct B { b0: A, b1: A, b2: A, b3: A, b4: A, b5: A, b6: A, b7: A }
+struct C { c0: B, c1: B, c2: B, c3: B, c4: B, c5: B, c6: B, c7: B }
+struct D { d0: C, d1: C, d2: C, d3: C, d4: C, d5: C, d6: C, d7: C }
+struct E { e0: D, e1: D, e2: D, e3: D, e4: D, e5: D, e6: D, e7: D, name: str }
+
+fn a(x: int) -> A { A { a0: x, a1: x, a2: x, a3: x, a4: x, a5: x, a6: x, a7: x } }
+
+fn b(x: int) -> B { B { b0: a(x), b1: a(x), b2: a(x), b3: a(x), b4: a(x), b5: a(x), b6: a(x), b7: a(x + 1) } }
+
+fn c(x: int) -> C { C { c0: b(x), c1: b(x), c2: b(x), c3: b(x), c4: b(x), c5: b(x), c6: b(x), c7: b(x + 1) } }
+
+fn d(x: int) -> D { D { d0: c(x), d1: c(x), d2: c(x), d3: c(x), d4: c(x), d5: c(x), d6: c(x), d7: c(x + 1) } }
+
+fn e(x: int, name: str) -> E { E { e0: d(x), e1: d(x), e2: d(x), e3: d(x), e4: d(x), e5: d(x), e6: d(x), e7: d(x + 1), name: name } }
+
+fn churn() {
+    i := 0
+    while i < 20000 {
+        junk: Vec[int] = []
+        junk.push(i)
+        i = i + 1
+    }
+}
+
+fn main() -> int {
+    x := e(1, "first")
+    y := e(5, "e".concat("nd"))
+    far := "f".concat("ar")
+    held: Vec[int] = []
+    held.push(9)
+    churn()
+    io.println(x.e0.d0.c0.b0.a0 + x.e7.d7.c7.b7.a7 + y.e7.d7.c7.b7.a7)
+    io.println(far)
+    io.println(held.get(0).unwrap_or(0))
+    io.println(y.name)
+    return 0
+}

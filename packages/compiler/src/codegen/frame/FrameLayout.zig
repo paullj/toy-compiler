@@ -35,15 +35,14 @@
 //! Same IR + layouts => same offsets => same bytes. This underpins the VERIFY
 //! byte-identity re-lower.
 //!
-//! GUARDS (preserved from the old codegen, surfaced as errors so codegen can emit the SAME
-//! diagnostic strings):
-//!   * frame > 4095          -> error.FrameTooLarge        ("function frame too
+//! GUARDS (surfaced as errors so codegen can emit the SAME diagnostic strings):
+//!   * frame > MAX_FRAME     -> error.FrameTooLarge        ("function frame too
 //!                              large for codegen (too many locals)")
 //!   * an incoming stack-arg scaled offset > 4095*8 -> error.ParamOffsetTooLarge
 //!                              ("too many parameters for codegen ...")
-//! NOTE: spill-all enlarges frames vs the old reused-temp path, so FrameTooLarge
-//! can trip on programs that compiled before — the corpus must verify every fn
-//! stays < 4096B (slot-coloring is the deferred fix).
+//! Codegen reaches an offset past an instruction's immediate through a base it builds
+//! from the 4 KiB-page part (`add xN, sp, #pages, lsl #12`), so the cap is where the
+//! page count leaves the imm12: 16 MiB, twice macOS's default 8 MiB stack.
 
 const std = @import("std");
 const Ir = @import("../../ir/Ir.zig");
@@ -57,9 +56,13 @@ pub const VariantLayout = types.VariantLayout;
 
 const FrameLayout = @This();
 
-/// The widest scalable ldr/str immediate offset (imm12 * 8). Any sp/fp offset
-/// past this cannot be encoded.
+/// The widest scalable ldr/str immediate offset (imm12 * 8). An incoming stack arg is
+/// read at its fp offset directly, so one past this cannot be encoded.
 const MAX_SCALED_OFFSET: u32 = 4095 * 8;
+
+/// The largest frame codegen addresses: every offset below it splits into a 4 KiB page
+/// count and a remainder that each fit an imm12.
+pub const MAX_FRAME: u32 = (4095 << 12) | 0xFF0;
 
 /// `sret_save_off == NO_SRET` means the function does not return a >16B
 /// aggregate (no x8 buffer to save).
@@ -210,10 +213,9 @@ pub fn compute(
     std.debug.assert(frame % 16 == 0);
     std.debug.assert(out_base % 16 == 0);
 
-    // GUARD: the prologue's `sub sp, sp, #frame` uses a 12-bit immediate, and
-    // every slot/value ldr/str uses a scaled imm12. The top offset is < frame,
-    // so a frame within imm12 keeps every access encodable.
-    if (frame > 4095) {
+    // GUARD: codegen splits every offset below the frame into a page count and a
+    // remainder, each an imm12 (see `MAX_FRAME`).
+    if (frame > MAX_FRAME) {
         // errdefer (registered above for both offset slices) frees them.
         return error.FrameTooLarge;
     }
@@ -656,15 +658,26 @@ test "frame: sret return reserves an 8-byte save slot atop the frame" {
     try testing.expectEqual(@as(u32, 16), fl.frame);
 }
 
-test "frame: FrameTooLarge when spill-all overflows the imm12 budget" {
+test "frame: a frame past 4095 bytes lays out; FrameTooLarge only past MAX_FRAME" {
     const gpa = testing.allocator;
-    // 600 int values * 8 = 4800 > 4095. Should error cleanly.
+    // 600 int values * 8 = 4800, past the old imm12 budget (#32).
     var vtypes: [600]Type = undefined;
     for (&vtypes) |*v| v.* = Type.int;
     var func = try buildSimple(gpa, &.{}, &vtypes, 0, Type.int);
     defer func.deinit(gpa);
+    var fl = try compute(gpa, &func, &.{}, &.{});
+    defer fl.deinit(gpa);
+    try testing.expectEqual(@as(u32, 4800), fl.frame);
+    try testing.expectEqual(@as(u32, 4792), fl.valueAddr(599));
 
-    try testing.expectError(error.FrameTooLarge, compute(gpa, &func, &.{}, &.{}));
+    var slot = try buildSimple(gpa, &.{Type.structT(0)}, &.{}, 0, Type.unit);
+    defer slot.deinit(gpa);
+    const fits = [_]Layout{.{ .name = "S", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = MAX_FRAME - 8, .@"align" = 8 }};
+    var at_cap = try compute(gpa, &slot, &fits, &.{});
+    defer at_cap.deinit(gpa);
+    try testing.expectEqual(MAX_FRAME, at_cap.frame);
+    const over = [_]Layout{.{ .name = "S", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = MAX_FRAME + 1, .@"align" = 8 }};
+    try testing.expectError(error.FrameTooLarge, compute(gpa, &slot, &over, &.{}));
 }
 
 test "frame: ParamOffsetTooLarge when an incoming stack-arg offset exceeds imm12" {
@@ -680,10 +693,7 @@ test "frame: ParamOffsetTooLarge when an incoming stack-arg offset exceeds imm12
     var func = try buildSimple(gpa, &ptypes, &.{}, n, Type.unit);
     defer func.deinit(gpa);
 
-    // The frame guard would trip first (4110 param slots * 8 > 4095), so this
-    // test instead confirms an over-budget configuration errors (either guard).
-    const res = compute(gpa, &func, &.{}, &.{});
-    try testing.expect(res == error.FrameTooLarge or res == error.ParamOffsetTooLarge);
+    try testing.expectError(error.ParamOffsetTooLarge, compute(gpa, &func, &.{}, &.{}));
 }
 
 // A `Layout` with the given fields (owned arrays freed by the caller).
