@@ -894,7 +894,7 @@ test "a changed capture offset flips the fold" {
     const sig: @import("../layout/Engine.zig").FnSig = .{ .params = &.{}, .ret = Type.int };
     const env_a = [_]Closure.EnvSlot{ .{ .slot = 0, .ty = Type.int, .mode = .copy, .off = 0 }, .{ .slot = 1, .ty = Type.str, .mode = .copy, .off = 8 } };
     const env_b = [_]Closure.EnvSlot{ .{ .slot = 0, .ty = Type.int, .mode = .copy, .off = 0 }, .{ .slot = 1, .ty = Type.str, .mode = .copy, .off = 16 } };
-    const unit: Closure.LambdaUnit = .{ .owner = .{ .base = 0 }, .mod = 0, .fn_node = Ast.Index.from(9), .node = Ast.Index.from(4), .rank = 0, .name = "f$l0", .sig = sig, .param_slots = &.{}, .env = &env_a, .env_size = 24 };
+    const unit: Closure.LambdaUnit = .{ .owner = 0, .mod = 0, .fn_node = Ast.Index.from(9), .node = Ast.Index.from(4), .rank = 0, .name = "f$l0", .sig = sig, .param_slots = &.{}, .env = &env_a, .env_size = 24 };
     var moved = unit;
     moved.env = &env_b;
     moved.env_size = 32;

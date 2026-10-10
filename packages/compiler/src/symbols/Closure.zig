@@ -10,6 +10,7 @@ const LayoutEngine = @import("../layout/Engine.zig");
 const Type = @import("../layout/Type.zig").Type;
 const Resolution = @import("Resolution.zig").Resolution;
 const Modes = @import("Modes.zig");
+const Body = @import("Body.zig");
 
 /// A local named inside a lambda but declared outside it: `slot` is the owner fn's
 /// resolver slot, `first_use` the first identifier node (in resolve order) naming it.
@@ -48,9 +49,9 @@ pub fn deinitFnClosures(gpa: std.mem.Allocator, list: []const FnClosures) void {
     gpa.free(list);
 }
 
-/// A body that owns closure units: a base fn (its global id) or a generic instance (its
-/// index in the instance table).
-pub const Owner = union(enum) { base: u32, instance: u32 };
+/// A body that owns closure units, by its index in the program's body list
+/// (`Body.List`): a base fn or a generic instance.
+pub const Owner = Body.Index;
 
 /// An owner's boxed locals: the slots a closure captures and something assigns, which
 /// live in a GC cell for their whole lifetime. Recorded only for an owner with one.
@@ -88,7 +89,7 @@ pub const Storage = struct { boxed: []const u32 = &.{}, unboxed: []const u32 = &
 pub fn ownerStorage(list: []const OwnerClosure, owner: Owner, frame: bool) Storage {
     const i = std.sort.binarySearch(OwnerClosure, list, owner, struct {
         fn order(key: Owner, oc: OwnerClosure) std.math.Order {
-            return ownerOrder(key, oc.owner);
+            return std.math.order(key, oc.owner);
         }
     }.order) orelse return .{};
     const oc = list[i];
@@ -100,31 +101,13 @@ pub fn ownerStorage(list: []const OwnerClosure, owner: Owner, frame: bool) Stora
 pub fn ownerHasFrameEnv(units: []const LambdaUnit, owner: Owner) bool {
     var i = std.sort.lowerBound(LambdaUnit, units, owner, struct {
         fn order(key: Owner, u: LambdaUnit) std.math.Order {
-            return ownerOrder(key, u.owner);
+            return std.math.order(key, u.owner);
         }
     }.order);
-    while (i < units.len and ownerOrder(owner, units[i].owner) == .eq) : (i += 1) {
+    while (i < units.len and units[i].owner == owner) : (i += 1) {
         if (units[i].frame_env != null) return true;
     }
     return false;
-}
-
-/// The canonical owner order: every base fn before every instance, then by id.
-pub fn ownerLess(a: Owner, b: Owner) bool {
-    return ownerOrder(a, b) == .lt;
-}
-
-fn ownerOrder(a: Owner, b: Owner) std.math.Order {
-    const ta: u8 = @intFromEnum(std.meta.activeTag(a));
-    const tb: u8 = @intFromEnum(std.meta.activeTag(b));
-    if (ta != tb) return std.math.order(ta, tb);
-    const ia = switch (a) {
-        inline else => |v| v,
-    };
-    const ib = switch (b) {
-        inline else => |v| v,
-    };
-    return std.math.order(ia, ib);
 }
 
 /// How a closure holds a captured local: `copy` is the local's value, taken when the
@@ -315,7 +298,7 @@ pub fn findUnit(units: []const LambdaUnit, owner: Owner, node: Ast.Index) ?u32 {
     const Key = struct { owner: Owner, node: Ast.Index };
     const i = std.sort.binarySearch(LambdaUnit, units, Key{ .owner = owner, .node = node }, struct {
         fn order(k: Key, u: LambdaUnit) std.math.Order {
-            return switch (ownerOrder(k.owner, u.owner)) {
+            return switch (std.math.order(k.owner, u.owner)) {
                 .eq => std.math.order(k.node.int(), u.node.int()),
                 else => |o| o,
             };
@@ -372,7 +355,7 @@ pub fn adapterName(gpa: std.mem.Allocator, target_sym: []const u8, kind: Adapter
 }
 
 /// The adapter a bound method value goes through: the receiver's address when it is one
-/// of the owner's `mut` params (`places`, as `Modes.ofProto`), the receiver's cell when it
+/// of the owner's `mut` params (`places`, its body's `sig.mut_mask`), the receiver's cell when it
 /// is a local its owner boxes (the closure then sees later writes to it), else a copy of
 /// the receiver taken when the value is made.
 pub fn boundKind(recv_local: ?u32, boxed: []const u32, places: u64) AdapterKind {
@@ -470,17 +453,17 @@ test "ownerHasFrameEnv reads only the owner's own run" {
     const sig: LayoutEngine.FnSig = .{ .params = &.{}, .ret = Type.unit };
     const idx = Ast.Index.from;
     const units = [_]LambdaUnit{
-        .{ .owner = .{ .base = 1 }, .mod = 0, .fn_node = idx(9), .node = idx(3), .rank = 0, .name = "", .sig = sig, .param_slots = &.{} },
-        .{ .owner = .{ .base = 1 }, .mod = 0, .fn_node = idx(9), .node = idx(5), .rank = 1, .name = "", .sig = sig, .param_slots = &.{}, .frame_env = 4 },
-        .{ .owner = .{ .base = 2 }, .mod = 0, .fn_node = idx(19), .node = idx(13), .rank = 0, .name = "", .sig = sig, .param_slots = &.{} },
-        .{ .owner = .{ .instance = 0 }, .mod = 0, .fn_node = idx(29), .node = idx(23), .rank = 0, .name = "", .sig = sig, .param_slots = &.{}, .frame_env = 5 },
+        .{ .owner = 1, .mod = 0, .fn_node = idx(9), .node = idx(3), .rank = 0, .name = "", .sig = sig, .param_slots = &.{} },
+        .{ .owner = 1, .mod = 0, .fn_node = idx(9), .node = idx(5), .rank = 1, .name = "", .sig = sig, .param_slots = &.{}, .frame_env = 4 },
+        .{ .owner = 2, .mod = 0, .fn_node = idx(19), .node = idx(13), .rank = 0, .name = "", .sig = sig, .param_slots = &.{} },
+        .{ .owner = 100, .mod = 0, .fn_node = idx(29), .node = idx(23), .rank = 0, .name = "", .sig = sig, .param_slots = &.{}, .frame_env = 5 },
     };
-    try testing.expect(ownerHasFrameEnv(&units, .{ .base = 1 }));
-    try testing.expect(!ownerHasFrameEnv(&units, .{ .base = 2 }));
-    try testing.expect(!ownerHasFrameEnv(&units, .{ .base = 7 }));
-    try testing.expect(ownerHasFrameEnv(&units, .{ .instance = 0 }));
-    try testing.expect(!ownerHasFrameEnv(&units, .{ .instance = 1 }));
-    try testing.expect(!ownerHasFrameEnv(&.{}, .{ .base = 1 }));
+    try testing.expect(ownerHasFrameEnv(&units, 1));
+    try testing.expect(!ownerHasFrameEnv(&units, 2));
+    try testing.expect(!ownerHasFrameEnv(&units, 7));
+    try testing.expect(ownerHasFrameEnv(&units, 100));
+    try testing.expect(!ownerHasFrameEnv(&units, 101));
+    try testing.expect(!ownerHasFrameEnv(&.{}, 1));
 }
 
 test "findFn and contains binary-search their sorted tables" {
@@ -501,7 +484,7 @@ test "findFn and contains binary-search their sorted tables" {
     try testing.expect(!contains(&.{}, 0));
 }
 
-test "findUnit orders base owners before instances, then by node" {
+test "findUnit orders by owner, then by node" {
     const idx = Ast.Index.from;
     const sig: LayoutEngine.FnSig = .{ .params = &.{}, .ret = Type.unit };
     const mk = struct {
@@ -510,20 +493,18 @@ test "findUnit orders base owners before instances, then by node" {
         }
     }.f;
     const units = [_]LambdaUnit{
-        mk(.{ .base = 2 }, 5, sig),
-        mk(.{ .base = 2 }, 8, sig),
-        mk(.{ .base = 7 }, 1, sig),
-        mk(.{ .instance = 0 }, 5, sig),
-        mk(.{ .instance = 3 }, 2, sig),
+        mk(2, 5, sig),
+        mk(2, 8, sig),
+        mk(7, 1, sig),
+        mk(100, 5, sig),
+        mk(103, 2, sig),
     };
-    for (units[1..], units[0 .. units.len - 1]) |cur, prev| try testing.expect(ownerLess(prev.owner, cur.owner) or (std.meta.eql(prev.owner, cur.owner) and prev.node.int() < cur.node.int()));
-    try testing.expectEqual(@as(?u32, 1), findUnit(&units, .{ .base = 2 }, idx(8)));
-    try testing.expectEqual(@as(?u32, 3), findUnit(&units, .{ .instance = 0 }, idx(5)));
-    try testing.expectEqual(@as(?u32, 4), findUnit(&units, .{ .instance = 3 }, idx(2)));
-    try testing.expectEqual(@as(?u32, null), findUnit(&units, .{ .instance = 2 }, idx(5)));
-    try testing.expectEqual(@as(?u32, null), findUnit(&units, .{ .base = 7 }, idx(5)));
-    try testing.expect(ownerLess(.{ .base = 99 }, .{ .instance = 0 }));
-    try testing.expect(!ownerLess(.{ .instance = 0 }, .{ .base = 99 }));
+    for (units[1..], units[0 .. units.len - 1]) |cur, prev| try testing.expect(prev.owner < cur.owner or (prev.owner == cur.owner and prev.node.int() < cur.node.int()));
+    try testing.expectEqual(@as(?u32, 1), findUnit(&units, 2, idx(8)));
+    try testing.expectEqual(@as(?u32, 3), findUnit(&units, 100, idx(5)));
+    try testing.expectEqual(@as(?u32, 4), findUnit(&units, 103, idx(2)));
+    try testing.expectEqual(@as(?u32, null), findUnit(&units, 102, idx(5)));
+    try testing.expectEqual(@as(?u32, null), findUnit(&units, 7, idx(5)));
 }
 
 test "findAdapter binary-searches by (kind, key)" {
@@ -566,8 +547,8 @@ test "ownerFacts is empty with no env slot and no boxed slot" {
     const idx = Ast.Index.from;
     const sig: LayoutEngine.FnSig = .{ .params = &.{}, .ret = Type.unit };
     const bare = [_]LambdaUnit{
-        .{ .owner = .{ .base = 1 }, .mod = 0, .fn_node = idx(50), .node = idx(3), .rank = 1, .name = "", .sig = sig, .param_slots = &.{} },
-        .{ .owner = .{ .base = 1 }, .mod = 0, .fn_node = idx(50), .node = idx(7), .rank = 0, .name = "", .sig = sig, .param_slots = &.{} },
+        .{ .owner = 1, .mod = 0, .fn_node = idx(50), .node = idx(3), .rank = 1, .name = "", .sig = sig, .param_slots = &.{} },
+        .{ .owner = 1, .mod = 0, .fn_node = idx(50), .node = idx(7), .rank = 0, .name = "", .sig = sig, .param_slots = &.{} },
     };
     try testing.expectEqual(@as(usize, 0), (try ownerFacts(gpa, &bare, .{}, false)).len);
     try testing.expectEqual(@as(usize, 0), (try ownerFacts(gpa, &.{}, .{}, false)).len);
@@ -590,31 +571,31 @@ test "ownerFacts is empty with no env slot and no boxed slot" {
 
 test "ownerStorage finds an owner's record and is empty for an owner without one" {
     const ocs = [_]OwnerClosure{
-        .{ .owner = .{ .base = 3 }, .boxed = &.{ 1, 4 } },
-        .{ .owner = .{ .base = 9 }, .boxed = &.{0} },
-        .{ .owner = .{ .instance = 2 }, .boxed = &.{ 2, 5, 6 } },
+        .{ .owner = 3, .boxed = &.{ 1, 4 } },
+        .{ .owner = 9, .boxed = &.{0} },
+        .{ .owner = 102, .boxed = &.{ 2, 5, 6 } },
     };
-    try testing.expectEqualSlices(u32, &.{ 1, 4 }, ownerStorage(&ocs, .{ .base = 3 }, false).boxed);
-    try testing.expectEqualSlices(u32, &.{0}, ownerStorage(&ocs, .{ .base = 9 }, false).boxed);
-    try testing.expectEqualSlices(u32, &.{ 2, 5, 6 }, ownerStorage(&ocs, .{ .instance = 2 }, false).boxed);
-    try testing.expectEqual(@as(usize, 0), ownerStorage(&ocs, .{ .base = 2 }, false).boxed.len);
-    try testing.expectEqual(@as(usize, 0), ownerStorage(&ocs, .{ .instance = 3 }, false).boxed.len);
-    try testing.expectEqual(@as(usize, 0), ownerStorage(&.{}, .{ .base = 3 }, false).boxed.len);
+    try testing.expectEqualSlices(u32, &.{ 1, 4 }, ownerStorage(&ocs, 3, false).boxed);
+    try testing.expectEqualSlices(u32, &.{0}, ownerStorage(&ocs, 9, false).boxed);
+    try testing.expectEqualSlices(u32, &.{ 2, 5, 6 }, ownerStorage(&ocs, 102, false).boxed);
+    try testing.expectEqual(@as(usize, 0), ownerStorage(&ocs, 2, false).boxed.len);
+    try testing.expectEqual(@as(usize, 0), ownerStorage(&ocs, 103, false).boxed.len);
+    try testing.expectEqual(@as(usize, 0), ownerStorage(&.{}, 3, false).boxed.len);
 }
 
 test "ownerStorage keeps every box without frame storage and only the kept ones with it" {
     const ocs = [_]OwnerClosure{
-        .{ .owner = .{ .base = 1 }, .boxed = &.{ 2, 5 }, .unboxable = &.{5}, .kept_boxed = &.{2} },
-        .{ .owner = .{ .instance = 0 }, .boxed = &.{3}, .unboxable = &.{}, .kept_boxed = &.{3} },
+        .{ .owner = 1, .boxed = &.{ 2, 5 }, .unboxable = &.{5}, .kept_boxed = &.{2} },
+        .{ .owner = 100, .boxed = &.{3}, .unboxable = &.{}, .kept_boxed = &.{3} },
     };
-    const off = ownerStorage(&ocs, .{ .base = 1 }, false);
+    const off = ownerStorage(&ocs, 1, false);
     try testing.expectEqualSlices(u32, &.{ 2, 5 }, off.boxed);
     try testing.expectEqualSlices(u32, &.{}, off.unboxed);
-    const on = ownerStorage(&ocs, .{ .base = 1 }, true);
+    const on = ownerStorage(&ocs, 1, true);
     try testing.expectEqualSlices(u32, &.{2}, on.boxed);
     try testing.expectEqualSlices(u32, &.{5}, on.unboxed);
-    try testing.expectEqualSlices(u32, &.{3}, ownerStorage(&ocs, .{ .instance = 0 }, true).boxed);
-    try testing.expectEqual(@as(usize, 0), ownerStorage(&ocs, .{ .base = 7 }, true).boxed.len);
+    try testing.expectEqualSlices(u32, &.{3}, ownerStorage(&ocs, 100, true).boxed);
+    try testing.expectEqual(@as(usize, 0), ownerStorage(&ocs, 7, true).boxed.len);
 }
 
 test "envStruct types a copy as its capture, a cell as rawptr and an address as int" {
@@ -626,7 +607,7 @@ test "envStruct types a copy as its capture, a cell as rawptr and an address as 
         .{ .slot = 3, .ty = Type.int, .mode = .box, .off = 24 },
         .{ .slot = 0, .ty = Type.int, .mode = .ref, .off = 32 },
     };
-    const u: LambdaUnit = .{ .owner = .{ .base = 0 }, .mod = 0, .fn_node = Ast.Index.from(9), .node = Ast.Index.from(4), .rank = 0, .name = "m.f$l0", .sig = sig, .param_slots = &.{}, .env = &env, .env_size = 40 };
+    const u: LambdaUnit = .{ .owner = 0, .mod = 0, .fn_node = Ast.Index.from(9), .node = Ast.Index.from(4), .rank = 0, .name = "m.f$l0", .sig = sig, .param_slots = &.{}, .env = &env, .env_size = 40 };
     const l = try envStruct(gpa, u, &.{3});
     defer freeEnvStruct(gpa, l);
     try testing.expectEqualStrings("env$m.f$l0", l.name);
@@ -640,7 +621,7 @@ test "ownerFacts folds each unit's frame-env bit only with frame storage" {
     const gpa = testing.allocator;
     const sig: LayoutEngine.FnSig = .{ .params = &.{}, .ret = Type.unit };
     const env = [_]EnvSlot{.{ .slot = 2, .ty = Type.int, .mode = .copy, .off = 0 }};
-    var u: LambdaUnit = .{ .owner = .{ .base = 1 }, .mod = 0, .fn_node = Ast.Index.from(50), .node = Ast.Index.from(3), .rank = 0, .name = "", .sig = sig, .param_slots = &.{}, .env = &env, .env_size = 8 };
+    var u: LambdaUnit = .{ .owner = 1, .mod = 0, .fn_node = Ast.Index.from(50), .node = Ast.Index.from(3), .rank = 0, .name = "", .sig = sig, .param_slots = &.{}, .env = &env, .env_size = 8 };
     const heap_o0 = try ownerFacts(gpa, &.{u}, .{}, false);
     defer gpa.free(heap_o0);
     const heap_o1 = try ownerFacts(gpa, &.{u}, .{}, true);
@@ -662,7 +643,7 @@ test "ownerFacts folds which boxes a lowering keeps and which it unboxes" {
         .{ .slot = 2, .ty = Type.int, .mode = .box, .off = 0 },
         .{ .slot = 3, .ty = Type.int, .mode = .box, .off = 8 },
     };
-    const u: LambdaUnit = .{ .owner = .{ .base = 1 }, .mod = 0, .fn_node = Ast.Index.from(50), .node = Ast.Index.from(3), .rank = 0, .name = "", .sig = sig, .param_slots = &.{}, .env = &env, .env_size = 16 };
+    const u: LambdaUnit = .{ .owner = 1, .mod = 0, .fn_node = Ast.Index.from(50), .node = Ast.Index.from(3), .rank = 0, .name = "", .sig = sig, .param_slots = &.{}, .env = &env, .env_size = 16 };
     const cells = try ownerFacts(gpa, &.{u}, .{ .boxed = &.{ 2, 3 } }, true);
     defer gpa.free(cells);
     const one = try ownerFacts(gpa, &.{u}, .{ .boxed = &.{2}, .unboxed = &.{3} }, true);

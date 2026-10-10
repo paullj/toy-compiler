@@ -28,6 +28,7 @@ pub const diagnostics = struct {
 pub const Resolve = @import("resolve.zig");
 pub const Callee = @import("symbols/Callee.zig").Callee;
 pub const Closure = @import("symbols/Closure.zig");
+pub const Body = @import("symbols/Body.zig");
 pub const Spec = @import("symbols/Spec.zig");
 pub const Escape = @import("symbols/Escape.zig");
 pub const Modes = @import("symbols/Modes.zig");
@@ -91,6 +92,7 @@ test {
     _ = Resolve;
     _ = @import("symbols/Callee.zig");
     _ = Closure;
+    _ = Body;
     _ = Spec;
     _ = Escape;
     _ = Modes;

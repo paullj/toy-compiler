@@ -417,7 +417,6 @@ pub const BodyChecker = struct {
     pub fn checkBody(bc: *BodyChecker, fid: u32, f: FnSym) !void {
         _ = fid;
         const decl = bc.tree.nodes[(f.decl_node).int()];
-        const proto = Ast.protoAt(bc.tree, (decl.lhs).int());
 
         // Rebuild the per-function slot→type table. Parameters get slots 0..N first
         // (the resolver declares them first), then `:=` locals as we encounter them.
@@ -435,7 +434,7 @@ pub const BodyChecker = struct {
             if (!try bc.reportTailMismatch(decl.rhs, body_ty, f.ret))
                 try bc.sink.report(.{ .span = bc.tokSpan(decl.main_token), .code = .T0043 }, "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(decl.main_token), bc.typeName(f.ret) });
         }
-        try bc.classifyCaptures(proto);
+        try bc.classifyCaptures(f.mut_mask);
     }
 
     /// The expression whose value a block yields, or null when it ends in a statement.
@@ -493,11 +492,11 @@ pub const BodyChecker = struct {
     /// outlives the call. That depends on other fns' bodies, so the serial escape pass
     /// decides it (T0052), not this per-body check. A bounded template's abstract check
     /// skips this: each instance re-check decides for itself.
-    fn classifyCaptures(bc: *BodyChecker, proto: Ast.FnProto) error{OutOfMemory}!void {
+    fn classifyCaptures(bc: *BodyChecker, place_params: u64) error{OutOfMemory}!void {
         if (bc.abstract_template) return;
         if (bc.closures == null and bc.bound_roots.items.len == 0) return;
-        // Params are resolver slots 0..n-1, so a param's slot is its index.
-        const place_params = Modes.ofProto(bc.tree, bc.tokens, proto);
+        // Params are resolver slots 0..n-1, so a param's slot is its index, and a mask bit
+        // is set only below the param count.
         std.mem.sort(u32, bc.mutated_roots.items, {}, std.sort.asc(u32));
         const assigned = sortedSet(bc.assigned_roots.items);
         var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
@@ -509,7 +508,7 @@ pub const BodyChecker = struct {
             defer bc.gpa.free(by_rank);
             for (fc.boundaries, 0..) |b, i| by_rank[b.rank] = @intCast(i);
             for (by_rank) |bi| for (fc.boundaries[bi].captures) |c| {
-                if (c.slot < proto.params.len and Modes.isMut(place_params, c.slot)) continue;
+                if (Modes.isMut(place_params, c.slot)) continue;
                 if ((try seen.getOrPut(bc.gpa, c.slot)).found_existing) continue;
                 if (Closure.contains(assigned, c.slot) or Closure.contains(bc.mutated_roots.items, c.slot)) {
                     try bc.boxed.append(bc.gpa, c.slot);
@@ -517,7 +516,7 @@ pub const BodyChecker = struct {
             };
         }
         for (bc.bound_roots.items) |slot| {
-            if (slot < proto.params.len and Modes.isMut(place_params, slot)) continue;
+            if (Modes.isMut(place_params, slot)) continue;
             if ((try seen.getOrPut(bc.gpa, slot)).found_existing) continue;
             if (Closure.contains(assigned, slot) or Closure.contains(bc.mutated_roots.items, slot)) {
                 try bc.boxed.append(bc.gpa, slot);
@@ -2908,7 +2907,7 @@ pub const BodyChecker = struct {
     fn setCallee(bc: *BodyChecker, call: Ast.Node, c: Callee) void {
         // A bounded template's receiver types live in a discarded scratch, so the seal
         // could never resolve a pending slot there.
-        if (c.tag == .pending and bc.abstract_template) return;
+        if (c.isPending() and bc.abstract_template) return;
         const fa = Callee.memberNode(bc.tree, call) orelse return;
         const slot = &bc.callees[fa.int()];
         if (builtin.mode == .Debug) std.debug.assert(slot.tag == .none or std.meta.eql(slot.*, c));
@@ -2919,7 +2918,7 @@ pub const BodyChecker = struct {
     /// value.
     fn setCalleeAt(bc: *BodyChecker, slot: Ast.Index, c: Callee) void {
         // A bounded template is never lowered, and its instances record their own refs.
-        if (bc.abstract_template and (c.tag == .fn_ref or c.tag == .bound_method or c.tag == .pending)) return;
+        if (bc.abstract_template and (c.tag == .fn_ref or c.tag == .bound_method or c.isPending())) return;
         const cell = &bc.callees[slot.int()];
         if (builtin.mode == .Debug) std.debug.assert(cell.tag == .none or std.meta.eql(cell.*, c));
         cell.* = c;

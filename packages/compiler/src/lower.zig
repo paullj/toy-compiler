@@ -45,6 +45,7 @@ const Derive = @import("symbols/Derive.zig");
 const Infer = @import("symbols/Infer.zig");
 const Intrinsic = @import("symbols/Intrinsic.zig");
 const Modes = @import("symbols/Modes.zig");
+const Body = @import("symbols/Body.zig");
 const AstWalk = @import("query/AstWalk.zig");
 const StdNames = @import("symbols/StdNames.zig");
 const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
@@ -119,10 +120,17 @@ pub const Inputs = struct {
     /// passing `ClosureInputs.none` only for a unit that reads no AST.
     closure: ClosureInputs,
 
-    /// The template facts `Mono.callInstanceRef` reads, from the callee's `Sig`, so the
-    /// fingerprint's walk can run over these inputs.
-    pub fn genericTemplate(self: *const Inputs, gid: u32) ?Mono.TemplateRef {
-        return Mono.templateRef(self.sigs, gid);
+    pub fn bodyView(in: *const Inputs) Body.BodyView {
+        return .{ .tree = in.tree, .resolutions = in.resolutions, .node_types = in.node_types, .callees = in.callees };
+    }
+
+    pub fn programView(in: *const Inputs) Body.ProgramView {
+        return .{ .sigs = in.sigs, .methods = in.methods, .instances = in.instances, .names = in.names, .layouts = in.layouts };
+    }
+
+    /// The lambda units this body's lambda literals lower to.
+    pub fn lambdas(in: *const Inputs) Spec.Lambdas {
+        return .{ .owner = in.closure.owner, .units = in.closure.lambda_units };
     }
 };
 
@@ -135,6 +143,9 @@ pub const ClosureInputs = struct {
     /// The body being lowered, as the owner of the lambdas written in it (a lambda unit
     /// lowers under its owner's). Null for a unit with no source body.
     owner: ?Closure.Owner = null,
+    /// The owner body's `mut` params, `mut self` first (its sig's `mut_mask`): a bound
+    /// method value on one holds its address.
+    owner_modes: u64 = 0,
     /// The owner's boxed locals (resolver slots, ascending): each lives in a GC cell for its
     /// whole lifetime, in the owner and in every lambda unit of it.
     boxed: []const u32 = &.{},
@@ -199,9 +210,6 @@ pub const Builder = struct {
     /// aggregate store through a place slot builds the whole value aside before writing any
     /// of it. A capture of an unboxed local is never staged, as its box is not at -O0.
     staged_places: bool = false,
-    /// The owner fn's `mut` params (`Modes.ofProto`): a bound method value on one holds
-    /// its address.
-    owner_places: u64 = 0,
     /// Resolver locals a call's later argument may write before the call reads them: each
     /// local a call in this unit passes as a `mut` argument, and each local the owner keeps
     /// unboxed (a closure an argument calls may write it, as through its box at -O0). A
@@ -433,7 +441,6 @@ pub fn lowerFn(
         try b.local_slots.put(gpa, @intCast(i), sid);
     }
 
-    b.owner_places = Modes.ofProto(in.tree, in.tokens, proto);
     const blocks = try openBodyBlocks(&b, ret_type);
     if (b.in.closure.boxed.len != 0) {
         const lis = try gpa.alloc(u32, params.items.len);
@@ -473,7 +480,6 @@ pub fn lowerLambda(
         try b.local_slots.put(gpa, li, sid);
     }
     const lam = in.tree.nodes[unit.node.int()];
-    b.owner_places = Modes.ofProto(in.tree, in.tokens, Ast.protoAt(in.tree, in.tree.nodes[unit.fn_node.int()].lhs.int()));
     const blocks = try openBodyBlocks(&b, unit.sig.ret);
     try bindCaptures(&b, unit, env_slot);
     if (unit.self_slot) |ss| try bindSelf(&b, unit, ss, env_slot);
@@ -2188,7 +2194,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             const m = b.in.methods[mi];
             callee = witnessCallee(b, m);
             if (m.instance) |ii| {
-                if (try Spec.select(b.gpa, &b.in, node_idx, .{ .ii = ii, .self_n = @intFromBool(!m.is_static) })) |name|
+                if (try Spec.select(b.gpa, b.in.closure.specs, b.in.bodyView(), b.in.programView(), b.in.lambdas(), node_idx, .{ .ii = ii, .self_n = @intFromBool(!m.is_static) })) |name|
                     callee = .{ .kind = .user_fn, .name = name };
             }
             // An associated function (`Vec[int].new()`) takes no `self`: its receiver is a type.
@@ -2265,7 +2271,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                 try b.note(callee_node.main_token, "unresolved generic instance in lower");
                 return .none;
             };
-            callee = .{ .kind = .user_fn, .name = (try Spec.select(b.gpa, &b.in, node_idx, .{ .ii = ii, .self_n = 0 })) orelse b.in.instances[ii].name.? };
+            callee = .{ .kind = .user_fn, .name = (try Spec.select(b.gpa, b.in.closure.specs, b.in.bodyView(), b.in.programView(), b.in.lambdas(), node_idx, .{ .ii = ii, .self_n = 0 })) orelse b.in.instances[ii].name.? };
         } else {
             // The callee identifier resolves to a `.func` index into `names`.
             const callee_res = b.in.resolutions[(n.lhs).int()];
@@ -2408,7 +2414,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
                     try b.note(callee_node.main_token, "unresolved generic instance in lower");
                     return .none;
                 };
-                callee = .{ .kind = .user_fn, .name = (try Spec.select(b.gpa, &b.in, node_idx, .{ .ii = inst, .self_n = 0 })) orelse b.in.instances[inst].name.? };
+                callee = .{ .kind = .user_fn, .name = (try Spec.select(b.gpa, b.in.closure.specs, b.in.bodyView(), b.in.programView(), b.in.lambdas(), node_idx, .{ .ii = inst, .self_n = 0 })) orelse b.in.instances[inst].name.? };
             } else {
                 callee = b.in.names[callee_res.func];
             }
@@ -2440,7 +2446,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             args[0] = try lowerExpr(b, self_recv);
         }
     }
-    const arg_mut = Modes.argMask(&b.in, node_idx);
+    const arg_mut = Modes.argMask(b.in.bodyView(), b.in.programView(), node_idx);
     for (arg_nodes, 0..) |arg, i| {
         if (Modes.isMut(arg_mut, i)) {
             // A `mut` param takes the argument's place ADDRESS, like a `mut self` receiver.
@@ -2860,7 +2866,7 @@ fn boundMethodRef(b: *const Builder, node_idx: Ast.Index) ?u32 {
 fn lowerBoundValue(b: *Builder, node_idx: Ast.Index, mi: u32, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
     const n = b.in.tree.nodes[(node_idx).int()];
     const recv_local = Closure.boundRecvLocal(b.in.tree, b.in.resolutions, node_idx);
-    const kind = Closure.boundKind(recv_local, b.in.closure.boxed, b.owner_places);
+    const kind = Closure.boundKind(recv_local, b.in.closure.boxed, b.in.closure.owner_modes);
     const ai = Closure.findAdapter(b.in.closure.adapters, kind, mi) orelse {
         try b.note(n.main_token, "bound method has no adapter in lower");
         return .none;
@@ -4211,7 +4217,7 @@ fn noteMutArgRoots(b: *Builder, body: Ast.Index) error{OutOfMemory}!void {
                 .callee => |c| c,
                 else => return,
             };
-            const mask = Modes.argMask(&v.b.in, c.call);
+            const mask = Modes.argMask(v.b.in.bodyView(), v.b.in.programView(), c.call);
             if (mask == 0) return;
             const args = Ast.rangeSlice(v.b.in.tree, v.b.in.tree.nodes[c.call.int()].rhs.int());
             for (args, 0..) |a, i| if (Modes.isMut(mask, i)) if (placeRootLocal(v.b, a)) |li|
@@ -7514,11 +7520,8 @@ test "Escape.callTarget names the unit lowerCall calls" {
     defer fe.deinit(gpa);
     const rr = fe.resolve;
     const tc = fe.typecheck;
-    const view: Typecheck.EscapeView = .{ .tree = t, .resolutions = rr.resolutions[0], .node_types = tc.node_types[0], .callees = tc.callees[0], .sigs = tc.sigs, .instances = tc.instances, .methods = tc.methods, .layouts = tc.layouts };
-    const is_base = try gpa.alloc(bool, rr.fns.len);
-    defer gpa.free(is_base);
-    for (rr.fns, is_base, 0..) |f, *b, i| b.* = f.decl_node != Ast.none and f.kind == .user_fn and !tc.sigs[i].isGenericTemplate();
-    const units: Escape.Units = .{ .is_base = is_base };
+    const body: Body.BodyView = .{ .tree = t, .resolutions = rr.resolutions[0], .node_types = tc.node_types[0], .callees = tc.callees[0] };
+    const prog: Body.ProgramView = .{ .sigs = tc.sigs, .methods = tc.methods, .instances = tc.instances, .layouts = tc.layouts };
 
     var got: std.ArrayList(u8) = .empty;
     defer got.deinit(gpa);
@@ -7528,8 +7531,8 @@ test "Escape.callTarget names the unit lowerCall calls" {
             if (LayoutEngine.isFnStruct(tc.node_types[0][a.int()], tc.layouts)) break true;
         } else false;
         if (!passes_fn) continue;
-        const target = (try Escape.callTarget(gpa, &view, units, Ast.Index.from(@intCast(k)))) orelse return error.TestExpectedTarget;
-        const sym = if (target.unit < rr.fns.len) rr.fns[target.unit].name else tc.instances[target.unit - rr.fns.len].name.?;
+        const target = (try Escape.callTarget(gpa, body, prog, tc.bodies, Ast.Index.from(@intCast(k)))) orelse return error.TestExpectedTarget;
+        const sym = tc.bodies.items[target.unit].sig.name;
         var buf: [128]u8 = undefined;
         const call = try std.fmt.bufPrint(&buf, "call @{s}(", .{sym});
         if (std.mem.indexOf(u8, ir, call) == null) {

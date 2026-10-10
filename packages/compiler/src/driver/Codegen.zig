@@ -28,6 +28,7 @@ const Link = @import("../link/Link.zig");
 const link = @import("../link/emit.zig");
 const Abi = @import("../codegen/abi/Abi.zig");
 const Derive = @import("../symbols/Derive.zig");
+const Body = @import("../symbols/Body.zig");
 
 /// The mangled name of the erased `(ty, kind)` witness in `tc.erased_units` — a linear
 /// scan matching `(Type.eql, kind)`. Borrowed (the plan holds it by reference); `null`
@@ -189,18 +190,16 @@ fn linkAndTail(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, names: []cons
 }
 
 /// One lowered unit, by class and its index in that class's table. Its position in the
-/// plan is its codegen slot, its link order and its `--emit ir` order.
+/// plan is its codegen slot, its link order and its `--emit ir` order; a body's unit is
+/// the body's own index, so the bodies lead the plan.
 const Unit = union(enum) {
-    /// A non-generic fn with a body, by global fn id. A generic template is lowered only
-    /// through its instances, so an uncalled generic fn makes no unit.
-    base: u32,
-    /// A monomorphized instance, in canonical order.
-    instance: u32,
+    /// A body written in source (`Body`): a non-generic fn, or a monomorphized instance.
+    body: Body.Index,
     /// A source-less auto-derive recipe.
     derive: u32,
     /// An erased hash/eq/trace witness.
     erased: u32,
-    /// A lambda or local fn of a lowered owner, in `(owner, node)` order.
+    /// A lambda or local fn of a body, in `(owner, node)` order.
     lambda: u32,
     /// A fn-value thunk, in `(kind, key)` order.
     adapter: u32,
@@ -227,8 +226,8 @@ const Plan = struct {
     units: []Unit,
     /// Owned.
     specs: Spec.Table,
-    /// Per base and instance unit, its closure facts; empty (no entries) when the program
-    /// has no lambda unit and no boxed local. Owned.
+    /// Per body, its closure facts; empty (no entries) when the program has no lambda unit
+    /// and no boxed local. Owned.
     closure_facts: []const []const u8,
     /// The unit of the entry `main`: the bare `main` with a body in the entry module.
     entry: ?u32,
@@ -241,18 +240,17 @@ const Plan = struct {
         const names = try buildGraphNames(gpa, res.fns, tc.sigs);
         errdefer freeNames(gpa, names);
 
+        const bodies = tc.bodies.items;
         var units: std.ArrayList(Unit) = .empty;
         errdefer units.deinit(gpa);
-        var bases: std.ArrayList(Spec.Source.Base) = .empty;
-        defer bases.deinit(gpa);
         var entry: ?u32 = null;
-        for (res.fns, 0..) |f, gid| {
-            if (!lowerableBase(graph, f)) continue;
-            if (f.module == graph.entry_index and std.mem.eql(u8, f.name, "main")) entry = @intCast(units.items.len);
-            try units.append(gpa, .{ .base = @intCast(gid) });
-            try bases.append(gpa, .{ .gid = @intCast(gid), .mod = f.module, .decl = f.decl_node });
+        for (bodies, 0..) |b, i| {
+            if (b.of == .base) {
+                const f = res.fns[b.of.base];
+                if (f.module == graph.entry_index and std.mem.eql(u8, f.name, "main")) entry = @intCast(i);
+            }
+            try units.append(gpa, .{ .body = @intCast(i) });
         }
-        for (0..tc.instances.len) |k| try units.append(gpa, .{ .instance = @intCast(k) });
         for (0..tc.derives.len) |k| try units.append(gpa, .{ .derive = @intCast(k) });
         for (0..tc.erased_units.len) |k| try units.append(gpa, .{ .erased = @intCast(k) });
         for (0..tc.lambda_units.len) |k| try units.append(gpa, .{ .lambda = @intCast(k) });
@@ -261,20 +259,15 @@ const Plan = struct {
         const specs = if (o.specialize) try Spec.build(gpa, .{
             .modules = modules,
             .resolutions = res.resolutions,
-            .node_types = tc.node_types,
-            .callees = tc.callees,
             .closures = res.closures,
-            .names = names,
-            .sigs = tc.sigs,
-            .instances = tc.instances,
-            .methods = tc.methods,
+            .bodies = tc.bodies,
+            .prog = .{ .sigs = tc.sigs, .methods = tc.methods, .instances = tc.instances, .names = names, .layouts = tc.layouts },
             .lambda_units = tc.lambda_units,
-            .bases = bases.items,
         }) else Spec.Table{};
         errdefer specs.deinit(gpa);
         for (0..specs.units.len) |k| try units.append(gpa, .{ .spec = @intCast(k) });
 
-        const closure_facts = try buildClosureFacts(gpa, tc.lambda_units, tc.owner_closures, bases.items, tc.instances.len, o.frame);
+        const closure_facts = try buildClosureFacts(gpa, tc.lambda_units, tc.owner_closures, bodies.len, o.frame);
         errdefer freeClosureFacts(gpa, closure_facts);
         return .{
             .graph = graph,
@@ -299,15 +292,14 @@ const Plan = struct {
         p.* = undefined;
     }
 
-    /// The body whose tables unit `u` reads: its own, or for a lambda unit its owner's and
-    /// for a spec unit its instance's. Null for a source-less unit, whose emitter is
+    /// The body whose tables unit `u` reads: its own, or for a lambda unit its owner and
+    /// for a spec unit its instance. Null for a source-less unit, whose emitter is
     /// table-driven.
     fn ownerOf(p: *const Plan, u: Unit) ?Closure.Owner {
         return switch (u) {
-            .base => |gid| .{ .base = gid },
-            .instance => |k| .{ .instance = k },
+            .body => |i| i,
             .lambda => |k| p.tc.lambda_units[k].owner,
-            .spec => |k| .{ .instance = p.specs.units[k].inst },
+            .spec => |k| p.tc.bodies.ofInstance(p.specs.units[k].inst),
             .derive, .erased, .adapter => null,
         };
     }
@@ -316,68 +308,60 @@ const Plan = struct {
     fn moduleOf(p: *const Plan, u: Unit) u32 {
         const tc = p.tc;
         return switch (u) {
-            .base => |gid| p.res.fns[gid].module,
-            .instance => |k| tc.instances[k].mod,
+            .body, .lambda, .spec => tc.bodies.items[p.ownerOf(u).?].mod,
             .derive => |k| tc.derives[k].mod,
             .erased => |k| tc.erased_units[k].mod,
-            .lambda => |k| tc.lambda_units[k].mod,
             // An adapter reads no AST; module 0 only gives its view a tree to carry.
             .adapter => 0,
-            .spec => |k| tc.instances[p.specs.units[k].inst].mod,
         };
     }
 
     /// The declaration a diagnostic with no position of its own blames: the fn a body is
     /// written in (a lambda unit's owner), none for a source-less unit.
     fn declOf(p: *const Plan, u: Unit) Ast.Index {
-        const tc = p.tc;
-        return switch (u) {
-            .base => |gid| p.res.fns[gid].decl_node,
-            .instance => |k| tc.instances[k].decl_node,
-            .lambda => |k| tc.lambda_units[k].fn_node,
-            .spec => |k| tc.instances[p.specs.units[k].inst].decl_node,
-            .derive, .erased, .adapter => Ast.none,
-        };
+        const o = p.ownerOf(u) orelse return Ast.none;
+        return p.tc.bodies.items[o].decl;
     }
 
     /// The symbol unit `u` is emitted and linked under. Borrowed from the plan's tables.
     fn symOf(p: *const Plan, u: Unit) Link.SymName {
         const tc = p.tc;
-        return switch (u) {
-            .base => |gid| p.names[gid],
-            .instance => |k| .{ .kind = .user_fn, .name = tc.instances[k].name.? },
-            .derive => |k| .{ .kind = .user_fn, .name = tc.derives[k].name.? },
-            .erased => |k| .{ .kind = .user_fn, .name = tc.erased_units[k].name.? },
-            .lambda => |k| .{ .kind = .user_fn, .name = tc.lambda_units[k].name },
-            .adapter => |k| .{ .kind = .user_fn, .name = tc.adapters[k].name },
-            .spec => |k| .{ .kind = .user_fn, .name = p.specs.units[k].name },
-        };
+        return .{ .kind = .user_fn, .name = switch (u) {
+            .body => |i| tc.bodies.items[i].sig.name,
+            .derive => |k| tc.derives[k].name.?,
+            .erased => |k| tc.erased_units[k].name.?,
+            .lambda => |k| tc.lambda_units[k].name,
+            .adapter => |k| tc.adapters[k].name,
+            .spec => |k| p.specs.units[k].name,
+        } };
     }
 
-    /// The single-unit view job `i` lowers against: its owning module's arrays and the
-    /// program-wide tables. An instance reads its OWN `node_types`, so two instances of one
-    /// template never alias.
+    /// The single-unit view job `i` lowers against: its owner body's tables (an instance's
+    /// OWN `node_types`, so two instances of one template never alias) and the program-wide
+    /// ones.
     fn frozenFor(p: *const Plan, i: usize) Engine.Frozen {
         const tc = p.tc;
         const u = p.units[i];
         const mod = p.moduleOf(u);
         const owner = p.ownerOf(u);
-        const inst: ?*const Mono.Instance = if (owner) |o| switch (o) {
-            .instance => |k| &tc.instances[k],
-            .base => null,
-        } else null;
+        const ob: ?*const Body = if (owner) |o| &tc.bodies.items[o] else null;
         const sym = p.symOf(u);
+        const inst: ?*const Mono.Instance = if (u == .body and ob.?.of == .instance) &tc.instances[ob.?.of.instance] else null;
         const body: Engine.Body = switch (u) {
-            .base => |gid| .{ .source = .{ .decl = p.res.fns[gid].decl_node, .is_entry = p.entry == @as(?u32, @intCast(i)) } },
-            .instance, .spec => .{ .source = .{ .decl = inst.?.decl_node, .cached = u == .instance } },
+            .body => .{ .source = .{ .decl = ob.?.decl, .is_entry = p.entry == @as(?u32, @intCast(i)) } },
+            .spec => .{ .source = .{ .decl = ob.?.decl, .cached = false } },
             .lambda => |k| .{ .lambda = k },
             .derive => |k| .{ .derive = &tc.derives[k] },
             .erased => |k| .{ .erased = &tc.erased_units[k] },
             .adapter => |k| .{ .adapter = &tc.adapters[k] },
         };
         const sig: ?Fingerprint.Sig = switch (u) {
-            .base => |gid| tc.sigs[gid],
-            .instance, .spec => .{ .kind = .user_fn, .name = sym.name, .params = inst.?.params, .ret = inst.?.ret },
+            .body => ob.?.sig,
+            .spec => blk: {
+                var s = ob.?.sig;
+                s.name = sym.name;
+                break :blk s;
+            },
             .derive, .erased, .lambda, .adapter => null,
         };
         const src = p.modules[mod];
@@ -387,8 +371,8 @@ const Plan = struct {
                 .tokens = src.tokens,
                 .source = src.source,
                 .resolutions = p.res.resolutions[mod],
-                .node_types = if (inst) |x| x.node_types else if (owner != null) tc.node_types[mod] else &.{},
-                .callees = if (inst) |x| x.callees else if (owner != null) tc.callees[mod] else &.{},
+                .node_types = if (ob) |b| b.node_types else &.{},
+                .callees = if (ob) |b| b.callees else &.{},
                 .layouts = tc.layouts,
                 .enum_layouts = tc.enum_layouts,
                 .names = p.names,
@@ -407,9 +391,9 @@ const Plan = struct {
             .body = body,
             .sym = sym,
             .opt = p.o.opt,
-            .type_args = if (u == .instance) inst.?.args else &.{},
-            .conformances = if (u == .instance) inst.?.conformances else &.{},
-            .closure_facts = if (i < p.closure_facts.len) p.closure_facts[i] else &.{},
+            .type_args = if (inst) |x| x.args else &.{},
+            .conformances = if (inst) |x| x.conformances else &.{},
+            .closure_facts = if (u == .body and i < p.closure_facts.len) p.closure_facts[i] else &.{},
         };
     }
 
@@ -420,6 +404,7 @@ const Plan = struct {
             .adapters = p.tc.adapters,
             .lambda_units = p.tc.lambda_units,
             .owner = owner,
+            .owner_modes = p.tc.bodies.items[owner].sig.mut_mask,
             .boxed = st.boxed,
             .unboxed = st.unboxed,
             .frame_envs = p.o.frame,
@@ -443,43 +428,33 @@ fn frameStorage(opt: Opt.Config) bool {
     return opt.any();
 }
 
-/// Each base and instance unit's closure facts, indexed like the plan's first units: its
-/// storage under `frame` (as `closureFor` hands it to the lowering) and its own lambda
-/// units (a contiguous run of the `(owner, node)`-sorted table) laid out by
-/// `Closure.ownerFacts`. Serial, once per owner. Empty when there is no lambda unit and no
-/// boxed local.
+/// Each body's closure facts, indexed like the body list: its storage under `frame` (as
+/// `closureFor` hands it to the lowering) and its own lambda units (a contiguous run of the
+/// `(owner, node)`-sorted table) laid out by `Closure.ownerFacts`. Serial, once per owner.
+/// Empty when there is no lambda unit and no boxed local.
 fn buildClosureFacts(
     gpa: std.mem.Allocator,
     units: []const Closure.LambdaUnit,
     owner_closures: []const Closure.OwnerClosure,
-    bases: []const Spec.Source.Base,
-    n_instances: usize,
+    n_bodies: usize,
     frame: bool,
 ) ![]const []const u8 {
     if (units.len == 0 and owner_closures.len == 0) return &.{};
-    const facts = try gpa.alloc([]const u8, bases.len + n_instances);
+    const facts = try gpa.alloc([]const u8, n_bodies);
     @memset(facts, &.{});
     errdefer freeClosureFacts(gpa, facts);
     // Every owner with a unit or a box, each once: both tables are sorted by owner.
     var i: usize = 0;
     var oi: usize = 0;
     while (i < units.len or oi < owner_closures.len) {
-        const owner = if (oi == owner_closures.len or (i < units.len and !Closure.ownerLess(owner_closures[oi].owner, units[i].owner)))
+        const owner = if (oi == owner_closures.len or (i < units.len and units[i].owner <= owner_closures[oi].owner))
             units[i].owner
         else
             owner_closures[oi].owner;
         var j = i;
-        while (j < units.len and std.meta.eql(units[j].owner, owner)) j += 1;
-        if (oi < owner_closures.len and std.meta.eql(owner_closures[oi].owner, owner)) oi += 1;
-        const at: ?usize = switch (owner) {
-            .base => |gid| std.sort.binarySearch(Spec.Source.Base, bases, gid, struct {
-                fn order(key: u32, x: Spec.Source.Base) std.math.Order {
-                    return std.math.order(key, x.gid);
-                }
-            }.order),
-            .instance => |k| bases.len + k,
-        };
-        if (at) |ui| facts[ui] = try Closure.ownerFacts(gpa, units[i..j], Closure.ownerStorage(owner_closures, owner, frame), frame);
+        while (j < units.len and units[j].owner == owner) j += 1;
+        if (oi < owner_closures.len and owner_closures[oi].owner == owner) oi += 1;
+        facts[owner] = try Closure.ownerFacts(gpa, units[i..j], Closure.ownerStorage(owner_closures, owner, frame), frame);
         i = j;
     }
     return facts;
@@ -531,7 +506,7 @@ pub fn lowerGraphProgram(
     // Parameters on main are unsupported (codegen also guards; cleaner up front).
     {
         const em = &graph.modules[graph.entry_index];
-        const main_gid = plan.units[entry].base;
+        const main_gid = tc.bodies.items[plan.units[entry].body].of.base;
         const main_decl = em.nodes[res.fns[main_gid].decl_node.int()];
         const main_proto = Ast.protoAt(em.tree(), main_decl.lhs.int());
         if (main_proto.params.len > 0) return .{ .err = .{
@@ -630,18 +605,6 @@ pub fn lowerGraphProgram(
 
 fn nowNs(io: Io) i128 {
     return Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
-}
-
-/// Whether global fn `f` is lowered as a base unit: a fn with a body. A synthetic builtin
-/// has no body, an `extern` is referenced only via `names[gid]`, and a generic TEMPLATE's
-/// params/ret are `type_var`s with no ABI, so it is lowered only through its instances (an
-/// uncalled generic fn emits ZERO codegen units).
-fn lowerableBase(graph: *const Graph.Graph, f: ResolveGraph.GlobalFn) bool {
-    if (f.decl_node == Ast.none) return false;
-    if (f.kind == .import) return false;
-    const gm = &graph.modules[f.module];
-    const gdecl = gm.nodes[f.decl_node.int()];
-    return Ast.protoAt(gm.tree(), gdecl.lhs.int()).generic_params.len == 0;
 }
 
 /// One codegen job: unit `i`'s view through `Engine.codegen`'s fingerprint → cache →
@@ -807,10 +770,10 @@ test "the plan lists every unit class in canonical order, each under its own sym
     defer plan.deinit(gpa);
 
     const want = [_]struct { std.meta.Tag(Unit), []const u8 }{
-        .{ .base, "main.add" },
-        .{ .base, "main" },
-        .{ .instance, "main.apply$int" },
-        .{ .instance, "main.keep$int" },
+        .{ .body, "main.add" },
+        .{ .body, "main" },
+        .{ .body, "main.apply$int" },
+        .{ .body, "main.keep$int" },
         .{ .derive, "Eq$eq$s0" },
         .{ .lambda, "main$l0" },
         .{ .adapter, "main.add$fnval" },
@@ -822,6 +785,12 @@ test "the plan lists every unit class in canonical order, each under its own sym
         try testing.expectEqualStrings(w[1], plan.symOf(u).name);
     }
     try testing.expectEqual(@as(?u32, 1), plan.entry);
+    // The bodies lead the plan: a body's unit is its index in the body list.
+    try testing.expectEqual(@as(usize, 4), ck.tc.bodies.items.len);
+    for (ck.tc.bodies.items, 0..) |b, i| {
+        try testing.expectEqual(@as(Body.Index, @intCast(i)), plan.units[i].body);
+        try testing.expectEqualStrings(b.sig.name, plan.symOf(plan.units[i]).name);
+    }
 }
 
 test "--emit ir renders exactly the plan's units, in plan order" {
@@ -855,19 +824,23 @@ test "each unit reads its owner's tables: an instance its own, a lambda its owne
     for (plan.units, 0..) |u, i| {
         const fr = plan.frozenFor(i);
         switch (u) {
-            .base => |gid| {
-                try testing.expectEqual(tc.node_types[0].ptr, fr.in.node_types.ptr);
+            .body => |bi| {
+                try testing.expectEqual(@as(?Closure.Owner, bi), fr.in.closure.owner);
                 try testing.expect(fr.body.source.cached);
-                try testing.expectEqual(tc.sigs[gid].mut_mask, fr.in.sig.?.mut_mask);
-            },
-            .instance => |k| {
-                try testing.expectEqual(tc.instances[k].node_types.ptr, fr.in.node_types.ptr);
-                try testing.expectEqual(tc.instances[k].args.ptr, fr.type_args.ptr);
-                try testing.expect(fr.body.source.cached);
+                switch (tc.bodies.items[bi].of) {
+                    .base => |gid| {
+                        try testing.expectEqual(tc.node_types[0].ptr, fr.in.node_types.ptr);
+                        try testing.expectEqual(tc.sigs[gid].mut_mask, fr.in.sig.?.mut_mask);
+                    },
+                    .instance => |k| {
+                        try testing.expectEqual(tc.instances[k].node_types.ptr, fr.in.node_types.ptr);
+                        try testing.expectEqual(tc.instances[k].args.ptr, fr.type_args.ptr);
+                    },
+                }
             },
             .lambda => |k| {
                 try testing.expectEqual(tc.node_types[0].ptr, fr.in.node_types.ptr);
-                try testing.expect(std.meta.eql(tc.lambda_units[k].owner, fr.in.closure.owner.?));
+                try testing.expectEqual(tc.lambda_units[k].owner, fr.in.closure.owner.?);
                 try testing.expect(fr.in.closure.frame_envs);
             },
             .spec => |k| {

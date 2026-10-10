@@ -764,10 +764,7 @@ fn lambdaTables(gpa: std.mem.Allocator, g: *const Graph.Graph, tr: *const GraphR
 /// offset) and frame env.
 fn ownerClosures(gpa: std.mem.Allocator, tr: *const GraphResult, out: *std.ArrayList(u8)) !void {
     for (tr.owner_closures) |oc| {
-        switch (oc.owner) {
-            .base => |gid| try out.print(gpa, "b{d}:", .{gid}),
-            .instance => |k| try out.print(gpa, "i{s}:", .{tr.instances[k].name.?}),
-        }
+        try out.print(gpa, "{s}:", .{tr.bodies.items[oc.owner].sig.name});
         for (oc.boxed) |sl| try out.print(gpa, "{d},", .{sl});
         try out.appendSlice(gpa, "u");
         for (oc.unboxable) |sl| try out.print(gpa, "{d},", .{sl});
@@ -828,7 +825,7 @@ test "callee tables are byte-identical at -j1 and -jN" {
             try testing.expect(tags.get(.method) > 0);
             try testing.expect(tags.get(.builtin) > 0);
             try testing.expect(tags.get(.protocol) > 0);
-            try testing.expectEqual(@as(usize, 0), tags.get(.pending));
+            try testing.expectEqual(@as(usize, 0), tags.get(.pending_method) + tags.get(.pending_bound) + tags.get(.pending_call));
         }
     }.project);
 }
@@ -861,7 +858,7 @@ test "callee tables with own-generic instances are byte-identical at -j1 and -jN
             // Every member call seals to a row: three `pick`s per body over three instances,
             // and 8 in `_vecs` (no instance body makes a method call).
             try testing.expectEqual(@as(usize, racers * 3 + 8), tags.get(.method));
-            try testing.expectEqual(@as(usize, 0), tags.get(.pending));
+            try testing.expectEqual(@as(usize, 0), tags.get(.pending_method) + tags.get(.pending_bound) + tags.get(.pending_call));
         }
     }.project);
 }
@@ -1066,7 +1063,7 @@ test "owner_closures are identical at -j1 and -jN" {
             try ownerClosures(gpa, tr, out);
             // Every `_u` body, plus the `keep` instances (int and each S{k}).
             try testing.expectEqual(@as(usize, racers + racers + 1), tr.owner_closures.len);
-            for (tr.owner_closures) |oc| switch (oc.owner) {
+            for (tr.owner_closures) |oc| switch (tr.bodies.items[oc.owner].of) {
                 // A `_u` body boxes `total`, `s`, `c` and the for-in `x`, and only `x` is
                 // captured by a closure that escapes (pushed).
                 .base => {

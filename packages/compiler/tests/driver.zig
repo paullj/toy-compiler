@@ -4576,12 +4576,8 @@ test "cross-serializer parity: every int-aware identity serializer folds int_des
         Type.uint32, Type.uint64,
     };
 
-    // appendTouched only reads `frozen` on the struct/enum branches; an int never reaches
-    // them, so empty layout tables are a sound throwaway.
-    const throwaway: struct {
-        layouts: []const Typecheck.Layout = &.{},
-        enum_layouts: []const Typecheck.EnumLayout = &.{},
-    } = .{};
+    // appendTouched reads the layout tables only on the struct/enum branches; an int never
+    // reaches them, so empty tables are sound.
 
     for (ints, 0..) |a, i| {
         for (ints, 0..) |b, j| {
@@ -4613,8 +4609,8 @@ test "cross-serializer parity: every int-aware identity serializer folds int_des
             defer ta.deinit(gpa);
             var tb: std.ArrayList(Fingerprint.TouchedType) = .empty;
             defer tb.deinit(gpa);
-            try AstWalk.appendTouched(gpa, &throwaway, a, &ta);
-            try AstWalk.appendTouched(gpa, &throwaway, b, &tb);
+            try AstWalk.appendTouched(gpa, &.{}, &.{}, a, &ta);
+            try AstWalk.appendTouched(gpa, &.{}, &.{}, b, &tb);
             const touched_same = ta.items[0].kind == tb.items[0].kind and
                 ta.items[0].int_desc == tb.items[0].int_desc;
             try testing.expectEqual(same, touched_same);

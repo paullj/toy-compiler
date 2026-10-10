@@ -652,7 +652,7 @@ fn deriveKey(gpa: std.mem.Allocator, target: []const u8, fr: *const Frozen, d: *
         AstWalk.freeTouched(gpa, conform_list.items);
         conform_list.deinit(gpa);
     }
-    try AstWalk.appendTouched(gpa, &fr.in, d.conform_ty, &conform_list);
+    try AstWalk.appendTouched(gpa, fr.in.layouts, fr.in.enum_layouts, d.conform_ty, &conform_list);
     const conform: Fingerprint.TouchedType = if (conform_list.items.len > 0) conform_list.items[0] else .{ .kind = d.conform_ty.kind };
     const fp = Fingerprint.deriveFingerprint(d.protocol_name, d.kind, conform, d.field_witnesses);
     return Key.codegen(target, fp, fr.opt, fr.sym);
