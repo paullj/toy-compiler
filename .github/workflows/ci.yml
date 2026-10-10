@@ -31,10 +31,35 @@ jobs:
           path: .zig-cache
           key: zig-cache-test-${{ runner.os }}-${{ hashFiles('build.zig', 'build.zig.zon', 'packages/**/*.zig', 'packages/lib/**/*.toy') }}
           restore-keys: zig-cache-test-${{ runner.os }}-
-      # Unit, cli, lsp and integration suites; integration includes the tests/corpora
-      # harness and the tree-sitter grammar agreement test.
+      # Unit, cli, lsp, integration and corpus suites. The integration tests drive the toy
+      # this step builds and installs; the corpus harness builds every tests/corpora fixture
+      # in --verify mode, so it is also the determinism gate.
       - name: Tests
         run: zig build test --summary all
+
+  gates:
+    name: Cache and opt gates (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # TODO: add ubuntu-latest and windows-latest once the backend targets Linux/Windows.
+        os: [macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: jdx/mise-action@v4
+      - uses: actions/cache@v6
+        with:
+          path: .zig-cache
+          key: zig-cache-gates-${{ runner.os }}-${{ hashFiles('build.zig', 'build.zig.zon', 'packages/**/*.zig', 'packages/lib/**/*.toy') }}
+          restore-keys: zig-cache-gates-${{ runner.os }}-
+      # Edit scenarios across separate toy runs sharing one on-disk cache: a warm rebuild
+      # must match a cold build's __text and recompile less than a full build.
+      - name: Incremental cache soundness
+        run: bash tests/corpora/language-features/incremental.sh
+      # -O0 against -O1 over the corpus (exit code and stdout), and each opt pass's win.
+      - name: Opt-level differential
+        run: bash tests/corpora/benchmark/opt-check.sh
 
   fuzz:
     name: Bounded fuzz (${{ matrix.os }})
@@ -126,7 +151,7 @@ jobs:
   pages:
     name: Deploy docs site
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    needs: [test, fuzz, lint, site]
+    needs: [test, gates, fuzz, lint, site]
     runs-on: ubuntu-latest
     permissions:
       actions: read

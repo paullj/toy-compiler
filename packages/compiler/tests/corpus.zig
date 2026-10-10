@@ -26,7 +26,10 @@
 //!   in-process path the real `toy build` uses (`Graph.discover` -> `resolveGraph`
 //!   -> `checkGraph` -> `lowerGraphProgram` -> `buildImage`), so it follows imports
 //!   and multi-file module graphs. Codegen+exec is gated on macOS/aarch64; off that
-//!   target a clean front-end counts as covered but does not run the binary.
+//!   target a clean front-end counts as covered but does not run the binary. It lowers
+//!   in `--verify` mode: each unit twice on a cache miss, or against its cached blob on
+//!   a hit, so a nondeterministic or unsound unit fails its fixture. That makes this
+//!   harness the determinism gate the retired `diff.sh` was.
 //!
 //! Each corpus states its exact fixture `count`, so a moved, renamed or removed
 //! fixture (or a silently inert walk) fails the suite, and adding one means editing
@@ -43,6 +46,7 @@ const builtin = @import("builtin");
 const Io = std.Io;
 const toyc = @import("toy_compiler");
 
+const Driver = toyc.Driver;
 const Graph = toyc.Graph;
 const ResolveGraph = toyc.ResolveGraph;
 const TypecheckGraph = toyc.TypecheckGraph;
@@ -130,7 +134,7 @@ fn collectDiags(
     cache: Cache,
     path: []const u8,
 ) !std.ArrayList(Emitted) {
-    var graph = try Graph.discover(gpa, io, cache, "native", path, .{});
+    var graph = try Graph.discover(gpa, io, cache, Driver.default_target, path, .{});
     defer graph.deinit(gpa);
     const entry = graph.entry();
 
@@ -525,7 +529,7 @@ fn compileAndRun(
     entry: []const u8,
     out_name: []const u8,
 ) !RunResult {
-    var graph = try Graph.discover(gpa, io, cache, "aarch64-macos", entry, .{});
+    var graph = try Graph.discover(gpa, io, cache, Driver.default_target, entry, .{});
     defer graph.deinit(gpa);
     if (graph.err) |err| {
         try checkGraphSpans(gpa, &graph, err.parse_diags);
@@ -546,7 +550,7 @@ fn compileAndRun(
 
     if (!can_exec) return .skipped_exec;
 
-    var lowered = try DriverCodegen.lowerGraphProgram(gpa, io, cache, "aarch64-macos", &graph, &res, &tc, .normal, .O0, true, null, null, 0);
+    var lowered = try DriverCodegen.lowerGraphProgram(gpa, io, cache, Driver.default_target, &graph, &res, &tc, .verify, .O0, true, null, null, 0);
     const lp = switch (lowered) {
         .ok => |*ok| ok,
         // A codegen `EmitError` after a clean typecheck is a real back-end failure,

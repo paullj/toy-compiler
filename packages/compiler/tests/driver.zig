@@ -88,19 +88,19 @@ test "cold then warm parse: 2nd run hits cache and renders identically" {
 
     // Ensure a genuinely cold start: drop any prior parse entry for this source.
     {
-        const key = Cache.Key.fromSource(.parse, "native", src);
+        const key = Cache.Key.fromSource(.parse, Driver.default_target, src);
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
         const epath = std.fmt.bufPrint(&pbuf, "{s}/{x:0>16}", .{ dir, key.digest() }) catch unreachable;
         Io.Dir.cwd().deleteFile(io, epath) catch {};
     }
 
     var first: FileResult = .{ .path = path };
-    try pipeline(gpa, io, cache, .parse, "native", &first, 0);
+    try pipeline(gpa, io, cache, .parse, Driver.default_target, &first, 0);
     defer first.deinit(gpa);
     try testing.expect(!first.nodes_cached);
 
     var second: FileResult = .{ .path = path };
-    try pipeline(gpa, io, cache, .parse, "native", &second, 1);
+    try pipeline(gpa, io, cache, .parse, Driver.default_target, &second, 1);
     defer second.deinit(gpa);
     try testing.expect(second.nodes_cached);
 
@@ -135,7 +135,7 @@ test "emit=check on a clean program resolves with no diagnostics" {
     const cache = try Cache.init(io, dir);
 
     var r: FileResult = .{ .path = path };
-    try pipeline(gpa, io, cache, .check, "native", &r, 0);
+    try pipeline(gpa, io, cache, .check, Driver.default_target, &r, 0);
     defer r.deinit(gpa);
 
     try testing.expect(r.checked);
@@ -165,7 +165,7 @@ test "emit=check on a bad program reports a resolve error" {
     const cache = try Cache.init(io, dir);
 
     var r: FileResult = .{ .path = path };
-    try pipeline(gpa, io, cache, .check, "native", &r, 0);
+    try pipeline(gpa, io, cache, .check, Driver.default_target, &r, 0);
     defer r.deinit(gpa);
 
     try testing.expect(r.checked);
@@ -209,7 +209,7 @@ test "a many-error file collects the FULL uncapped diagnostic set (render cap is
     const cache = try Cache.init(io, dir);
 
     var r: FileResult = .{ .path = path };
-    try pipeline(gpa, io, cache, .check, "native", &r, 0);
+    try pipeline(gpa, io, cache, .check, Driver.default_target, &r, 0);
     defer r.deinit(gpa);
 
     try testing.expectEqual(@as(?anyerror, error.ResolveError), r.err);
@@ -4644,7 +4644,7 @@ fn checkWithBlankedMethods(gpa: std.mem.Allocator, io: Io, comptime dir_name: []
 
     var r: FileResult = .{ .path = path };
     errdefer r.deinit(gpa);
-    try pipeline(gpa, io, cache, .check, "native", &r, 0);
+    try pipeline(gpa, io, cache, .check, Driver.default_target, &r, 0);
     try testing.expectEqual(@as(?anyerror, null), r.err);
     var k: usize = 0;
     for (r.typecheck.?.callees[0]) |*c| if (c.view() == .method) {
@@ -4672,7 +4672,7 @@ test "a lowering diagnostic reaches the build result with its text and span" {
     var ck = try checkWithBlankedMethods(gpa, io, dir_name, lower_diag_src, &blankAll);
     defer ck.r.deinit(gpa);
 
-    var out = try lowerSingleFile(gpa, io, ck.cache, "native", &ck.r, .force, .O0);
+    var out = try lowerSingleFile(gpa, io, ck.cache, Driver.default_target, &ck.r, .force, .O0);
     defer if (out == .ok) out.ok.deinit(gpa);
     try testing.expect(out == .err);
     try testing.expectEqualStrings("call target unsupported in lower", out.err.message);
@@ -4731,7 +4731,7 @@ test "the first failing unit in index order is reported at every -j" {
     var graph = try Graph.single(gpa, "main", ck.r.path, ck.r.source, ck.r.tokens, ck.r.nodes, ck.r.extra, ck.r.pub_bits);
     defer graph.deinit(gpa);
     for ([_]usize{ 1, 8 }) |ncpu| {
-        var out = try lowerGraphProgram(gpa, io, ck.cache, "native", &graph, &ck.r.resolve.?, &ck.r.typecheck.?, .force, .O0, true, null, null, ncpu);
+        var out = try lowerGraphProgram(gpa, io, ck.cache, Driver.default_target, &graph, &ck.r.resolve.?, &ck.r.typecheck.?, .force, .O0, true, null, null, ncpu);
         defer if (out == .ok) out.ok.deinit(gpa);
         try testing.expect(out == .err);
         const at = out.err.span.?.start;

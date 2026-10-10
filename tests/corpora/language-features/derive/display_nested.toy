@@ -1,7 +1,7 @@
 # Feature: structural `Display` recurses through NESTED aggregates. `Line`'s derived
 # `display` calls `Point`'s own derived `display` (a distinct source-less unit) for each of
 # its `Point` fields — two recipes, both source-less. This is also a multi-recipe
-# discovery-order case for the determinism gate (examples/diff.sh).
+# discovery-order case for the determinism gate (the corpus harness's --verify build).
 import std/io
 struct Point { x: int, y: int }
 struct Line { from: Point, to: Point }

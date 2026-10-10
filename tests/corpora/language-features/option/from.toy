@@ -7,7 +7,7 @@
 # matches its `.err` arm to exit 42. `same_err` exercises the IDENTITY case: a `?` on a
 # same-error-type `Result[int,BigErr]` needs NO `From` and stays a plain byte copy. Two
 # distinct Result instances (`Result[int,SmallErr]` + `Result[int,BigErr]`) plus their
-# discovery order make this a `-j1`==`-jN` determinism case (diff.sh).
+# discovery order make this a `-j1`==`-jN` determinism case.
 # expect: exit 42
 enum SmallErr { bad }
 

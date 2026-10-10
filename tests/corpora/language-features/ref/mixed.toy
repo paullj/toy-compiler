@@ -1,7 +1,7 @@
 # expect: exit 42
 # Determinism anchor: build BOTH `Ref[int]` AND `Ref[bool]` in one program. The two
 # managed-box instances reify to fresh struct ids in canonical (structural-key) order, so
-# the layout/codegen is byte-identical under -j1 and -j8 (see examples/diff.sh --verify).
+# the layout/codegen is byte-identical under -j1 and -j8.
 import std/ref
 
 fn main() -> int {
