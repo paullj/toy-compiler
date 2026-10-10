@@ -1,0 +1,10 @@
+# Feature: an associated fn of a non-generic struct or enum declared in another module,
+# called through the module, `shapes.Rect.square(3)`: 9 + 1 + 30.
+# expect: exit 40
+import shapes
+
+fn main() -> int {
+    r := shapes.Rect.square(3)
+    t := shapes.Turn.flip(shapes.Turn.Left)
+    return r.area() + t.sign() + shapes.Rect.square(5).w * 6
+}

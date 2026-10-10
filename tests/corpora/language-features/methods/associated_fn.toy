@@ -1,0 +1,52 @@
+# Feature: an associated fn (an `impl` fn without `self`) of a non-generic struct or enum is called on its type, `K.make(..)`, as `Box[int].new()` is on a generic one: with a lambda argument, a `mut` parameter, from inside the impl, through a pipe, beside a fn-typed field of the same name, and on an enum without a variant of that name
+# expect: stdout "5 11 102 6 -1 1 7 104 2"
+# expect: exit 0
+import std/io
+
+struct Counter { n: int, step: fn(int) -> int }
+
+impl Counter {
+    fn new(n: int) -> Counter { Counter { n: n, step: fn(x) { x + 1 } } }
+    fn with_step(n: int, step: fn(int) -> int) -> Counter { Counter { n: n, step: step } }
+    fn bump(self) -> Counter { Counter { n: self.step(self.n), step: self.step } }
+    fn ten() -> Counter { Counter.new(10).bump() }
+    fn add_into(mut total: int, c: Counter) { total = total + c.n }
+}
+
+struct Op { apply: fn(int) -> int }
+
+impl Op {
+    fn apply(x: int) -> int { x + 100 }
+}
+
+enum Dir { Up, Down }
+
+impl Dir {
+    fn default() -> Dir { Dir.Down }
+    fn parse(s: str) -> Dir { if s == "up" { Dir.Up } else { Dir.Down } }
+    fn sign(self) -> int { match self { .Up -> 1, .Down -> -1 } }
+}
+
+fn put(acc: str, n: int) -> str { acc.concat(" ").concat(n.to_string()) }
+
+fn main() -> int {
+    a := Counter.new(5)
+    b := Counter.with_step(1, fn(x) { x * 10 }).bump().bump()
+    total := 0
+    Counter.add_into(total, a)
+    Counter.add_into(total, Counter.new(1))
+    c := 7 |> Counter.new
+    op := Op { apply: fn(x) { x * 2 } }
+    f := op.apply
+    out := a.n.to_string()
+    out = put(out, Counter.ten().n)
+    out = put(out, b.n + 2)
+    out = put(out, total)
+    out = put(out, Dir.default().sign())
+    out = put(out, Dir.parse("up").sign())
+    out = put(out, c.n)
+    out = put(out, Op.apply(4))
+    out = put(out, f(1))
+    io.println(out)
+    return 0
+}

@@ -546,8 +546,8 @@ fn emitEndConnector(w: *std.Io.Writer, theme: Theme, opts: RenderOpts, gw: usize
 
 /// Emit one single-line marker row for `lbl` on `line`: `emptyPrefix` + ' ' + rail
 /// region (so the marker sits after the rail) + pad-to-column + styled glyph run +
-/// optional message. A one-cell/zero-width span draws a caret; a wider span an
-/// underline as wide as its display cells.
+/// optional message. A one-cell/zero-width primary draws a caret; any other label an
+/// underline as wide as its display cells (at least one).
 fn emitMarkerRow(
     w: *std.Io.Writer,
     theme: Theme,
@@ -570,10 +570,10 @@ fn emitMarkerRow(
     const start_dcol = startDisplayCol(sm, lbl, opts.tab_width);
     try w.splatByteAll(' ', start_dcol - 1);
 
-    // Glyph + style. Single caret for a zero-width point OR a one-cell run;
-    // otherwise an underline as wide as the span's display cells.
+    // A secondary keeps its dashes even one cell wide: a lone '^' under a one-letter name
+    // read as a second primary, and color is no help at `.none`.
     const run_cells = runCellsClamped(sm, lbl, line, opts.tab_width);
-    const use_caret = lbl.span.isZeroWidth() or run_cells <= 1;
+    const use_caret = lbl.kind == .primary and (lbl.span.isZeroWidth() or run_cells <= 1);
     const s = refStyle(theme, severity, lbl.kind);
 
     if (use_caret) {
@@ -1099,6 +1099,35 @@ test "T15 one-cell non-zero span renders a caret, not an underline" {
     try testing.expect(std.mem.indexOf(u8, out, "^^") == null);
 }
 
+test "T15b a one-cell or zero-width secondary renders a dash, not a caret" {
+    var sm = mapOver("o.toy", "ab = c\n");
+    defer sm.deinit(sm.gpa);
+    const secondary = [_]Diagnostic.Label{
+        .{ .kind = .secondary, .span = .{ .start = 0, .end = 1 }, .message = "one" },
+        .{ .kind = .secondary, .span = .{ .start = 3, .end = 3 }, .message = "point" },
+    };
+    const d = Diagnostic.Diagnostic{
+        .severity = .err,
+        .message = "m",
+        .primary = .{ .kind = .primary, .span = .{ .start = 5, .end = 6 }, .message = "p" },
+        .secondary = &secondary,
+    };
+    var buf: [256]u8 = undefined;
+    try testing.expectEqualStrings(
+        "error: m\n" ++
+            " --> o.toy:1:6\n" ++
+            "  |\n" ++
+            "1 | ab = c\n" ++
+            "  | - one\n" ++
+            "  |    - point\n" ++
+            "  |      ^ p\n",
+        renderInto(&buf, d, &sm, .{}),
+    );
+    var ubuf: [256]u8 = undefined;
+    const u = renderInto(&ubuf, d, &sm, .{ .unicode = true });
+    try testing.expect(std.mem.indexOf(u8, u, "| \u{2504} one\n") != null);
+}
+
 test "T16 unicode theme glyphs: underline '─', secondary '┄', note bullet '═'" {
     var sm = mapOver("u.toy", "abcd\n");
     defer sm.deinit(sm.gpa);
@@ -1349,7 +1378,7 @@ test "message rides the END connector, not the START" {
 test "single-line secondary on an interior line sits AFTER the rail_vertical" {
     // Multi-line primary {0,7} over "a\nb\nc\nd\n" opens the rail on lines 1..4.
     // A single-line secondary on line 2 ('b', byte 2, span {2,3}) must render its
-    // caret AFTER the open rail cell.
+    // marker AFTER the open rail cell.
     var sm = mapOver("mix.toy", "a\nb\nc\nd\n");
     defer sm.deinit(sm.gpa);
     const secondary = [_]Diagnostic.Label{
@@ -1362,9 +1391,9 @@ test "single-line secondary on an interior line sits AFTER the rail_vertical" {
         .secondary = &secondary,
     };
     var buf: [512]u8 = undefined;
-    // Line 2 source "2 | |b" then a marker row "  | |^ bee": the open rail '|'
-    // comes first, then 'b' at content display col 1 (pad 0), so the caret sits
-    // directly after the rail cell. The secondary marker uses '^' (1-cell).
+    // Line 2 source "2 | |b" then a marker row "  | |- bee": the open rail '|'
+    // comes first, then 'b' at content display col 1 (pad 0), so the marker sits
+    // directly after the rail cell. The one-cell secondary marker is a dash.
     try testing.expectEqualStrings(
         "error: mixed\n" ++
             " --> mix.toy:1:1\n" ++
@@ -1372,7 +1401,7 @@ test "single-line secondary on an interior line sits AFTER the rail_vertical" {
             "1 |  a\n" ++
             "  | /^\n" ++
             "2 | |b\n" ++
-            "  | |^ bee\n" ++
+            "  | |- bee\n" ++
             "3 | |c\n" ++
             "4 | |d\n" ++
             "  | \\-^ span\n",

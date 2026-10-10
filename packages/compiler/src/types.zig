@@ -5683,6 +5683,69 @@ test "an associated fn of a bare generic struct infers its type params from its 
     }
 }
 
+test "an associated fn of a non-generic struct or enum is called on its type as a static method" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct K { n: int }
+        \\impl K {
+        \\ fn make(n: int) -> K { K { n: n } }
+        \\ fn get(self) -> int { self.n }
+        \\}
+        \\enum E { A, B }
+        \\impl E { fn first() -> E { E.B } }
+        \\enum F { Mk(int) }
+        \\impl F { fn Mk(x: int) -> F { F.Mk(x + 1) } }
+        \\fn main() -> int {
+        \\ k := K.make(1)
+        \\ _e := E.first()
+        \\ _f := F.Mk(2)
+        \\ return k.get()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const make = try calleeMethod(&c, "make", 0);
+    try testing.expect(make.is_static and make.instance == null and make.recv.kind == .@"struct");
+    const first = try calleeMethod(&c, "first", 0);
+    try testing.expect(first.is_static and first.recv.kind == .@"enum");
+    // A variant keeps its name: `F.Mk(2)` constructs, it does not call the fn.
+    try testing.expect((try calleeView(&c, "Mk", 1)) == .none);
+}
+
+test "an associated fn called on a value, or a method on a type, is T0018 naming how to reach each" {
+    const gpa = testing.allocator;
+    const decls =
+        \\struct H { run: fn(int) -> int, n: int }
+        \\impl H {
+        \\ fn run(x: int) -> int { x + 1 }
+        \\ fn make(n: int) -> H { H { run: fn(x) { x }, n: n } }
+        \\ fn get(self) -> int { self.n }
+        \\}
+        \\enum E { A }
+        \\
+    ;
+    const cases = [_]struct { stmt: []const u8, code: codes.Code, message: []const u8 }{
+        // The field is not called instead; the message says how to reach each.
+        .{ .stmt = "_a := h.run(2)", .code = .T0018, .message = "'run' is both an associated function of 'H' and a field of fn type: 'H.run(..)' calls the function and 'h.run' reads the field" },
+        .{ .stmt = "_b := h.make(3)", .code = .T0018, .message = "'make' is an associated function; call it as 'H.make(..)'" },
+        .{ .stmt = "_c := H.get()", .code = .T0018, .message = "'get' is an instance method, not an associated function; call it on a value" },
+        .{ .stmt = "_d := H.nope(1)", .code = .T0018, .message = "'H' has no associated function 'nope'" },
+        .{ .stmt = "_e := H.make(1, 2)", .code = .T0039, .message = "expected 1 argument(s), got 2; 'make' takes (int)" },
+        .{ .stmt = "_f := E.nope()", .code = .T0061, .message = "enum 'E' has no variant 'nope'" },
+    };
+    for (cases) |case| {
+        const src = try std.mem.concat(gpa, u8, &.{ decls, "fn main() -> int {\n h := H.make(1)\n ", case.stmt, "\n return h.n\n}\n" });
+        defer gpa.free(src);
+        var d = try checkSource(src);
+        defer d.deinit(gpa);
+        errdefer for (d.result.diags) |dg| std.debug.print("got {s}: {s}\n", .{ @tagName(dg.code), dg.message });
+        try testing.expectEqual(@as(usize, 1), d.result.diags.len);
+        try testing.expectEqual(case.code, d.result.diags[0].code);
+        try testing.expectEqualStrings(case.message, d.result.diags[0].message);
+    }
+}
+
 test "an associated fn `Vec[int].new()` mints one instance + a static reified-dispatch Method; an instance method's recv stays its self param" {
     const gpa = testing.allocator;
     var c = try checkSource(
