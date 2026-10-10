@@ -289,15 +289,28 @@ pub const Facts = struct {
             if (u.mod != f.entry() or u.node != node) continue;
             for (u.env) |es| {
                 if (es.slot != slot) continue;
-                const h: Hold = switch (es.mode) {
-                    .ref => .by_address,
-                    .box => if (Closure.contains(Closure.ownerStorage(f.tc.owner_closures, u.owner, true).boxed, slot)) .boxed else .shared,
-                    .copy => .{ .copied = f.sizeOf(es.ty) },
-                };
+                const h = f.ownerHold(u.owner, slot, f.sizeOf(es.ty));
                 hold = if (hold) |prev| prev.merge(h) else h;
             }
         }
         return hold orelse .unknown;
+    }
+
+    /// How `owner` holds `slot` in every build: the compiler's storage without frame
+    /// storage and with it, merged, so a storage word survives only where both agree.
+    /// `copy_size` is the bytes a copy takes.
+    fn ownerHold(f: Facts, owner: Closure.Owner, slot: u32, copy_size: ?u32) Hold {
+        var hold: ?Hold = null;
+        for ([_]bool{ false, true }) |frame| {
+            const h: Hold = switch (Closure.ownerStorage(f.tc.bodies, f.tc.owner_closures, owner, frame).hold(slot)) {
+                .copy => .{ .copied = copy_size },
+                .cell => .boxed,
+                .frame_addr => .shared,
+                .param_addr => .by_address,
+            };
+            hold = if (hold) |prev| prev.merge(h) else h;
+        }
+        return hold.?;
     }
 
     fn isBoundReceiver(f: Facts, recv: u32) bool {
@@ -312,9 +325,9 @@ pub const Facts = struct {
         return false;
     }
 
-    /// How a bound method value holds its local receiver: as `Closure.boundKind` picks its
-    /// adapter. A boxed receiver keeps its cell in every build (bound values keep heap
-    /// envs), so it is never just "shared".
+    /// How a bound method value holds its local receiver: as its owner holds it, which
+    /// `Closure.boundKind` turns into its adapter. A `mut` param is held by address even in
+    /// a generic fn with no instance.
     fn boundHold(f: Facts, tok: u32, recv: u32, slot: u32) Hold {
         const fn_node = Ast.Index.from(f.enclosingFn(tok) orelse return .unknown);
         const e = f.entry();
@@ -326,15 +339,10 @@ pub const Facts = struct {
         var hold: ?Hold = null;
         for (f.tc.bodies.items, 0..) |b, i| {
             if (b.mod != e or b.decl != fn_node) continue;
-            const h = f.receiverHold(@intCast(i), b.node_types, recv, slot);
+            const h = f.ownerHold(@intCast(i), slot, if (recv < b.node_types.len) f.sizeOf(b.node_types[recv]) else null);
             hold = if (hold) |prev| prev.merge(h) else h;
         }
         return hold orelse .unknown;
-    }
-
-    fn receiverHold(f: Facts, owner: Closure.Owner, node_types: []const Type, recv: u32, slot: u32) Hold {
-        if (Closure.contains(Closure.ownerStorage(f.tc.owner_closures, owner, false).boxed, slot)) return .boxed;
-        return .{ .copied = if (recv < node_types.len) f.sizeOf(node_types[recv]) else null };
     }
 
     /// The top-level fn (or method) whose body holds `tok`.

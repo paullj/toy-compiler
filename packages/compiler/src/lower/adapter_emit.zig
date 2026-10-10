@@ -48,18 +48,18 @@ pub fn lowerAdapter(
 }
 
 /// The `self` a bound adapter passes: the address of the receiver for a `mut self`
-/// method, else its value. A `.bound_copy` env holds the receiver itself; a `.bound_box`
-/// env holds the pointer to the boxed local's cell, where the receiver lives; a
-/// `.bound_ref` env holds the address of the `mut` param it lives in, as an `int`.
+/// method, else its value. The env holds the receiver as its owner held it
+/// (`AdapterKind.recvHold`): a copy holds the receiver itself, a cell word points at the
+/// boxed local's cell, where the receiver lives, and an address word, an `int`, at the
+/// `mut` param it lives in.
 fn receiverOperand(b: *L.Builder, a: Closure.Adapter, env_slot: Ir.SlotId) error{OutOfMemory}!Ir.Operand {
     const rawptr = Typecheck.Type.rawptr;
     const env_addr = try b.emit(.{ .slot_addr = env_slot }, Typecheck.Type.int);
     const env = try b.emit(.{ .load = .{ .addr = env_addr, .ty = rawptr } }, rawptr);
-    const recv_addr = switch (a.kind) {
-        .bound_copy => env,
-        .bound_box => try b.emit(.{ .load = .{ .addr = env, .ty = rawptr } }, rawptr),
-        .bound_ref => try b.emit(.{ .load = .{ .addr = env, .ty = Typecheck.Type.int } }, Typecheck.Type.int),
-        .fn_value => unreachable,
+    const recv_addr = switch (a.kind.recvHold()) {
+        .copy => env,
+        .cell => try b.emit(.{ .load = .{ .addr = env, .ty = rawptr } }, rawptr),
+        .param_addr, .frame_addr => try b.emit(.{ .load = .{ .addr = env, .ty = Typecheck.Type.int } }, Typecheck.Type.int),
     };
     if (a.mut_self) return .{ .value = recv_addr };
     return try L.addrOperand(b, recv_addr, a.recv);

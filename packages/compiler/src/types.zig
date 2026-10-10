@@ -716,7 +716,7 @@ fn collectBound(
             if (e.idx.int() >= self.body.callees.len) return;
             switch (self.body.callees[e.idx.int()].view()) {
                 .bound_method => |mi| try self.keys.append(self.gpa, .{
-                    .kind = Closure.boundKind(Closure.boundRecvLocal(self.tree, self.resolutions, e.idx), self.body.boxed, self.body.sig.mut_mask),
+                    .kind = Closure.boundKind(Closure.boundRecvLocal(self.tree, self.resolutions, e.idx), Closure.heapStorage(self.body)),
                     .key = mi,
                 }),
                 .none, .method, .protocol, .builtin, .value, .fn_ref, .direct, .instance, .generic => {},
@@ -757,38 +757,20 @@ fn isTemplateOwner(f: GraphFnInput, fsym: FnSym) bool {
     return f.decl_node != Ast.none and f.kind == .user_fn and fsym.isGeneric();
 }
 
-/// The owner-closure table: each body with a boxed local, in body order, its boxed slots.
-/// Serial over the finished tables, so it is identical at any `-j`.
+/// The owner-closure table: each body with a boxed local, in body order, its unboxable
+/// slots. Serial over the finished tables, so it is identical at any `-j`.
 fn buildOwnerClosures(gpa: std.mem.Allocator, bodies: Body.List, unboxable: []const []const u32) ![]Closure.OwnerClosure {
     var out: std.ArrayList(Closure.OwnerClosure) = .empty;
     errdefer {
-        for (out.items) |oc| {
-            gpa.free(oc.boxed);
-            gpa.free(oc.unboxable);
-            gpa.free(oc.kept_boxed);
-        }
+        for (out.items) |oc| gpa.free(oc.unboxable);
         out.deinit(gpa);
     }
     for (bodies.items, unboxable, 0..) |b, ub, i| {
         if (b.boxed.len == 0) continue;
         try out.ensureUnusedCapacity(gpa, 1);
-        out.appendAssumeCapacity(try ownerClosure(gpa, @intCast(i), b.boxed, ub));
+        out.appendAssumeCapacity(.{ .owner = @intCast(i), .unboxable = try gpa.dupe(u32, ub) });
     }
     return out.toOwnedSlice(gpa);
-}
-
-fn ownerClosure(gpa: std.mem.Allocator, owner: Closure.Owner, boxed: []const u32, unboxable: []const u32) !Closure.OwnerClosure {
-    const bx = try gpa.dupe(u32, boxed);
-    errdefer gpa.free(bx);
-    const ub = try gpa.dupe(u32, unboxable);
-    errdefer gpa.free(ub);
-    const kept = try gpa.alloc(u32, boxed.len - unboxable.len);
-    var n: usize = 0;
-    for (boxed) |sl| if (!Closure.contains(unboxable, sl)) {
-        kept[n] = sl;
-        n += 1;
-    };
-    return .{ .owner = owner, .boxed = bx, .unboxable = ub, .kept_boxed = kept };
 }
 
 /// The escape pass's results for the closure tables: each body's unboxable slots (indexed
@@ -934,7 +916,10 @@ fn analyzeEscapes(
         var ub: std.ArrayList(u32) = .empty;
         errdefer ub.deinit(gpa);
         for (bodies.items[u].boxed) |sl| {
-            if (std.mem.indexOfScalar(u32, escaping_slots.items, sl) != null or Closure.contains(f.bound_recv, sl)) continue;
+            if (std.mem.indexOfScalar(u32, escaping_slots.items, sl) != null) continue;
+            // A bound method value's receiver keeps its cell: its adapter (`boundKind`) is
+            // minted once from the heap storage, for every opt level.
+            if (Closure.contains(f.bound_recv, sl)) continue;
             // A slot of 16 B or less never makes the frame bigger than at -O0: it adds at
             // most 8 slot bytes and drops the 16 bytes of values its box costs, so only
             // frame envs can overflow a frame, and the fallback reverts exactly those.
@@ -973,21 +958,28 @@ fn reportEscapingCapture(t: *Typecheck, mc: *const GraphCtx.ModuleCtx, mod: u32,
 /// Append one env struct per frame-env lambda unit to `layouts` (after every existing id,
 /// so no id moves) and point the unit at it. Returns the grown table, which replaces
 /// `layouts` (freed) only on success.
-fn appendEnvLayouts(gpa: std.mem.Allocator, layouts: []Layout, lambda_units: []Closure.LambdaUnit, esc: EscapeTables) ![]Layout {
+fn appendEnvLayouts(
+    gpa: std.mem.Allocator,
+    layouts: []Layout,
+    lambda_units: []Closure.LambdaUnit,
+    frame: []const bool,
+    bodies: Body.List,
+    owner_closures: []const Closure.OwnerClosure,
+) ![]Layout {
     var envs: std.ArrayList(Layout) = .empty;
     defer envs.deinit(gpa);
     errdefer for (envs.items) |l| Closure.freeEnvStruct(gpa, l);
-    for (lambda_units, esc.frame) |lu, s| {
+    for (lambda_units, frame) |lu, s| {
         if (!s) continue;
         try envs.ensureUnusedCapacity(gpa, 1);
-        envs.appendAssumeCapacity(try Closure.envStruct(gpa, lu, esc.unboxable[lu.owner]));
+        envs.appendAssumeCapacity(try Closure.envStruct(gpa, lu, Closure.ownerStorage(bodies, owner_closures, lu.owner, true)));
     }
     if (envs.items.len == 0) return layouts;
     const out = try gpa.alloc(Layout, layouts.len + envs.items.len);
     @memcpy(out[0..layouts.len], layouts);
     @memcpy(out[layouts.len..], envs.items);
     var id: u32 = @intCast(layouts.len);
-    for (lambda_units, esc.frame) |*lu, s| if (s) {
+    for (lambda_units, frame) |*lu, s| if (s) {
         lu.frame_env = id;
         id += 1;
     };
@@ -1024,7 +1016,7 @@ fn appendLambdaUnits(
         };
         const env = try gpa.alloc(Closure.EnvSlot, bd.captures.len);
         errdefer gpa.free(env);
-        const env_size = try layoutCaptureEnv(gpa, bd.captures, b.node_types, b.boxed, b.sig.mut_mask, layouts, enum_layouts, env);
+        const env_size = try layoutCaptureEnv(gpa, bd.captures, b.node_types, Closure.heapStorage(b), layouts, enum_layouts, env);
         try units.append(gpa, .{
             .owner = owner,
             .mod = b.mod,
@@ -1042,15 +1034,15 @@ fn appendLambdaUnits(
 }
 
 /// Fill `out` with one env slot per capture (ascending slot, as the resolver lists them),
-/// typed as the owner typed the capture's first use, and return the env size. A boxed
-/// capture holds its cell's pointer (8 bytes); any other holds a copy of the value. A
-/// capture left `.invalid` by an earlier error sizes as 0; such a program is never lowered.
+/// typed as the owner typed the capture's first use, and return the env size. A capture the
+/// owner's heap storage `st` holds by cell or address takes one 8-byte word, which frame
+/// storage reuses for a frame address; a copy takes the value's size. A capture left
+/// `.invalid` by an earlier error sizes as 0; such a program is never lowered.
 fn layoutCaptureEnv(
     gpa: std.mem.Allocator,
     captures: []const Closure.Capture,
     node_types: []const Type,
-    boxed: []const u32,
-    places: u64,
+    st: Closure.Storage,
     layouts: []const Layout,
     enum_layouts: []const EnumLayout,
     out: []Closure.EnvSlot,
@@ -1062,7 +1054,7 @@ fn layoutCaptureEnv(
     const offs = try gpa.alloc(u32, captures.len);
     defer gpa.free(offs);
     for (captures, sizes, aligns) |c, *sz, *al| {
-        if (Closure.contains(boxed, c.slot) or Modes.isMut(places, c.slot)) {
+        if (st.hold(c.slot) != .copy) {
             sz.* = 8;
             al.* = 8;
             continue;
@@ -1072,12 +1064,7 @@ fn layoutCaptureEnv(
         al.* = Abi.typeAlign(ty, layouts, enum_layouts);
     }
     const size = Closure.envLayout(sizes, aligns, offs);
-    for (captures, offs, out) |c, off, *es| es.* = .{
-        .slot = c.slot,
-        .ty = node_types[c.first_use.int()],
-        .mode = if (Modes.isMut(places, c.slot)) .ref else if (Closure.contains(boxed, c.slot)) .box else .copy,
-        .off = off,
-    };
+    for (captures, offs, out) |c, off, *es| es.* = .{ .slot = c.slot, .ty = node_types[c.first_use.int()], .off = off };
     return size;
 }
 
@@ -2549,9 +2536,9 @@ pub fn checkGraph(
     errdefer Closure.freeLambdaUnits(gpa, lambda_units);
     var esc = try t.analyzeEscapes(fns, sigs, node_types, callees, bodies, instances, methods, lambda_units, layouts, enum_layouts);
     defer esc.deinit(gpa);
-    layouts = try appendEnvLayouts(gpa, layouts, lambda_units, esc);
     const owner_closures = try buildOwnerClosures(gpa, bodies, esc.unboxable);
     errdefer Closure.freeOwnerClosures(gpa, owner_closures);
+    layouts = try appendEnvLayouts(gpa, layouts, lambda_units, esc.frame, bodies, owner_closures);
     if (builtin.mode == .Debug) checkOwners(bodies, lambda_units, owner_closures);
 
     // Diagnostics already carry their owning module in `scope`, sorted by
@@ -2673,7 +2660,8 @@ fn checkOwners(bodies: Body.List, lambda_units: []const Closure.LambdaUnit, owne
         std.debug.assert(i == 0 or lambda_units[i - 1].owner <= u.owner);
     }
     for (owner_closures, 0..) |oc, i| {
-        std.debug.assert(std.mem.eql(u32, bodies.items[oc.owner].boxed, oc.boxed));
+        const st = Closure.ownerStorage(bodies, owner_closures, oc.owner, true);
+        for (oc.unboxable) |sl| std.debug.assert(st.hold(sl) == .frame_addr);
         std.debug.assert(i == 0 or owner_closures[i - 1].owner < oc.owner);
     }
 }
@@ -10950,7 +10938,7 @@ test "env slots take their types from the first use and are laid out once" {
     for (f.env, want_kinds, want_offs, 0..) |es, k, off, i| {
         try testing.expectEqual(k, es.ty.kind);
         try testing.expectEqual(off, es.off);
-        try testing.expectEqual(Closure.CaptureMode.copy, es.mode);
+        try testing.expectEqual(Closure.Hold.copy, heldAt(&c, f, es));
         if (i > 0) try testing.expect(f.env[i - 1].slot < es.slot);
     }
     try testing.expectEqual(@as(u32, 64), f.env_size);
@@ -10966,24 +10954,35 @@ test "env slots take their types from the first use and are laid out once" {
     try testing.expectEqual(@as(u32, 0), h.env_size);
 }
 
+/// How unit `u`'s owner holds env slot `es` with every box in its cell.
+fn heldAt(c: *const Checked, u: Closure.LambdaUnit, es: Closure.EnvSlot) Closure.Hold {
+    return Closure.heapStorage(c.result.bodies.items[u.owner]).hold(es.slot);
+}
+
+/// The boxed slots of owner-closure record `oc`.
+fn boxedOf(c: *const Checked, oc: Closure.OwnerClosure) []const u32 {
+    return c.result.bodies.items[oc.owner].boxed;
+}
+
 /// The boxed slots of the one owner in `c` that has any, checked against the env of every
-/// lambda unit that captures them: a boxed capture is an 8-byte `.box` slot, any other a copy.
+/// lambda unit that captures them: a boxed capture is an 8-byte cell word, any other a copy.
 fn expectBoxedOnce(c: *const Checked, want_len: usize) ![]const u32 {
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     const ocs = c.result.owner_closures;
     if (want_len == 0) {
         try testing.expectEqual(@as(usize, 0), ocs.len);
-        for (c.result.lambda_units) |u| for (u.env) |es| try testing.expectEqual(Closure.CaptureMode.copy, es.mode);
+        for (c.result.lambda_units) |u| for (u.env) |es| try testing.expectEqual(Closure.Hold.copy, heldAt(c, u, es));
         return &.{};
     }
     try testing.expectEqual(@as(usize, 1), ocs.len);
-    try testing.expectEqual(want_len, ocs[0].boxed.len);
+    const boxed = boxedOf(c, ocs[0]);
+    try testing.expectEqual(want_len, boxed.len);
     var boxed_env: usize = 0;
     for (c.result.lambda_units) |u| {
         if (!std.meta.eql(u.owner, ocs[0].owner)) continue;
         for (u.env) |es| {
-            const is_boxed = Closure.contains(ocs[0].boxed, es.slot);
-            try testing.expectEqual(if (is_boxed) Closure.CaptureMode.box else Closure.CaptureMode.copy, es.mode);
+            const is_boxed = Closure.contains(boxed, es.slot);
+            try testing.expectEqual(if (is_boxed) Closure.Hold.cell else Closure.Hold.copy, heldAt(c, u, es));
             if (is_boxed) {
                 try testing.expectEqual(@as(u32, 0), es.off % 8);
                 boxed_env += 1;
@@ -10991,7 +10990,7 @@ fn expectBoxedOnce(c: *const Checked, want_len: usize) ![]const u32 {
         }
     }
     try testing.expect(boxed_env >= want_len);
-    return ocs[0].boxed;
+    return boxed;
 }
 
 test "boxed = captured ∩ (assigned ∪ mut self receivers ∪ mut arguments)" {
@@ -11054,8 +11053,8 @@ test "boxed = captured ∩ (assigned ∪ mut self receivers ∪ mut arguments)" 
     const bx = try expectBoxedOnce(&mixed, 1);
     const f_unit = mixed.result.lambda_units[0];
     try testing.expectEqual(@as(usize, 2), f_unit.env.len);
-    try testing.expectEqual(Closure.CaptureMode.copy, f_unit.env[0].mode); // k
-    try testing.expectEqual(Closure.CaptureMode.box, f_unit.env[1].mode); // a
+    try testing.expectEqual(Closure.Hold.copy, heldAt(&mixed, f_unit, f_unit.env[0])); // k
+    try testing.expectEqual(Closure.Hold.cell, heldAt(&mixed, f_unit, f_unit.env[1])); // a
     try testing.expectEqual(f_unit.env[1].slot, bx[0]);
     // A boxed capture holds an 8-byte pointer, even for a wider value.
     var wide = try checkSource(
@@ -11147,12 +11146,12 @@ test "an instance recheck writes its own boxed list" {
     const inst = c.result.instances[k];
     try testing.expectEqualStrings("A", c.result.layouts[inst.args[0].struct_id].name);
     try testing.expectEqualSlices(u32, &.{0}, inst.boxed);
-    try testing.expectEqualSlices(u32, &.{0}, ocs[0].boxed);
+    try testing.expectEqualSlices(u32, &.{0}, boxedOf(&c, ocs[0]));
     try testing.expectEqual(@as(usize, 0), c.result.instances[1 - k].boxed.len);
     for (c.result.lambda_units) |u| {
         try testing.expectEqual(@as(usize, 1), u.env.len);
-        const want: Closure.CaptureMode = if (c.result.bodies.items[u.owner].of.instance == k) .box else .copy;
-        try testing.expectEqual(want, u.env[0].mode);
+        const want: Closure.Hold = if (c.result.bodies.items[u.owner].of.instance == k) .cell else .copy;
+        try testing.expectEqual(want, heldAt(&c, u, u.env[0]));
     }
 }
 
@@ -11323,8 +11322,8 @@ test "a captured mut param is a ref env slot, and a non-escaping capture keeps n
     try testing.expectEqual(@as(usize, 1), c.result.lambda_units.len);
     const u = c.result.lambda_units[0];
     try testing.expectEqual(@as(usize, 2), u.env.len);
-    try testing.expectEqual(Closure.CaptureMode.ref, u.env[0].mode);
-    try testing.expectEqual(Closure.CaptureMode.box, u.env[1].mode);
+    try testing.expectEqual(Closure.Hold.param_addr, heldAt(&c, u, u.env[0]));
+    try testing.expectEqual(Closure.Hold.cell, heldAt(&c, u, u.env[1]));
     try testing.expectEqual(@as(u32, 16), u.env_size);
     const sid = u.frame_env.?;
     const l = c.result.layouts[sid];
@@ -11332,9 +11331,9 @@ test "a captured mut param is a ref env slot, and a non-escaping capture keeps n
     try testing.expectEqualSlices(Type, &.{ Type.int, Type.int }, l.field_types);
     try testing.expectEqual(@as(usize, 1), c.result.owner_closures.len);
     const oc = c.result.owner_closures[0];
-    try testing.expectEqualSlices(u32, &.{1}, oc.boxed);
+    try testing.expectEqualSlices(u32, &.{1}, boxedOf(&c, oc));
     try testing.expectEqualSlices(u32, &.{1}, oc.unboxable);
-    try testing.expectEqualSlices(u32, &.{}, oc.kept_boxed);
+    try testing.expectEqual(Closure.Hold.frame_addr, Closure.ownerStorage(c.result.bodies, c.result.owner_closures, oc.owner, true).hold(1));
 }
 
 test "a box stays when an escaping closure, a bound value or an outer escaping lambda holds it" {
@@ -11365,9 +11364,10 @@ test "a box stays when an escaping closure, a bound value or an outer escaping l
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     const oc = c.result.owner_closures[0];
-    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, oc.boxed);
+    try testing.expectEqualSlices(u32, &.{ 1, 2, 3, 4 }, boxedOf(&c, oc));
     try testing.expectEqualSlices(u32, &.{1}, oc.unboxable);
-    try testing.expectEqualSlices(u32, &.{ 2, 3, 4 }, oc.kept_boxed);
+    const st = Closure.ownerStorage(c.result.bodies, c.result.owner_closures, oc.owner, true);
+    for ([_]u32{ 2, 3, 4 }) |sl| try testing.expectEqual(Closure.Hold.cell, st.hold(sl));
     var where: std.ArrayList(u8) = .empty;
     defer where.deinit(gpa);
     for (c.result.lambda_units) |u| if (std.meta.eql(u.owner, oc.owner)) try where.print(gpa, "{s}:{c} ", .{ u.name, @as(u8, if (u.frame_env != null) 'f' else 'h') });
@@ -11539,11 +11539,11 @@ test "a captured local fn is copied, never boxed" {
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(@as(usize, 1), c.result.owner_closures.len);
-    try testing.expectEqualSlices(u32, &.{0}, c.result.owner_closures[0].boxed);
+    try testing.expectEqualSlices(u32, &.{0}, boxedOf(&c, c.result.owner_closures[0]));
     const g_unit = c.result.lambda_units[1];
     try testing.expectEqual(@as(usize, 1), g_unit.env.len);
     try testing.expectEqual(@as(u32, 1), g_unit.env[0].slot);
-    try testing.expectEqual(Closure.CaptureMode.copy, g_unit.env[0].mode);
+    try testing.expectEqual(Closure.Hold.copy, heldAt(&c, g_unit, g_unit.env[0]));
     try testing.expectEqual(@as(u32, 16), g_unit.env_size);
 }
 
@@ -11811,7 +11811,7 @@ test "a mut self bound method boxes its local receiver" {
         const fa = c.tree.nodes[(try valueMember(&c, if (std.mem.indexOf(u8, body, "c.bump\n") != null) "bump" else "get", 0)).int()];
         const slot = c.resolve.resolutions[0][fa.lhs.int()].local;
         try testing.expectEqual(@as(usize, 1), c.result.owner_closures.len);
-        try testing.expectEqualSlices(u32, &.{slot}, c.result.owner_closures[0].boxed);
+        try testing.expectEqualSlices(u32, &.{slot}, boxedOf(&c, c.result.owner_closures[0]));
         try testing.expectEqual(@as(usize, 1), c.result.adapters.len);
         try testing.expectEqual(Closure.AdapterKind.bound_box, c.result.adapters[0].kind);
         try testing.expect(std.mem.endsWith(u8, c.result.adapters[0].name, "$boundbox"));
@@ -11995,9 +11995,9 @@ test "a captured-and-mutated local over 16 bytes stays boxed" {
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     const oc = c.result.owner_closures[0];
-    try testing.expectEqualSlices(u32, &.{ 0, 1 }, oc.boxed);
+    try testing.expectEqualSlices(u32, &.{ 0, 1 }, boxedOf(&c, oc));
     try testing.expectEqualSlices(u32, &.{1}, oc.unboxable);
-    try testing.expectEqualSlices(u32, &.{0}, oc.kept_boxed);
+    try testing.expectEqual(Closure.Hold.cell, Closure.ownerStorage(c.result.bodies, c.result.owner_closures, oc.owner, true).hold(0));
     try testing.expect(c.result.lambda_units[0].frame_env != null);
 }
 

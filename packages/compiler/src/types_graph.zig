@@ -172,6 +172,7 @@ fn importTarget(graph: *const Graph.Graph, m: *const Graph.Module, decl: Ast.Nod
 
 const testing = std.testing;
 const Cache = @import("query/Cache.zig");
+const Closure = @import("symbols/Closure.zig");
 const Io = std.Io;
 
 const FixtureFile = struct { path: []const u8, source: []const u8 };
@@ -734,7 +735,7 @@ fn lambdaTables(gpa: std.mem.Allocator, g: *const Graph.Graph, tr: *const GraphR
         for (u.env) |es| {
             try out.appendSlice(gpa, std.mem.asBytes(&es.slot));
             try out.appendSlice(gpa, std.mem.asBytes(&es.off));
-            try out.appendSlice(gpa, @tagName(es.mode));
+            try out.appendSlice(gpa, @tagName(Closure.heapStorage(tr.bodies.items[u.owner]).hold(es.slot)));
             try out.appendSlice(gpa, typeLabel(tr, es.ty));
         }
         if (u.frame_env) |sid| {
@@ -745,7 +746,6 @@ fn lambdaTables(gpa: std.mem.Allocator, g: *const Graph.Graph, tr: *const GraphR
     for (tr.owner_closures) |oc| {
         try out.appendSlice(gpa, std.mem.sliceAsBytes(oc.unboxable));
         try out.append(gpa, 0xff);
-        try out.appendSlice(gpa, std.mem.sliceAsBytes(oc.kept_boxed));
     }
     for (g.modules, 0..) |m, mi| for (m.nodes, 0..) |n, k| {
         if (n.tag != .lambda) continue;
@@ -760,20 +760,19 @@ fn lambdaTables(gpa: std.mem.Allocator, g: *const Graph.Graph, tr: *const GraphR
     return frame_envs;
 }
 
-/// Each owner's boxed, unboxable and escaping slots, then each lambda unit's env (slot, mode,
-/// offset) and frame env.
+/// Each owner's boxed and unboxable slots, then each lambda unit's env (slot, hold under frame
+/// storage, offset) and frame env.
 fn ownerClosures(gpa: std.mem.Allocator, tr: *const GraphResult, out: *std.ArrayList(u8)) !void {
     for (tr.owner_closures) |oc| {
         try out.print(gpa, "{s}:", .{tr.bodies.items[oc.owner].sig.name});
-        for (oc.boxed) |sl| try out.print(gpa, "{d},", .{sl});
+        for (tr.bodies.items[oc.owner].boxed) |sl| try out.print(gpa, "{d},", .{sl});
         try out.appendSlice(gpa, "u");
         for (oc.unboxable) |sl| try out.print(gpa, "{d},", .{sl});
-        try out.appendSlice(gpa, "e");
-        for (oc.kept_boxed) |sl| try out.print(gpa, "{d},", .{sl});
     }
     for (tr.lambda_units) |u| {
         try out.appendSlice(gpa, u.name);
-        for (u.env) |es| try out.print(gpa, "({d} {s} {d})", .{ es.slot, @tagName(es.mode), es.off });
+        const st = Closure.ownerStorage(tr.bodies, tr.owner_closures, u.owner, true);
+        for (u.env) |es| try out.print(gpa, "({d} {s} {d})", .{ es.slot, @tagName(st.hold(es.slot)), es.off });
         if (u.frame_env) |sid| try out.print(gpa, "[{s}]", .{tr.layouts[sid].name});
     }
 }
@@ -1067,13 +1066,12 @@ test "owner_closures are identical at -j1 and -jN" {
                 // A `_u` body boxes `total`, `s`, `c` and the for-in `x`, and only `x` is
                 // captured by a closure that escapes (pushed).
                 .base => {
-                    try testing.expectEqual(@as(usize, 4), oc.boxed.len);
+                    try testing.expectEqual(@as(usize, 4), tr.bodies.items[oc.owner].boxed.len);
                     try testing.expectEqual(@as(usize, 3), oc.unboxable.len);
-                    try testing.expectEqual(@as(usize, 1), oc.kept_boxed.len);
                 },
                 // A `keep` instance boxes its `x` for a called closure.
                 .instance => {
-                    try testing.expectEqualSlices(u32, &.{0}, oc.boxed);
+                    try testing.expectEqualSlices(u32, &.{0}, tr.bodies.items[oc.owner].boxed);
                     try testing.expectEqualSlices(u32, &.{0}, oc.unboxable);
                 },
             };

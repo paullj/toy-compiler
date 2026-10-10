@@ -267,9 +267,7 @@ const Plan = struct {
         errdefer specs.deinit(gpa);
         for (0..specs.units.len) |k| try units.append(gpa, .{ .spec = @intCast(k) });
 
-        const closure_facts = try buildClosureFacts(gpa, tc.lambda_units, tc.owner_closures, bodies.len, o.frame);
-        errdefer freeClosureFacts(gpa, closure_facts);
-        return .{
+        var p: Plan = .{
             .graph = graph,
             .res = res,
             .tc = tc,
@@ -277,10 +275,13 @@ const Plan = struct {
             .names = names,
             .units = try units.toOwnedSlice(gpa),
             .specs = specs,
-            .closure_facts = closure_facts,
+            .closure_facts = &.{},
             .entry = entry,
             .o = o,
         };
+        errdefer gpa.free(p.units);
+        p.closure_facts = try p.ownerClosureFacts(gpa);
+        return p;
     }
 
     fn deinit(p: *Plan, gpa: std.mem.Allocator) void {
@@ -399,18 +400,30 @@ const Plan = struct {
 
     /// The closure tables a body of `owner` lowers against.
     fn closureFor(p: *const Plan, owner: Closure.Owner, spec_targets: []const Spec.Target) lower.ClosureInputs {
-        const st = Closure.ownerStorage(p.tc.owner_closures, owner, p.o.frame);
         return .{
             .adapters = p.tc.adapters,
             .lambda_units = p.tc.lambda_units,
             .owner = owner,
-            .owner_modes = p.tc.bodies.items[owner].sig.mut_mask,
-            .boxed = st.boxed,
-            .unboxed = st.unboxed,
+            .storage = Closure.ownerStorage(p.tc.bodies, p.tc.owner_closures, owner, p.o.frame),
             .frame_envs = p.o.frame,
             .specs = p.specs,
             .spec_targets = spec_targets,
         };
+    }
+
+    /// Each body's closure facts, indexed like the body list: `Closure.ownerFacts` of the
+    /// closure tables its lowering gets (`closureFor`), so its key and its code read one
+    /// storage. Serial, once per body. Empty when there is no lambda unit and no boxed local.
+    fn ownerClosureFacts(p: *const Plan, gpa: std.mem.Allocator) ![]const []const u8 {
+        if (p.tc.lambda_units.len == 0 and p.tc.owner_closures.len == 0) return &.{};
+        const facts = try gpa.alloc([]const u8, p.tc.bodies.items.len);
+        @memset(facts, &.{});
+        errdefer freeClosureFacts(gpa, facts);
+        for (facts, 0..) |*f, i| {
+            const c = p.closureFor(@intCast(i), &.{});
+            f.* = try Closure.ownerFacts(gpa, Closure.ownerUnits(c.lambda_units, c.owner.?), c.storage, c.frame_envs);
+        }
+        return facts;
     }
 
     fn emitError(p: *const Plan, d: CodegenIr.Diagnostic, i: usize) EmitError {
@@ -426,38 +439,6 @@ const Plan = struct {
 /// off also turns this off.
 fn frameStorage(opt: Opt.Config) bool {
     return opt.any();
-}
-
-/// Each body's closure facts, indexed like the body list: its storage under `frame` (as
-/// `closureFor` hands it to the lowering) and its own lambda units (a contiguous run of the
-/// `(owner, node)`-sorted table) laid out by `Closure.ownerFacts`. Serial, once per owner.
-/// Empty when there is no lambda unit and no boxed local.
-fn buildClosureFacts(
-    gpa: std.mem.Allocator,
-    units: []const Closure.LambdaUnit,
-    owner_closures: []const Closure.OwnerClosure,
-    n_bodies: usize,
-    frame: bool,
-) ![]const []const u8 {
-    if (units.len == 0 and owner_closures.len == 0) return &.{};
-    const facts = try gpa.alloc([]const u8, n_bodies);
-    @memset(facts, &.{});
-    errdefer freeClosureFacts(gpa, facts);
-    // Every owner with a unit or a box, each once: both tables are sorted by owner.
-    var i: usize = 0;
-    var oi: usize = 0;
-    while (i < units.len or oi < owner_closures.len) {
-        const owner = if (oi == owner_closures.len or (i < units.len and units[i].owner <= owner_closures[oi].owner))
-            units[i].owner
-        else
-            owner_closures[oi].owner;
-        var j = i;
-        while (j < units.len and units[j].owner == owner) j += 1;
-        if (oi < owner_closures.len and owner_closures[oi].owner == owner) oi += 1;
-        facts[owner] = try Closure.ownerFacts(gpa, units[i..j], Closure.ownerStorage(owner_closures, owner, frame), frame);
-        i = j;
-    }
-    return facts;
 }
 
 fn freeClosureFacts(gpa: std.mem.Allocator, facts: []const []const u8) void {
