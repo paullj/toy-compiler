@@ -950,3 +950,34 @@ test "the calls a for-in and a try_into make are folded into the body's key (#35
     try testing.expectEqual(@as(usize, 3), try unfoldedCalls(gpa, &plan, &unfolded));
     try testing.expectEqual(@as(usize, 0), unfolded.items.len);
 }
+
+test "--verify names a reloc target the unit's key does not fold" {
+    const gpa = testing.allocator;
+    const ck = try Checked.create(gpa, every_class_src);
+    defer ck.destroy(gpa);
+    var plan = try ck.plan(gpa, .O0);
+    defer plan.deinit(gpa);
+    // `main` (unit 1) calls `main.add` through `apply`'s spec unit and names it as a value.
+    const fr = plan.frozenFor(1);
+    try testing.expectEqualStrings("main", fr.sym.name);
+    const Case = struct { target: Link.SymName, uncovered: bool };
+    const cases = [_]Case{
+        .{ .target = .{ .kind = .user_fn, .name = "main.keep$int" }, .uncovered = false },
+        .{ .target = .{ .kind = .user_fn, .name = "main.add$fnval" }, .uncovered = false },
+        .{ .target = .{ .kind = .user_fn, .name = "main$l0" }, .uncovered = false },
+        .{ .target = .{ .kind = .user_fn, .name = "main" }, .uncovered = false },
+        .{ .target = .{ .kind = .builtin, .name = "gc_alloc" }, .uncovered = false },
+        .{ .target = .{ .kind = .user_fn, .name = "main.keep$bool" }, .uncovered = true },
+        .{ .target = .{ .kind = .user_fn, .name = "other.add$fnval" }, .uncovered = true },
+        .{ .target = .{ .kind = .user_fn, .name = "mainly" }, .uncovered = true },
+    };
+    for (cases) |case| {
+        var relocs = [_]Link.Reloc{.{ .site = 0, .target = .{ .func = case.target }, .kind = .call26 }};
+        const fc: Link.FnCode = .{ .sym = fr.sym, .code = &.{}, .relocs = &relocs, .literals = &.{} };
+        const got = try Engine.uncoveredReloc(gpa, &fr, &fc);
+        errdefer std.debug.print("case: {s}\n", .{case.target.name});
+        if (case.uncovered) {
+            try testing.expectEqualStrings(case.target.name, got.?);
+        } else try testing.expectEqual(@as(?[]const u8, null), got);
+    }
+}
