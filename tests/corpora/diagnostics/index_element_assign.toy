@@ -1,0 +1,19 @@
+# `xs[i]` reads a copy of the element and `Vec` has no index assignment, so storing a
+# whole element is T0074, on a local `Vec`, a field's and a nested one alike. A `Map` has
+# no index operator at all, which is the one error its store gets.
+import std/vec
+import std/map
+
+struct H { xs: Vec[int] }
+
+fn main() -> int {
+    xs: Vec[int] = [1, 2, 3]
+    xs[1] = 7  #~ ERROR [T0074] cannot assign to an index element `xs[i]`; a 'Vec' element is not a place and 'Vec' has no index assignment
+    h := H { xs: xs }
+    h.xs[0] = 5  #~ ERROR [T0074] cannot assign to an index element
+    vs: Vec[Vec[int]] = [[1]]
+    vs[0][0] = 2  #~ ERROR [T0074] cannot assign to an index element
+    m: Map[str, int] = Map[str, int].new()
+    m["k"] = 1  #~ ERROR [T0057] Map has no index operator; use .get
+    return xs[1]
+}

@@ -126,6 +126,8 @@ pub const Code = enum(u16) {
     T0071, // too-many-fields (a tuple struct past the positional field limit)
     T0072, // bound-receiver-not-local (a `mut self` method bound on a field, not a local)
     T0073, // main-params (the entry `main` declares parameters)
+    T0074, // index-element-assign (`xs[i] = v`: an index element is no place to store to)
+    T0075, // temporary-field-assign (`f(..).x = v` writes a field of a temporary copy)
 
     // Warning band (W####).
     W0001, // unused-variable
@@ -264,6 +266,8 @@ pub const table = [_]Entry{
     .{ .code = .T0071, .str = "T0071", .slug = "too-many-fields" },
     .{ .code = .T0072, .str = "T0072", .slug = "bound-receiver-not-local" },
     .{ .code = .T0073, .str = "T0073", .slug = "main-params" },
+    .{ .code = .T0074, .str = "T0074", .slug = "index-element-assign" },
+    .{ .code = .T0075, .str = "T0075", .slug = "temporary-field-assign" },
     .{ .code = .W0001, .str = "W0001", .slug = "unused-variable", .default_severity = .warning },
     .{ .code = .W0002, .str = "W0002", .slug = "unused-parameter", .default_severity = .warning },
     .{ .code = .W0003, .str = "W0003", .slug = "unused-function", .default_severity = .warning },
@@ -557,6 +561,8 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("type-arg-count", slug(.T0054).?);
     try testing.expectEqualStrings("main-params", slug(.T0073).?);
     try testing.expectEqual(Code.T0073, fromStr("T0073").?);
+    try testing.expectEqualStrings("index-element-assign", slug(.T0074).?);
+    try testing.expectEqualStrings("temporary-field-assign", slug(.T0075).?);
 
     try testing.expectEqualStrings("W0013", str(.W0013).?);
     try testing.expectEqualStrings("fn-field-method-clash", slug(.W0013).?);

@@ -3633,7 +3633,7 @@ fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.ValueI
         // an rvalue with no named place, so materialize it into a temp and return that
         // temp's ptr — the `.field_access` recursion above then computes `field_addr`
         // off it. A store through this ptr would write the copy, not the vector, so the
-        // checker's `targetRootsAtIndexElement` gate rejects assigning through it; only
+        // checker's `storeRoot` gate rejects assigning through it (T0070); only
         // the read base (`= b.items[i].x`, `b.items[i].m()`) reaches here.
         .index => {
             const op = try lowerExpr(b, node_idx);
@@ -3648,9 +3648,9 @@ fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.ValueI
         // call/method result, a `match`/`if` expression — is materialized into a temp
         // once so the field_addr chain reads from the copy. Without this, `f().field`
         // (e.g. the idiomatic `v.get(i).unwrap().field`) resolves to no address and
-        // silently reads a stale register, or crashes when used in arithmetic. A store
-        // through such a base is a parse error, so this read-only materialization can
-        // never alias a real place.
+        // silently reads a stale register, or crashes when used in arithmetic. The
+        // checker rejects a store through such a base (T0075), so this read-only
+        // materialization can never alias a real place.
         else => switch (passKind(b, b.in.node_types[(node_idx).int()])) {
             .str, .@"struct", .@"enum" => {
                 const op = try lowerExpr(b, node_idx);

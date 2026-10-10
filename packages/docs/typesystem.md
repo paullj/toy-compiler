@@ -110,7 +110,11 @@ from two angles — assignability is directional (want ← got), join is symmetr
 * `name := e` — infers `name : synth(e)`. `e` must produce a value; `()` is an
   error (nothing to bind).
 * `name: T = e` — explicit typed local. Parse `T`, `check(e, T)`, bind `name : T`.
-* `name = e` — assignment. `assignable(typeof(name), synth(e))`.
+* `name = e` — assignment. `assignable(typeof(name), synth(e))`. The target is a
+  local or a field / tuple-field chain rooted at one. An index element is no place:
+  `xs[i]` reads a copy and `Vec` has no index assignment, so `xs[i] = v` is **T0074**
+  and `xs[i].f = v` is **T0070**. Nor is any other temporary: a field of a call result
+  (`p.get().x = v`) is **T0075**, and a call result itself (`p.get() = v`) **R0007**.
 * `return e` / bare `return` — `assignable(declared_ret, T)` where `T` is the
   value type (or `()` for a bare return).
 * Every `return e` **and** the body's trailing expression are checked against the
