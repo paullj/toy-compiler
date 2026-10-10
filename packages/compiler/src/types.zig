@@ -5683,6 +5683,38 @@ test "an associated fn of a bare generic struct infers its type params from its 
     }
 }
 
+test "an index element, a field of one and a field of a call result are no store targets" {
+    const gpa = testing.allocator;
+    const decls =
+        \\struct P { x: int }
+        \\struct H { xs: Vec[int] }
+        \\struct Vec[T] { n: int }
+        \\fn id[T](x: T) -> T { x }
+        \\
+    ;
+    const cases = [_]struct { stmt: []const u8, code: codes.Code, message: []const u8 }{
+        .{ .stmt = "ps[0].x = 5", .code = .T0070, .message = "cannot assign to a field of an index element `xs[i].field`; the element is a temporary copy, so the write would be lost" },
+        .{ .stmt = "ps[i].x = 5", .code = .T0070, .message = "cannot assign to a field of an index element `xs[i].field`; the element is a temporary copy, so the write would be lost" },
+        .{ .stmt = "xs[1] = 7", .code = .T0074, .message = "cannot assign to an index element `xs[i]`; a 'Vec' element is not a place and 'Vec' has no index assignment" },
+        .{ .stmt = "h.xs[0] = 7", .code = .T0074, .message = "cannot assign to an index element `xs[i]`; a 'Vec' element is not a place and 'Vec' has no index assignment" },
+        // The element's type is still the rhs's expectation, so a wrong value is named too.
+        .{ .stmt = "xs[1] = true", .code = .T0041, .message = "cannot assign bool to variable of type int" },
+        // Any other temporary is no place either.
+        .{ .stmt = "id[H](h).xs = xs", .code = .T0075, .message = "cannot assign to a field of a temporary value, such as a call result; it is a copy, so the write would be lost" },
+    };
+    for (cases) |case| {
+        const src = try std.mem.concat(gpa, u8, &.{ decls, "fn g(ps: Vec[P], xs: Vec[int], h: H) -> int {\n i := 0\n ", case.stmt, "\n return i + h.xs.n + ps.n + xs.n\n}\nfn main() -> int { 0 }\n" });
+        defer gpa.free(src);
+        var d = try checkSource(src);
+        defer d.deinit(gpa);
+        errdefer for (d.result.diags) |dg| std.debug.print("got {s}: {s}\n", .{ @tagName(dg.code), dg.message });
+        const got = for (d.result.diags) |dg| {
+            if (dg.code == case.code) break dg;
+        } else return error.TestExpectedDiagnostic;
+        try testing.expectEqualStrings(case.message, got.message);
+    }
+}
+
 test "an associated fn of a non-generic struct or enum is called on its type as a static method" {
     const gpa = testing.allocator;
     var c = try checkSource(
@@ -11821,8 +11853,9 @@ test "a field wins over a method in value position" {
         \\}
         \\
     , .T0046, "no field 'plus' in struct 'Acc'");
-    // Only the target's own member: the rest of the place, a call argument or a lambda
-    // body in it, still binds.
+    // Only the target's own member: the rest of the target, a call argument or a lambda
+    // body in it, still binds. A field of a call result is no place (T0075), but the
+    // target is still checked.
     var inner = try checkSource(
         \\struct Acc { n: int }
         \\struct P { x: int }
@@ -11841,7 +11874,8 @@ test "a field wins over a method in value position" {
         \\
     );
     defer inner.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), inner.result.diags.len);
+    try testing.expectEqual(@as(usize, 2), inner.result.diags.len);
+    for (inner.result.diags) |d| try testing.expectEqual(codes.Code.T0075, d.code);
     for (0..2) |k| {
         const m = try valueMember(&inner, "plus", k);
         try testing.expect(inner.result.callees[0][m.int()].view() == .bound_method);

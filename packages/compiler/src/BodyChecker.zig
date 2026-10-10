@@ -1011,6 +1011,9 @@ pub const BodyChecker = struct {
                         defer bc.place_target = was;
                         break :blk try bc.typeOf(stmt.lhs);
                     },
+                    // Typed for the rhs's expectation and for its own errors (`m[k]` on a
+                    // Map is T0057 there); the store itself is rejected below.
+                    .index => try bc.typeOf(stmt.lhs),
                     else => .invalid,
                 };
                 bc.node_types[(stmt.lhs).int()] = lhs;
@@ -1019,9 +1022,15 @@ pub const BodyChecker = struct {
                 if (!Type.assignable(lhs, rhs)) {
                     try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0041 }, "cannot assign {s} to variable of type {s}", .{ bc.typeName(rhs), bc.typeName(lhs) });
                 }
-                if (bc.targetRootsAtIndexElement(stmt.lhs)) {
-                    try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0070 }, "cannot assign to a field of an index element `xs[i].field`; the element is a temporary copy, so the write would be lost", .{});
-                }
+                if (target.tag == .index) {
+                    if (lhs.kind != .invalid)
+                        try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0074 }, "cannot assign to an index element `xs[i]`; a 'Vec' element is not a place and 'Vec' has no index assignment", .{});
+                } else if (target.tag == .field_access or target.tag == .tuple_field) switch (bc.storeRoot(stmt.lhs)) {
+                    .name => {},
+                    .index_element => try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0070 }, "cannot assign to a field of an index element `xs[i].field`; the element is a temporary copy, so the write would be lost", .{}),
+                    .temporary => if (lhs.kind != .invalid)
+                        try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0075 }, "cannot assign to a field of a temporary value, such as a call result; it is a copy, so the write would be lost", .{}),
+                };
             },
             .return_stmt => {
                 if (bc.ret_infer) {
@@ -4823,23 +4832,26 @@ pub const BodyChecker = struct {
         };
     }
 
-    /// A `.field`/`.tuple_field` chain that bottoms out at an index element
-    /// (`ps[i]` — an `.index` node, or a value-headed `type_app` the parser could
-    /// not tell from a turbofish) has no named, addressable place: `lower`'s
-    /// place-addr materializes the element into a temp, so a store through it would
-    /// write the copy and silently drop the write. Reject the assignment instead.
-    fn targetRootsAtIndexElement(bc: *BodyChecker, node_idx: Ast.Index) bool {
+    /// What a `.field`/`.tuple_field` store chain bottoms out at. Only a name can be a
+    /// place: an index element (`ps[i]` — an `.index` node, or a value-headed `type_app`
+    /// the parser could not tell from a turbofish) or any other temporary (`p.get()`,
+    /// `o?`) has no addressable home, and `lower`'s place-addr materializes it into a
+    /// temp, so a store through it would write the copy and silently drop the write.
+    const StoreRoot = enum { name, index_element, temporary };
+
+    fn storeRoot(bc: *BodyChecker, node_idx: Ast.Index) StoreRoot {
         var cur = node_idx;
-        while (cur != Ast.none) {
+        while (true) {
             const n = bc.tree.nodes[cur.int()];
             switch (n.tag) {
                 .field_access, .tuple_field => cur = n.lhs,
-                .index => return true,
-                .type_app => return bc.appHeadIsValue(cur),
-                else => return false,
+                .identifier => return .name,
+                .index => return .index_element,
+                // A type-named head (`Vec[int].x`) is not a value; its own error stands.
+                .type_app => return if (bc.appHeadIsValue(cur)) .index_element else .name,
+                else => return .temporary,
             }
         }
-        return false;
     }
 
     fn typeFromNode(bc: *BodyChecker, type_node: Ast.Index) Type {

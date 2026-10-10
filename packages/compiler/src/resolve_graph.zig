@@ -916,9 +916,15 @@ const GraphResolve = struct {
             .assign => {
                 const target = g.nodes()[stmt.lhs.int()];
                 // A `.`-rooted place (`p.x`) resolves as an expression (its root name is
-                // checked there), not as a bare assignable name.
-                if (target.tag == .field_access or target.tag == .tuple_field) {
+                // checked there), not as a bare assignable name. So does an index element
+                // (`xs[i]`), which the checker rejects as a target with its type in hand.
+                if (target.tag == .field_access or target.tag == .tuple_field or target.tag == .index) {
                     try g.resolveExpr(stmt.lhs);
+                } else if (target.tag != .identifier) {
+                    // A call result (`p.get() = v`) or another value with no name: its
+                    // main token is no name to look up.
+                    try g.resolveExpr(stmt.lhs);
+                    try g.sink.report(.{ .span = g.nodeSpan(g.cur_mod, stmt.lhs), .code = .R0007, .scope = g.cur_mod }, "cannot assign to a temporary value, such as a call result; only a variable or a field of one can be assigned", .{});
                 } else {
                     const resn = g.lookupName(target.main_token);
                     g.res(stmt.lhs, resn);
@@ -3998,6 +4004,41 @@ test "a local fn may reuse a label of the loop around it" {
     , struct {
         fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
             try testing.expectEqual(@as(usize, 0), r.diags.len);
+        }
+    }.run);
+}
+
+test "an index element store resolves its receiver, not '[' as a name" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ xs := 0
+        \\ xs[0] = 1
+        \\ q[0] = 1
+        \\ return xs
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), countCode(r, .R0007));
+            try testing.expectEqual(@as(usize, 1), countCode(r, .R0001));
+            try testing.expectEqualStrings("undeclared identifier 'q'", firstError(r).message);
+        }
+    }.run);
+}
+
+test "assigning a call result is R0007, not an undeclared '('" {
+    try withResolvedSource(
+        \\fn id(x: int) -> int { x }
+        \\fn main() -> int {
+        \\ x := 1
+        \\ x.f() = 2
+        \\ return x
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 1), countCode(r, .R0007));
+            try testing.expectEqualStrings("cannot assign to a temporary value, such as a call result; only a variable or a field of one can be assigned", firstError(r).message);
         }
     }.run);
 }

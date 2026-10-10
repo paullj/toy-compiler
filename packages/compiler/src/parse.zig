@@ -1868,10 +1868,11 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
                 const value = try p.parseExpr(0);
                 return p.addNode(.{ .tag = .assign, .main_token = name_tok, .lhs = target, .rhs = value });
             },
-            // A `.`-rooted place: `p.x = v`, `p.a.b = v`. Parse the place (a
-            // postfix chain over a name); if `=` follows it is a field store,
-            // otherwise it is an expression statement (continue the infix climb).
-            .dot => {
+            // A `.`- or `[`-rooted place: `p.x = v`, `p.a.b = v`, `ps[0].x = v`. Parse the
+            // place (a postfix chain over a name); if `=` follows it is a store, otherwise
+            // it is an expression statement (continue the infix climb). An index element
+            // is no place, but parsing it as one lets the checker say so (T0070, T0074).
+            .dot, .l_bracket => {
                 const first = p.index;
                 const place = try p.parsePostfix(try p.parsePrefix());
                 if (p.eat(.eq)) {
@@ -4270,6 +4271,13 @@ test "nested field place-store" {
     try expectProgram(
         "fn f() { p.a.b = 5\n return }\n",
         "(program (fn f () _ (block (= (. (. p a) b) 5) (return))))",
+    );
+}
+
+test "an index-rooted place parses as a store, other index-led statements as before" {
+    try expectProgram(
+        "fn f() {\n ps[0].x = 5\n ps[i].x = 6\n xs[1] = 7\n xs[0] == 1\n id[int](5)\n Vec[int].new()\n return\n}\n",
+        "(program (fn f () _ (block (= (. (index ps 0) x) 5) (= (. (tyapp ps i) x) 6) (= (index xs 1) 7) (== (index xs 0) 1) (call (tyapp id int) 5) (call (. (tyapp Vec int) new)) (return))))",
     );
 }
 
