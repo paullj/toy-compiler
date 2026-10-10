@@ -62,7 +62,8 @@ pub fn build(b: *std.Build) void {
     });
     exe.root_module.addOptions("build_options", options);
 
-    b.installArtifact(exe);
+    const install_exe = b.addInstallArtifact(exe, .{});
+    b.getInstallStep().dependOn(&install_exe.step);
 
     const run_step = b.step("run", "Run the app");
 
@@ -103,9 +104,10 @@ pub fn build(b: *std.Build) void {
     // they can also be run directly (`./zig-out/bin/toy-test`), handy for a
     // `--test-filter` or a debugger.
     const install_mod_tests = b.addInstallArtifact(mod_tests, .{});
-    const test_bin_step = b.step("test-bin", "Install the test binaries to run directly (e.g. ./zig-out/bin/toy-test)");
+    const test_bin_step = b.step("test-bin", "Install the test binaries, and the toy the integration tests drive, to run directly (e.g. ./zig-out/bin/toy-test)");
     test_bin_step.dependOn(&install_mod_tests.step);
     test_bin_step.dependOn(&b.addInstallArtifact(exe_tests, .{}).step);
+    test_bin_step.dependOn(&install_exe.step);
 
     // Integration tests consume the compiler as a BLACK BOX through the published
     // `toy_compiler` module (root.zig's pub exports) — `@import("toy_compiler")`,
@@ -136,11 +138,19 @@ pub fn build(b: *std.Build) void {
     });
     integration_mod.addIncludePath(b.path("packages/tree-sitter-toy/src"));
     integration_mod.link_libc = true;
+    // Many integration tests drive the CLI. They get the install path of the `toy` built
+    // from this same tree, and every run of them waits for that install, so they never
+    // spawn a stale binary or find none on a fresh checkout.
+    const test_options = b.addOptions();
+    test_options.addOption([]const u8, "toy_exe", b.getInstallPath(.bin, exe.out_filename));
+    integration_mod.addOptions("test_options", test_options);
     const integration_tests = b.addTest(.{
         .name = "toy-integration-test",
         .root_module = integration_mod,
     });
-    test_step.dependOn(&b.addRunArtifact(integration_tests).step);
+    const run_integration = b.addRunArtifact(integration_tests);
+    run_integration.step.dependOn(&install_exe.step);
+    test_step.dependOn(&run_integration.step);
     // Install the integration binary too so it runs directly
     // (`./zig-out/bin/toy-integration-test`) alongside toy-test under `test-bin`.
     test_bin_step.dependOn(&b.addInstallArtifact(integration_tests, .{}).step);

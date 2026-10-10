@@ -1,22 +1,35 @@
-//! Shared helpers for the integration tests that build a toy program with the installed
-//! `zig-out/bin/toy` and run the result.
+//! Shared helpers for the integration tests that build a toy program with the `toy` built
+//! alongside this test binary and run the result.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 
-/// The emitted binary is macOS/aarch64 Mach-O, and these tests drive the installed CLI.
+/// The absolute install path of the `toy` this test binary was built with. build.zig
+/// installs it before any integration test runs, under `test` and `test-bin` alike, so a
+/// test never drives a stale or missing compiler.
+pub const toy_exe: []const u8 = @import("test_options").toy_exe;
+
+/// A missing compiler is a failure, never a skip: a skip here once hid every CLI test on a
+/// fresh checkout, where nothing had installed `toy` yet.
+pub fn requireToy(io: Io) !void {
+    Io.Dir.accessAbsolute(io, toy_exe, .{}) catch |e| {
+        std.debug.print("no toy at {s} ({t}); run the integration tests through 'zig build test' or 'zig build test-bin'\n", .{ toy_exe, e });
+        return error.ToyMissing;
+    };
+}
+
+/// The emitted binary is macOS/aarch64 Mach-O, and these tests drive the CLI.
 pub fn skipUnlessBackend(io: Io) !void {
     if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
-    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
+    try requireToy(io);
 }
 
 /// Write `entry_src` to `dir_name/main.toy`, build it to `dir_name/prog`, and return the
 /// binary's absolute path (owned by `gpa`). Keeping the `main.toy`/`prog` basenames fixed
 /// matters: the binary embeds them, so two builds only compare equal with the same names.
 pub fn compile(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, entry_src: []const u8, flags: []const []const u8) ![:0]u8 {
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/toy", gpa);
-    defer gpa.free(bin_abs);
+    const bin_abs = toy_exe;
 
     try Io.Dir.cwd().createDirPath(io, dir_name);
     const main_path = try std.fmt.allocPrint(gpa, "{s}/main.toy", .{dir_name});
@@ -83,11 +96,10 @@ fn buildImage(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, jobs: []cons
     return .{ .prog = prog, .bytes = try Io.Dir.cwd().readFileAlloc(io, prog, gpa, .unlimited) };
 }
 
-/// Run the installed `toy` with `args` in the directory `cwd_abs` (absolute), which owns the
+/// Run the built `toy` with `args` in the directory `cwd_abs` (absolute), which owns the
 /// `.toy/` cache the build reads and writes. Fails unless toy exits 0.
 pub fn buildIn(gpa: std.mem.Allocator, io: Io, cwd_abs: []const u8, args: []const []const u8) !void {
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/toy", gpa);
-    defer gpa.free(bin_abs);
+    const bin_abs = toy_exe;
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.append(gpa, bin_abs);
@@ -179,8 +191,7 @@ pub fn exitAtBothLevels(gpa: std.mem.Allocator, io: Io, dir: []const u8, src: []
 
 /// The `--emit ir` text of `path` built with `flags` (owned).
 pub fn emitIr(gpa: std.mem.Allocator, io: Io, path: []const u8, flags: []const []const u8) ![]u8 {
-    const bin = try Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/toy", gpa);
-    defer gpa.free(bin);
+    const bin = toy_exe;
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.appendSlice(gpa, &.{ bin, "--emit", "ir" });

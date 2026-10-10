@@ -13,18 +13,16 @@ const Io = std.Io;
 const harness = @import("harness.zig");
 
 /// Compile `entry_src` (written into a fresh temp dir) with the installed `toy`, run the
-/// produced binary, and return its exit code. Skips when `toy` is absent (the corpus
-/// gate builds it first) or off aarch64-macos (the only backend target).
+/// produced binary, and return its exit code. Skips off aarch64-macos (the only backend
+/// target).
 fn buildAndRun(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, entry_src: []const u8) !u8 {
     return buildAndRunWith(gpa, io, dir_name, entry_src, &.{});
 }
 
 /// `buildAndRun` with extra build `flags`.
 fn buildAndRunWith(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, entry_src: []const u8, flags: []const []const u8) !u8 {
-    if (builtin.os.tag != .macos or builtin.cpu.arch != .aarch64) return error.SkipZigTest;
-    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/toy", gpa);
-    defer gpa.free(bin_abs);
+    try harness.skipUnlessBackend(io);
+    const bin_abs = harness.toy_exe;
 
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     try Io.Dir.cwd().createDirPath(io, dir_name);

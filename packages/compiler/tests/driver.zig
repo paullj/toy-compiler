@@ -12,6 +12,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const toyc = @import("toy_compiler");
+const harness = @import("harness.zig");
 
 const Driver = toyc.Driver;
 const Codegen = toyc.DriverCodegen;
@@ -220,7 +221,7 @@ test "a many-error file collects the FULL uncapped diagnostic set (render cap is
 test "`toy check` on a many-error file caps output at DIAG_CAP primaries + a summary line" {
     // End-to-end render check via the built `toy` binary (the only path that exercises
     // DiagRender). Migrated from the removed `--emit check` inspection table to the
-    // `toy check` subcommand. Skips gracefully if the binary isn't present. DIAG_CAP = 100
+    // `toy check` subcommand. DIAG_CAP = 100
     // primary `-->` carets are drawn, then one `... and N more` line; the summary count
     // is total - 100.
     if (builtin.os.tag != .macos) return error.SkipZigTest;
@@ -229,8 +230,7 @@ test "`toy check` on a many-error file caps output at DIAG_CAP primaries + a sum
     defer threaded.deinit();
     const io = threaded.io();
 
-    const toy_bin = "zig-out/bin/toy";
-    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
+    try harness.requireToy(io);
 
     const dir_name = ".toy-test-driver-cap-render";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
@@ -249,8 +249,7 @@ test "`toy check` on a many-error file caps output at DIAG_CAP primaries + a sum
     const path = dir_name ++ "/many.toy";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src.items });
 
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
-    defer gpa.free(bin_abs);
+    const bin_abs = harness.toy_exe;
 
     var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "check", path }, .stdout = .pipe });
     var rdr = child.stdout.?.readerStreaming(io, &.{});
@@ -280,10 +279,8 @@ test "a pre-verb CLI error is reported once, not doubled by the subcommand re-pa
     defer threaded.deinit();
     const io = threaded.io();
 
-    const toy_bin = "zig-out/bin/toy";
-    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
-    defer gpa.free(bin_abs);
+    try harness.requireToy(io);
+    const bin_abs = harness.toy_exe;
 
     var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "--color", "alwyas", "build", "x.toy" }, .stdout = .pipe });
     var rdr = child.stdout.?.readerStreaming(io, &.{});
@@ -302,10 +299,8 @@ test "explain: a known code prints its doc (exit 0); an unknown code arg-errors 
     defer threaded.deinit();
     const io = threaded.io();
 
-    const toy_bin = "zig-out/bin/toy";
-    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
-    defer gpa.free(bin_abs);
+    try harness.requireToy(io);
+    const bin_abs = harness.toy_exe;
 
     // Known code: prints the doc, exit 0.
     {
@@ -336,10 +331,8 @@ test "explain --list enumerates EVERY registered code (and `explain list` works 
     defer threaded.deinit();
     const io = threaded.io();
 
-    const toy_bin = "zig-out/bin/toy";
-    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
-    defer gpa.free(bin_abs);
+    try harness.requireToy(io);
+    const bin_abs = harness.toy_exe;
 
     // `--list`: exit 0; band headers; and — the drift guard — EVERY registry code +
     // its kebab title appears, so a newly-added code shows up automatically.
@@ -376,8 +369,7 @@ test "coded render: `return nope` renders `error[R0001]:` and stays report-once 
     defer threaded.deinit();
     const io = threaded.io();
 
-    const toy_bin = "zig-out/bin/toy";
-    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
+    try harness.requireToy(io);
 
     const dir_name = ".toy-test-driver-coded";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
@@ -387,8 +379,7 @@ test "coded render: `return nope` renders `error[R0001]:` and stays report-once 
     const path = dir_name ++ "/one.toy";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "fn main() -> int {\n  return nope\n}\n" });
 
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
-    defer gpa.free(bin_abs);
+    const bin_abs = harness.toy_exe;
 
     // Migrated from `--emit check` (removed inspection table) to the `toy check` subcommand.
     var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "check", path }, .stdout = .pipe });
@@ -422,10 +413,8 @@ test "explain: a parse code (P0001) prints its doc (exit 0)" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    const toy_bin = "zig-out/bin/toy";
-    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
-    defer gpa.free(bin_abs);
+    try harness.requireToy(io);
+    const bin_abs = harness.toy_exe;
 
     var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "explain", "P0001" }, .stdout = .pipe });
     var rdr = child.stdout.?.readerStreaming(io, &.{});
@@ -442,8 +431,7 @@ test "coded render: a parse error renders `error[P0002]:` and stays report-once 
     defer threaded.deinit();
     const io = threaded.io();
 
-    const toy_bin = "zig-out/bin/toy";
-    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
+    try harness.requireToy(io);
 
     const dir_name = ".toy-test-driver-parse-coded";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
@@ -453,8 +441,7 @@ test "coded render: a parse error renders `error[P0002]:` and stays report-once 
     const path = dir_name ++ "/one.toy";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "fn a() -> int {\n  return )\n}\n" });
 
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
-    defer gpa.free(bin_abs);
+    const bin_abs = harness.toy_exe;
 
     // Migrated from `--emit check` (removed inspection table) to the `toy check` subcommand.
     var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "check", path }, .stdout = .pipe });
@@ -470,14 +457,12 @@ test "coded render: a parse error renders `error[P0002]:` and stays report-once 
 }
 
 /// Spawn the built `toy` binary with `argv_tail` (already including the entry path),
-/// capturing stdout and the exit term. Skips when the binary is absent. Used by the
+/// capturing stdout and the exit term. Used by the
 /// multi-module `check` regression below, which writes several files under `dir_name`
 /// then drives `check` over the entry.
 fn spawnToy(gpa: std.mem.Allocator, io: Io, argv_tail: []const []const u8) !struct { out: []u8, term: std.process.Child.Term } {
-    const toy_bin = "zig-out/bin/toy";
-    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
-    defer gpa.free(bin_abs);
+    try harness.requireToy(io);
+    const bin_abs = harness.toy_exe;
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.append(gpa, bin_abs);
@@ -504,7 +489,7 @@ test "check follows imports: a VALID multi-module program reports zero diagnosti
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
+    try harness.requireToy(io);
 
     const dir_name = ".toy-test-driver-check-multimod";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
@@ -563,7 +548,7 @@ test "io.print(char) emits byte-exact UTF-8 for 1/2/3/4-byte codepoints (no extr
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
+    try harness.requireToy(io);
 
     const dir_name = ".toy-test-m10-charutf8";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
@@ -600,7 +585,7 @@ test "io.print(int) renders decimal for 0 / negative / i64 max / i64 MIN (never-
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
+    try harness.requireToy(io);
 
     const dir_name = ".toy-test-display-int-edges";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
@@ -648,7 +633,7 @@ test "char Display is a shared witness — >6 boundary codepoints compile + byte
     defer threaded.deinit();
     const io = threaded.io();
 
-    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
+    try harness.requireToy(io);
 
     const dir_name = ".toy-test-c4-charbands";
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
@@ -1250,17 +1235,15 @@ test "unwrap on an aggregate payload compiles and runs (result-slot copy, not a 
 
 /// Spawn `toy` with `args` over a one-file fixture (the `return nope` R0001 program),
 /// capturing stdout+stderr merged and the exit code. Returns the captured bytes (the
-/// caller frees) and the term. Skips when the built binary is absent.
+/// caller frees) and the term.
 fn runToyOnFixture(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, src: []const u8, args: []const []const u8) !struct { out: []u8, term: std.process.Child.Term } {
-    const toy_bin = "zig-out/bin/toy";
-    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
+    try harness.requireToy(io);
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     try Io.Dir.cwd().createDirPath(io, dir_name);
     var path_buf: [256]u8 = undefined;
     const path = try std.fmt.bufPrint(&path_buf, "{s}/one.toy", .{dir_name});
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
-    defer gpa.free(bin_abs);
+    const bin_abs = harness.toy_exe;
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
@@ -4758,10 +4741,8 @@ test "the first failing unit in index order is reported at every -j" {
 
 /// `spawnToy` with stderr captured too, where an uncaught error's name lands.
 fn spawnToyBoth(gpa: std.mem.Allocator, io: Io, argv_tail: []const []const u8) !struct { out: []u8, err: []u8, term: std.process.Child.Term } {
-    const toy_bin = "zig-out/bin/toy";
-    Io.Dir.cwd().access(io, toy_bin, .{}) catch return error.SkipZigTest;
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, toy_bin, gpa);
-    defer gpa.free(bin_abs);
+    try harness.requireToy(io);
+    const bin_abs = harness.toy_exe;
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.append(gpa, bin_abs);

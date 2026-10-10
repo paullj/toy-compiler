@@ -321,8 +321,7 @@ test "warm -O1: a generic method instance that stops keeping its fn param rebuil
 
 /// The diagnostics a `toy` run in `cwd_abs` that must fail prints (owned).
 fn buildErrIn(gpa: std.mem.Allocator, io: Io, cwd_abs: []const u8, args: []const []const u8) ![]u8 {
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/toy", gpa);
-    defer gpa.free(bin_abs);
+    const bin_abs = harness.toy_exe;
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.append(gpa, bin_abs);
