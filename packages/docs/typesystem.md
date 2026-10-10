@@ -265,6 +265,17 @@ impl's (`impl Box[T] { fn conv[T](..) }`), and no fn declares one name twice
 (`impl Pair[A, B]`); a partly concrete or repeated one (`impl Pair[T, int]`,
 `impl Pair[T, T]`) is **T0013**.
 
+## Associated functions
+
+An `impl` fn without `self` is an associated function, called on its type: `K.make(1)`
+on a struct or enum `K`, `lib.K.make(1)` through a module, `Box[int].new()` on a generic
+struct (or `Box.new(5)`, inferred as above). The call selects it like a method and
+passes no receiver. It is never called on a value (`k.make(1)` is **T0018**), an instance
+method is never called on a type (`K.get()` is **T0018**), and on an enum a variant keeps
+its name: `E.A(1)` constructs the variant `A` even when an associated fn `A` exists. An
+associated fn of a generic enum is not callable yet (the call reads as a variant,
+**T0061**), and an associated fn is not a value (`f := K.make` is **T0056**).
+
 ## Same-named methods
 
 Two modules may declare a method of one name on one type: a program's own
@@ -458,7 +469,10 @@ of fn type: 'h.run(..)' calls the method and 'h.run' reads the field; rename one
 covers inherent and conformance methods and the methods of a generic struct (a field
 `f: fn(T) -> T` of `Box[T]`). A field of another type cannot be called, so it does not
 warn, even a type parameter `v: T` that an instance grounds to a function type, and
-neither does an associated fn, on which `h.run(1)` is already T0018.
+neither does an associated fn, on which `h.run(1)` is already T0018. That error does not
+call the field either; its message names both ways in: "'run' is both an associated
+function of 'H' and a field of fn type: 'H.run(..)' calls the function and 'h.run' reads
+the field".
 
 The receiver is captured like any other variable. A bare local receiver that is
 assigned anywhere in the function (including by a `mut self` call) is boxed, and the

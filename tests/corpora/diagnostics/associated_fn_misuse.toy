@@ -1,0 +1,35 @@
+# An associated fn is called on its type and an instance method on a value. Calling one
+# the other way is T0018, and when a field of fn type shares the associated fn's name the
+# message names both: 'H.run(..)' calls the function and 'h.run' reads the field.
+struct H { run: fn(int) -> int, n: int }
+
+impl H {
+    fn run(x: int) -> int { x + 1 }
+    fn make(n: int) -> H { H { run: fn(x) { x }, n: n } }
+    fn get(self) -> int { self.n }
+}
+
+struct Box[T] { v: T, mk: fn() -> T }
+
+impl Box[T] {
+    fn mk(v: T) -> Box[T] { Box[T] { v: v, mk: fn() { v } } }
+}
+
+enum E { A }
+
+impl E {
+    fn first() -> E { E.A }
+}
+
+fn main() -> int {
+    h := H.make(1)
+    _a := h.run(2)  #~ ERROR [T0018] 'run' is both an associated function of 'H' and a field of fn type: 'H.run(..)' calls the function and 'h.run' reads the field
+    _b := h.make(3)  #~ ERROR [T0018] 'make' is an associated function; call it as 'H.make(..)'
+    _c := H.get()  #~ ERROR [T0018] 'get' is an instance method, not an associated function; call it on a value
+    _d := H.nope()  #~ ERROR [T0018] 'H' has no associated function 'nope'
+    b := Box[int].mk(4)
+    _e := b.mk()  #~ ERROR [T0018] 'mk' is both an associated function of 'Box' and a field of fn type: 'Box[..].mk(..)' calls the function and 'b.mk' reads the field
+    _f := E.second()  #~ ERROR [T0061] enum 'E' has no variant 'second'
+    f := h.run
+    return f(1) + E.first().to_string().len()
+}

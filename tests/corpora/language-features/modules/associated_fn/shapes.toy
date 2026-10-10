@@ -1,0 +1,13 @@
+pub struct Rect { w: int, h: int }
+
+impl Rect {
+    fn square(side: int) -> Rect { Rect { w: side, h: side } }
+    fn area(self) -> int { self.w * self.h }
+}
+
+pub enum Turn { Left, Right }
+
+impl Turn {
+    fn flip(t: Turn) -> Turn { match t { .Left -> Turn.Right, .Right -> Turn.Left } }
+    fn sign(self) -> int { match self { .Left -> -1, .Right -> 1 } }
+}

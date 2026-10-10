@@ -3025,7 +3025,7 @@ pub const BodyChecker = struct {
                 try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0022 }, "mutating method '{s}' is not supported on the builtin type '{s}'; `mut self` is only allowed on struct and enum receivers", .{ member, bc.typeName(recv_ty) });
             } else try bc.checkMutReceiver(fa.lhs, member);
         }
-        _ = try bc.checkCall(node_idx, args, bc.methodSig(mf, member));
+        _ = try bc.checkCall(node_idx, args, if (m.is_static) bc.fnSig(mf, member) else bc.methodSig(mf, member));
         bc.node_types[(node_idx).int()] = mf.ret;
         return mf.ret;
     }
@@ -3180,9 +3180,10 @@ pub const BodyChecker = struct {
     // method dispatch does not re-run `typeOf` on the args and double-diagnose.
     fn tryEnumConstruction(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node) error{OutOfMemory}!?Type {
         const recv = bc.tree.nodes[(callee.lhs).int()];
-        if (recv.tag == .identifier and bc.activeEnumMap().get(bc.nameText(recv.main_token)) != null) {
+        if (recv.tag == .identifier) if (bc.activeEnumMap().get(bc.nameText(recv.main_token))) |enum_id| {
+            if (bc.isAssociatedFnOfEnum(enum_id, callee.main_token)) return null;
             return try bc.typeOfEnumInitQualified(node_idx, .tuple, callee.lhs, callee.main_token, n.rhs);
-        }
+        };
         // An explicit generic-enum tuple-variant construction `Either[int,bool].left(42)`
         //: the callee field_access's receiver is a `type_app` resolving to an
         // enum-`App`. Substitute the variant payload patterns through the App's args
@@ -3206,11 +3207,72 @@ pub const BodyChecker = struct {
         // A cross-module tuple-variant `mod.Enum.Variant(args)` (graph mode): the
         // callee field_access's receiver is the inner `mod.Enum`.
         if (bc.qualifiedEnumId(callee.lhs)) |enum_id| {
+            if (bc.isAssociatedFnOfEnum(enum_id, callee.main_token)) return null;
             const ty = try bc.checkVariant(node_idx, enum_id, callee.main_token, .tuple, n.rhs);
             bc.node_types[(node_idx).int()] = ty;
             return ty;
         }
         return null;
+    }
+
+    /// `E.m(..)` names an associated fn rather than a variant: a non-generic enum `E` with
+    /// no variant `m` and a method `m` (a variant keeps the name when both exist).
+    fn isAssociatedFnOfEnum(bc: *BodyChecker, enum_id: u32, member_tok: u32) bool {
+        const e = bc.model.enums[enum_id];
+        if (e.is_generic) return false;
+        const member = bc.nameText(member_tok);
+        for (e.variants) |v| if (std.mem.eql(u8, v.name, member)) return false;
+        return Typecheck.pickMethodIndex(bc.model.methods, Type.enumT(enum_id), member, null, null, bc.methodSite()) != .none;
+    }
+
+    /// The non-generic struct or enum a call's receiver names as a type (`K` in `K.make()`,
+    /// or a qualified `lib.K`), or null when the receiver is a value, a module or a generic
+    /// type.
+    fn concreteTypeNamed(bc: *BodyChecker, recv_idx: Ast.Index) ?Type {
+        const r = bc.tree.nodes[recv_idx.int()];
+        const ids: struct { s: ?u32, e: ?u32 } = switch (r.tag) {
+            .identifier => blk: {
+                if (bc.resolutions[recv_idx.int()] != .unresolved) return null;
+                const name = bc.nameText(r.main_token);
+                break :blk .{ .s = bc.activeStructMap().get(name), .e = bc.activeEnumMap().get(name) };
+            },
+            .field_access => blk: {
+                const inner = bc.tree.nodes[r.lhs.int()];
+                if (inner.tag != .identifier or bc.resolutions[r.lhs.int()] != .module) return null;
+                const g = bc.model.graph;
+                const target = g.namespaceOfIn(bc.graph_mod, bc.nameText(inner.main_token)) orelse return null;
+                const name = bc.nameText(r.main_token);
+                break :blk .{ .s = g.mods[target].struct_ids.get(name), .e = g.mods[target].enum_ids.get(name) };
+            },
+            else => return null,
+        };
+        if (ids.s) |sid| return if (sid < bc.structSyms().len and !bc.structSyms()[sid].is_generic) Type.structT(sid) else null;
+        if (ids.e) |eid| return if (!bc.model.enums[eid].is_generic) Type.enumT(eid) else null;
+        return null;
+    }
+
+    /// `K.make(args)` on a non-generic struct or enum `K`: a self-less fn of the type's
+    /// inherent impl. Recorded as its method callee, which lower calls with no receiver,
+    /// as it does the generic `Box[int].new()`.
+    fn checkConcreteAssociatedCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node, ty: Type) error{OutOfMemory}!Type {
+        const member = bc.nameText(callee.main_token);
+        const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+        switch (Typecheck.pickMethodIndex(bc.model.methods, ty, member, null, null, bc.methodSite())) {
+            .one => |mi| {
+                if (bc.model.methods[mi].is_static) return bc.dispatchMethod(node_idx, n, callee, ty, member, mi);
+                try bc.drainArgs(args);
+                try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' is an instance method, not an associated function; call it on a value", .{member});
+            },
+            .ambiguous => {
+                try bc.drainArgs(args);
+                try bc.emitAmbiguousConformance(callee.main_token, ty, member);
+            },
+            .none => {
+                try bc.drainArgs(args);
+                try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' has no associated function '{s}'", .{ bc.typeName(ty), member });
+            },
+        }
+        return .invalid;
     }
 
     /// An ASSOCIATED-function call `Vec[int].new(args)`: a `field_access` callee whose
@@ -3258,6 +3320,7 @@ pub const BodyChecker = struct {
             _ = try bc.checkCall(node_idx, args, bc.fnSig(mf, member).substituted(targs_opt));
             return bc.substRet(node_idx, mf, targs_opt orelse return .invalid);
         }
+        if (bc.concreteTypeNamed(callee.lhs)) |ty| return try bc.checkConcreteAssociatedCall(node_idx, n, callee, ty);
         // A bare `Box.new(5)` (no turbofish) naming a generic struct with an associated fn:
         // its type params come from the value args, or the call needs explicit ones.
         if (recv.tag == .identifier and bc.resolutions[(callee.lhs).int()] != .module) {
@@ -4130,7 +4193,8 @@ pub const BodyChecker = struct {
                 // never on a value receiver.
                 if (bc.model.methods[mi].is_static) {
                     try bc.drainArgs(args);
-                    try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' is an associated function; call it as '{s}.{s}(..)'", .{ member, bc.typeName(recv_ty), member });
+                    const has_field = recv_ty.kind == .@"struct" and bc.fnField(recv_ty.struct_id, member, &.{}) != null;
+                    try bc.reportAssociatedOnValue(callee, bc.typeName(recv_ty), "", has_field);
                     return .invalid;
                 }
                 return try bc.dispatchMethod(node_idx, n, callee, recv_ty, member, mi);
@@ -4262,6 +4326,19 @@ pub const BodyChecker = struct {
         return .invalid;
     }
 
+    /// T0018 at `recv.m(..)` where `m` is an associated fn. A fn-typed field `m` beside it
+    /// is not called instead (a call selects the method first); the message only says how
+    /// to reach each, because "call it as 'T.m(..)'" alone misleads someone after the field.
+    fn reportAssociatedOnValue(bc: *BodyChecker, callee: Ast.Node, type_name: []const u8, targs: []const u8, has_field: bool) error{OutOfMemory}!void {
+        const member = bc.nameText(callee.main_token);
+        const at: DiagnosticSink.Report = .{ .span = bc.tokSpan(callee.main_token), .code = .T0018 };
+        if (!has_field) return bc.sink.report(at, "'{s}' is an associated function; call it as '{s}{s}.{s}(..)'", .{ member, type_name, targs, member });
+        const rs = bc.spanOf(callee.lhs);
+        const text = bc.source[rs.start..rs.end];
+        const recv = if (std.mem.indexOfScalar(u8, text, '\n') == null) text else "x";
+        try bc.sink.report(at, "'{s}' is both an associated function of '{s}' and a field of fn type: '{s}{s}.{s}(..)' calls the function and '{s}.{s}' reads the field", .{ member, type_name, type_name, targs, member, recv, member });
+    }
+
     fn dispatchAppMethod(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node, recv_ty: Type) error{OutOfMemory}!Type {
         // A method call on a generic-type instance `b.get()`: the
         // receiver is an `App` (`Box[int]`; reify runs later in the mono
@@ -4277,7 +4354,8 @@ pub const BodyChecker = struct {
             // it must be reached via `Type[args].fn()`.
             if (!m.has_self) {
                 try bc.drainArgs(args);
-                try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' is an associated function; call it as '{s}[..].{s}(..)'", .{ member, bc.typeName(recv_ty), member });
+                const has_field = !e.ctor_is_enum and bc.fnField(e.ctor, member, e.args) != null;
+                try bc.reportAssociatedOnValue(callee, bc.typeName(recv_ty), "[..]", has_field);
                 return .invalid;
             }
             const mf = bc.model.fns[m.fn_id];

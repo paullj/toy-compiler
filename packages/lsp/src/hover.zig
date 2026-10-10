@@ -459,6 +459,40 @@ test "hover on a method callee shows the selected method" {
     }
 }
 
+test "hover on a non-generic type's associated fn callee shows the fn" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const test_util = @import("test_util.zig");
+    const src =
+        \\struct K { n: int }
+        \\impl K { fn make(n: int) -> K { K { n: n } } }
+        \\enum E { A }
+        \\impl E { fn first() -> E { E.A } }
+        \\fn main() -> int {
+        \\    k := K.make(1)
+        \\    _e := E.first()
+        \\    return k.n
+        \\}
+        \\
+    ;
+    const cases = [_]struct { at: @import("protocol.zig").Position, want: []const u8 }{
+        .{ .at = test_util.posOf(src, "make(1)"), .want = "fn make(n: int) -> K" },
+        .{ .at = test_util.posOf(src, "first()"), .want = "fn first() -> E" },
+    };
+    for (cases) |c| {
+        var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no hover for '{s}'\n", .{c.want});
+            return error.NoHover;
+        };
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}\n```", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}
+
 test "hover on a generic method call whose args do not check shows the method as declared" {
     const gpa = testing.allocator;
     var docs: @import("Documents.zig") = .{};
