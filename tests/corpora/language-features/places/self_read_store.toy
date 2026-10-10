@@ -1,0 +1,88 @@
+# Feature: an aggregate assignment whose value reads its own destination (a local, `self` in a `mut self` method, a field, an if or match value, a constructor call) builds the whole value before it writes any of it, and so does one whose value calls a closure or a function that can read it (#26)
+# expect: stdout "21\n21\n21\n21\n21\n21\n71\n51\n51\n51\nba|ab\n"
+# expect: exit 0
+import std/io
+
+struct P { x: int, y: int }
+struct O { p: P, k: int }
+struct T(int, int)
+struct S { a: str, b: str }
+
+enum E { A(int, int), B }
+
+impl P {
+    fn swap(mut self) { self = P { x: self.y, y: self.x } }
+
+    fn set_from(mut self, g: fn() -> int) { self = P { x: 5, y: g() } }
+}
+
+impl S {
+    fn flip(mut self) { self = S { a: self.b.concat(self.a), b: self.a.concat(self.b) } }
+}
+
+fn pick(e: E) -> int {
+    match e {
+        E.A(a, _) -> a,
+        E.B -> 0,
+    }
+}
+
+fn main() -> int {
+    p := P { x: 1, y: 2 }
+    p = P { x: p.y, y: p.x }
+    io.println(p.x * 10 + p.y)
+
+    q := P { x: 1, y: 2 }
+    q.swap()
+    io.println(q.x * 10 + q.y)
+
+    o := O { p: P { x: 1, y: 2 }, k: 0 }
+    o.p = P { x: o.p.y, y: o.p.x }
+    io.println(o.p.x * 10 + o.p.y)
+
+    r := P { x: 1, y: 2 }
+    r = if o.k == 0 { P { x: r.y, y: r.x } } else { r }
+    io.println(r.x * 10 + r.y)
+
+    s := P { x: 1, y: 2 }
+    s = match o.k {
+        0 -> P { x: s.y, y: s.x },
+        _ -> s,
+    }
+    io.println(s.x * 10 + s.y)
+
+    t := T(1, 2)
+    t = T(t.1, t.0)
+    io.println(t.0 * 10 + t.1)
+
+    # The payload is written before `pick` reads the old one.
+    e := E.A(1, 2)
+    e = E.A(7, pick(e))
+    io.println(match e {
+        E.A(a, b) -> a * 10 + b,
+        E.B -> 0,
+    })
+
+    # `g` reads `c` through the closure, not by name.
+    c := P { x: 1, y: 2 }
+    g := fn() { c.x }
+    c = P { x: 5, y: g() }
+    io.println(c.x * 10 + c.y)
+
+    # The method's `self` is the place `h` reads.
+    d := P { x: 1, y: 2 }
+    h := fn() { d.x }
+    d.set_from(h)
+    io.println(d.x * 10 + d.y)
+
+    # A closure the value makes and calls on the spot.
+    f := P { x: 1, y: 2 }
+    f = P { x: 5, y: fn() { f.x }() }
+    io.println(f.x * 10 + f.y)
+
+    # Heap values in the temp: each new string is made from both old ones.
+    w := S { a: "a", b: "b" }
+    w.flip()
+    io.println(w.a.concat("|").concat(w.b))
+    return 0
+}

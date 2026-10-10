@@ -142,14 +142,60 @@ pub fn readsCopyOnReadRoot(b: *const Builder, node_idx: Ast.Index) bool {
     };
 }
 
-/// Whether an aggregate store into the place rooted at `place` builds its value aside
-/// first (see `staged_places`).
-pub fn stagesStore(b: *const Builder, place: Ast.Index) bool {
-    if (!b.staged_places) return false;
+/// Whether an aggregate store of `value` into the place rooted at `place` builds the value
+/// aside first, because `value` may read that storage after part of it is written. Two
+/// `addr` homes may name one caller storage (see `staged_places`). Otherwise only a value
+/// that writes the destination piece by piece can see it half written, and only when it
+/// reads the root: by name, or, for a root a closure or a caller may hold by reference,
+/// through code it runs. Staging every aggregate store would change the code of programs
+/// none of this reaches.
+pub fn stagesStore(b: *Builder, place: Ast.Index, value: Ast.Index) bool {
     const li = symbols_res.placeRoot(b.in.tree, b.in.resolutions, place) orelse return false;
     const home = b.homes.get(li) orelse return false;
-    // A store to a local kept in the owner's frame is unstaged, as through its box at -O0.
-    return home == .addr and b.in.closure.storage.hold(li) != .frame_addr;
+    const hold = b.in.closure.storage.hold(li);
+    // A store to a local kept in the owner's frame is unstaged here, as through its box at -O0.
+    if (b.staged_places and home == .addr and hold != .frame_addr) return true;
+    if (!L.producesInPlace(b, value)) return false;
+    const shared = home != .slot or hold == .frame_addr;
+    const reads = readsOf(b, value, li);
+    return reads.names_root or (shared and reads.runs_code);
+}
+
+const Reads = struct { names_root: bool = false, runs_code: bool = false };
+
+/// Whether `expr` names local `li` (in a lambda inside it too), and whether it may run code
+/// other than its own: a call, an index, a `for` (`iter`/`next`), or an operator a protocol
+/// witness implements.
+fn readsOf(b: *const Builder, expr: Ast.Index, li: u32) Reads {
+    const Visitor = struct {
+        b: *const Builder,
+        li: u32,
+        r: Reads = .{},
+        pub fn on(v: *@This(), ev: Walk.Event) void {
+            const e = switch (ev) {
+                .enter => |e| e,
+                else => return,
+            };
+            const in = v.b.in;
+            switch (e.tag) {
+                .identifier => switch (in.resolutions[e.idx.int()]) {
+                    .local => |l| if (l == v.li) {
+                        v.r.names_root = true;
+                    },
+                    else => {},
+                },
+                .call, .index, .type_app, .for_in_stmt, .for_in2_stmt => v.r.runs_code = true,
+                .binary => switch (in.node_types[in.tree.nodes[e.idx.int()].lhs.int()].kind) {
+                    .@"struct", .@"enum" => v.r.runs_code = true,
+                    else => {},
+                },
+                else => {},
+            }
+        }
+    };
+    var v: Visitor = .{ .b = b, .li = li };
+    Walk.walk(.{ .tree = b.in.tree, .tokens = b.in.tokens, .source = b.in.source }, expr, &v) catch unreachable;
+    return v.r;
 }
 
 /// Produce the aggregate `value` into a fresh temp, then copy it to `dst`, so `value`

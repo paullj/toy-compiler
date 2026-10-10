@@ -541,7 +541,7 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
                 return;
             }
             const home = try places.bindingHome(b, stmt.lhs, place_ty);
-            if (places.stagesStore(b, stmt.lhs) and isAggregatePass(b, place_ty)) {
+            if (isAggregatePass(b, place_ty) and places.stagesStore(b, stmt.lhs, stmt.rhs)) {
                 try places.storeStaged(b, stmt.rhs, try places.homeAddr(b, home), place_ty);
                 return;
             }
@@ -2845,6 +2845,22 @@ pub fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Type
     }
 }
 
+/// Whether `lowerExprInto` writes `expr`'s aggregate value into the destination piece by
+/// piece while it still evaluates parts of it, rather than finishing the value elsewhere
+/// and copying it in whole.
+pub fn producesInPlace(b: *Builder, expr: Ast.Index) bool {
+    const n = b.in.tree.nodes[expr.int()];
+    return switch (n.tag) {
+        .struct_init, .enum_init_tuple, .enum_init_struct => true,
+        .if_stmt, .block, .unsafe_block, .loop_expr, .labeled, .match_expr => true,
+        .call => blk: {
+            const ty = b.in.node_types[expr.int()];
+            break :blk isTupleStructCtorCall(b, n, ty) or isQualifiedVariantCtorCall(b, n, ty);
+        },
+        else => false,
+    };
+}
+
 /// An aggregate value yielded by an identifier / field-access / call: lower it to
 /// an Operand.slot, then byte-copy that slot into `dst_ptr`.
 fn copyAggInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
@@ -3089,7 +3105,7 @@ fn lowerFieldStore(b: *Builder, place: Ast.Index, value: Ast.Index, ty: Typechec
         try b.note(b.in.tree.nodes[(place).int()].main_token, "field store target unsupported in lower");
         return;
     }
-    if (places.stagesStore(b, place) and isAggregatePass(b, ty)) return places.storeStaged(b, value, addr, ty);
+    if (isAggregatePass(b, ty) and places.stagesStore(b, place, value)) return places.storeStaged(b, value, addr, ty);
     try storeThrough(b, addr, value, ty, b.in.tree.nodes[(place).int()].main_token);
 }
 
@@ -4989,7 +5005,7 @@ test "mut self receiver lowering is unchanged" {
         \\
     , "step",
         \\fn main.P.step(s0, s1) -> int {
-        \\  slots: s0:int s1:int s2:rawptr s3:fn$unit s4:fn$unit
+        \\  slots: s0:int s1:int s2:rawptr s3:fn$unit s4:fn$unit s5:P
         \\b0:
         \\  %1 = iconst 8
         \\  %2 = call @gc_alloc(%1)
@@ -5033,22 +5049,25 @@ test "mut self receiver lowering is unchanged" {
         \\  store %24, %32 : int
         \\  %33 = slot_addr s0
         \\  %34 = load %33 : int
-        \\  %35 = field_addr %34, 0 : int
-        \\  %36 = slot_addr s0
-        \\  %37 = load %36 : int
-        \\  %38 = field_addr %37, 0 : int
-        \\  %39 = load %38 : int
-        \\  store %35, %39 : int
-        \\  %40 = field_addr %34, 8 : int
-        \\  %41 = slot_addr s2
-        \\  %42 = load %41 : rawptr
-        \\  %43 = load %42 : int
-        \\  store %40, %43 : int
-        \\  %44 = slot_addr s0
-        \\  %45 = load %44 : int
-        \\  %46 = field_addr %45, 8 : int
+        \\  %35 = slot_addr s5
+        \\  %36 = field_addr %35, 0 : int
+        \\  %37 = slot_addr s0
+        \\  %38 = load %37 : int
+        \\  %39 = field_addr %38, 0 : int
+        \\  %40 = load %39 : int
+        \\  store %36, %40 : int
+        \\  %41 = field_addr %35, 8 : int
+        \\  %42 = slot_addr s2
+        \\  %43 = load %42 : rawptr
+        \\  %44 = load %43 : int
+        \\  store %41, %44 : int
+        \\  %45 = slot_addr s5
+        \\  copy %34 <- %45 : P
+        \\  %46 = slot_addr s0
         \\  %47 = load %46 : int
-        \\  br b1(%47)
+        \\  %48 = field_addr %47, 8 : int
+        \\  %49 = load %48 : int
+        \\  br b1(%49)
         \\b1(%0:int):
         \\  ret %0
         \\}
@@ -6137,6 +6156,123 @@ test "a mut self method with no other mut param still produces a whole assignmen
     );
 }
 
+/// How many `copy` instructions of the type spelled `ty` the rendered unit `ir` has.
+fn copiesOf(ir: []const u8, ty: []const u8) usize {
+    var n: usize = 0;
+    var it = std.mem.splitScalar(u8, ir, '\n');
+    while (it.next()) |line| {
+        const t = std.mem.trim(u8, line, " ");
+        if (!std.mem.startsWith(u8, t, "copy ") or !std.mem.endsWith(u8, t, ty)) continue;
+        if (std.mem.endsWith(u8, t[0 .. t.len - ty.len], " : ")) n += 1;
+    }
+    return n;
+}
+
+test "an aggregate store whose value reads its destination builds the value aside, then copies it (#26)" {
+    const gpa = testing.allocator;
+    const src =
+        \\struct P { x: int, y: int }
+        \\struct O { p: P }
+        \\impl P {
+        \\ fn swap(mut self) { self = P { x: self.y, y: self.x } }
+        \\ fn reset(mut self) { self = P { x: 0, y: 0 } }
+        \\}
+        \\fn local() -> int {
+        \\ p := P { x: 1, y: 2 }
+        \\ p = P { x: p.y, y: p.x }
+        \\ p.x
+        \\}
+        \\fn field() -> int {
+        \\ o := O { p: P { x: 1, y: 2 } }
+        \\ o.p = P { x: o.p.y, y: o.p.x }
+        \\ o.p.x
+        \\}
+        \\fn ifv(c: bool) -> int {
+        \\ p := P { x: 1, y: 2 }
+        \\ p = if c { P { x: p.y, y: p.x } } else { P { x: 0, y: 0 } }
+        \\ p.x
+        \\}
+        \\fn other() -> int {
+        \\ p := P { x: 1, y: 2 }
+        \\ q := P { x: 3, y: 4 }
+        \\ p = P { x: q.y, y: q.x }
+        \\ p.x
+        \\}
+        \\fn main() -> int {
+        \\ p := P { x: 1, y: 2 }
+        \\ p.swap()
+        \\ p.reset()
+        \\ return local() + field() + ifv(true) + other()
+        \\}
+        \\
+    ;
+    const Case = struct { unit: []const u8, ty: []const u8, copies: usize };
+    for ([_]Case{
+        .{ .unit = "local", .ty = "P", .copies = 1 },
+        .{ .unit = "swap", .ty = "P", .copies = 1 },
+        .{ .unit = "field", .ty = "P", .copies = 1 },
+        .{ .unit = "ifv", .ty = "P", .copies = 1 },
+        // A value that never reads its destination is still produced in place.
+        .{ .unit = "reset", .ty = "P", .copies = 0 },
+        .{ .unit = "other", .ty = "P", .copies = 0 },
+    }) |c| {
+        const ir = try renderUnit(gpa, src, c.unit, .{});
+        defer gpa.free(ir);
+        testing.expectEqual(c.copies, copiesOf(ir, c.ty)) catch |e| {
+            std.debug.print("unit {s}:\n{s}\n", .{ c.unit, ir });
+            return e;
+        };
+    }
+}
+
+test "a store into a place a closure or a caller may hold stages a value that runs code (#26)" {
+    const gpa = testing.allocator;
+    const src =
+        \\struct P { x: int, y: int }
+        \\fn id(k: int) -> int { k }
+        \\impl P {
+        \\ fn set(mut self, g: fn() -> int) { self = P { x: 5, y: g() } }
+        \\ fn put(mut self, k: int) { self = P { x: 5, y: k + 1 } }
+        \\}
+        \\fn boxed() -> int {
+        \\ p := P { x: 1, y: 2 }
+        \\ g := fn() { p.x }
+        \\ p = P { x: 5, y: g() }
+        \\ p = P { x: 6, y: 7 }
+        \\ p.y
+        \\}
+        \\fn plain() -> int {
+        \\ p := P { x: 1, y: 2 }
+        \\ p = P { x: 5, y: id(3) }
+        \\ p.y
+        \\}
+        \\fn main() -> int {
+        \\ p := P { x: 1, y: 2 }
+        \\ p.set(fn() { 3 })
+        \\ p.put(4)
+        \\ return boxed() + plain()
+        \\}
+        \\
+    ;
+    const Case = struct { unit: []const u8, frame: bool, copies: usize };
+    for ([_]Case{
+        // Only the store whose value calls code is staged.
+        .{ .unit = "boxed", .frame = false, .copies = 1 },
+        .{ .unit = "boxed", .frame = true, .copies = 1 },
+        .{ .unit = "set", .frame = false, .copies = 1 },
+        .{ .unit = "put", .frame = false, .copies = 0 },
+        // Nothing but the local itself can reach an unshared local.
+        .{ .unit = "plain", .frame = false, .copies = 0 },
+    }) |c| {
+        const ir = try renderUnit(gpa, src, c.unit, .{ .frame = c.frame });
+        defer gpa.free(ir);
+        testing.expectEqual(c.copies, copiesOf(ir, "P")) catch |e| {
+            std.debug.print("unit {s} (frame {}):\n{s}\n", .{ c.unit, c.frame, ir });
+            return e;
+        };
+    }
+}
+
 test "a by-value read of a local some call passes as a mut argument copies it on the spot" {
     try expectUnit(
         "struct Q { a: int, b: int }\n" ++
@@ -6654,14 +6790,15 @@ test "with frame storage a by-value read of an unboxed aggregate copies it first
 
 test "with frame storage an unboxed capture is an int place slot in the lambda whose aggregate stores are not staged" {
     const gpa = testing.allocator;
-    // The `mut` param turns staging on for the lambda; only its store is staged.
+    // The `mut` param turns staging on for the lambda; only its store is staged, as `p`'s
+    // value reads neither `p` nor code that could.
     const src =
         \\struct P { x: int, y: int }
         \\fn run(f: fn()) { f() }
         \\fn f(mut q: P) -> int {
         \\ p := P { x: 1, y: 2 }
         \\ run(fn() {
-        \\  p = P { x: p.y, y: p.x }
+        \\  p = P { x: 3, y: 4 }
         \\  q = P { x: q.y, y: q.x }
         \\ })
         \\ return p.x
@@ -6689,7 +6826,7 @@ test "a .ref capture is an int place slot in the lambda, and a non-self .ref sta
         \\fn run(f: fn()) { f() }
         \\impl P {
         \\ fn flip(mut self) {
-        \\  run(fn() { self = P { x: self.y, y: self.x } })
+        \\  run(fn() { self = P { x: 3, y: 4 } })
         \\ }
         \\}
         \\fn swap(mut a: P) {
@@ -6718,7 +6855,8 @@ test "a .ref capture is an int place slot in the lambda, and a non-self .ref sta
     defer gpa.free(own);
     try testing.expect(std.mem.indexOf(u8, own, "slots: s0:int s1:P\n") != null);
     try testing.expect(std.mem.indexOf(u8, own, "copy %1 <- %13 : P\n") != null);
-    // A `mut self` owner writes its receiver in place, so its lambda does too.
+    // A `mut self` owner writes its receiver in place when the value does not read it, so
+    // its lambda does too.
     const self_lam = try renderUnit(gpa, src, "main.P.flip$l0", .{});
     defer gpa.free(self_lam);
     try testing.expect(std.mem.indexOf(u8, self_lam, "slots: s0:rawptr s1:int\n") != null);

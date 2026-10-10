@@ -133,7 +133,7 @@ bump(count)                          # count changes
   - **Captures.** A lambda, a local fn, a `_` capture or a bound method may capture a `mut` param (`mut self` included) when it does not escape; one that escapes is T0052.
   - **Not a value.** A fn with any `mut` param, or a method with a `mut` param after `self`, cannot be used as a value: T0049. A call through a function value passes every argument by value.
   - **Boxing.** A caller local passed as a `mut` argument counts as assigned, so if a closure captures it, it is boxed.
-  - **Aliasing** is allowed: `swap(x, x)`, and `f(x, x)` with one `mut` and one by-value param. A by-value argument is the copy taken where it is evaluated, so a later argument that writes the variable through a `mut` param (`f(q, touch(q))`) does not change it. An assignment through a `mut` param builds the whole value before it writes any of it, so `a = P { x: b.y, y: b.x }` is right when `a` and `b` name one variable. [Known limitations](#known-limitations) lists the cases outside `mut` params that these rules do not cover yet.
+  - **Aliasing** is allowed: `swap(x, x)`, and `f(x, x)` with one `mut` and one by-value param. A by-value argument is the copy taken where it is evaluated, so a later argument that writes the variable through a `mut` param (`f(q, touch(q))`) does not change it. An assignment through a `mut` param builds the whole value before it writes any of it, so `a = P { x: b.y, y: b.x }` is right when `a` and `b` name one variable. So does any aggregate assignment whose value can read its own destination: one that names it (`p = P { x: p.y, y: p.x }`, `self = ..` in a `mut self` method, `o.p = P { x: o.p.y, .. }`, an `if` or `match` value), or, for a variable a closure or a caller may hold by reference (a captured and assigned local, a `mut` param, `self`), one that calls code. [Known limitations](#known-limitations) lists the cases these rules do not cover yet.
 
 ## `Ref[T]` is a plain library type
 
@@ -251,7 +251,7 @@ The names `unwrap`, `unwrap_or`, `is_err` and `map_err` may change; see issue #2
 
 Open issues that touch this page. Each has a repro.
 
-- **Aliasing outside `mut` params** ([#26](https://github.com/paullj/toy-compiler/issues/26), [#27](https://github.com/paullj/toy-compiler/issues/27)): the staging rules under `mut` parameters hold only when a non-`self` `mut` param is involved. A plain local, `self = ..` or a field store whose right side reads its own destination (`p = P { x: p.y, y: p.x }`) writes a field before it reads it, and a later argument's `mut self` call (`hq(q, q.touch())`) changes an earlier by-value argument.
+- **Aliasing through a `mut self` argument** ([#27](https://github.com/paullj/toy-compiler/issues/27)): a later argument's `mut self` call (`hq(q, q.touch())`) changes an earlier by-value argument.
 - **`mut self` through a desugar** ([#28](https://github.com/paullj/toy-compiler/issues/28)): a `mut self` witness reached through `==`, `<`, `+`, `io.println` or a `Map` key crashes; the desugar passes `self` by value.
 - **`for` over a user iterator** ([#29](https://github.com/paullj/toy-compiler/issues/29)): `for x in it` passes `iter`'s receiver by value and `next`'s by address, whatever the methods declare.
 - **An enum type name as a value** ([#30](https://github.com/paullj/toy-compiler/issues/30)): `x := Shape` passes `toy check` and fails in lowering.
