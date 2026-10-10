@@ -335,12 +335,45 @@ test "grammar agreement: deterministic control snippets agree span-for-span" {
         "fn f() {\n  w := x |> .m()?\n}\n",
         "fn f() {\n  u := x |> .len\n}\n",
         "fn f() {\n  t := x |> .m[int](1)\n}\n",
+        // A postfix straight after a block-bodied value, where no statement break can absorb it.
+        "fn f() {\n  n := g(loop { break h }(1), { o }?.x)\n}\n",
+        "fn f() {\n  n := g(if t { p } else { q }.y, match t { true -> h, false -> h }.f(1))\n}\n",
+        "fn f() {\n  n := g(@l loop { break @l o }?.y, @k { h }.f(1))\n}\n",
     };
     for (snippets) |src| {
         _ = compareFile(a, src, classifyTag, true) catch |err| {
             std.debug.print("control snippet failed ({s}): {s}\n", .{ @errorName(err), src });
             return err;
         };
+    }
+}
+
+test "grammar agreement: a postfix binds to a block-bodied value on its line, not across a line break" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parser = ts.Parser.create();
+    defer parser.destroy();
+    try parser.setLanguage(tree_sitter_toy());
+    const cases = [_]struct { src: []const u8, has: []const u8, lacks: ?[]const u8 = null }{
+        .{ .src = "fn f() {\n  { g }(1)\n}\n", .has = "(call_expression function: (block" },
+        .{ .src = "fn f() {\n  x := loop { break o }?.y\n}\n", .has = "(field_expression value: (try_expression (loop_expression" },
+        .{ .src = "fn f() {\n  x := if t { a } else { b }.f(1)\n}\n", .has = "(call_expression function: (field_expression value: (if_expression" },
+        .{ .src = "fn f() {\n  x := match t { true -> a, false -> b }[0]\n}\n", .has = "(index_expression value: (match_expression" },
+        // The compiler ends a statement at the line break, so the next line's `(1)` is its own.
+        .{ .src = "fn f() {\n  { g }\n  (1)\n}\n", .has = "(expression_statement (parenthesized_expression", .lacks = "call_expression" },
+    };
+    for (cases) |c| {
+        const tree = parser.parseString(c.src, null) orelse return error.TreeSitterParseReturnedNull;
+        defer tree.destroy();
+        const sexp = try tree.rootNode().toSexp(a);
+        const ok = std.mem.indexOf(u8, sexp, c.has) != null and
+            !std.mem.containsAtLeast(u8, sexp, 1, "ERROR") and
+            (c.lacks == null or std.mem.indexOf(u8, sexp, c.lacks.?) == null);
+        if (!ok) {
+            std.debug.print("unexpected parse of {s}\n  {s}\n", .{ c.src, sexp });
+            return error.UnexpectedGrammarShape;
+        }
     }
 }
 

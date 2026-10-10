@@ -62,13 +62,13 @@ module.exports = grammar({
   conflicts: ($) => [
     // `break @l <block>` — `@l` as break's label + a block value, vs `@l <block>` as a
     // single labeled-block value. Identical leaves either way.
-    [$.labeled_expression, $._expression],
+    [$.labeled_expression, $._postfix_operand],
     // `X { .. }` in a scrutinee/condition position (`if X { .. }`, `match X { .. }`): the
     // `{` could open a struct-literal body or the following block/match body. Declaring
     // the conflict (rather than forcing one via precedence) lets GLR keep both stacks and
     // discard whichever hits an ERROR — so a genuine struct literal (`P{ x: 1 }`) and a
     // condition-then-block (`if a == b { .. }`) each resolve to their error-free parse.
-    [$._expression, $.struct_literal],
+    [$._postfix_operand, $.struct_literal],
     // `fn(..)` in a bracket list is a function-type argument or a lambda; only a
     // lambda's `{` body tells them apart.
     [$.parameter_list, $.function_type],
@@ -268,20 +268,7 @@ module.exports = grammar({
     // ---- Expressions ------------------------------------------------------
 
     _expression: ($) =>
-      choice(
-        $.unary_expression,
-        $.binary_expression,
-        $.pipe_expression,
-        $._primary_expression,
-        $.if_expression,
-        $.match_expression,
-        $.loop_expression,
-        $.while_expression,
-        $.for_expression,
-        $.labeled_expression,
-        $.unsafe_expression,
-        $.block,
-      ),
+      choice($.unary_expression, $.binary_expression, $.pipe_expression, $._postfix_operand),
 
     _primary_expression: ($) =>
       choice(
@@ -365,8 +352,28 @@ module.exports = grammar({
     pipe_expression: ($) =>
       prec.left(PREC.pipe, seq(field("value", $._expression), "|>", field("target", $._expression))),
 
+    // What a postfix (call, `[..]`, `.f`, `?`) may follow. The compiler applies its postfixes
+    // after every prefix form, so a block-bodied value takes them too: `loop { .. }(x)`,
+    // `if c { a } else { b }.f`, `match v { .. }?`, `{ o }?.y`. `_expression` reaches these
+    // forms only through this rule, so a same-line postfix shifts by PREC.postfix exactly as
+    // after a primary, while a line break first ends the statement (the scanner's
+    // `_newline`). `while`/`for` are statements to the compiler; they sit here so that
+    // `break @l <loop>` stays the single conflict entry above.
+    _postfix_operand: ($) =>
+      choice(
+        $._primary_expression,
+        $.if_expression,
+        $.match_expression,
+        $.loop_expression,
+        $.while_expression,
+        $.for_expression,
+        $.labeled_expression,
+        $.unsafe_expression,
+        $.block,
+      ),
+
     call_expression: ($) =>
-      prec(PREC.postfix, seq(field("function", $._primary_expression), $.arguments)),
+      prec(PREC.postfix, seq(field("function", $._postfix_operand), $.arguments)),
 
     arguments: ($) => seq("(", optional(commaList($._expression)), ")"),
 
@@ -375,17 +382,17 @@ module.exports = grammar({
     // indexing (`counts["the"]`) share one production — the grammar need not tell them
     // apart. A function type is not an expression, so the list admits it by name.
     index_expression: ($) =>
-      prec(PREC.postfix, seq(field("value", $._primary_expression), "[", commaList(choice($._expression, $.function_type)), "]")),
+      prec(PREC.postfix, seq(field("value", $._postfix_operand), "[", commaList(choice($._expression, $.function_type)), "]")),
 
     // Member access. The name after `.` is an identifier (field/method) or an integer
     // (`x.0` tuple index). A `float` is intentionally NOT accepted here so `x.0.0` and
     // `0..5` tokenize as the compiler lexer does (post-`.` position excludes floats).
     field_expression: ($) =>
-      prec(PREC.postfix, seq(field("value", $._primary_expression), ".", field("field", choice($.identifier, $.number)))),
+      prec(PREC.postfix, seq(field("value", $._postfix_operand), ".", field("field", choice($.identifier, $.number)))),
 
-    try_expression: ($) => prec(PREC.postfix, seq($._primary_expression, "?")),
+    try_expression: ($) => prec(PREC.postfix, seq($._postfix_operand, "?")),
 
-    // No forcing precedence: the `_primary_expression`/`struct_literal` conflict is left
+    // No forcing precedence: the `_postfix_operand`/`struct_literal` conflict is left
     // for GLR to resolve by discarding the ERROR branch (see `conflicts`).
     struct_literal: ($) =>
       seq(field("type", $._primary_expression), $.field_initializer_list),
