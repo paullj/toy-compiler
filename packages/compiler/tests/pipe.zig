@@ -22,8 +22,7 @@ const skipUnlessBackend = harness.skipUnlessBackend;
 /// The binary embeds the input and output basenames, so both sides of a pair must use
 /// the same ones or every pair would differ.
 fn build(gpa: std.mem.Allocator, io: Io, dir: []const u8, src_path: []const u8) ![]u8 {
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/toy", gpa);
-    defer gpa.free(bin_abs);
+    const bin_abs = harness.toy_exe;
     try Io.Dir.cwd().createDirPath(io, dir);
 
     const src = try Io.Dir.cwd().readFileAlloc(io, src_path, gpa, .unlimited);

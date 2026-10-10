@@ -16,15 +16,15 @@
 //!        would go undeclared and this would FAIL);
 //!   (iii) a multi-module program with a REAL error in the IMPORTED module -> an
 //!        error reported AGAINST the imported module (not the entry).
-//! A separate, binary-gated block additionally spawns the real `toy check` and
-//! `toy build` and asserts their EXIT CODES agree on the same three fixtures — the
-//! literal check==build differential over the CLI — skipping cleanly when the
-//! binary is absent (build additionally needs macOS codegen).
+//! A separate block additionally spawns the real `toy check` and `toy build` and
+//! asserts their EXIT CODES agree on the same three fixtures — the literal
+//! check==build differential over the CLI (build additionally needs macOS codegen).
 
 const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const toyc = @import("toy_compiler");
+const harness = @import("harness.zig");
 
 const Driver = toyc.Driver;
 const Graph = toyc.Graph;
@@ -272,10 +272,8 @@ test "coherence: overlapping cross-module impls with a mismatched sig report T00
 }
 
 /// Spawn the built `toy` with `argv_tail`, returning the exit code (or an error).
-/// Skips (via error.SkipZigTest at the call site) when the binary is absent.
 fn spawnExit(gpa: std.mem.Allocator, io: Io, argv_tail: []const []const u8) !std.process.Child.Term {
-    const bin_abs = try Io.Dir.cwd().realPathFileAlloc(io, "zig-out/bin/toy", gpa);
-    defer gpa.free(bin_abs);
+    const bin_abs = harness.toy_exe;
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(gpa);
     try argv.append(gpa, bin_abs);
@@ -323,7 +321,7 @@ fn spawnBinaryTermStderr(gpa: std.mem.Allocator, io: Io, abs_path: []const u8) !
 
 test "differential: the real `toy check` and `toy build` exit codes AGREE on the three fixtures" {
     // The literal CLI differential: spawn both subcommands and compare exit codes.
-    // `build` runs codegen, so it needs macOS + the built binary; skip cleanly
+    // `build` runs codegen, so it needs macOS; skip cleanly
     // otherwise. The in-process test above is the always-on guard; this pins the
     // end-to-end CLI agreement.
     if (builtin.os.tag != .macos) return error.SkipZigTest;
@@ -331,7 +329,7 @@ test "differential: the real `toy check` and `toy build` exit codes AGREE on the
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
+    try harness.requireToy(io);
 
     // (i) single-file valid: check exit 0 AND build exit 0.
     {
@@ -426,14 +424,14 @@ test "sibling protocol reusing eq/cmp: check is clean (in-process, always-on)" {
 test "sibling protocol reusing eq/cmp: build+run yields the derive result (exit 111), not a codegen abort" {
     // The end-to-end guard for the check/lower divergence: `check` accepted these, so a
     // name-selected witness would `.ambiguous` in lower and abort `build`. Needs macOS
-    // codegen + the built `toy`; skips cleanly otherwise (the in-process check above is
+    // codegen; skips cleanly otherwise (the in-process check above is
     // the always-on guard).
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
+    try harness.requireToy(io);
 
     inline for (.{ sibling_eq_src, sibling_cmp_src }, .{ ".toy-test-sibling-eq-run", ".toy-test-sibling-cmp-run" }) |src, dir| {
         try writeFixture(io, dir, &.{.{ "main.toy", src }});
@@ -459,7 +457,7 @@ test "panic: div/mod/unwrap traps + user panic() write msg + a symbolized-backtr
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    Io.Dir.cwd().access(io, "zig-out/bin/toy", .{}) catch return error.SkipZigTest;
+    try harness.requireToy(io);
 
     const fixtures = .{
         .{ .dir = ".toy-test-panic-div0", .src = "fn main() -> int { return 10 / 0 }\n", .want = @as(?u8, 1), .err = "division by zero" },
