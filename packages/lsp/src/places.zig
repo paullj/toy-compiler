@@ -121,9 +121,9 @@ pub const Facts = struct {
         return f.graph.entry();
     }
 
-    fn span(f: Facts, node: u32) toyc.AstWalk.Span {
+    fn span(f: Facts, node: u32) toyc.Walk.Span {
         const m = f.module();
-        return toyc.AstWalk.nodeSpan(.{ .tree = m.tree(), .tokens = m.tokens, .source = m.source }, Ast.Index.from(node));
+        return toyc.Walk.nodeSpan(.{ .tree = m.tree(), .tokens = m.tokens, .source = m.source }, Ast.Index.from(node));
     }
 
     fn fnClosures(f: Facts) []const Closure.FnClosures {

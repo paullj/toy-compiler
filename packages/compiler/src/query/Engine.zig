@@ -31,6 +31,7 @@ const Opt = @import("../opt/Opt.zig");
 const lower = @import("../lower.zig");
 const DeriveEmit = @import("../lower/derive_emit.zig");
 const AdapterEmit = @import("../lower/adapter_emit.zig");
+const LowerClosure = @import("../lower/closure.zig");
 const Closure = @import("../symbols/Closure.zig");
 const Mono = @import("../symbols/Mono.zig");
 const Derive = @import("../symbols/Derive.zig");
@@ -465,7 +466,7 @@ pub const Frozen = struct {
     /// conformance invalidates exactly the dependent instances. Empty for every other unit.
     type_args: []const Typecheck.Type = &.{},
     conformances: []const Mono.ResolvedConformance = &.{},
-    /// A base fn's or instance's closure facts (`Closure.ownerFacts`), folded into its key;
+    /// A base fn's or instance's closure facts (`Fingerprint.ownerFacts`), folded into its key;
     /// empty for every other unit and for a body with no env slot and no boxed local.
     closure_facts: []const u8 = &.{},
 };
@@ -485,7 +486,7 @@ pub const Fitted = union(enum) {
     fn run(f: Fitted, gpa: std.mem.Allocator, in: lower.Inputs, sym: Link.SymName, diags: *std.ArrayList(CodegenIr.Diagnostic)) error{OutOfMemory}!Ir.Function {
         return switch (f) {
             .source => |s| lower.lowerFn(gpa, in, s.decl, sym, s.is_entry, diags),
-            .lambda => |ui| lower.lowerLambda(gpa, in, ui, sym, diags),
+            .lambda => |ui| LowerClosure.lowerLambda(gpa, in, ui, sym, diags),
         };
     }
 };

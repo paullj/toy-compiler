@@ -11,7 +11,7 @@
 
 const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
-const AstWalk = @import("../query/AstWalk.zig");
+const Walk = @import("../ast/Walk.zig");
 const Callee = @import("Callee.zig").Callee;
 const Closure = @import("Closure.zig");
 const Modes = @import("Modes.zig");
@@ -146,7 +146,7 @@ pub const Mode = enum {
 /// carry a closure.
 pub fn factsOf(
     gpa: std.mem.Allocator,
-    src: AstWalk.Source,
+    src: Walk.Source,
     body: Body.BodyView,
     prog: Body.ProgramView,
     bodies: Body.List,
@@ -193,7 +193,7 @@ pub fn factsOf(
             self.escapes.set(slot);
         }
 
-        pub fn on(self: *@This(), ev: AstWalk.Event) error{OutOfMemory}!void {
+        pub fn on(self: *@This(), ev: Walk.Event) error{OutOfMemory}!void {
             const e = switch (ev) {
                 .enter => |e| e,
                 else => return,
@@ -269,7 +269,7 @@ pub fn factsOf(
         v.sites.deinit(gpa);
         v.bound_recv.deinit(gpa);
     }
-    try AstWalk.walk(src, decl, &v);
+    try Walk.walk(src, decl, &v);
     // A captured local is copied or shared into a closure the walk does not follow.
     if (closures) |fc| for (fc.boundaries) |b| for (b.captures) |c| try v.escape(c.slot);
 

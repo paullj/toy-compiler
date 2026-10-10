@@ -45,7 +45,7 @@ const DiagnosticSink = @import("diagnostics/Sink.zig");
 const nearmiss = @import("diagnostics/nearmiss.zig");
 const codes = @import("diagnostics/codes.zig");
 const Span = @import("diagnostics/model.zig").Span;
-const AstWalk = @import("query/AstWalk.zig");
+const Walk = @import("ast/Walk.zig");
 
 pub const Resolution = @import("symbols/Resolution.zig").Resolution;
 const symbols_res = @import("symbols/Resolution.zig");
@@ -230,7 +230,7 @@ const GraphResolve = struct {
     }
     fn nodeSpan(g: *GraphResolve, mod: u32, idx: Ast.Index) Span {
         const m = &g.graph.modules[mod];
-        return AstWalk.nodeSpan(.{ .tree = g.tree(mod), .tokens = m.tokens, .source = m.source }, idx);
+        return Walk.nodeSpan(.{ .tree = g.tree(mod), .tokens = m.tokens, .source = m.source }, idx);
     }
     /// An import's module path `a/b/c`: what an error about the imported module underlines.
     fn importPathSpan(g: *GraphResolve, mod: u32, decl: Ast.Node) Span {

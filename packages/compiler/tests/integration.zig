@@ -18,6 +18,7 @@ test {
     _ = @import("check.zig");
     _ = @import("differential.zig");
     _ = @import("heap.zig");
+    _ = @import("closures_gc.zig");
     _ = @import("closures.zig");
     _ = @import("places.zig");
     _ = @import("ref.zig");

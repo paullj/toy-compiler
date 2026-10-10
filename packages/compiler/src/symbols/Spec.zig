@@ -13,7 +13,7 @@ const Ast = @import("../ast/Ast.zig");
 const Sym = @import("Sym.zig");
 const Type = @import("../layout/Type.zig").Type;
 const Closure = @import("Closure.zig");
-const AstWalk = @import("../query/AstWalk.zig");
+const Walk = @import("../ast/Walk.zig");
 const Callee = @import("Callee.zig").Callee;
 const Modes = @import("Modes.zig");
 const Resolution = @import("Resolution.zig").Resolution;
@@ -84,7 +84,7 @@ pub const cap_per_template: u32 = 8;
 /// param (a spec unit assumes the param still holds the caller's argument at every call of
 /// it), and below 64. A template with a lambda or local fn (`has_closures`) specializes
 /// nothing, so every lambda unit belongs to exactly one lowered body.
-pub fn eligibleMask(src: AstWalk.Source, body: Body.BodyView, prog: Body.ProgramView, fn_decl: Ast.Index, params: []const Type, has_closures: bool) u64 {
+pub fn eligibleMask(src: Walk.Source, body: Body.BodyView, prog: Body.ProgramView, fn_decl: Ast.Index, params: []const Type, has_closures: bool) u64 {
     if (has_closures) return 0;
     var fn_params: u64 = 0;
     for (params[0..@min(params.len, 64)], 0..) |p, i| {
@@ -107,7 +107,7 @@ pub fn eligibleMask(src: AstWalk.Source, body: Body.BodyView, prog: Body.Program
             }
         }
 
-        pub fn on(self: *@This(), ev: AstWalk.Event) void {
+        pub fn on(self: *@This(), ev: Walk.Event) void {
             switch (ev) {
                 .enter => |e| if (e.tag == .assign) self.clearLocal(self.body.tree.nodes[e.idx.int()].lhs),
                 .callee => |c| {
@@ -121,7 +121,7 @@ pub fn eligibleMask(src: AstWalk.Source, body: Body.BodyView, prog: Body.Program
         }
     };
     var v: V = .{ .body = body, .prog = prog, .mask = fn_params };
-    AstWalk.walk(src, fn_decl, &v) catch unreachable;
+    Walk.walk(src, fn_decl, &v) catch unreachable;
     return v.mask;
 }
 
@@ -289,7 +289,7 @@ pub fn freeUnits(gpa: std.mem.Allocator, cands: []const Candidate) void {
 /// tables.
 pub const Source = struct {
     /// Each module's tree, tokens and source.
-    modules: []const AstWalk.Source,
+    modules: []const Walk.Source,
     resolutions: []const []const Resolution,
     closures: []const []const Closure.FnClosures,
     bodies: Body.List,
@@ -375,7 +375,7 @@ fn collectCandidates(gpa: std.mem.Allocator, src: Source, masks: []const Templat
         pending: *std.ArrayList(PendingCall),
         targets: std.ArrayList(Target) = .empty,
 
-        pub fn on(self: *@This(), ev: AstWalk.Event) error{OutOfMemory}!void {
+        pub fn on(self: *@This(), ev: Walk.Event) error{OutOfMemory}!void {
             const e = switch (ev) {
                 .enter => |e| e,
                 else => return,
@@ -403,7 +403,7 @@ fn collectCandidates(gpa: std.mem.Allocator, src: Source, masks: []const Templat
             .pending = pending,
         };
         defer v.targets.deinit(gpa);
-        try AstWalk.walk(src.modules[b.mod], b.decl, &v);
+        try Walk.walk(src.modules[b.mod], b.decl, &v);
     }
 }
 
