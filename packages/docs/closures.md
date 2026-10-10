@@ -129,6 +129,7 @@ bump(count)                          # count changes
   - A generic fn is checked once on its own text even when nothing instantiates it, so a library reports its own escaping captures. A call whose callee depends on the type arguments (a generic fn, a protocol method of `T`) is taken not to keep the closure there; each instance decides it.
 - **Limits:**
   - **Where `mut` may appear.** On the params of top-level fns and of inherent-impl methods, static (associated) methods included, and on any `self` receiver where `mut self` is allowed today. It is P0006 on a lambda's params, a local fn's params, an `extern` fn's params, a protocol sig's or a conformance method's params after `self`, and any param past the 64th.
+  - **A conformance method's receiver** is `self` or `mut self` exactly as its protocol method declares it; otherwise T0076. An operator or loop that calls a witness for you (`==`, `<`, `+`, `io.println`, a `Map` key's hash, `for`'s `next`) knows only the protocol, so that is how it passes the receiver. The prelude protocols (`Eq`, `Ord`, the arithmetic ones, `Hash`, `Display`, `From`, `Into`) declare `self`; `std/iter`'s `Iterator.next` declares `mut self`, so every iterator's `next` takes `mut self`, even one that changes nothing.
   - **The argument.** A local (a param, a forwarded `mut` param, a loop variable and a match binding included) or a field / tuple-field chain rooted at one. Not a place (T0019): a literal, a call result, an index element `xs[i]` or `xs[i].f`, a struct literal or its field, a top-level fn name, a local fn name, a bound method `p.m`.
   - **Captures.** A lambda, a local fn, a `_` capture or a bound method may capture a `mut` param (`mut self` included) when it does not escape; one that escapes is T0052.
   - **Not a value.** A fn with any `mut` param, or a method with a `mut` param after `self`, cannot be used as a value: T0049. A call through a function value passes every argument by value.
@@ -251,7 +252,6 @@ The names `unwrap`, `unwrap_or`, `is_err` and `map_err` may change; see issue #2
 
 Open issues that touch this page. Each has a repro.
 
-- **`mut self` through a desugar** ([#28](https://github.com/paullj/toy-compiler/issues/28)): a `mut self` witness reached through `==`, `<`, `+`, `io.println` or a `Map` key crashes; the desugar passes `self` by value.
 - **`for` over a user iterator** ([#29](https://github.com/paullj/toy-compiler/issues/29)): `for x in it` passes `iter`'s receiver by value and `next`'s by address, whatever the methods declare.
 - **An enum type name as a value** ([#30](https://github.com/paullj/toy-compiler/issues/30)): `x := Shape` passes `toy check` and fails in lowering.
 - **Turbofish on a generic type's method** ([#31](https://github.com/paullj/toy-compiler/issues/31)): `b.map[int](..)` and `x |> .m[int]()` are T0018, so a method whose type parameter appears only in its return type cannot be called.

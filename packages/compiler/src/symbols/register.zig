@@ -259,6 +259,7 @@ pub fn registerProtocols(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32)
         // are already registered (Phase 0), so a struct/enum param type resolves.
         const method_params = try t.gpa.alloc([]const Type, sig_nodes.len);
         const method_rets = try t.gpa.alloc(Type, sig_nodes.len);
+        const mut_self = try t.gpa.alloc(bool, sig_nodes.len);
         const prev_self = t.cur_self_type;
         t.cur_self_type = Type.typeVar(0);
         defer t.cur_self_type = prev_self;
@@ -281,6 +282,7 @@ pub fn registerProtocols(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32)
             }
             method_params[i] = pars;
             method_rets[i] = if (mp.ret_type == Ast.none) Type.unit else t.typeFromNode(mp.ret_type);
+            mut_self[i] = mp.params.len > 0 and Ast.isSelfParam(t.tree, t.tokens, t.source, mp.params[0]) and Ast.isMutParam(t.tree, t.tokens, mp.params[0]);
         }
         const id: u32 = @intCast(t.protocols.items.len);
         try t.protocols.append(t.gpa, .{
@@ -292,6 +294,7 @@ pub fn registerProtocols(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32)
             .methods = names,
             .method_params = method_params,
             .method_rets = method_rets,
+            .mut_self = mut_self,
         });
         try t.activeProtocolMap().put(t.gpa, name, id);
     }

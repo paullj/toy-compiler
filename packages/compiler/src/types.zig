@@ -1000,7 +1000,8 @@ pub fn freeMethodEntries(gpa: std.mem.Allocator, methods: []const Method) void {
 }
 
 /// Free the per-protocol owned arrays: `methods`, `generic_params` (outer arrays; the name
-/// slices are borrowed), and the decoded `method_params` (inner + outer) and `method_rets`.
+/// slices are borrowed), the decoded `method_params` (inner + outer) and `method_rets`, and
+/// `mut_self`.
 pub fn freeProtocolEntries(gpa: std.mem.Allocator, protocols: []const ProtocolSym) void {
     for (protocols) |p| {
         gpa.free(@constCast(p.methods));
@@ -1008,6 +1009,7 @@ pub fn freeProtocolEntries(gpa: std.mem.Allocator, protocols: []const ProtocolSy
         for (p.method_params) |mp| gpa.free(@constCast(mp));
         if (p.method_params.len > 0) gpa.free(@constCast(p.method_params));
         if (p.method_rets.len > 0) gpa.free(@constCast(p.method_rets));
+        if (p.mut_self.len > 0) gpa.free(@constCast(p.mut_self));
     }
 }
 
@@ -1281,6 +1283,15 @@ pub const ProtocolSym = struct {
     /// `t.protocols` (freed at teardown); scalar/struct element Types are PODs.
     method_params: []const []const Type = &.{},
     method_rets: []const Type = &.{},
+    /// Whether method i's requirement takes `mut self`, parallel to `methods`; empty for a
+    /// prelude protocol, whose requirements all take `self`. A conformance method must take
+    /// its receiver the same way (T0076), so a desugar that calls a witness (`==`, `for`)
+    /// knows the mode from the protocol. Owned by `t.protocols`.
+    mut_self: []const bool = &.{},
+
+    pub fn requiresMutSelf(p: ProtocolSym, i: usize) bool {
+        return i < p.mut_self.len and p.mut_self[i];
+    }
 };
 
 /// One recorded conformance: `impl <recv> has <protocol>`. Frozen onto the
@@ -4113,6 +4124,22 @@ pub fn expectSpans(cases: []const SpanCase) !void {
         const sp = d.span();
         try testing.expectEqualStrings(c.want, c.src[sp.start..sp.end]);
     }
+}
+
+/// Test support for the checker's files: typecheck `src` and require exactly `n`
+/// diagnostics coded `code`.
+pub fn expectCodeCount(src: []const u8, code: codes.Code, n: usize) !void {
+    const gpa = testing.allocator;
+    var r = try checkSource(src);
+    defer r.deinit(gpa);
+    var seen: usize = 0;
+    for (r.result.diags) |d| {
+        if (d.code == code) seen += 1;
+    }
+    testing.expectEqual(n, seen) catch |e| {
+        for (r.result.diags) |d| std.debug.print("{s}\n", .{d.message});
+        return e;
+    };
 }
 
 /// Typecheck a source and return the diagnostic count (and free everything).

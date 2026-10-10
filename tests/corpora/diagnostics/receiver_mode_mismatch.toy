@@ -1,0 +1,46 @@
+import std/iter
+
+# A conformance method takes its receiver the way its protocol declares it (#28).
+protocol Counter {
+    fn bump(mut self) -> int
+}
+
+struct P { x: int }
+struct Q { x: int }
+struct R { x: int }
+struct S { x: int }
+struct H { x: int }
+struct C { n: int }
+
+impl P has Eq {
+    fn eq(mut self, o: P) -> bool { self.x == o.x }  #~ ERROR [T0076] impl method 'eq' takes 'mut self', but protocol 'Eq' declares 'self'
+}
+
+impl Q has Ord {
+    fn cmp(mut self, o: Q) -> Ordering { if self.x < o.x { Ordering.lt } else { Ordering.eq } }  #~ ERROR [T0076] protocol 'Ord' declares 'self'
+}
+
+impl R has Add {
+    fn add(mut self, o: R) -> R { R { x: self.x + o.x } }  #~ ERROR [T0076] protocol 'Add' declares 'self'
+}
+
+impl S has Display {
+    fn display(mut self) -> str { "s" }  #~ ERROR [T0076] protocol 'Display' declares 'self'
+}
+
+impl H has Hash {
+    fn hash(mut self) -> int { self.x }  #~ ERROR [T0076] protocol 'Hash' declares 'self'
+}
+
+# `Iterator.next` declares `mut self`, so a by-value `next` is the mismatch.
+impl C has iter.Iterator[int] {
+    fn next(self) -> Option[int] { Option.some(self.n) }  #~ ERROR [T0076] impl method 'next' takes 'self', but protocol 'Iterator' declares 'mut self'
+}
+
+impl P has Counter {
+    fn bump(self) -> int { self.x }  #~ ERROR [T0076] protocol 'Counter' declares 'mut self'
+}
+
+fn main() -> int {
+    return 0
+}

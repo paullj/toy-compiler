@@ -1,0 +1,74 @@
+# Feature: a protocol method may require `mut self`; its witnesses take `mut self` too (T0076 otherwise), so a call through the protocol bound changes the caller's variable, as a direct call does, while `==`, `<`, `+`, `Display` and `Hash` witnesses take `self` (#28)
+# expect: stdout "3\n2\n12\n1\ntrue\ntrue\n4\np7\n1\n"
+# expect: exit 0
+import std/io
+import std/map
+
+protocol Counter {
+    fn bump(mut self) -> int
+}
+
+struct C { n: int }
+
+impl C has Counter {
+    fn bump(mut self) -> int {
+        self.n = self.n + 1
+        self.n
+    }
+}
+
+struct G[T] { n: int, tag: T }
+
+impl G[T] has Counter {
+    fn bump(mut self) -> int {
+        self.n = self.n + 10
+        self.n
+    }
+}
+
+fn twice[T has Counter](mut c: T) -> int {
+    c.bump()
+    c.bump()
+}
+
+struct P { x: int }
+
+impl P has Eq {
+    fn eq(self, o: P) -> bool { self.x == o.x }
+}
+
+impl P has Ord {
+    fn cmp(self, o: P) -> Ordering { if self.x < o.x { Ordering.lt } else if self.x == o.x { Ordering.eq } else { Ordering.gt } }
+}
+
+impl P has Add {
+    fn add(self, o: P) -> P { P { x: self.x + o.x } }
+}
+
+impl P has Display {
+    fn display(self) -> str { "p".concat(self.x.to_string()) }
+}
+
+impl P has Hash {
+    fn hash(self) -> int { self.x }
+}
+
+fn main() -> int {
+    c := C { n: 1 }
+    io.println(twice(c))
+    d := C { n: 1 }
+    io.println(d.bump())
+    g := G[str] { n: 2, tag: "g" }
+    io.println(g.bump())
+    io.println(c.n - d.n)
+    a := P { x: 3 }
+    b := P { x: 4 }
+    io.println(a == P { x: 3 })
+    io.println(a < b)
+    io.println((a + P { x: 1 }).x)
+    io.println(a + b)
+    m: Map[P, int] = Map[P, int].new()
+    m.set(a, 1)
+    io.println(m.get(P { x: 3 }).unwrap_or(0))
+    return 0
+}
