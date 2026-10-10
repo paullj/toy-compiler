@@ -22,6 +22,8 @@ const Callee = @import("../symbols/Callee.zig").Callee;
 const Spec = @import("../symbols/Spec.zig");
 const Body = @import("../symbols/Body.zig");
 const lower = @import("../lower.zig");
+const StdNames = @import("../symbols/StdNames.zig");
+const symbols_res = @import("../symbols/Resolution.zig");
 
 pub const Sig = @import("../symbols/Sig.zig").Sig;
 const Fingerprint = @import("Fingerprint.zig");
@@ -94,6 +96,7 @@ pub const CallVisitor = struct {
             // identity and signature exactly as a direct call does.
             .enter => |e| {
                 const fr = self.frozen;
+                try self.foldDesugar(e.idx, e.tag);
                 if (e.idx.int() >= fr.callees.len) return;
                 switch (fr.callees[e.idx.int()].view()) {
                     .fn_ref => |gid| if (gid < fr.names.len and gid < fr.sigs.len) {
@@ -160,6 +163,35 @@ pub const CallVisitor = struct {
         }
     }
 
+    /// Fold what a sugar node calls, which no call slot names: `for`'s `iter` and `next`, a
+    /// list literal's `new` and `push`, an index's `ga_at` instance. Lower resolves each
+    /// through the same helpers, so the fold names what the code relocates to ([C2]).
+    fn foldDesugar(self: *Self, idx: Ast.Index, tag: Ast.Node.Tag) error{OutOfMemory}!void {
+        const fr = self.frozen;
+        if (idx.int() >= fr.node_types.len) return;
+        const n = fr.tree.nodes[idx.int()];
+        switch (tag) {
+            .for_in_stmt, .for_in2_stmt => {
+                const calls = lower.forInCalls(fr, fr.node_types[n.rhs.int()]) catch return;
+                try self.foldWitness(calls.iter);
+                try self.foldWitness(calls.next);
+            },
+            .empty_list, .list_literal => for (StdNames.desugarMethods(tag)) |dm| {
+                if (Typecheck.findMethod(fr.methods, fr.node_types[idx.int()], dm.name)) |m| try self.foldWitness(m);
+            },
+            .index => try self.foldGaAt(idx),
+            .type_app => if (fr.resolutions.len == fr.tree.nodes.len and symbols_res.leftmostHeadIsValue(fr.tree, fr.resolutions, n.lhs)) try self.foldGaAt(idx),
+            else => {},
+        }
+    }
+
+    fn foldGaAt(self: *Self, idx: Ast.Index) error{OutOfMemory}!void {
+        const fr = self.frozen;
+        const ii = lower.gaAtInstance(fr, fr.node_types[idx.int()]) orelse return;
+        const inst = fr.instances[ii];
+        try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret, .mut_mask = templateMask(fr.sigs, inst) });
+    }
+
     /// Fold call `call`'s callee identity and signature from the checker's table: the fn
     /// a direct call names, the instance (or its spec unit) a generic call runs, or the
     /// method a member call selects. A generic call with no instance here folds nothing,
@@ -219,7 +251,15 @@ pub const CallVisitor = struct {
                     const params: []const Typecheck.Type = if (recv.kind == .bool) &hash_params_bool else &hash_params_int;
                     try self.out.append(self.gpa, .{ .kind = .builtin, .name = "hash", .params = params, .ret = Typecheck.Type.int });
                 },
-                .str_concat, .str_len, .str_byte_at, .scalar_to_string, .conv_into, .conv_try_into, .opt_is_tag0, .opt_is_tag1, .opt_unwrap, .opt_unwrap_or => {},
+                // A `try_into` to or from `char`, or from `float`, calls a shared witness.
+                .conv_try_into => {
+                    const call_ty: Typecheck.Type = if (call_idx.int() < fr.node_types.len) fr.node_types[call_idx.int()] else .{ .kind = .invalid };
+                    if (call_ty.kind != .@"enum" or call_ty.enum_id >= fr.enum_layouts.len) return;
+                    const kind = lower.convWitnessKind(fr, recv, call_ty) orelse return;
+                    const d = fr.derives[lower.convWitness(fr, kind) orelse return];
+                    try self.out.append(self.gpa, .{ .kind = .user_fn, .name = d.name.?, .params = d.params, .ret = d.ret });
+                },
+                .str_concat, .str_len, .str_byte_at, .scalar_to_string, .conv_into, .opt_is_tag0, .opt_is_tag1, .opt_unwrap, .opt_unwrap_or => {},
             },
         }
     }

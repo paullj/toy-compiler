@@ -2639,16 +2639,12 @@ fn lowerConvMethod(b: *Builder, node_idx: Ast.Index, cv: ConvCall) error{OutOfMe
     const call_ty = b.in.node_types[(node_idx).int()];
     const e = b.in.enum_layouts[call_ty.enum_id];
     const dst_T = Typecheck.somePayload(e);
-    const to_char = isCharTy(b, dst_T);
 
     // int→char / char→byte are heavy (~24 / ~12 SSA cells); inlining >10 / >20 per fn
     // overflowed the imm12 frame cap. Emit each as ONE shared witness and CALL it (O(1)/site).
-    if (to_char) return convCallWitness(b, .conv_int_char, v, call_ty);
-    if (recv_is_char) return convCallWitness(b, .conv_char_byte, v, call_ty);
-
-    // float -> int: the shared program-global witness (O(1) frame/site — never inlined).
-    // `v` is the raw f64 value cell; convCallWitness passes it as a float arg -> v0.
-    if (recv_ty.kind == .float) return convCallWitness(b, .conv_float_int, v, call_ty);
+    // float -> int is one too (never inlined); `v` is then the raw f64 value cell, which
+    // convCallWitness passes as a float arg -> v0.
+    if (convWitnessKind(&b.in, recv_ty, call_ty)) |kind| return convCallWitness(b, kind, v, call_ty);
 
     // int→int narrow: a per-(width,signedness) family — no single program-global
     // witness — so it stays inline (see derive_synth: only the 2 char cases become recipes).
@@ -2716,7 +2712,24 @@ pub fn emitConvResultTail(
 /// table for its recipe (the synthesis barrier appended exactly one per used kind). Null
 /// only on a mis-wired build (the checker gate guarantees a recipe at any real conv site).
 fn convWitnessCallee(b: *Builder, kind: Derive.Kind) ?Link.SymName {
-    for (b.in.derives) |d| if (d.kind == kind) return .{ .kind = .user_fn, .name = d.name.? };
+    const di = convWitness(&b.in, kind) orelse return null;
+    return .{ .kind = .user_fn, .name = b.in.derives[di].name.? };
+}
+
+/// The shared witness a `try_into` from `recv_ty` to the `Result` `call_ty` calls, or null
+/// when the conversion is computed inline (an int narrow). The fingerprint folds the same
+/// witness ([C2]).
+pub fn convWitnessKind(in: *const Inputs, recv_ty: Typecheck.Type, call_ty: Typecheck.Type) ?Derive.Kind {
+    const dst_T = Typecheck.somePayload(in.enum_layouts[call_ty.enum_id]);
+    if (Typecheck.isCharTy(dst_T, in.char_struct)) return .conv_int_char;
+    if (Typecheck.isCharTy(recv_ty, in.char_struct)) return .conv_char_byte;
+    if (recv_ty.kind == .float) return .conv_float_int;
+    return null;
+}
+
+/// The derive index of the program-global witness of `kind`.
+pub fn convWitness(in: *const Inputs, kind: Derive.Kind) ?usize {
+    for (in.derives, 0..) |d, i| if (d.kind == kind) return i;
     return null;
 }
 
@@ -2975,12 +2988,12 @@ fn lowerListLiteralSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) er
     return slot;
 }
 
-/// The mangled symbol of the `mem.ga_at[V]` instance a `Vec[V]` index desugars to, or
-/// null when the primitive or its instance is absent (an internal invariant break —
-/// scanCalls enqueues the instance whenever an index node types concrete).
-fn gaAtCallee(b: *Builder, elem_ty: Typecheck.Type) ?Link.SymName {
+/// The `mem.ga_at[V]` instance a `Vec[V]` index desugars to, or null when the primitive or
+/// its instance is absent (an internal invariant break — scanCalls enqueues the instance
+/// whenever an index node types concrete). The fingerprint folds the same instance ([C2]).
+pub fn gaAtInstance(in: *const Inputs, elem_ty: Typecheck.Type) ?usize {
     var gid: ?u32 = null;
-    for (b.in.names, 0..) |sn, i| {
+    for (in.names, 0..) |sn, i| {
         if (sn.kind == .user_fn and std.mem.eql(u8, sn.name, StdNames.ga_at)) {
             gid = @intCast(i);
             break;
@@ -2988,7 +3001,11 @@ fn gaAtCallee(b: *Builder, elem_ty: Typecheck.Type) ?Link.SymName {
     }
     const g = gid orelse return null;
     const targs = [_]Typecheck.Type{elem_ty};
-    const ii = Mono.find(b.in.instances, g, &targs) orelse return null;
+    return Mono.find(in.instances, g, &targs);
+}
+
+fn gaAtCallee(b: *Builder, elem_ty: Typecheck.Type) ?Link.SymName {
+    const ii = gaAtInstance(&b.in, elem_ty) orelse return null;
     return .{ .kind = .user_fn, .name = b.in.instances[ii].name.? };
 }
 
@@ -3847,6 +3864,35 @@ fn emitForNext(b: *Builder, next_m: Typecheck.Method, it_slot: Ir.SlotId, opt_sl
     _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, next_m), .args = args, .ret_slot = opt_slot } }, null);
 }
 
+/// What a `for` loop over a value of type `recv_ty` calls: `iter` on it, then `next` on
+/// the iterator `iter` returns, with that iterator's type and `next`'s `Option`. The
+/// fingerprint folds these same methods, since no call slot names them ([C2]).
+pub const ForInCalls = struct { iter: Typecheck.Method, next: Typecheck.Method, iter_ty: Typecheck.Type, opt_ty: Typecheck.Type };
+
+pub const ForInError = error{ NoIter, IterNotInstance, NoNext, NextNotInstance };
+
+pub fn forInCalls(in: *const Inputs, recv_ty: Typecheck.Type) ForInError!ForInCalls {
+    const dm = comptime StdNames.desugarMethods(.for_in_stmt);
+    comptime std.debug.assert(dm.len == 2); // dm[0]: iter, dm[1]: next
+    comptime std.debug.assert(std.mem.eql(u8, StdNames.desugarMethods(.for_in2_stmt)[0].name, dm[0].name) and
+        std.mem.eql(u8, StdNames.desugarMethods(.for_in2_stmt)[1].name, dm[1].name));
+    const iter_m = Typecheck.findMethod(in.methods, recv_ty, dm[0].name) orelse return error.NoIter;
+    const ii = iter_m.instance orelse return error.IterNotInstance;
+    const iter_ty = in.instances[ii].ret;
+    const next_m = Typecheck.findMethod(in.methods, iter_ty, dm[1].name) orelse return error.NoNext;
+    const ni = next_m.instance orelse return error.NextNotInstance;
+    return .{ .iter = iter_m, .next = next_m, .iter_ty = iter_ty, .opt_ty = in.instances[ni].ret };
+}
+
+fn forInFailure(e: ForInError, comptime what: []const u8) []const u8 {
+    return switch (e) {
+        error.NoIter => what ++ ": no reified 'iter' method in lower",
+        error.IterNotInstance => what ++ ": 'iter' is not a reified instance in lower",
+        error.NoNext => what ++ ": no reified 'next' method in lower",
+        error.NextNotInstance => what ++ ": 'next' is not a reified instance in lower",
+    };
+}
+
 /// `for x in xs { body }`: the structural iterator desugar, composing the existing
 /// loop + Option-tag primitives (never touches `lowerFor`, so range-for stays
 /// byte-identical). Lowers to:
@@ -3859,30 +3905,12 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
     const stmt = b.in.tree.nodes[(stmt_idx).int()];
     const int_ty = Typecheck.Type.int;
 
-    const dm = comptime StdNames.desugarMethods(.for_in_stmt);
-    comptime std.debug.assert(dm.len == 2); // dm[0]: iter, dm[1]: next
-    const recv_ty = b.in.node_types[(stmt.rhs).int()];
-    const iter_m = Typecheck.findMethod(b.in.methods, recv_ty, dm[0].name) orelse {
-        try b.note(stmt.main_token, "for-in: no reified 'iter' method in lower");
-        return;
-    };
-    const ii = iter_m.instance orelse {
-        try b.note(stmt.main_token, "for-in: 'iter' is not a reified instance in lower");
-        return;
-    };
-    const iter_ty = b.in.instances[ii].ret;
-    const it_slot = try b.addSlot(iter_ty);
-    if (!try emitForIter(b, stmt.rhs, iter_m, it_slot)) return;
+    const calls = forInCalls(&b.in, b.in.node_types[(stmt.rhs).int()]) catch |e| return b.note(stmt.main_token, forInFailure(e, "for-in"));
+    const next_m = calls.next;
+    const it_slot = try b.addSlot(calls.iter_ty);
+    if (!try emitForIter(b, stmt.rhs, calls.iter, it_slot)) return;
 
-    const next_m = Typecheck.findMethod(b.in.methods, iter_ty, dm[1].name) orelse {
-        try b.note(stmt.main_token, "for-in: no reified 'next' method in lower");
-        return;
-    };
-    const ni = next_m.instance orelse {
-        try b.note(stmt.main_token, "for-in: 'next' is not a reified instance in lower");
-        return;
-    };
-    const opt_ty = b.in.instances[ni].ret;
+    const opt_ty = calls.opt_ty;
     if (opt_ty.kind != .@"enum" or opt_ty.enum_id >= b.in.enum_layouts.len) {
         try b.note(stmt.main_token, "for-in: 'next' did not reify to an Option enum in lower");
         return;
@@ -3935,30 +3963,12 @@ fn lowerForIn2(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOf
     const h = Ast.forIn2HeaderAt(b.in.tree, stmt.lhs.int());
     const int_ty = Typecheck.Type.int;
 
-    const dm = comptime StdNames.desugarMethods(.for_in2_stmt);
-    comptime std.debug.assert(dm.len == 2); // dm[0]: iter, dm[1]: next
-    const recv_ty = b.in.node_types[(stmt.rhs).int()];
-    const iter_m = Typecheck.findMethod(b.in.methods, recv_ty, dm[0].name) orelse {
-        try b.note(stmt.main_token, "for-in2: no reified 'iter' method in lower");
-        return;
-    };
-    const ii = iter_m.instance orelse {
-        try b.note(stmt.main_token, "for-in2: 'iter' is not a reified instance in lower");
-        return;
-    };
-    const iter_ty = b.in.instances[ii].ret;
-    const it_slot = try b.addSlot(iter_ty);
-    if (!try emitForIter(b, stmt.rhs, iter_m, it_slot)) return;
+    const calls = forInCalls(&b.in, b.in.node_types[(stmt.rhs).int()]) catch |e| return b.note(stmt.main_token, forInFailure(e, "for-in2"));
+    const next_m = calls.next;
+    const it_slot = try b.addSlot(calls.iter_ty);
+    if (!try emitForIter(b, stmt.rhs, calls.iter, it_slot)) return;
 
-    const next_m = Typecheck.findMethod(b.in.methods, iter_ty, dm[1].name) orelse {
-        try b.note(stmt.main_token, "for-in2: no reified 'next' method in lower");
-        return;
-    };
-    const ni = next_m.instance orelse {
-        try b.note(stmt.main_token, "for-in2: 'next' is not a reified instance in lower");
-        return;
-    };
-    const opt_ty = b.in.instances[ni].ret;
+    const opt_ty = calls.opt_ty;
     if (opt_ty.kind != .@"enum" or opt_ty.enum_id >= b.in.enum_layouts.len) {
         try b.note(stmt.main_token, "for-in2: 'next' did not reify to an Option enum in lower");
         return;

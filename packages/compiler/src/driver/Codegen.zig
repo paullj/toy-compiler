@@ -855,35 +855,13 @@ test "the build lowers and links every unit of the plan" {
     }
 }
 
-test "every call a body makes relocates to a symbol its key folds, but for unkeyed instances" {
-    const gpa = testing.allocator;
-    const ck = try Checked.create(gpa,
-        \\struct P { x: int, y: int }
-        \\struct B[T] { v: int }
-        \\impl B[T] { fn get(self) -> int { self.v } }
-        \\fn add(a: int, b: int) -> int { a + b }
-        \\fn apply[T](f: fn(T, T) -> T, x: T) -> T { f(x, x) }
-        \\fn keep[T](x: T) -> T { x }
-        \\fn mk[T]() -> B[T] { B[T] { v: 4 } }
-        \\fn main() -> int {
-        \\    p := P { x: 1, y: 2 }
-        \\    q := P { x: 1, y: 2 }
-        \\    k := 3
-        \\    h := fn(a: int, b: int) -> int { a * b + k }
-        \\    e := if p == q { 1 } else { 0 }
-        \\    apply(add, 2) + apply(h, 1) + keep(e) + keep[int](1) + mk[bool]().get()
-        \\}
-        \\
-    );
-    defer ck.destroy(gpa);
-    var plan = try ck.plan(gpa, .O0);
-    defer plan.deinit(gpa);
+/// The calls each body's code makes to a unit of `plan` that the body's key does not fold
+/// ([C2]), into `unfolded` (names borrowed from `plan`); returns how many calls it checked.
+fn unfoldedCalls(gpa: std.mem.Allocator, plan: *const Plan, unfolded: *std.ArrayList([]const u8)) !usize {
     var unit_syms: std.StringHashMapUnmanaged(void) = .empty;
     defer unit_syms.deinit(gpa);
     for (plan.units) |u| try unit_syms.put(gpa, plan.symOf(u).name, {});
 
-    var unfolded: std.ArrayList([]const u8) = .empty;
-    defer unfolded.deinit(gpa);
     var calls: usize = 0;
     for (plan.units, 0..) |u, i| {
         if (u != .body) continue;
@@ -908,8 +886,68 @@ test "every call a body makes relocates to a symbol its key folds, but for unkey
             else => {},
         };
     }
-    try testing.expect(calls >= 6);
+    return calls;
+}
+
+test "every call a body makes relocates to a symbol its key folds, but for unkeyed instances" {
+    const gpa = testing.allocator;
+    const ck = try Checked.create(gpa,
+        \\struct P { x: int, y: int }
+        \\struct B[T] { v: int }
+        \\impl B[T] { fn get(self) -> int { self.v } }
+        \\fn add(a: int, b: int) -> int { a + b }
+        \\fn apply[T](f: fn(T, T) -> T, x: T) -> T { f(x, x) }
+        \\fn keep[T](x: T) -> T { x }
+        \\fn mk[T]() -> B[T] { B[T] { v: 4 } }
+        \\fn main() -> int {
+        \\    p := P { x: 1, y: 2 }
+        \\    q := P { x: 1, y: 2 }
+        \\    k := 3
+        \\    h := fn(a: int, b: int) -> int { a * b + k }
+        \\    e := if p == q { 1 } else { 0 }
+        \\    apply(add, 2) + apply(h, 1) + keep(e) + keep[int](1) + mk[bool]().get()
+        \\}
+        \\
+    );
+    defer ck.destroy(gpa);
+    var plan = try ck.plan(gpa, .O0);
+    defer plan.deinit(gpa);
+    var unfolded: std.ArrayList([]const u8) = .empty;
+    defer unfolded.deinit(gpa);
+    try testing.expect(try unfoldedCalls(gpa, &plan, &unfolded) >= 6);
     // `mk[bool]()` names no type param in its value params, so its key misses it ([C2]).
     try testing.expectEqual(@as(usize, 1), unfolded.items.len);
     try testing.expectEqualStrings("main.mk$bool", unfolded.items[0]);
+}
+
+test "the calls a for-in and a try_into make are folded into the body's key (#35)" {
+    const gpa = testing.allocator;
+    const ck = try Checked.create(gpa,
+        \\protocol Iterator[T] { fn next(mut self) -> Option[T] }
+        \\struct It[T] { i: int, n: int }
+        \\impl It[T] has Iterator[int] {
+        \\    fn next(mut self) -> Option[int] {
+        \\        self.i = self.i + 1
+        \\        if self.i > self.n { return Option[int].none }
+        \\        return Option.some(self.i)
+        \\    }
+        \\}
+        \\impl It[T] { fn iter(self) -> It[T] { self } }
+        \\fn main() -> int {
+        \\    t := 0
+        \\    it := It[int] { i: 0, n: 4 }
+        \\    for x in it { t = t + x }
+        \\    _c: char = t.try_into().unwrap()
+        \\    return t
+        \\}
+        \\
+    );
+    defer ck.destroy(gpa);
+    var plan = try ck.plan(gpa, .O0);
+    defer plan.deinit(gpa);
+    var unfolded: std.ArrayList([]const u8) = .empty;
+    defer unfolded.deinit(gpa);
+    // `iter`, `next` and the `TryInto` witness; no call node names any of them.
+    try testing.expectEqual(@as(usize, 3), try unfoldedCalls(gpa, &plan, &unfolded));
+    try testing.expectEqual(@as(usize, 0), unfolded.items.len);
 }
