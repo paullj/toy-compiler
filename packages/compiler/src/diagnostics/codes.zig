@@ -138,7 +138,7 @@ pub const Code = enum(u16) {
     W0008, // unused-must-use
     W0009, // shadowed-binding
     W0010, // dead-store
-    W0011, // shadows-std-method
+    W0011, // shadows-std-or-builtin-method (a method named like a std method or a builtin of the same type)
     W0012, // uncalled-function (an expression statement drops a function value it never calls)
     W0013, // fn-field-method-clash (a method shares its name with a fn-typed field of its receiver)
 
@@ -274,7 +274,7 @@ pub const table = [_]Entry{
     .{ .code = .W0008, .str = "W0008", .slug = "unused-must-use", .default_severity = .warning },
     .{ .code = .W0009, .str = "W0009", .slug = "shadowed-binding", .default_severity = .warning, .related = "outer binding declared here" },
     .{ .code = .W0010, .str = "W0010", .slug = "dead-store", .default_severity = .warning },
-    .{ .code = .W0011, .str = "W0011", .slug = "shadows-std-method", .default_severity = .warning },
+    .{ .code = .W0011, .str = "W0011", .slug = "shadows-std-or-builtin-method", .default_severity = .warning },
     .{ .code = .W0012, .str = "W0012", .slug = "uncalled-function", .default_severity = .warning },
     .{ .code = .W0013, .str = "W0013", .slug = "fn-field-method-clash", .default_severity = .warning, .related = "field declared here" },
 };
@@ -542,7 +542,7 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqual(Code.W0010, fromStr("W0010").?);
 
     try testing.expectEqualStrings("W0011", str(.W0011).?);
-    try testing.expectEqualStrings("shadows-std-method", slug(.W0011).?);
+    try testing.expectEqualStrings("shadows-std-or-builtin-method", slug(.W0011).?);
     try testing.expectEqual(Severity.warning, defaultSeverity(.W0011));
     try testing.expectEqual(Code.W0011, fromStr("W0011").?);
 
