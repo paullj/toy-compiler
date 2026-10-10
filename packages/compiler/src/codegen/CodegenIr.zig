@@ -82,8 +82,8 @@ const Gen = struct {
     /// One label per IR block, pre-allocated so a forward branch can target a
     /// not-yet-emitted block. Indexed by BlockId.
     block_labels: []LabelId,
-    /// This fn's precise GC root map (`FrameLayout.projectRoots`).
-    root_bitmap: []const u8 = &.{},
+    /// This fn's precise GC roots (`FrameLayout.collectRoots`).
+    roots: []const FrameLayout.Root = &.{},
 
     fn emit(g: *Gen, word: u32) error{OutOfMemory}!void {
         var buf: [4]u8 = undefined;
@@ -286,9 +286,11 @@ pub fn lowerIr(
     // The precise GC root map, a byproduct of the (still-live) frame layout, which the
     // prologue reads too. `g.fl` is deinited by the `defer` above only AFTER this return
     // value is built.
-    const rb = try FrameLayout.projectRoots(gpa, func, &g.fl, layouts, enum_layouts);
+    const roots = try FrameLayout.collectRoots(gpa, func, &g.fl, layouts, enum_layouts);
+    defer gpa.free(roots);
+    g.roots = roots;
+    const rb = try FrameLayout.encodeRoots(gpa, roots);
     errdefer gpa.free(rb);
-    g.root_bitmap = rb;
 
     try genBody(&g);
 
@@ -350,22 +352,16 @@ fn genBody(g: *Gen) error{OutOfMemory}!void {
     try g.resolveFixups();
 }
 
-/// Clear each frame word the root map tags as a container header (tag 1). A collection
-/// at a call walks such a word as a `gc_array` header, and a cell not written yet still
-/// holds whatever an earlier frame left there, which may point into any live cell.
+/// Clear each frame word the roots tag as a container header. A collection at a call
+/// walks such a word as a `gc_array` header, and a cell not written yet still holds
+/// whatever an earlier frame left there, which may point into any live cell.
 fn zeroContainerRoots(g: *Gen) error{OutOfMemory}!void {
-    const rb = g.root_bitmap;
-    if (rb.len < 4) return;
-    const n = std.mem.readInt(u32, rb[0..4], .little);
-    for (0..n) |i| {
-        const off = std.mem.readInt(u32, rb[4 + i * 8 ..][0..4], .little);
-        const tag = std.mem.readInt(u32, rb[4 + i * 8 + 4 ..][0..4], .little);
-        if (tag != 1) continue;
-        const seen = for (0..i) |j| {
-            if (std.mem.readInt(u32, rb[4 + j * 8 ..][0..4], .little) == off and
-                std.mem.readInt(u32, rb[4 + j * 8 + 4 ..][0..4], .little) == 1) break true;
+    for (g.roots, 0..) |r, i| {
+        if (r.tag != .container) continue;
+        const seen = for (g.roots[0..i]) |o| {
+            if (o.off == r.off and o.tag == .container) break true;
         } else false;
-        if (!seen) try g.emit(Aarch64.strSp(Aarch64.XZR, off));
+        if (!seen) try g.emit(Aarch64.strSp(Aarch64.XZR, r.off));
     }
 }
 

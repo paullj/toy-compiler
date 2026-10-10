@@ -18,6 +18,7 @@ const Callee = @import("Callee.zig").Callee;
 const Modes = @import("Modes.zig");
 const Resolution = @import("Resolution.zig").Resolution;
 const Body = @import("Body.zig");
+const Mangle = @import("Mangle.zig");
 
 pub const TargetKind = enum(u8) { named, lambda };
 
@@ -158,17 +159,6 @@ pub fn targetsOf(gpa: std.mem.Allocator, body: Body.BodyView, prog: Body.Program
     }
 }
 
-/// `<inst>$sp<p>$<sym>` per target, ascending p. A pure function of the instance and target
-/// symbols. No instance, fn or lambda symbol has a `$`-separated piece spelled `sp<n>`, so
-/// the pieces split back apart and distinct target lists give distinct names.
-pub fn nameOf(gpa: std.mem.Allocator, inst_name: []const u8, targets: []const Target) error{OutOfMemory}![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    try out.appendSlice(gpa, inst_name);
-    for (targets) |t| try out.print(gpa, "$sp{d}${s}", .{ t.param, t.sym.name });
-    return out.toOwnedSlice(gpa);
-}
-
 /// Binary search over `t.units` by name.
 pub fn find(t: Table, name: []const u8) ?*const Unit {
     const i = std.sort.binarySearch(Unit, t.units, name, struct {
@@ -195,7 +185,7 @@ pub const Candidate = struct { gid: u32, unit: Unit };
 /// Record the unit a call of instance `ii` with `targets` would get, unless an equal one is
 /// already in `out`, and return its index in `out`. `targets` is copied.
 pub fn addCandidate(gpa: std.mem.Allocator, out: *std.ArrayList(Candidate), gid: u32, ii: usize, inst_name: []const u8, targets: []const Target) error{OutOfMemory}!u32 {
-    const name = try nameOf(gpa, inst_name, targets);
+    const name = try Mangle.spec(gpa, inst_name, targets);
     errdefer gpa.free(name);
     for (out.items, 0..) |c, k| if (std.mem.eql(u8, c.unit.name, name)) {
         gpa.free(name);
@@ -408,44 +398,6 @@ fn collectCandidates(gpa: std.mem.Allocator, src: Source, masks: []const Templat
 }
 
 const testing = std.testing;
-
-test "nameOf is content-derived and injective" {
-    const gpa = testing.allocator;
-    const add: Sym.SymName = .{ .kind = .user_fn, .name = "main.add" };
-    const lam: Sym.SymName = .{ .kind = .user_fn, .name = "main$l0" };
-    const a = try nameOf(gpa, "main.apply$int", &.{.{ .param = 0, .kind = .named, .sym = add }});
-    defer gpa.free(a);
-    try testing.expectEqualStrings("main.apply$int$sp0$main.add", a);
-    const b = try nameOf(gpa, "main.apply$int", &.{.{ .param = 0, .kind = .named, .sym = add }});
-    defer gpa.free(b);
-    try testing.expectEqualStrings(a, b);
-
-    // Distinct instances, params, targets and target lists give distinct names.
-    const variants = [_][]const Target{
-        &.{.{ .param = 1, .kind = .named, .sym = add }},
-        &.{.{ .param = 0, .kind = .lambda, .sym = lam }},
-        &.{ .{ .param = 0, .kind = .named, .sym = add }, .{ .param = 1, .kind = .lambda, .sym = lam } },
-        &.{ .{ .param = 0, .kind = .lambda, .sym = lam }, .{ .param = 1, .kind = .named, .sym = add } },
-    };
-    var names: std.ArrayList([]u8) = .empty;
-    defer {
-        for (names.items) |n| gpa.free(n);
-        names.deinit(gpa);
-    }
-    try names.append(gpa, try gpa.dupe(u8, a));
-    try names.append(gpa, try nameOf(gpa, "main.apply$bool", &.{.{ .param = 0, .kind = .named, .sym = add }}));
-    for (variants) |v| try names.append(gpa, try nameOf(gpa, "main.apply$int", v));
-    for (names.items, 0..) |x, i| for (names.items[i + 1 ..]) |y| try testing.expect(!std.mem.eql(u8, x, y));
-    try testing.expectEqualStrings("main.apply$int$sp0$main.add$sp1$main$l0", names.items[4]);
-
-    // A spec piece is never a generic-instance arg spelling.
-    const Mono = @import("Mono.zig");
-    for ([_]Type{ Type.int, Type.bool, Type.str, Type.unit, Type.float, Type.structT(3), Type.enumT(4), Type.rawptr }) |t| {
-        const m = try Mono.mangle(gpa, "f", &.{t});
-        defer gpa.free(m);
-        try testing.expect(std.mem.indexOf(u8, m, "$sp") == null);
-    }
-}
 
 test "finish caps each template by name and sorts the units by name" {
     const gpa = testing.allocator;

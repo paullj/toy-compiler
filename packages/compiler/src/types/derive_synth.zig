@@ -10,6 +10,7 @@ const Type = Typecheck.Type;
 const Method = Typecheck.Method;
 const DeriveRecipe = Typecheck.DeriveRecipe;
 const Derive = @import("../symbols/Derive.zig");
+const Mangle = @import("../symbols/Mangle.zig");
 const Abi = @import("../codegen/abi/Abi.zig");
 const LayoutEngine = @import("../layout/Engine.zig");
 
@@ -449,7 +450,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     // an Eq recipe an `eq` Method{protocol_id=eq}. `derive=index` routes lower/fold to the
     // synthetic unit.
     for (t.derives.items, 0..) |*d, di| {
-        d.name = try Derive.mangle(gpa, d.protocol_name, d.kind, d.conform_ty);
+        d.name = try Mangle.derive(gpa, d.protocol_name, d.kind, d.conform_ty);
         // A `Hash` witness takes ONLY `self` (`hash(self) -> int`); `Eq`/`Ord` are
         // homogeneous 2-ary (`m(self, other) -> _`). The param count feeds the ABI + the
         // fingerprint Sig fold, so it MUST match the emitter's declared param count.
@@ -568,8 +569,8 @@ pub fn synthesizeDescriptors(t: *Typecheck) !void {
             false) else false;
         try t.descriptor_types.append(gpa, .{ .ty = ty, .hashable = hashable });
         if (hashable) {
-            try t.erased_units.append(gpa, .{ .ty = ty, .kind = .hash, .name = try Derive.erasedMangle(gpa, .hash, ty) });
-            try t.erased_units.append(gpa, .{ .ty = ty, .kind = .eq, .name = try Derive.erasedMangle(gpa, .eq, ty) });
+            try t.erased_units.append(gpa, .{ .ty = ty, .kind = .hash, .name = try Mangle.erased(gpa, .hash, ty) });
+            try t.erased_units.append(gpa, .{ .ty = ty, .kind = .eq, .name = try Mangle.erased(gpa, .eq, ty) });
         }
         // A container stashes `descriptor_of[Elem]`/[K]/[V] in its header; the collector reads
         // that descriptor's `trace_off` to mark the managed object each live cell references.
@@ -578,7 +579,7 @@ pub fn synthesizeDescriptors(t: *Typecheck) !void {
         // aggregate transitively holding one (`needsTrace`). A scalar / managed-free aggregate
         // needs none — its cells are leaves the leaf-marked backing already keeps.
         if (ty.kind == .str or isRefType(t, ty) or try needsTrace(t, ty, true, &tmemo)) {
-            try t.erased_units.append(gpa, .{ .ty = ty, .kind = .trace, .name = try Derive.erasedMangle(gpa, .trace, ty) });
+            try t.erased_units.append(gpa, .{ .ty = ty, .kind = .trace, .name = try Mangle.erased(gpa, .trace, ty) });
         }
     }
 }

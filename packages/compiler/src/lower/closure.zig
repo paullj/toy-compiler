@@ -103,7 +103,7 @@ fn isSelfParam(b: *const Builder, fn_node: Ast.Index, slot: u32) bool {
     if (slot != 0) return false;
     const proto = Ast.protoAt(b.in.tree, b.in.tree.nodes[fn_node.int()].lhs.int());
     if (proto.params.len == 0) return false;
-    return std.mem.eql(u8, b.in.tokens[b.in.tree.nodes[proto.params[0].int()].main_token].text(b.in.source), "self");
+    return Ast.isSelfParam(b.in.tree, b.in.tokens, b.in.source, proto.params[0]);
 }
 
 /// A local fn's prologue: its own name reads as the pair of its code and the env it was

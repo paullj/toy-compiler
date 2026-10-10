@@ -78,6 +78,9 @@ pub const ImportHint = struct {
     spelling: ?[]const u8 = null,
 };
 
+/// The tail of every missing-import diagnostic, formatted with the module name.
+pub const add_import = "add 'import std/{s}'";
+
 pub const ref_methods = [_][]const u8{ "new", "get", "set" };
 pub const option_methods = [_][]const u8{ "map", "then", "or_else" };
 pub const result_methods = [_][]const u8{ "map", "then", "map_err", "or_else" };

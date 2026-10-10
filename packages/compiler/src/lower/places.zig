@@ -9,6 +9,7 @@ const Ast = @import("../ast/Ast.zig");
 const L = @import("../lower.zig");
 const Typecheck = @import("../types.zig");
 const Modes = @import("../symbols/Modes.zig");
+const symbols_res = @import("../symbols/Resolution.zig");
 const Walk = @import("../ast/Walk.zig");
 const Ir = @import("../ir/Ir.zig");
 const Abi = @import("../codegen/abi/Abi.zig");
@@ -104,32 +105,6 @@ pub fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Va
     }
 }
 
-/// Whether a `field_access`/identifier place is rooted at a local.
-pub fn isLocalRootedPlace(b: *Builder, node_idx: Ast.Index) bool {
-    const n = b.in.tree.nodes[(node_idx).int()];
-    return switch (n.tag) {
-        .identifier => b.in.resolutions[(node_idx).int()] == .local,
-        .field_access, .tuple_field => isLocalRootedPlace(b, n.lhs),
-        else => false,
-    };
-}
-
-/// The resolver local a `field_access`/identifier place is rooted at.
-fn placeRootLocal(b: *const Builder, node_idx: Ast.Index) ?u32 {
-    var cur = node_idx;
-    while (true) {
-        const n = b.in.tree.nodes[cur.int()];
-        switch (n.tag) {
-            .identifier => return switch (b.in.resolutions[cur.int()]) {
-                .local => |li| li,
-                else => null,
-            },
-            .field_access, .tuple_field => cur = n.lhs,
-            else => return null,
-        }
-    }
-}
-
 /// Put each local a call in `body` passes as a `mut` argument into `copy_on_read_roots`.
 pub fn noteMutArgRoots(b: *Builder, body: Ast.Index) error{OutOfMemory}!void {
     const Visitor = struct {
@@ -142,7 +117,7 @@ pub fn noteMutArgRoots(b: *Builder, body: Ast.Index) error{OutOfMemory}!void {
             const mask = Modes.argMask(v.b.in.bodyView(), v.b.in.programView(), c.call);
             if (mask == 0) return;
             const args = Ast.rangeSlice(v.b.in.tree, v.b.in.tree.nodes[c.call.int()].rhs.int());
-            for (args, 0..) |a, i| if (Modes.isMut(mask, i)) if (placeRootLocal(v.b, a)) |li|
+            for (args, 0..) |a, i| if (Modes.isMut(mask, i)) if (symbols_res.placeRoot(v.b.in.tree, v.b.in.resolutions, a)) |li|
                 try v.b.copy_on_read_roots.put(v.b.gpa, li, {});
         }
     };
@@ -171,7 +146,7 @@ pub fn readsCopyOnReadRoot(b: *const Builder, node_idx: Ast.Index) bool {
 /// first (see `staged_places`).
 pub fn stagesStore(b: *const Builder, place: Ast.Index) bool {
     if (!b.staged_places) return false;
-    const li = placeRootLocal(b, place) orelse return false;
+    const li = symbols_res.placeRoot(b.in.tree, b.in.resolutions, place) orelse return false;
     const home = b.homes.get(li) orelse return false;
     // A store to a local kept in the owner's frame is unstaged, as through its box at -O0.
     return home == .addr and b.in.closure.storage.hold(li) != .frame_addr;

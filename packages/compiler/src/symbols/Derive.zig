@@ -116,7 +116,7 @@ pub const Derive = struct {
 
 /// True when `conform_ty` is an enum (the id then lives in `enum_id`, not `struct_id`).
 /// Routes through `Type.idField` so the enum-vs-struct id-space split is single-sourced.
-fn isEnum(t: Type) bool {
+pub fn isEnum(t: Type) bool {
     return Type.idField(t.kind) == .enum_id;
 }
 
@@ -156,162 +156,14 @@ pub fn writeKey(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), protocol_id: u3
     try buf.appendSlice(gpa, &w);
 }
 
-/// The mangled synthetic symbol: `<Protocol>$<method>$<s|e><id>` (e.g. `Eq$eq$s0`,
-/// `Eq$eq$e2`). `$` is not a valid source identifier char, so this can never collide
-/// with a user fn; the `<Protocol>$<method>$` prefix + the `s`/`e`-tagged id keep it
-/// disjoint from a Mono instance's `<template>$<args>` mangling too. The id is only a
-/// SEPARATION layer — a layout edit that keeps the id still flips the unit's
-/// fingerprint via the derive-fingerprint's layout fold, so the name never needs the
-/// layout.
-pub fn mangle(gpa: std.mem.Allocator, protocol_name: []const u8, kind: Kind, conform_ty: Type) ![]u8 {
-    // See `writeKey`: the mangled name drops the int descriptor for the same reason
-    // (no `.int` conformer ever reaches derive synthesis).
-    std.debug.assert(!Type.carriesIntDesc(conform_ty.kind));
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(gpa);
-    try buf.appendSlice(gpa, protocol_name);
-    try buf.append(gpa, '$');
-    try buf.appendSlice(gpa, methodName(kind));
-    try buf.append(gpa, '$');
-    var nb: [16]u8 = undefined;
-    const tag: u8 = if (isEnum(conform_ty)) 'e' else 's';
-    try buf.append(gpa, tag);
-    try buf.appendSlice(gpa, std.fmt.bufPrint(&nb, "{d}", .{typeId(conform_ty)}) catch unreachable);
-    return buf.toOwnedSlice(gpa);
-}
-
 /// Which erased key witness a descriptor entry carries. The erased units adapt a
-/// natural `hash`/`eq` recipe to a key-by-pointer ABI; unlike `Kind`/`mangle`, they
-/// must also name SCALAR key types (a `Map[int, V]` key is an `int`), so they get
-/// their own scalar-capable mangle rather than reusing `mangle` (which asserts a
+/// natural `hash`/`eq` recipe to a key-by-pointer ABI; unlike `Kind`, they must also
+/// name SCALAR key types (a `Map[int, V]` key is an `int`), so they get their own
+/// scalar-capable name (`Mangle.erased`) rather than `Mangle.derive` (which asserts a
 /// nominal struct/enum via `carriesIntDesc`).
 pub const ErasedKind = enum { hash, eq, trace };
 
-/// The mangled erased-unit symbol: `descriptor$hash$<tag>` / `descriptor$eq$<tag>` /
-/// `descriptor$trace$<tag>`, where `<tag>` is `s<id>`/`e<id>` for a struct/enum, or the
-/// kind spelling for a scalar. `$` bars source collision; the `descriptor$` prefix bars
-/// collision with a `Hash$hash$…`/`Eq$eq$…`/`Trace$trace$…` derive name and a Mono
-/// `<template>$<args>` name.
-pub fn erasedMangle(gpa: std.mem.Allocator, kind: ErasedKind, ty: Type) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(gpa);
-    try buf.appendSlice(gpa, "descriptor$");
-    try buf.appendSlice(gpa, switch (kind) {
-        .hash => "hash",
-        .eq => "eq",
-        .trace => "trace",
-    });
-    try buf.append(gpa, '$');
-    switch (ty.kind) {
-        .@"struct", .@"enum" => {
-            try buf.append(gpa, if (isEnum(ty)) 'e' else 's');
-            var nb: [16]u8 = undefined;
-            try buf.appendSlice(gpa, std.fmt.bufPrint(&nb, "{d}", .{typeId(ty)}) catch unreachable);
-        },
-        // Per-width spelling (`int`/`uint`/`int8`…/`uint64`), so each int width mints a
-        // distinct erased symbol — mirroring `appendKeyBytes`/`descHash` folding the
-        // sign/width byte into the type key. A bare "int" would alias every width onto ONE
-        // hash/eq implementation (a silent wrong-width read).
-        .int => try buf.appendSlice(gpa, ty.intName()),
-        .bool => try buf.appendSlice(gpa, "bool"),
-        .str => try buf.appendSlice(gpa, "str"),
-        .unit => try buf.appendSlice(gpa, "unit"),
-        .float => try buf.appendSlice(gpa, "float"),
-        .rawptr => try buf.appendSlice(gpa, "rawptr"),
-        else => try buf.appendSlice(gpa, "other"),
-    }
-    return buf.toOwnedSlice(gpa);
-}
-
 const testing = std.testing;
-
-test "erasedMangle distinct per (kind, type), disjoint from mangle" {
-    const gpa = testing.allocator;
-    const hs = try erasedMangle(gpa, .hash, Type.structT(0));
-    defer gpa.free(hs);
-    try testing.expectEqualStrings("descriptor$hash$s0", hs);
-    const es = try erasedMangle(gpa, .eq, Type.structT(0));
-    defer gpa.free(es);
-    try testing.expectEqualStrings("descriptor$eq$s0", es);
-    const hi = try erasedMangle(gpa, .hash, Type.int);
-    defer gpa.free(hi);
-    try testing.expectEqualStrings("descriptor$hash$int", hi);
-    const hstr = try erasedMangle(gpa, .hash, Type.str);
-    defer gpa.free(hstr);
-    try testing.expectEqualStrings("descriptor$hash$str", hstr);
-    try testing.expect(!std.mem.eql(u8, hs, es));
-    // Each int width mints its own erased symbol — a bare "int" would alias every width
-    // onto one hash/eq body (a silent wrong-width read for a `byte`/`int8` key).
-    const hi8 = try erasedMangle(gpa, .hash, Type.int8);
-    defer gpa.free(hi8);
-    try testing.expectEqualStrings("descriptor$hash$int8", hi8);
-    const hu8 = try erasedMangle(gpa, .hash, Type.uint8);
-    defer gpa.free(hu8);
-    try testing.expectEqualStrings("descriptor$hash$uint8", hu8);
-    try testing.expect(!std.mem.eql(u8, hi, hi8));
-    try testing.expect(!std.mem.eql(u8, hi8, hu8));
-    // Disjoint from a natural derive name for the same type.
-    const dhs = try mangle(gpa, "Hash", .hash, Type.structT(0));
-    defer gpa.free(dhs);
-    try testing.expect(!std.mem.eql(u8, hs, dhs));
-    // The erased `.trace` kind mangles per (type) too: `descriptor$trace$str` for a heap
-    // string buffer, `descriptor$trace$s<id>` for a reified Ref/gc_array box.
-    const tstr = try erasedMangle(gpa, .trace, Type.str);
-    defer gpa.free(tstr);
-    try testing.expectEqualStrings("descriptor$trace$str", tstr);
-    const ts0 = try erasedMangle(gpa, .trace, Type.structT(0));
-    defer gpa.free(ts0);
-    try testing.expectEqualStrings("descriptor$trace$s0", ts0);
-    try testing.expect(!std.mem.eql(u8, tstr, hstr)); // trace vs hash disjoint
-}
-
-test "mangle is distinct per (protocol, kind, type)" {
-    const gpa = testing.allocator;
-    const a = try mangle(gpa, "Eq", .eq, Type.structT(0));
-    defer gpa.free(a);
-    try testing.expectEqualStrings("Eq$eq$s0", a);
-    const b = try mangle(gpa, "Eq", .eq, Type.structT(1));
-    defer gpa.free(b);
-    try testing.expectEqualStrings("Eq$eq$s1", b);
-    const c = try mangle(gpa, "Eq", .eq, Type.enumT(0));
-    defer gpa.free(c);
-    try testing.expectEqualStrings("Eq$eq$e0", c);
-    // a struct#0 and an enum#0 mangle distinctly (the s/e tag separates the two id
-    // spaces), and neither collides with a Mono `<template>$<args>` name.
-    try testing.expect(!std.mem.eql(u8, a, c));
-    try testing.expect(!std.mem.eql(u8, a, b));
-}
-
-test "mangle distinguishes Ord `cmp` from Eq `eq` per (kind, type)" {
-    const gpa = testing.allocator;
-    const oe = try mangle(gpa, "Ord", .ord, Type.enumT(0));
-    defer gpa.free(oe);
-    try testing.expectEqualStrings("Ord$cmp$e0", oe);
-    const os = try mangle(gpa, "Ord", .ord, Type.structT(0));
-    defer gpa.free(os);
-    try testing.expectEqualStrings("Ord$cmp$s0", os);
-    // The Ord `cmp` name is disjoint from the Eq `eq` name for the same struct id.
-    const es = try mangle(gpa, "Eq", .eq, Type.structT(0));
-    defer gpa.free(es);
-    try testing.expect(!std.mem.eql(u8, os, es));
-}
-
-test "mangle produces a distinct `Hash$hash$` name per (struct/enum, id)" {
-    const gpa = testing.allocator;
-    const hs = try mangle(gpa, "Hash", .hash, Type.structT(0));
-    defer gpa.free(hs);
-    try testing.expectEqualStrings("Hash$hash$s0", hs);
-    const he = try mangle(gpa, "Hash", .hash, Type.enumT(0));
-    defer gpa.free(he);
-    try testing.expectEqualStrings("Hash$hash$e0", he);
-    // The Hash `hash` name is disjoint from the Eq `eq` and Ord `cmp` names for the same id.
-    const es = try mangle(gpa, "Eq", .eq, Type.structT(0));
-    defer gpa.free(es);
-    const os = try mangle(gpa, "Ord", .ord, Type.structT(0));
-    defer gpa.free(os);
-    try testing.expect(!std.mem.eql(u8, hs, es));
-    try testing.expect(!std.mem.eql(u8, hs, os));
-}
 
 test "lessThan is a total canonical order (protocol, kind, enum-flag, id)" {
     const s0 = Derive{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = Type.structT(0) };
@@ -348,24 +200,8 @@ test "lessThan orders eq < ord < hash for the same protocol/type" {
     try testing.expect(!lessThan({}, hash0, hash0));
 }
 
-test "mangle produces a distinct `Display$display$` name; kind orders last" {
+test "the display kind orders last and keys apart from hash" {
     const gpa = testing.allocator;
-    const ds = try mangle(gpa, "Display", .display, Type.structT(0));
-    defer gpa.free(ds);
-    try testing.expectEqualStrings("Display$display$s0", ds);
-    const de = try mangle(gpa, "Display", .display, Type.enumT(2));
-    defer gpa.free(de);
-    try testing.expectEqualStrings("Display$display$e2", de);
-    // The Display `display` name is disjoint from the Eq/Ord/Hash names for the same id.
-    const es = try mangle(gpa, "Eq", .eq, Type.structT(0));
-    defer gpa.free(es);
-    const os = try mangle(gpa, "Ord", .ord, Type.structT(0));
-    defer gpa.free(os);
-    const hs = try mangle(gpa, "Hash", .hash, Type.structT(0));
-    defer gpa.free(hs);
-    try testing.expect(!std.mem.eql(u8, ds, es));
-    try testing.expect(!std.mem.eql(u8, ds, os));
-    try testing.expect(!std.mem.eql(u8, ds, hs));
     // The kind ordinal (eq=0 < ord=1 < hash=2 < display=3) makes a Display recipe sort LAST
     // within one (protocol, type), so its synthetic id/name is minted after all others.
     const eq0 = Derive{ .protocol_id = 0, .protocol_name = "Eq", .kind = .eq, .conform_ty = Type.structT(0) };
@@ -385,31 +221,8 @@ test "mangle produces a distinct `Display$display$` name; kind orders last" {
     try testing.expect(!std.mem.eql(u8, a.items, d.items));
 }
 
-test "mangle produces distinct `TryInto$` conv names, disjoint from Display/Eq" {
+test "writeKey separates the conv kinds" {
     const gpa = testing.allocator;
-    const ic = try mangle(gpa, "TryInto", .conv_int_char, Type.structT(3));
-    defer gpa.free(ic);
-    try testing.expectEqualStrings("TryInto$int_to_char$s3", ic);
-    const cb = try mangle(gpa, "TryInto", .conv_char_byte, Type.structT(3));
-    defer gpa.free(cb);
-    try testing.expectEqualStrings("TryInto$char_to_byte$s3", cb);
-    // The two conv names are disjoint from each other and from a Display/Eq name for the
-    // same struct id (the `<method>` segment separates them).
-    try testing.expect(!std.mem.eql(u8, ic, cb));
-    const ds = try mangle(gpa, "Display", .display, Type.structT(3));
-    defer gpa.free(ds);
-    const es = try mangle(gpa, "Eq", .eq, Type.structT(3));
-    defer gpa.free(es);
-    try testing.expect(!std.mem.eql(u8, ic, ds));
-    try testing.expect(!std.mem.eql(u8, ic, es));
-    try testing.expect(!std.mem.eql(u8, cb, ds));
-    // The float->int witness anchors on `Type.float` (no char struct); `carriesIntDesc(.float)`
-    // is false, so mangle/writeKey accept it and mint the `s0` name distinct from the char convs.
-    const fi = try mangle(gpa, "TryInto", .conv_float_int, Type.float);
-    defer gpa.free(fi);
-    try testing.expectEqualStrings("TryInto$float_to_int$s0", fi);
-    try testing.expect(!std.mem.eql(u8, fi, ic));
-    try testing.expect(!std.mem.eql(u8, fi, cb));
     // writeKey separates the conv kinds for the same (protocol, type).
     var a: std.ArrayList(u8) = .empty;
     defer a.deinit(gpa);
@@ -418,23 +231,6 @@ test "mangle produces distinct `TryInto$` conv names, disjoint from Display/Eq" 
     try writeKey(gpa, &a, 10, .conv_int_char, Type.structT(3));
     try writeKey(gpa, &b, 10, .conv_char_byte, Type.structT(3));
     try testing.expect(!std.mem.eql(u8, a.items, b.items));
-}
-
-test "mangle produces a distinct `Trace$trace$` name per (struct/enum, id)" {
-    const gpa = testing.allocator;
-    const ts = try mangle(gpa, "Trace", .trace, Type.structT(0));
-    defer gpa.free(ts);
-    try testing.expectEqualStrings("Trace$trace$s0", ts);
-    const te = try mangle(gpa, "Trace", .trace, Type.enumT(1));
-    defer gpa.free(te);
-    try testing.expectEqualStrings("Trace$trace$e1", te);
-    // The Trace `trace` name is disjoint from the Eq/Hash names for the same struct id.
-    const es = try mangle(gpa, "Eq", .eq, Type.structT(0));
-    defer gpa.free(es);
-    const hs = try mangle(gpa, "Hash", .hash, Type.structT(0));
-    defer gpa.free(hs);
-    try testing.expect(!std.mem.eql(u8, ts, es));
-    try testing.expect(!std.mem.eql(u8, ts, hs));
 }
 
 test "writeKey is injective across kind/enum-flag/id" {

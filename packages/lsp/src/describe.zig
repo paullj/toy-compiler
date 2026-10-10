@@ -260,7 +260,7 @@ pub const Describer = struct {
             const pname = m.tokens[pn.main_token].text(m.source);
             try d.buf.appendSlice(d.a, pname);
             // The receiver's type is synthesized from the impl, not written.
-            if (pn.lhs == Ast.none or (k == 0 and std.mem.eql(u8, pname, "self"))) continue;
+            if (pn.lhs == Ast.none or (k == 0 and Ast.isSelfParam(tree, m.tokens, m.source, p))) continue;
             try d.buf.appendSlice(d.a, ": ");
             try d.appendNodeText(m, pn.lhs.int());
         }

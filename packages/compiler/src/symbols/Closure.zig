@@ -182,12 +182,6 @@ pub fn freeLambdaUnits(gpa: std.mem.Allocator, units: []const LambdaUnit) void {
     gpa.free(units);
 }
 
-/// The unit symbol of the owner's lambda of rank `rank`. `$` is not a source identifier
-/// char and no instance mangle spells an arg `l<n>` (see the test).
-pub fn lambdaName(gpa: std.mem.Allocator, owner_sym: []const u8, rank: u32) ![]u8 {
-    return std.fmt.allocPrint(gpa, "{s}$l{d}", .{ owner_sym, rank });
-}
-
 /// Binary search over `list`, which is sorted by `fn_node`.
 pub fn findFn(list: []const FnClosures, fn_node: Ast.Index) ?*const FnClosures {
     const i = std.sort.binarySearch(FnClosures, list, fn_node, struct {
@@ -261,19 +255,6 @@ pub const Adapter = struct {
     mut_self: bool = false,
 };
 
-/// The thunk / adapter symbol for `target_sym`. `$` is not a source identifier char, and
-/// no generic-instance mangle spells an arg `fnval`, `bound`, `boundbox` or `boundref`
-/// (see the test), so the name is disjoint from every user fn, instance, derive and erased unit.
-pub fn adapterName(gpa: std.mem.Allocator, target_sym: []const u8, kind: AdapterKind) ![]u8 {
-    const suffix = switch (kind) {
-        .fn_value => "$fnval",
-        .bound_copy => "$bound",
-        .bound_box => "$boundbox",
-        .bound_ref => "$boundref",
-    };
-    return std.mem.concat(gpa, u8, &.{ target_sym, suffix });
-}
-
 /// The adapter a bound method value goes through: it holds a bare local receiver as the
 /// owner's storage `st` holds it (a `mut` param's address, a boxed local's cell, so the
 /// value and its owner see each other's writes, or a copy), and any other receiver as a
@@ -319,44 +300,6 @@ pub fn findAdapter(ads: []const Adapter, kind: AdapterKind, key: u32) ?u32 {
 
 const testing = std.testing;
 const Sig = @import("Sig.zig").Sig;
-
-test "adapterName appends the kind suffix" {
-    const nm = try adapterName(testing.allocator, "geometry/rect.area", .fn_value);
-    defer testing.allocator.free(nm);
-    try testing.expectEqualStrings("geometry/rect.area$fnval", nm);
-}
-
-test "lambda and adapter names never equal a generic-instance mangle or each other" {
-    const Mono = @import("Mono.zig");
-    const gpa = testing.allocator;
-    const spellings = [_]Type{ Type.int, Type.bool, Type.str, Type.unit, Type.float, Type.structT(3), Type.enumT(4), Type.rawptr };
-    const ad = try adapterName(gpa, "f", .fn_value);
-    defer gpa.free(ad);
-    const bc = try adapterName(gpa, "f", .bound_copy);
-    defer gpa.free(bc);
-    const bb = try adapterName(gpa, "f", .bound_box);
-    defer gpa.free(bb);
-    const br = try adapterName(gpa, "f", .bound_ref);
-    defer gpa.free(br);
-    const l0 = try lambdaName(gpa, "f", 0);
-    defer gpa.free(l0);
-    const l12 = try lambdaName(gpa, "f", 12);
-    defer gpa.free(l12);
-    try testing.expectEqualStrings("f$l0", l0);
-    try testing.expectEqualStrings("f$l12", l12);
-    try testing.expectEqualStrings("f$bound", bc);
-    try testing.expectEqualStrings("f$boundbox", bb);
-    try testing.expectEqualStrings("f$boundref", br);
-    const units = [_][]const u8{ ad, bc, bb, br, l0, l12 };
-    for (units) |unit| {
-        for (spellings) |t| {
-            const m = try Mono.mangle(gpa, "f", &.{t});
-            defer gpa.free(m);
-            try testing.expect(!std.mem.eql(u8, m, unit));
-        }
-    }
-    for (units, 0..) |a, i| for (units[i + 1 ..]) |b| try testing.expect(!std.mem.eql(u8, a, b));
-}
 
 test "boundKind boxes only a boxed local receiver" {
     const st: Storage = .{ .boxed = &.{ 1, 3 } };

@@ -93,7 +93,7 @@ pub fn appendCollapsed(a: std.mem.Allocator, buf: *std.ArrayList(u8), text: []co
 }
 
 /// A nominal type's name as the user spells it. A generic instance is minted as
-/// `Template$arg$…` (see `Mono.mangle`), with a struct/enum argument as `s<id>`/`e<id>`
+/// `Template$arg$…` (see `Mangle.instance`), with a struct/enum argument as `s<id>`/`e<id>`
 /// into the same tables — rendered back as `Template[arg, …]`.
 pub fn renderNominal(a: std.mem.Allocator, buf: *std.ArrayList(u8), name: []const u8, layouts: []const Layout, enum_layouts: []const EnumLayout) error{OutOfMemory}!void {
     var parts = std.mem.splitScalar(u8, bareName(name), '$');

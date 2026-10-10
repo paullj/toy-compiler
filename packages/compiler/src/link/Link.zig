@@ -91,7 +91,7 @@ pub const FnCode = struct {
     code: []u8,
     relocs: []Reloc,
     literals: []Literal,
-    /// The per-fn precise GC root map (`FrameLayout.projectRoots`): `[u32 n][{u32 sp_off,
+    /// The per-fn precise GC root map (`FrameLayout.encodeRoots`): `[u32 n][{u32 sp_off,
     /// u32 tag} × n]`, where `tag` is 1 for a `gc_array` container header (precise
     /// container walk) and 0 for everything else (conservative word-scan). Empty for a
     /// hand-emitted builtin or a fn that failed to lower — the collector reads an empty map

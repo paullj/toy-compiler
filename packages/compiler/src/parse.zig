@@ -617,9 +617,9 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
         // A `mut` on a non-self first param is left to the param loop, which accepts or
         // rejects it like any other param's.
         const has_mut = p.at(.kw_mut);
-        const mut_self = has_mut and p.peek2().tag == .identifier and std.mem.eql(u8, p.peek2().text(p.src), "self");
+        const mut_self = has_mut and Ast.isSelfTok(p.tokens, p.src, p.index + 1);
         if (mut_self) p.bump(.kw_mut);
-        if (p.at(.identifier) and std.mem.eql(u8, p.peek().text(p.src), "self") and p.peek2().tag != .colon) {
+        if (Ast.isSelfTok(p.tokens, p.src, p.index) and p.peek2().tag != .colon) {
             const self_tok = p.index;
             p.bump(.identifier);
             // A generic impl hands down its `type_app` receiver (`Box[T]`) so the
@@ -681,32 +681,10 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
     else
         try p.parseBlock();
 
-    // Write the params run, then the generics run, then the fixed 5-cell FnProto.
-    // The layout is ADDITIVE: cells 0-2 (ret/params) are unchanged, so every
-    // 3-cell decode site reads byte-identically; cells 3-4 hold the generics run.
-    // An empty generics run leaves `generic_start` at the current extra length and
-    // `generic_len` 0, which `protoAt` decodes to an empty (safe) slice.
-    //
-    // A generic impl's params (`[T]`) come FIRST in the run, then the method's
+    // A generic impl's params (`[T]`) come FIRST in the generics run, then the method's
     // own `[U]`: a call binds the impl's from the receiver and the method's from its
-    // args (`Typecheck.implParamCount` splits the run). Both `impl_gparams` and
-    // `generics` are empty for a bare impl / a top-level fn, so the run stays
-    // byte-identical there.
-    const params_start: u32 = @intCast(p.extra.items.len);
-    const param_cells: []const u32 = @ptrCast(params.items);
-    try p.extra.appendSlice(p.gpa, param_cells);
-    const generic_start: u32 = @intCast(p.extra.items.len);
-    const impl_gp_cells: []const u32 = @ptrCast(impl_gparams);
-    try p.extra.appendSlice(p.gpa, impl_gp_cells);
-    const generic_cells: []const u32 = @ptrCast(generics.items);
-    try p.extra.appendSlice(p.gpa, generic_cells);
-    const proto_header = try p.addExtra(&.{
-        ret_type.int(),
-        params_start,
-        @intCast(params.items.len),
-        generic_start,
-        @intCast(impl_gparams.len + generics.items.len),
-    });
+    // args (`Typecheck.implParamCount` splits the run).
+    const proto_header = try p.addProto(ret_type, params.items, impl_gparams, generics.items);
 
     const decl_tag: Ast.Node.Tag = switch (kind) {
         .extern_top_level => .extern_fn_decl,
@@ -1556,8 +1534,8 @@ fn atMethodFn(p: *const Parser) bool {
     if (i + 2 >= p.tokens.len or p.tokens[i].tag != .identifier or p.tokens[i + 1].tag != .l_paren) return false;
     i += 2;
     if (p.tokens[i].tag == .kw_mut) i += 1;
-    if (i + 1 >= p.tokens.len or p.tokens[i].tag != .identifier) return false;
-    return std.mem.eql(u8, p.tokens[i].text(p.src), "self") and p.tokens[i + 1].tag != .colon;
+    if (i + 1 >= p.tokens.len) return false;
+    return Ast.isSelfTok(p.tokens, p.src, i) and p.tokens[i + 1].tag != .colon;
 }
 
 /// `fn(x, y: T) -> R { .. }` in expression position. A param's `: T` is optional (the
@@ -1595,17 +1573,7 @@ fn parseLambda(p: *Parser) Error!Ast.Index {
     try p.expect(.r_paren, "expected ')' to close a lambda's parameters");
     const ret_type: Ast.Index = if (p.eat(.arrow)) try p.parseType() else Ast.none;
     const body = try p.parseBlock();
-
-    const params_start: u32 = @intCast(p.extra.items.len);
-    const param_cells: []const u32 = @ptrCast(params.items);
-    try p.extra.appendSlice(p.gpa, param_cells);
-    const proto_header = try p.addExtra(&.{
-        ret_type.int(),
-        params_start,
-        @intCast(params.items.len),
-        @intCast(p.extra.items.len),
-        0,
-    });
+    const proto_header = try p.addProto(ret_type, params.items, &.{}, &.{});
     return p.addNode(.{ .tag = .lambda, .main_token = fn_tok, .lhs = proto_header, .rhs = body });
 }
 
@@ -2460,15 +2428,7 @@ fn wrapCapture(p: *Parser, call: Ast.Index, hole_tok: u32, lparen: u32) Error!As
     const stmt = try p.addNode(.{ .tag = .expr_stmt, .main_token = lparen, .lhs = call, .rhs = Ast.none });
     const stmts = try p.addRange(&.{stmt});
     const body = try p.addNode(.{ .tag = .block, .main_token = lparen, .lhs = stmts, .rhs = Ast.none });
-    const params_start: u32 = @intCast(p.extra.items.len);
-    try p.extra.append(p.gpa, param.int());
-    const proto_header = try p.addExtra(&.{
-        Ast.none.int(),
-        params_start,
-        1,
-        @intCast(p.extra.items.len),
-        0,
-    });
+    const proto_header = try p.addProto(Ast.none, &.{param}, &.{}, &.{});
     return p.addNode(.{ .tag = .lambda, .main_token = hole_tok, .lhs = proto_header, .rhs = body });
 }
 
@@ -2765,6 +2725,20 @@ fn addTokRange(p: *Parser, items: []const Ast.TokIndex) error{OutOfMemory}!Ast.I
 /// header mixes a node index (`ret_type`) with `extra` offsets
 /// (`params_start`/`params_len`); node-index cells are converted with `.int()`
 /// at the call site.
+/// Write a fn's proto: its params run, then its generics run (`impl_gparams`, then
+/// `generics`), then the fixed 5-cell `FnProto` header pointing at both, which it returns.
+/// The layout is ADDITIVE: cells 0-2 (ret/params) predate generics, so a 3-cell decode
+/// site still reads them; an empty generics run starts at the current extra length with
+/// length 0, which `protoAt` decodes to an empty slice.
+fn addProto(p: *Parser, ret_type: Ast.Index, params: []const Ast.Index, impl_gparams: []const Ast.Index, generics: []const Ast.Index) error{OutOfMemory}!Ast.Index {
+    const params_start: u32 = @intCast(p.extra.items.len);
+    try p.extra.appendSlice(p.gpa, @ptrCast(params));
+    const generic_start: u32 = @intCast(p.extra.items.len);
+    try p.extra.appendSlice(p.gpa, @ptrCast(impl_gparams));
+    try p.extra.appendSlice(p.gpa, @ptrCast(generics));
+    return p.addExtra(&.{ ret_type.int(), params_start, @intCast(params.len), generic_start, @intCast(impl_gparams.len + generics.len) });
+}
+
 fn addExtra(p: *Parser, vals: []const u32) error{OutOfMemory}!Ast.Index {
     const start: u32 = @intCast(p.extra.items.len);
     try p.extra.appendSlice(p.gpa, vals);

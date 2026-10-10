@@ -19,6 +19,7 @@ const Ast = @import("ast/Ast.zig");
 /// the `symbols/` peer data module; re-exported so `Resolve.Resolution` keeps
 /// working for downstream consumers.
 pub const Resolution = @import("symbols/Resolution.zig").Resolution;
+pub const placeRoot = @import("symbols/Resolution.zig").placeRoot;
 
 const testing = std.testing;
 const Lexer = @import("lex.zig");

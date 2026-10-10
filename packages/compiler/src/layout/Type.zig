@@ -289,7 +289,7 @@ pub const Type = struct {
     /// The source spelling of an integer type (`int`/`uint`/`int8`.../`uint64`).
     /// Exhaustive over `IntWidth` (no `else` arm) so a new width class is a build
     /// error here rather than a silently-wrong name. Static strings — no alloc, so a
-    /// borrowing accessor (`refs.typeName`, `Mono.mangle`) can return the slice directly.
+    /// borrowing accessor (`refs.typeName`, `Mangle.instance`) can return the slice directly.
     pub fn intName(t: Type) []const u8 {
         return switch (t.int_desc.width) {
             .plat => if (t.int_desc.signed) "int" else "uint",
