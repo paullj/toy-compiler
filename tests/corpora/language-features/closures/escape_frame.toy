@@ -1,4 +1,4 @@
-# Feature: a body whose frame would overflow at -O1 with a frame env keeps that env in a GC cell instead, so it builds at every level
+# Feature: a body with many locals whose lambda captures a 240-byte struct builds at every level; at -O1 it keeps that env in its frame, which before #32 pushed the frame past 4 KiB and sent the env to a GC cell (the fallback near the 16 MiB cap is tested in tests/closures.zig)
 # expect: exit 129
 struct S { f0: int, f1: int, f2: int, f3: int, f4: int, f5: int, f6: int, f7: int, f8: int, f9: int, f10: int, f11: int, f12: int, f13: int, f14: int, f15: int, f16: int, f17: int, f18: int, f19: int, f20: int, f21: int, f22: int, f23: int, f24: int, f25: int, f26: int, f27: int, f28: int, f29: int }
 fn run(f: fn() -> int) -> int { f() }

@@ -229,7 +229,7 @@ The names `unwrap`, `unwrap_or`, `is_err` and `map_err` may change; see issue #2
 - **Legality is the same at every level:** `toy check`, `-O0` and `-O1` agree on T0052. It can depend on another module's body: a callee that starts keeping its fn param makes a `mut`-param capture passed to it an error.
 - **`-O1` storage:** any one opt pass turns it on, not the level as such: `-O1` with every pass off (`--no-opt` for each) stores closures as `-O0` does, and `-O0 --opt=dce` stores them as `-O1` does.
   - a non-escaping env goes in the frame of the body that makes it, up to 256 B per function;
-  - past that, or when the frame would exceed codegen's limit, it goes in a GC cell;
+  - past that, or when the frame would exceed codegen's limit (16 MiB), it goes in a GC cell;
   - a captured-and-mutated local of 16 B or less that only non-escaping closures capture is not boxed: those closures hold its address;
   - a bound method value always gets a heap env, even when it does not escape, and its receiver stays boxed. This is the chosen default, not a limit of the analysis.
 - **`-O0`:** every env and box is on the heap. A captured `mut` param's address is a plain word in the env cell.
@@ -255,7 +255,6 @@ Open issues that touch this page. Each has a repro.
 
 - **An enum type name as a value** ([#30](https://github.com/paullj/toy-compiler/issues/30)): `x := Shape` passes `toy check` and fails in lowering.
 - **Turbofish on a generic type's method** ([#31](https://github.com/paullj/toy-compiler/issues/31)): `b.map[int](..)` and `x |> .m[int]()` are T0018, so a method whose type parameter appears only in its return type cannot be called.
-- **Frame size** ([#32](https://github.com/paullj/toy-compiler/issues/32)): a function frame over 4095 bytes fails to build, about 57 int locals or 13 `str` `==` at `-O0`.
 - **LSP in generic bodies** ([#33](https://github.com/paullj/toy-compiler/issues/33)): no hover, definition or signature help on a method call inside a generic body.
 - **Warm cache and `for`** ([#35](https://github.com/paullj/toy-compiler/issues/35)): two programs in one directory with the same `for`-in `main` body share the `.toy` cache, and the second build fails with "unresolved symbol after codegen".
 - **`core/*` is importable** ([#36](https://github.com/paullj/toy-compiler/issues/36)): a program can import `core/mem` and call its unchecked primitives, which std calls only after a bounds check.

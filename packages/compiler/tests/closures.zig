@@ -292,6 +292,50 @@ test "every std method that takes a closure keeps its caller's env in the frame 
     }
 }
 
+/// A `main` whose frame holds an `H.Small`, `H`'s other variant carrying `g_bytes` of
+/// nested structs, beside a 240-byte struct a lambda captures: the lambda's env is a frame
+/// env at -O1 when it fits. Nothing copies the big payload, so the frame costs no code.
+fn nearCapFrame(gpa: std.mem.Allocator, g_bytes: u32) ![]u8 {
+    var src: std.Io.Writer.Allocating = .init(gpa);
+    errdefer src.deinit();
+    const w = &src.writer;
+    try w.writeAll("struct A { a0: int, a1: int, a2: int, a3: int, a4: int, a5: int, a6: int, a7: int }\n");
+    const nest = [_][2][]const u8{ .{ "B", "A" }, .{ "C", "B" }, .{ "D", "C" }, .{ "E", "D" }, .{ "F", "E" } };
+    for (nest) |pair| {
+        try w.print("struct {s} {{ ", .{pair[0]});
+        for (0..8) |i| try w.print("{s}x{d}: {s}, ", .{ pair[0], i, pair[1] });
+        try w.writeAll("}\n");
+    }
+    // `g_bytes` as at most seven of each nested struct, largest first, then ints.
+    const sizes = [_]u32{ 2097152, 262144, 32768, 4096, 512, 64 };
+    const names = [_][]const u8{ "F", "E", "D", "C", "B", "A" };
+    var left = g_bytes;
+    try w.writeAll("struct G { ");
+    for (sizes, names) |size, name| {
+        const n = @min(7, left / size);
+        for (0..n) |i| try w.print("g{s}{d}: {s}, ", .{ name, i, name });
+        left -= n * size;
+    }
+    for (0..left / 8) |i| try w.print("gi{d}: int, ", .{i});
+    try w.writeAll("}\nenum H { Small, Huge(G) }\nstruct S { ");
+    for (0..30) |i| try w.print("f{d}: int, ", .{i});
+    try w.writeAll("}\nfn run(f: fn() -> int) -> int { f() }\nfn main() -> int {\n h := H.Small\n s := S { ");
+    for (0..30) |i| try w.print("f{d}: {d}, ", .{ i, i });
+    try w.writeAll("}\n r := run(fn() -> int { s.f3 + s.f29 })\n return match h { H.Small -> r, H.Huge(_) -> 0 }\n}\n");
+    return src.toOwnedSlice();
+}
+
+/// The exit code of `prog` run with a 32 MiB stack, room for a frame near codegen's 16 MiB
+/// cap (the default 8 MiB stack faults on the frame's first page past it).
+fn runExitBigStack(io: Io, prog: []const u8) !u8 {
+    var child = try std.process.spawn(io, .{ .argv = &.{ "/bin/sh", "-c", "ulimit -s 32768 && exec \"$0\"", prog } });
+    const term = try child.wait(io);
+    return switch (term) {
+        .exited => |c| c,
+        else => error.ChildCrashed,
+    };
+}
+
 test "a body whose -O1 frame would overflow with frame envs falls back to heap envs" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -299,39 +343,35 @@ test "a body whose -O1 frame would overflow with frame envs falls back to heap e
     const io = threaded.io();
     try harness.skipUnlessBackend(io);
 
+    // Since #32 the cap is 16 MiB, so only a frame within an env's size of it reaches the
+    // fallback. At this size `main`'s frame fits at -O0 and with a heap env at -O1, but not
+    // with the 240-byte frame env. If frames change size, these tripwires fire: retune
+    // `g_bytes` so the build still falls back and the lean one still keeps its frame env.
+    const g_bytes: u32 = 16776096;
     const tmp = ".toy-test-closures-frame";
     Io.Dir.cwd().deleteTree(io, tmp) catch {};
     defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    const path = cases_dir ++ "/escape_frame.toy";
-    const src = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
+    try Io.Dir.cwd().createDirPath(io, tmp);
+    const src = try nearCapFrame(gpa, g_bytes);
     defer gpa.free(src);
     const p0 = try harness.compile(gpa, io, tmp ++ "/o0", src, &.{ "--no-cache", "-O0" });
     defer gpa.free(p0);
     const p1 = try harness.compile(gpa, io, tmp ++ "/o1", src, &.{ "--no-cache", "-O1" });
     defer gpa.free(p1);
-    try std.testing.expectEqual(try harness.runExit(gpa, io, p0), try harness.runExit(gpa, io, p1));
-    // The tripwires: if frames shrink until the frame env fits, this file no longer
-    // exercises the fallback and must grow; and the same lambda without the `a<k>` locals
-    // keeps a frame env, so the cell above comes from the fallback, not from the budget.
+    try std.testing.expectEqual(@as(u8, 32), try runExitBigStack(io, p0));
+    try std.testing.expectEqual(@as(u8, 32), try runExitBigStack(io, p1));
+    const path = tmp ++ "/near.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
     const ir = try harness.emitIr(gpa, io, path, &.{"-O1"});
     defer gpa.free(ir);
     const body = harness.irBody(ir, "main") orelse return error.TestExpectedMain;
     try std.testing.expect(std.mem.indexOf(u8, body, "call @gc_alloc") != null);
-    var lean: std.ArrayList(u8) = .empty;
-    defer lean.deinit(gpa);
-    var lines = std.mem.splitScalar(u8, src, '\n');
-    var dropped: usize = 0;
-    while (lines.next()) |line| {
-        if (std.mem.startsWith(u8, line, " a") and std.mem.indexOf(u8, line, " := ") != null) {
-            dropped += 1;
-            continue;
-        }
-        try lean.appendSlice(gpa, if (std.mem.startsWith(u8, line, " return r + ")) " return r" else line);
-        try lean.append(gpa, '\n');
-    }
-    try std.testing.expect(dropped > 0);
+
+    // 120 bytes less, and the frame env fits: the cell above comes from the fallback.
+    const lean = try nearCapFrame(gpa, g_bytes - 120);
+    defer gpa.free(lean);
     const lean_path = tmp ++ "/lean.toy";
-    try Io.Dir.cwd().writeFile(io, .{ .sub_path = lean_path, .data = lean.items });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = lean_path, .data = lean });
     const lean_ir = try harness.emitIr(gpa, io, lean_path, &.{"-O1"});
     defer gpa.free(lean_ir);
     const lean_body = harness.irBody(lean_ir, "main") orelse return error.TestExpectedMain;
