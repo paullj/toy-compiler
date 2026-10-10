@@ -1,7 +1,7 @@
 //! How a function takes each parameter: by value, or by address (`mut`). A peer data
 //! module: lower and Spec ask `argMask` which VALUE args a call passes by address, so the
-//! two cannot disagree on them. A receiver's mode is not in that mask: lowerCall reads it
-//! off `Method.mut_self`, and the checker off its own `CallSig`. A mask is one `u64`, bit
+//! two cannot disagree on them. A receiver's mode is not in that mask: `receiverMut` and
+//! lowerCall read it off `Method.mut_self`, and the checker off its own `CallSig`. A mask is one `u64`, bit
 //! `i` for param `i`; a method's `self` is param 0.
 
 const std = @import("std");
@@ -53,6 +53,19 @@ pub fn argMask(body: Body.BodyView, prog: Body.ProgramView, call: Ast.Index) u64
         // An instance's modes are its template's.
         .instance => |ii| if (ii < prog.instances.len and prog.instances[ii].template_gid < prog.sigs.len) prog.sigs[prog.instances[ii].template_gid].mut_mask else 0,
         .none, .protocol, .builtin, .value, .fn_ref, .bound_method => 0,
+    };
+}
+
+/// Whether `call` is a method call whose callee takes its receiver by address (`mut self`),
+/// the bit `argMask` shifts out. It reads the `Method.mut_self` lowerCall passes the
+/// receiver by.
+pub fn receiverMut(body: Body.BodyView, prog: Body.ProgramView, call: Ast.Index) bool {
+    const n = body.tree.nodes[call.int()];
+    const slot = Callee.callSlot(body.tree, n) orelse return false;
+    if (slot.int() >= body.callees.len) return false;
+    return switch (body.callees[slot.int()].view()) {
+        .method => |mi| mi < prog.methods.len and !prog.methods[mi].is_static and prog.methods[mi].mut_self,
+        else => false,
     };
 }
 

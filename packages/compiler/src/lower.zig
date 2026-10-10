@@ -183,10 +183,11 @@ pub const Builder = struct {
     /// -O0.
     staged_places: bool = false,
     /// Resolver locals a call's later argument may write before the call reads them: each
-    /// local a call in this unit passes as a `mut` argument, and each local the owner keeps
-    /// in its frame (a closure an argument calls may write it, as through its box at -O0). A
-    /// plain aggregate local is read by slot at the call instruction, after a later
-    /// argument's call has run, so a by-value read of one of these copies it on the spot.
+    /// local a call in this unit passes as a `mut` argument or a `mut self` receiver, and
+    /// each local the owner keeps in its frame (a closure an argument calls may write it, as
+    /// through its box at -O0). A plain aggregate local is read by slot at the call
+    /// instruction, after a later argument's call has run, so a by-value read of one of
+    /// these copies it on the spot.
     copy_on_read_roots: std.AutoHashMapUnmanaged(u32, void) = .empty,
 
     /// The enclosing loop/labeled-block contexts (innermost last).
@@ -6295,6 +6296,36 @@ test "a by-value read of a local some call passes as a mut argument copies it on
             "  copy %6 <- %7 : Q\n" ++
             "  %8 = slot_addr s0\n" ++
             "  %9 = call @main.touch(%8)\n" ++
+            "  %10 = call @main.hq(s1, %9)\n" ++
+            "  br b1(%10)\n" ++
+            "b1(%0:int):\n" ++
+            "  ret %0\n" ++
+            "}\n",
+    );
+}
+
+test "a by-value read of a local some call passes as a mut self receiver copies it on the spot (#27)" {
+    try expectUnit(
+        "struct Q { a: int, b: int }\n" ++
+            "impl Q { fn touch(mut self) -> int { self.a = 50\n 0 } }\n" ++
+            "fn hq(v: Q, k: int) -> int { v.a + k }\n" ++
+            "fn main() -> int { q := Q{ a: 1, b: 2 }\n return hq(q, q.touch()) }\n",
+        "main",
+        "fn main() -> int {\n" ++
+            "  slots: s0:Q s1:Q\n" ++
+            "b0:\n" ++
+            "  %1 = slot_addr s0\n" ++
+            "  %2 = field_addr %1, 0 : int\n" ++
+            "  %3 = iconst 1\n" ++
+            "  store %2, %3 : int\n" ++
+            "  %4 = field_addr %1, 8 : int\n" ++
+            "  %5 = iconst 2\n" ++
+            "  store %4, %5 : int\n" ++
+            "  %6 = slot_addr s1\n" ++
+            "  %7 = slot_addr s0\n" ++
+            "  copy %6 <- %7 : Q\n" ++
+            "  %8 = slot_addr s0\n" ++
+            "  %9 = call @main.Q.touch(%8)\n" ++
             "  %10 = call @main.hq(s1, %9)\n" ++
             "  br b1(%10)\n" ++
             "b1(%0:int):\n" ++
