@@ -155,6 +155,21 @@ pub fn build(b: *std.Build) void {
     // (`./zig-out/bin/toy-integration-test`) alongside toy-test under `test-bin`.
     test_bin_step.dependOn(&b.addInstallArtifact(integration_tests, .{}).step);
 
+    // The corpus harness is its own binary: it is the longest suite, so the build runner
+    // runs it beside the other integration tests, and one fixture runs in a second
+    // (`TOY_CORPUS=<path substring> ./zig-out/bin/toy-corpus-test`).
+    const corpus_tests = b.addTest(.{
+        .name = "toy-corpus-test",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("packages/compiler/tests/corpus.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "toy_compiler", .module = mod }},
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(corpus_tests).step);
+    test_bin_step.dependOn(&b.addInstallArtifact(corpus_tests, .{}).step);
+
     // The language-server tests (transport framing, document store, diagnostic mapping,
     // and the in-process end-to-end JSON-RPC gate) live in the lsp module; give them their
     // own artifact wired into both `test` and `test-bin`. The e2e/mapping tests read the
