@@ -2,12 +2,12 @@
 //! and `Sig.zig`.
 //!
 //! This is the SINGLE home for the one-sided structural match that turns a bare
-//! (no-explicit-args) generic call `id(7)` into a concrete type-arg tuple. Four
+//! (no-explicit-args) generic call `id(7)` into a concrete type-arg tuple. Three
 //! consumers run it and MUST agree byte-for-byte on which `Mono.Instance` a bare
 //! call selects: Pass-C checking (`BodyChecker`), mono discovery (`types.scanCalls`),
-//! lowering (`lower.lowerCall`), and the caller-side fingerprint fold
-//! (`AstWalk.CallVisitor`). Keeping the algorithm — and especially the never/invalid
-//! skip rule — in ONE place is what stops them drifting.
+//! and the call seal (`Mono.instanceOf`), whose selection lowering, the fingerprint and
+//! every other reader then share. Keeping the algorithm — and especially the
+//! never/invalid skip rule — in ONE place is what stops them drifting.
 //!
 //! This is the DESIGNATED-DROPPABLE layer of the generics spine: it is pure and
 //! allocation-light (`match` allocates nothing), stores no `type_var` anywhere, and
@@ -161,8 +161,8 @@ pub fn fillExpected(out: []Type, bound: []bool, exp_args: ?[]const Type) FillOut
     return .ok;
 }
 
-/// Convenience for the two Sig-only reconstruction sites (`lower`, `CallVisitor`),
-/// which have the template params but not its generic-param count. The caller passes
+/// Convenience for the reconstruction sites that have the template params but not its
+/// generic-param count. The caller passes
 /// the authoritative `generic_param_count` (`1 + max typeVarOrd` over the sig's params,
 /// which equals `generic_params.len` for any call that survived Pass C — every var of
 /// a surviving call is bound, hence appears in a param). Returns the OWNED inferred

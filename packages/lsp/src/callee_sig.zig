@@ -87,8 +87,9 @@ fn select(
             const has_self = names.len > 0 and std.mem.eql(u8, names[0], "self");
             return .{ .name = name, .params = sig.params, .param_names = names, .ret = sig.ret, .has_self = has_self, .mut_mask = sig.mut_mask, .decl = .{ .module = gf.module, .node = gf.decl_node.int() } };
         },
-        // A function value's signature is its type, not a declaration's.
-        .value, .fn_ref => return null,
+        // A function value's signature is its type, not a declaration's; a free fn call's
+        // slot is not a member call's.
+        .value, .fn_ref, .direct, .instance, .generic => return null,
         // A bound method value is typed as its method minus `self`, and the method's own
         // row says the rest: names, decl and modes.
         .method, .bound_method => |i| {
@@ -228,7 +229,11 @@ test "of: every recorded callee in the fixture yields a signature; a non-method 
     var kinds = std.EnumSet(std.meta.Tag(Callee.View)){};
     for (tc.callees[entry], 0..) |c, fa| {
         const v = c.view();
-        if (v == .none) continue;
+        switch (v) {
+            // A free fn call's slot is no member call's.
+            .none, .direct, .instance, .generic => continue,
+            else => {},
+        }
         const sig = (try of(a, &graph, &res, &tc, entry, @intCast(fa))) orelse return error.RecordedCalleeWithoutSig;
         try testing.expectEqualStrings(m.tokens[m.nodes[fa].main_token].text(m.source), sig.name);
         try testing.expect(sig.params.len >= @intFromBool(sig.has_self));

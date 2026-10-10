@@ -637,12 +637,12 @@ fn buildAdapters(
     for (callees) |cs| for (cs) |c| switch (c.view()) {
         .fn_ref => |gid| try keys.append(gpa, .{ .kind = .fn_value, .key = gid }),
         .bound_method => any_bound = true,
-        .none, .method, .protocol, .builtin, .value => {},
+        .none, .method, .protocol, .builtin, .value, .direct, .instance, .generic => {},
     };
     for (instances) |inst| for (inst.callees) |c| switch (c.view()) {
         .fn_ref => |gid| try keys.append(gpa, .{ .kind = .fn_value, .key = gid }),
         .bound_method => any_bound = true,
-        .none, .method, .protocol, .builtin, .value => {},
+        .none, .method, .protocol, .builtin, .value, .direct, .instance, .generic => {},
     };
     // Whether a bound value boxes depends on its owner's boxed list, so bound values are
     // found per owner, by walking the owner's body.
@@ -719,7 +719,7 @@ fn collectBound(
                     .kind = Closure.boundKind(Closure.boundRecvLocal(self.tree, self.resolutions, e.idx), self.body.boxed, self.body.sig.mut_mask),
                     .key = mi,
                 }),
-                .none, .method, .protocol, .builtin, .value, .fn_ref => {},
+                .none, .method, .protocol, .builtin, .value, .fn_ref, .direct, .instance, .generic => {},
             }
         }
     };
@@ -2529,6 +2529,8 @@ pub fn checkGraph(
         gpa.free(erased_units);
     }
 
+    try sealCalls(gpa, t.graph, node_types, callees, instances, sigs);
+
     const fn_boxed = t.fn_boxed;
     t.fn_boxed = &.{};
     errdefer freeFnBoxed(gpa, fn_boxed);
@@ -2579,6 +2581,85 @@ pub fn checkGraph(
         .bodies = bodies,
         .fn_boxed = fn_boxed,
     };
+}
+
+/// Record each free-fn call's callee on its slot: `.direct` for a non-generic fn,
+/// `.instance` for the instance a generic call runs (`Mono.instanceOf`), `.generic` for a
+/// generic call with none here (one in a template's own body, or one that did not check).
+/// A turbofish of a non-template, one of the core intrinsics like `size_of[T]()`, names no
+/// code and stays `.none`. Runs once the instances, their names and the sigs are final,
+/// over every module slice and every instance's own body, so lower, the fingerprint, the
+/// escape pass, the spec table and the LSP all read one selection.
+fn sealCalls(
+    gpa: std.mem.Allocator,
+    graph: *const GraphCtx,
+    node_types: []const []const Type,
+    callees: []const []Callee,
+    instances: []const Mono.Instance,
+    sigs: []const Sig,
+) !void {
+    const V = struct {
+        gpa: std.mem.Allocator,
+        view: Mono.CallView,
+        callees: []Callee,
+        instances: []const Mono.Instance,
+        sigs: []const Sig,
+
+        fn seal(self: *const @This(), call: Ast.Index) !void {
+            const tree = self.view.tree;
+            const n = tree.nodes[call.int()];
+            if (n.tag != .call or n.lhs == Ast.none) return;
+            const slot = Callee.callSlot(tree, n).?;
+            if (slot.int() >= self.callees.len or self.callees[slot.int()].tag != .none) return;
+            const cn = tree.nodes[n.lhs.int()];
+            switch (cn.tag) {
+                .type_app, .identifier, .field_access => {},
+                else => return,
+            }
+            const head = if (cn.tag == .type_app) cn.lhs else n.lhs;
+            if (head == Ast.none or head.int() >= self.view.resolutions.len) return;
+            const gid = switch (self.view.resolutions[head.int()]) {
+                .func => |g| g,
+                else => return,
+            };
+            const generic = gid < self.sigs.len and self.sigs[gid].isGenericTemplate();
+            const c: Callee = if (cn.tag == .type_app) blk: {
+                const targ_nodes = Ast.rangeSlice(tree, cn.rhs.int());
+                const targs = try self.gpa.alloc(Type, targ_nodes.len);
+                defer self.gpa.free(targs);
+                for (targ_nodes, targs) |tn, *ta| ta.* = self.view.node_types[tn.int()];
+                if (Mono.find(self.instances, gid, targs)) |ii| {
+                    var ic = Callee.instanceCall(@intCast(ii));
+                    if (!generic) ic.tag = .instance_unkeyed;
+                    break :blk ic;
+                }
+                break :blk if (generic) Callee.genericCall(gid) else .{};
+            } else if (!generic)
+                Callee.direct(gid)
+            else if (try Mono.instanceOf(self.gpa, self.view, self.instances, call)) |ii|
+                Callee.instanceCall(@intCast(ii))
+            else
+                Callee.genericCall(gid);
+            self.callees[slot.int()] = c;
+        }
+
+        pub fn on(self: *@This(), ev: AstWalk.Event) !void {
+            switch (ev) {
+                .enter => |e| if (e.tag == .call) try self.seal(e.idx),
+                else => {},
+            }
+        }
+    };
+    for (graph.mods, node_types, callees) |*mc, nts, cs| {
+        const v: V = .{ .gpa = gpa, .view = .{ .tree = mc.tree, .resolutions = mc.resolutions, .node_types = nts, .templates = .{ .sigs = sigs } }, .callees = cs, .instances = instances, .sigs = sigs };
+        for (0..mc.tree.nodes.len) |i| try v.seal(Ast.Index.from(@intCast(i)));
+    }
+    // An instance's slice spans its template's whole module; only its own body is typed.
+    for (instances) |inst| {
+        const mc = &graph.mods[inst.mod];
+        var v: V = .{ .gpa = gpa, .view = .{ .tree = mc.tree, .resolutions = mc.resolutions, .node_types = inst.node_types, .templates = .{ .sigs = sigs } }, .callees = inst.callees, .instances = instances, .sigs = sigs };
+        try AstWalk.walk(.{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, inst.decl_node, &v);
+    }
 }
 
 /// Every closure table names its owner by body index: a lambda unit sits in its owner's
@@ -7567,13 +7648,14 @@ test "calling a fn-typed local records value at callSlot" {
     try testing.expectEqual(Callee.View.value, c.result.callees[0][slot.int()].view());
 }
 
-test "a direct call records no fn_ref on its callee" {
+test "a direct call records its fn as a direct callee, not a fn_ref" {
     const gpa = testing.allocator;
     var c = try checkSource("fn g(x: int) -> int { return x }\nfn main() -> int { return g(1) }\n");
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     const call = try nthCall(&c, 0);
-    try testing.expectEqual(Callee.View.none, c.result.callees[0][call.lhs.int()].view());
+    const g = c.resolve.resolutions[0][call.lhs.int()].func;
+    try testing.expectEqual(Callee.View{ .direct = g }, c.result.callees[0][call.lhs.int()].view());
     try testing.expectEqual(@as(usize, 0), c.result.adapters.len);
 }
 

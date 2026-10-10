@@ -872,3 +872,62 @@ test "the build lowers and links every unit of the plan" {
         try testing.expectEqual(@as(usize, 8), out.ok.codegen_compiled);
     }
 }
+
+test "every call a body makes relocates to a symbol its key folds, but for unkeyed instances" {
+    const gpa = testing.allocator;
+    const ck = try Checked.create(gpa,
+        \\struct P { x: int, y: int }
+        \\struct B[T] { v: int }
+        \\impl B[T] { fn get(self) -> int { self.v } }
+        \\fn add(a: int, b: int) -> int { a + b }
+        \\fn apply[T](f: fn(T, T) -> T, x: T) -> T { f(x, x) }
+        \\fn keep[T](x: T) -> T { x }
+        \\fn mk[T]() -> B[T] { B[T] { v: 4 } }
+        \\fn main() -> int {
+        \\    p := P { x: 1, y: 2 }
+        \\    q := P { x: 1, y: 2 }
+        \\    k := 3
+        \\    h := fn(a: int, b: int) -> int { a * b + k }
+        \\    e := if p == q { 1 } else { 0 }
+        \\    apply(add, 2) + apply(h, 1) + keep(e) + keep[int](1) + mk[bool]().get()
+        \\}
+        \\
+    );
+    defer ck.destroy(gpa);
+    var plan = try ck.plan(gpa, .O0);
+    defer plan.deinit(gpa);
+    var unit_syms: std.StringHashMapUnmanaged(void) = .empty;
+    defer unit_syms.deinit(gpa);
+    for (plan.units) |u| try unit_syms.put(gpa, plan.symOf(u).name, {});
+
+    var unfolded: std.ArrayList([]const u8) = .empty;
+    defer unfolded.deinit(gpa);
+    var calls: usize = 0;
+    for (plan.units, 0..) |u, i| {
+        if (u != .body) continue;
+        const fr = plan.frozenFor(i);
+        var sigs: std.ArrayList(Fingerprint.Sig) = .empty;
+        defer sigs.deinit(gpa);
+        try AstWalk.walkCalls(gpa, &fr.in, fr.body.source.decl, fr.in.sig, &sigs);
+        var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
+        defer diags.deinit(gpa);
+        var stats: Opt.Stats = .{};
+        var func = try Engine.lowerUnit(gpa, &fr, &diags, &stats);
+        defer func.deinit(gpa);
+        try testing.expectEqual(@as(usize, 0), diags.items.len);
+        for (func.blocks) |blk| for (blk.instrs) |ins| switch (ins.op) {
+            .call => |c| if (unit_syms.contains(c.callee.name)) {
+                calls += 1;
+                const folded = for (sigs.items) |sg| {
+                    if (std.mem.eql(u8, sg.name, c.callee.name)) break true;
+                } else false;
+                if (!folded) try unfolded.append(gpa, c.callee.name);
+            },
+            else => {},
+        };
+    }
+    try testing.expect(calls >= 6);
+    // `mk[bool]()` names no type param in its value params, so its key misses it ([C2]).
+    try testing.expectEqual(@as(usize, 1), unfolded.items.len);
+    try testing.expectEqualStrings("main.mk$bool", unfolded.items[0]);
+}
