@@ -173,6 +173,7 @@ fn importTarget(graph: *const Graph.Graph, m: *const Graph.Module, decl: Ast.Nod
 const testing = std.testing;
 const Cache = @import("query/Cache.zig");
 const Closure = @import("symbols/Closure.zig");
+const codes = @import("diagnostics/codes.zig");
 const Io = std.Io;
 
 const FixtureFile = struct { path: []const u8, source: []const u8 };
@@ -303,6 +304,35 @@ test "a method pipe from a module or a module's type is one 'not a value' error"
         }
     };
     try withCheckedGraph(".toy-test-typ-modpipe", files, "main.toy", Check.run);
+}
+
+test "another module's struct or enum named as a value is T0056 at the qualified name" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util
+        \\fn id[T](x: T) -> T { x }
+        \\fn main() -> int {
+        \\ _a := util.Shape
+        \\ _b := id(util.P)
+        \\ _c := util.Shape.circle(1)
+        \\ return 0
+        \\}
+        \\
+        },
+        .{ .path = "util.toy", .source = "pub enum Shape { circle(int) }\npub struct P { x: int }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            _ = r;
+            errdefer for (tr.diags) |d| std.debug.print("got: {s}\n", .{d.message});
+            try testing.expectEqual(@as(usize, 2), tr.diags.len);
+            try testing.expectEqual(codes.Code.T0056, tr.diags[0].code);
+            try testing.expectEqualStrings("type 'util.Shape' is not a value; name one of its variants, as in 'util.Shape.circle(..)'", tr.diags[0].message);
+            try testing.expectEqualStrings("type 'util.P' is not a value", tr.diags[1].message);
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-modtype", files, "main.toy", Check.run);
 }
 
 test "cross-module call typechecks clean and yields the callee return type" {

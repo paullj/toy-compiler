@@ -36,6 +36,11 @@ Two special types are not user-spellable:
   produces exactly one diagnostic and never cascades. It *absorbs* in both
   `assignable` and `merge`.
 
+A type-level name is never a value: a struct, an enum, a builtin type, an alias, a
+protocol or a type parameter named where a value is wanted (`x := Color`,
+`id(Color)`, `Color |> id`, `lib.Shape`) is **T0056**, and the hint for an enum names
+one of its variants (`Color.red`).
+
 ## Bidirectional checking: synth / check
 
 Checking is two cooperating modes over a known, concrete world:

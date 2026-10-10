@@ -1,0 +1,18 @@
+# An enum or struct name is no value wherever it stands (#30): T0056, an enum's with a hint
+# that names a variant.
+enum Shape { Circle, Square(int) }
+enum Pair[T] { both(T, T), none }
+struct Point { x: int, y: int }
+
+fn id[T](x: T) -> T { x }
+
+fn main() -> int {
+    _a := Shape  #~ ERROR [T0056] type 'Shape' is not a value; name one of its variants, as in 'Shape.Circle'
+    _b := Shape |> id  #~ ERROR [T0056] type 'Shape' is not a value; name one of its variants, as in 'Shape.Circle'
+    _c := id(Shape)  #~ ERROR [T0056] type 'Shape' is not a value; name one of its variants, as in 'Shape.Circle'
+    _d := Shape[int]  #~ ERROR [T0056] type 'Shape' is not a value; name one of its variants, as in 'Shape.Circle'
+    _e := Pair  #~ ERROR [T0056] type 'Pair' is not a value; name one of its variants, as in 'Pair.both(..)'
+    _f := Option  #~ ERROR [T0056] type 'Option' is not a value; name one of its variants, as in 'Option.some(..)'
+    _g := Point  #~ ERROR [T0056] type 'Point' is not a value
+    return 0
+}

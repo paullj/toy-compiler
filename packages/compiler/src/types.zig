@@ -10046,6 +10046,37 @@ test "an associated fn named through a type is not a value" {
     try expectOneDiag(src, .T0049, "'with' is an associated function and cannot be used as a value; wrap the call in a lambda");
 }
 
+test "a struct or enum name used as a value is T0056, an enum's with a hint, wherever it stands" {
+    const pre =
+        \\enum Shape { Circle, Square(int) }
+        \\enum E[T] { a(T), b }
+        \\enum W { s { r: int } }
+        \\struct P { x: int }
+        \\struct N(int)
+        \\fn id[T](x: T) -> T { x }
+        \\
+    ;
+    const shape = "type 'Shape' is not a value; name one of its variants, as in 'Shape.Circle'";
+    const cases = [_]struct { body: []const u8, want: []const u8 }{
+        .{ .body = "_x := Shape", .want = shape },
+        .{ .body = "_x := Shape |> id", .want = shape },
+        .{ .body = "_x := id(Shape)", .want = shape },
+        .{ .body = "_x := Shape[int]", .want = shape },
+        .{ .body = "_b := Shape == Shape", .want = shape },
+        .{ .body = "for _x in Shape {}", .want = shape },
+        .{ .body = "_x := E", .want = "type 'E' is not a value; name one of its variants, as in 'E.a(..)'" },
+        .{ .body = "_x := W", .want = "type 'W' is not a value; name one of its variants, as in 'W.s { .. }'" },
+        .{ .body = "_x := Option", .want = "type 'Option' is not a value; name one of its variants, as in 'Option.some(..)'" },
+        .{ .body = "_x := P", .want = "type 'P' is not a value" },
+        .{ .body = "_x := N", .want = "type 'N' is not a value" },
+    };
+    for (cases) |case| {
+        const src = try std.fmt.allocPrint(testing.allocator, "{s}fn main() -> int {{\n {s}\n return 0\n}}\n", .{ pre, case.body });
+        defer testing.allocator.free(src);
+        try expectOneDiag(src, .T0056, case.want);
+    }
+}
+
 test "a call's expected type reaches a literal receiver only as a hint" {
     const gpa = testing.allocator;
     var c = try checkSource(own_box_pre ++
