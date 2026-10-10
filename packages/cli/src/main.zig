@@ -748,7 +748,7 @@ fn emitExecutable(
 
     // `--timings` SUB-stage attribution of `lower` and `discover`: a borrowed probe per
     // stage splits its cache-backed queries into compute (the miss path) vs cache
-    // get/put I/O. The lower probe splits the codegen fan-out (`lowerOne` vs cache I/O)
+    // get/put I/O. The lower probe splits the codegen fan-out (`lowerCode` vs cache I/O)
     // and `link_ns` captures the serial relink/link tail; the discover probe splits the
     // per-module file-read+lex+parse compute vs the lex/parse content-cache reads. Null
     // when timings are off => zero clock reads in the hot paths.

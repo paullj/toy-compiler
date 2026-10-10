@@ -33,6 +33,8 @@ const DeriveEmit = @import("../lower/derive_emit.zig");
 const AdapterEmit = @import("../lower/adapter_emit.zig");
 const Closure = @import("../symbols/Closure.zig");
 const Mono = @import("../symbols/Mono.zig");
+const Derive = @import("../symbols/Derive.zig");
+const Typecheck = @import("../types.zig");
 const Phase = @import("Phase.zig");
 
 const Engine = @This();
@@ -406,62 +408,108 @@ pub fn barrier(
     return .{ .value = value, .fold = fold };
 }
 
-/// Dual-metric output of a fresh `lowerOne`: the summed opt counters for this fn
-/// and its post-opt IR instruction count. Surfaced via `--opt-stats`.
-pub const OptOut = struct {
+/// Dual-metric output of a fresh lowering: the summed opt counters for this unit and its
+/// post-opt IR instruction count. Surfaced via `--opt-stats`.
+const OptOut = struct {
     stats: Opt.Stats = .{},
     ir_instrs: usize = 0,
     /// The first lowering diagnostic of a unit that failed with `error.CodegenDiagnostic`.
     diag: ?CodegenIr.Diagnostic = null,
 };
 
+/// One codegen job's slot. Each job owns exactly one slot (no locks).
+pub const Slot = struct {
+    fc: ?Link.FnCode = null,
+    cached: bool = false,
+    err: ?anyerror = null,
+    /// With `err == error.CodegenDiagnostic`: the lowering's first diagnostic.
+    diag: ?CodegenIr.Diagnostic = null,
+    /// dual-metric, set only when the unit is freshly lowered (cached units leave these at
+    /// 0). Accumulated into the LinkedProgram in the collect loop.
+    opt_stats: Opt.Stats = .{},
+    ir_instrs: usize = 0,
+};
+
+/// What one codegen unit lowers.
+pub const Body = union(enum) {
+    /// A body written in source: a base fn or an instance, cached under its AST
+    /// fingerprint, or a spec unit (`cached` false), its instance's body with some value
+    /// calls made direct, whose name each caller's key folds instead.
+    source: Source,
+    /// A lambda unit, by its index in `in.closure.lambda_units`, lowered under its owner's
+    /// tables. Uncached: its body is part of its owner's fingerprint, so the owner's key
+    /// alone decides reuse.
+    lambda: u32,
+    /// A source-less auto-derive unit, cached under its recipe's fingerprint.
+    derive: *const Derive.Derive,
+    /// An erased hash/eq/trace unit. Uncached: it is pure over `(ty, kind, layout)` and
+    /// enumerated in canonical order, so it is `-jN`-deterministic without a key.
+    erased: *const Typecheck.ErasedUnit,
+    /// A fn-value thunk: source-less and uncached, like an erased unit.
+    adapter: *const Closure.Adapter,
+
+    pub const Source = struct { decl: Ast.Index, is_entry: bool = false, cached: bool = true };
+};
+
+/// The read-only view one codegen job runs against; nothing in it is mutated during the
+/// fan-out.
+pub const Frozen = struct {
+    /// The unit's lowering inputs: `in.sig` is the unit's own signature.
+    in: lower.Inputs,
+    body: Body,
+    sym: Link.SymName,
+    /// Mixed into the codegen key, so toggling `-O` lands on a different entry.
+    opt: Opt.Config,
+    /// An instance's own concrete type-args and resolved `[T has P]` bounds, folded into its
+    /// key so two instances of one template never share an entry and toggling a sibling
+    /// conformance invalidates exactly the dependent instances. Empty for every other unit.
+    type_args: []const Typecheck.Type = &.{},
+    conformances: []const Mono.ResolvedConformance = &.{},
+    /// A base fn's or instance's closure facts (`Closure.ownerFacts`), folded into its key;
+    /// empty for every other unit and for a body with no env slot and no boxed local.
+    closure_facts: []const u8 = &.{},
+};
+
 /// Fail a unit's lowering, keeping its first diagnostic where the driver reports it: such
 /// a diagnostic is an internal error, and its text must reach the user.
-fn failLowering(diags: []const CodegenIr.Diagnostic, out: anytype) error{CodegenDiagnostic} {
+fn failLowering(diags: []const CodegenIr.Diagnostic, out: ?*OptOut) error{CodegenDiagnostic} {
     if (out) |o| o.diag = diags[0];
     return error.CodegenDiagnostic;
 }
 
-/// A base fn or instance body, as `lowerFitted` lowers it.
-pub const FnBody = struct {
-    decl: Ast.Index,
-    sym: Link.SymName,
-    is_entry: bool,
+/// A body `lowerFitted` lowers: one from source, or a lambda unit by index.
+pub const Fitted = union(enum) {
+    source: struct { decl: Ast.Index, is_entry: bool },
+    lambda: u32,
 
-    pub fn run(fb: FnBody, gpa: std.mem.Allocator, in: lower.Inputs, diags: *std.ArrayList(CodegenIr.Diagnostic)) error{OutOfMemory}!Ir.Function {
-        return lower.lowerFn(gpa, in, fb.decl, fb.sym, fb.is_entry, diags);
+    fn run(f: Fitted, gpa: std.mem.Allocator, in: lower.Inputs, sym: Link.SymName, diags: *std.ArrayList(CodegenIr.Diagnostic)) error{OutOfMemory}!Ir.Function {
+        return switch (f) {
+            .source => |s| lower.lowerFn(gpa, in, s.decl, sym, s.is_entry, diags),
+            .lambda => |ui| lower.lowerLambda(gpa, in, ui, sym, diags),
+        };
     }
 };
 
-/// A lambda unit's body, as `lowerFitted` lowers it.
-pub const LambdaBody = struct {
-    ui: u32,
-    sym: Link.SymName,
-
-    pub fn run(lb: LambdaBody, gpa: std.mem.Allocator, in: lower.Inputs, diags: *std.ArrayList(CodegenIr.Diagnostic)) error{OutOfMemory}!Ir.Function {
-        return lower.lowerLambda(gpa, in, lb.ui, lb.sym, diags);
-    }
-};
-
-/// Lower one body (a `FnBody` or a `LambdaBody`) and run the opt stage on it in place. A
-/// frame env must never make a body fail at -O1 that builds at -O0, so when the body's
-/// owner keeps a frame env and the optimized frame would overflow codegen's budget, the
-/// body is lowered again with every env in a GC cell. A lambda unit reads its env the same
-/// way wherever it lives, so the fallback stays local to this body, and it is a pure
-/// function of the body's inputs. A lowering that reports a diagnostic is returned before
-/// the opt stage sees it, for the caller to fail on. `stats` are the final lowering's.
+/// Lower one body and run the opt stage on it in place. A frame env must never make a body
+/// fail at -O1 that builds at -O0, so when the body's owner keeps a frame env and the
+/// optimized frame would overflow codegen's budget, the body is lowered again with every
+/// env in a GC cell. A lambda unit reads its env the same way wherever it lives, so the
+/// fallback stays local to this body, and it is a pure function of the body's inputs. A
+/// lowering that reports a diagnostic is returned before the opt stage sees it, for the
+/// caller to fail on. `stats` are the final lowering's.
 pub fn lowerFitted(
     gpa: std.mem.Allocator,
     in: lower.Inputs,
     cfg: Opt.Config,
-    body: anytype,
+    body: Fitted,
+    sym: Link.SymName,
     diags: *std.ArrayList(CodegenIr.Diagnostic),
     stats: *Opt.Stats,
 ) error{OutOfMemory}!Ir.Function {
     const before = diags.items.len;
     stats.* = .{};
     {
-        var irf = try body.run(gpa, in, diags);
+        var irf = try body.run(gpa, in, sym, diags);
         errdefer irf.deinit(gpa);
         if (diags.items.len != before) return irf;
         try Opt.run(gpa, &irf, cfg, stats);
@@ -473,7 +521,7 @@ pub fn lowerFitted(
     }
     var heap = in;
     heap.closure.frame_envs = false;
-    var irf = try body.run(gpa, heap, diags);
+    var irf = try body.run(gpa, heap, sym, diags);
     errdefer irf.deinit(gpa);
     stats.* = .{};
     if (diags.items.len != before) return irf;
@@ -481,167 +529,136 @@ pub fn lowerFitted(
     return irf;
 }
 
-/// Lower one function (Ast→Ir→OPT→FnCode) with a throwaway diag sink (a job-local
-/// diagnostic still fails the build at relink, surfaced via `error.CodegenDiagnostic`).
-/// The IR is built INSIDE this query and never escapes — `irf` owns its arrays and
-/// is freed here, keeping the codegen cache ONE-TIER. The opt stage runs
-/// in-place on `irf` between lower and codegen; `opt_out` (when non-null) receives
-/// the per-fn dual-metric numbers.
-///
-/// `frozen` is the single-fn read-only view (`Driver.Frozen` / a graph `frozenFor`
-/// slice); taken `anytype` so the `Frozen` type can stay in the driver this stage.
-fn lowerOne(gpa: std.mem.Allocator, frozen: anytype, fn_decl: Ast.Index, sym: Link.SymName, is_entry: bool, sig: ?Fingerprint.Sig, verify: bool, opt_out: ?*OptOut) !Link.FnCode {
+/// Lower one unit to optimized IR: the stage `--emit ir` renders and codegen packs. A
+/// spec unit needs no heap fallback, since a template with a lambda or local fn has no
+/// eligible param (`Spec.eligibleMask`), but `lowerFitted` gives it none anyway: its
+/// owner has no lambda unit. A lowering that reports a diagnostic is returned before the
+/// opt stage sees it, for the caller to fail on.
+pub fn lowerUnit(gpa: std.mem.Allocator, fr: *const Frozen, diags: *std.ArrayList(CodegenIr.Diagnostic), stats: *Opt.Stats) error{OutOfMemory}!Ir.Function {
+    const in = fr.in;
+    const before = diags.items.len;
+    var irf = switch (fr.body) {
+        .source => |s| return lowerFitted(gpa, in, fr.opt, .{ .source = .{ .decl = s.decl, .is_entry = s.is_entry } }, fr.sym, diags, stats),
+        .lambda => |ui| return lowerFitted(gpa, in, fr.opt, .{ .lambda = ui }, fr.sym, diags, stats),
+        .derive => |d| try DeriveEmit.lower(gpa, in, d.*, fr.sym, diags),
+        .erased => |u| try DeriveEmit.lowerErased(gpa, in, u.ty, u.kind, fr.sym, diags),
+        .adapter => |a| try AdapterEmit.lowerAdapter(gpa, in, a.*, fr.sym, diags),
+    };
+    errdefer irf.deinit(gpa);
+    stats.* = .{};
+    if (diags.items.len != before) return irf;
+    try Opt.run(gpa, &irf, fr.opt, stats);
+    return irf;
+}
+
+/// Lower one unit to machine code (Ast→Ir→OPT→FnCode) with a throwaway diag sink (a
+/// diagnostic fails the build at relink, surfaced via `error.CodegenDiagnostic`). The IR
+/// is built and freed here and never escapes, keeping the codegen cache ONE-TIER [C8].
+/// `audit` runs the spill tripwire, a `--verify` runtime check like the determinism and
+/// cache audits: every reference must be spill-backed for the collector's conservative
+/// frame scan to see it.
+fn lowerCode(gpa: std.mem.Allocator, fr: *const Frozen, audit: bool, opt_out: ?*OptOut) !Link.FnCode {
     var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
     defer diags.deinit(gpa);
-
-    const in: lower.Inputs = .{
-        .tree = frozen.tree,
-        .tokens = frozen.tokens,
-        .source = frozen.source,
-        .resolutions = frozen.resolutions,
-        .node_types = frozen.node_types,
-        .callees = frozen.callees,
-        .layouts = frozen.layouts,
-        .enum_layouts = frozen.enum_layouts,
-        .names = frozen.names,
-        .sig = sig,
-        .instances = frozen.instances,
-        .sigs = frozen.sigs,
-        .methods = frozen.methods,
-        .derives = frozen.derives,
-        .prelude_ids = frozen.prelude_ids,
-        .char_struct = frozen.char_struct,
-        .closure = frozen.closure,
-    };
-    // Stays ONE-TIER: the IR `lowerFitted` builds and optimizes never escapes this query.
     var opt_st: Opt.Stats = .{};
-    var irf = try lowerFitted(gpa, in, frozen.opt, FnBody{ .decl = fn_decl, .sym = sym, .is_entry = is_entry }, &diags, &opt_st);
+    var irf = try lowerUnit(gpa, fr, &diags, &opt_st);
     defer irf.deinit(gpa);
-    // A lower diagnostic (an unsupported/not-yet-lowered construct) fails the build
-    // before we emit a partial FnCode.
     if (diags.items.len > 0) return failLowering(diags.items, opt_out);
     if (opt_out) |o| o.* = .{ .stats = opt_st, .ir_instrs = Ir.instrCount(&irf) };
 
-    const fc = try CodegenIr.lowerIr(gpa, &irf, frozen.layouts, frozen.enum_layouts, is_entry, &diags);
-    // A codegen diagnostic means an unsupported construct slipped past the
-    // front-end; surface it as an error so the build fails cleanly rather than
-    // emitting a half-lowered function.
-    if (diags.items.len > 0) {
-        var tmp = fc;
-        tmp.deinit(gpa);
-        return failLowering(diags.items, opt_out);
-    }
-    // The UAF tripwire runs only in `--verify` (a real runtime check, like the
-    // determinism/cache audits): every reference must be spill-backed for the collector's
-    // conservative frame scan to see it.
-    if (verify) {
-        CodegenIr.verifyRefsSpilled(gpa, &irf, frozen.layouts, frozen.enum_layouts) catch |e| {
-            var tmp = fc;
-            tmp.deinit(gpa);
-            return e;
-        };
-    }
+    const is_entry = switch (fr.body) {
+        .source => |s| s.is_entry,
+        else => false,
+    };
+    var fc = try CodegenIr.lowerIr(gpa, &irf, fr.in.layouts, fr.in.enum_layouts, is_entry, &diags);
+    errdefer fc.deinit(gpa);
+    // A codegen diagnostic means an unsupported construct slipped past the front-end; the
+    // build fails cleanly rather than emitting a half-lowered function.
+    if (diags.items.len > 0) return failLowering(diags.items, opt_out);
+    if (audit) try CodegenIr.verifyRefsSpilled(gpa, &irf, fr.in.layouts, fr.in.enum_layouts);
     return fc;
 }
 
-/// The per-function codegen query (single-file AND graph): fingerprint this fn,
-/// fold the uniform codegen key, then serve it from the cache or freshly lower —
-/// honoring `self.mode` (normal / force / verify). Writes ONLY the caller-owned
-/// `slot` (no locks), exactly as the driver's per-fn jobs did.
+/// The per-unit codegen query: fold the unit's content key and serve it from the cache or
+/// lower it fresh, honoring `self.mode` (normal / force / verify); an uncached unit is
+/// lowered fresh every build. Writes ONLY the caller-owned `slot` (no locks).
 ///
-/// REUSE = CONTENT-FP CACHE HIT, the SOLE driver. A `.normal` build serves the
-/// prior blob iff `cache.get(Key.codegen(...))` hits the fn's transitive content
-/// fingerprint; the StageGraph schedules, the content cache decides. `.force` skips
-/// the cache; `.verify` re-lowers fresh and audits the bytes.
-///
-/// The caller derives the per-fn view: `frozen` (a single-fn `Frozen` read-only
-/// view), the fn's emitted `sym`, `is_entry`, its typecheck `my_sig`, and a
-/// `tmp_tag` unique among concurrent writers (the fn index / lowerable-fn index).
-/// `slot` is a `*FnSlot`-shaped out pointer the engine fills (taken `anytype` so
-/// the `FnSlot`/`Frozen` types can stay in the driver this stage). One-tier:
-/// the IR is built+freed inside `lowerOne`; only the packed `FnCode` blob is cached.
+/// REUSE = CONTENT-FP CACHE HIT, the SOLE driver. A `.normal` build serves the prior blob
+/// iff `cache.get(Key.codegen(...))` hits the unit's transitive content fingerprint; the
+/// StageGraph schedules, the content cache decides. `.force` skips the cache; `.verify`
+/// re-lowers fresh and audits the bytes. One-tier: the IR is built and freed inside
+/// `lowerCode`; only the packed `FnCode` blob is cached.
 pub fn codegen(
     self: Engine,
     gpa: std.mem.Allocator,
     io: Io,
     target: []const u8,
-    frozen: anytype,
-    fn_decl: Ast.Index,
-    sym: Link.SymName,
-    is_entry: bool,
-    my_sig: ?Fingerprint.Sig,
+    fr: *const Frozen,
     tmp_tag: usize,
-    slot: anytype,
+    slot: *Slot,
 ) !void {
-    // Gather this fn's callee sigs (in walk order) and touched types for the
-    // fingerprint. The walk order is the body's call order; `walkCalls` mirrors
-    // `Fingerprint`'s walk so the supplied order matches.
+    const key: ?Cache.Key = switch (fr.body) {
+        .source => |s| if (s.cached) try sourceKey(gpa, target, fr, s.decl) else null,
+        .derive => |d| try deriveKey(gpa, target, fr, d),
+        .lambda, .erased, .adapter => null,
+    };
+    const audit = self.mode == .verify;
+    if (key) |k| return self.serve(gpa, io, k, tmp_tag, slot, fr, audit);
+    var out: OptOut = .{};
+    const fc = lowerCode(gpa, fr, audit, &out) catch |e| {
+        slot.diag = out.diag;
+        return e;
+    };
+    slot.* = .{ .fc = fc, .cached = false, .opt_stats = out.stats, .ir_instrs = out.ir_instrs };
+}
+
+/// The key of a body from source: its AST fingerprint over its callees' identities and
+/// signatures in walk order, the layouts it touches, an instance's type-args and bounds,
+/// and its closure facts, xor'd with the opt level and the unit's OWN emitted symbol
+/// (`Key.codegen` is the one place that fold lives).
+fn sourceKey(gpa: std.mem.Allocator, target: []const u8, fr: *const Frozen, decl: Ast.Index) !Cache.Key {
+    const in = &fr.in;
     var callee_sigs: std.ArrayList(Fingerprint.Sig) = .empty;
     defer callee_sigs.deinit(gpa);
-    try AstWalk.walkCalls(gpa, frozen, fn_decl, my_sig, &callee_sigs);
+    try AstWalk.walkCalls(gpa, in, decl, in.sig, &callee_sigs);
     var touched: std.ArrayList(Fingerprint.TouchedType) = .empty;
     defer {
         AstWalk.freeTouched(gpa, touched.items);
         touched.deinit(gpa);
     }
-    try AstWalk.walkTouchedSig(gpa, frozen, fn_decl, my_sig, &touched);
-
-    // (d) The concrete type-args of a monomorphized instance (empty for a
-    // non-generic fn, so the fold is skipped and its fp is byte-identical). Built
-    // with the SAME layout descriptor the touched fold uses, so a struct-layout edit
-    // to a type-arg invalidates exactly the dependent instance.
+    try AstWalk.walkTouchedSig(gpa, in, decl, in.sig, &touched);
     var type_args: std.ArrayList(Fingerprint.TouchedType) = .empty;
     defer {
         AstWalk.freeTouched(gpa, type_args.items);
         type_args.deinit(gpa);
     }
-    try AstWalk.walkTypeArgs(gpa, frozen, frozen.type_args, &type_args);
-
-    // (e) The resolved bound conformances of a bounded monomorphized instance,
-    // folded structurally so toggling a sibling-module conformance invalidates exactly
-    // the dependent monomorphizations. Empty for every non-bounded unit -> the fold is
-    // skipped and its fp is byte-identical (warm cache preserved). This is the SINGLE
-    // Engine.codegen threading point the contract names.
+    try AstWalk.walkTypeArgs(gpa, in, fr.type_args, &type_args);
     var confs: std.ArrayList(Fingerprint.ResolvedConformance) = .empty;
     defer {
         AstWalk.freeConformances(gpa, confs.items);
         confs.deinit(gpa);
     }
-    try AstWalk.walkConformances(gpa, frozen, frozen.conformances, &confs);
-
-    const fp = Fingerprint.foldClosure(Fingerprint.fingerprint(frozen.tree, frozen.tokens, frozen.source, fn_decl, callee_sigs.items, touched.items, type_args.items, confs.items), frozen.closure_facts);
-    // The uniform codegen key: the content fingerprint xor'd with the opt level
-    // and the fn's OWN emitted symbol, target-sensitive. `Key.codegen` is the ONE
-    // place the `fp ^ optMix ^ symMix` fold lives (was duplicated in Driver).
-    const key = Key.codegen(target, fp, frozen.opt, sym);
-
-    const Ctx = struct {
-        gpa: std.mem.Allocator,
-        frozen: @TypeOf(frozen),
-        fn_decl: Ast.Index,
-        sym: Link.SymName,
-        is_entry: bool,
-        my_sig: ?Fingerprint.Sig,
-        verify: bool,
-    };
-    return self.serve(gpa, io, key, tmp_tag, slot, Ctx{
-        .gpa = gpa,
-        .frozen = frozen,
-        .fn_decl = fn_decl,
-        .sym = sym,
-        .verify = self.mode == .verify,
-        .is_entry = is_entry,
-        .my_sig = my_sig,
-    }, struct {
-        fn f(c: Ctx, opt_out: ?*OptOut) !Link.FnCode {
-            return lowerOne(c.gpa, c.frozen, c.fn_decl, c.sym, c.is_entry, c.my_sig, c.verify, opt_out);
-        }
-    }.f);
+    try AstWalk.walkConformances(gpa, in, fr.conformances, &confs);
+    const fp = Fingerprint.foldClosure(Fingerprint.fingerprint(in.tree, in.tokens, in.source, decl, callee_sigs.items, touched.items, type_args.items, confs.items), fr.closure_facts);
+    return Key.codegen(target, fp, fr.opt, fr.sym);
 }
 
-/// The cache/verify/fresh-lower state machine both codegen paths share. Given a
-/// folded content `key` and a `lowerFresh(ctx, opt_out)` closure, it honors
-/// `self.mode`:
+/// The key of a source-less derive unit: a NON-AST fingerprint over the conforming type's
+/// index-free layout (the same descriptor the touched fold builds) and the resolved field
+/// witnesses, so a field-layout edit flips it. `symMix` separates it from every real fn.
+fn deriveKey(gpa: std.mem.Allocator, target: []const u8, fr: *const Frozen, d: *const Derive.Derive) !Cache.Key {
+    var conform_list: std.ArrayList(Fingerprint.TouchedType) = .empty;
+    defer {
+        AstWalk.freeTouched(gpa, conform_list.items);
+        conform_list.deinit(gpa);
+    }
+    try AstWalk.appendTouched(gpa, &fr.in, d.conform_ty, &conform_list);
+    const conform: Fingerprint.TouchedType = if (conform_list.items.len > 0) conform_list.items[0] else .{ .kind = d.conform_ty.kind };
+    const fp = Fingerprint.deriveFingerprint(d.protocol_name, d.kind, conform, d.field_witnesses);
+    return Key.codegen(target, fp, fr.opt, fr.sym);
+}
+
+/// The cache/verify/fresh-lower state machine of a keyed unit, honoring `self.mode`:
 ///   * `.verify` — always re-lower fresh and audit the packed bytes against a
 ///     reference (a cache HIT compares the stored blob for cache-soundness; a MISS
 ///     lowers a SECOND time and requires the two fresh lowerings agree, for pure
@@ -656,18 +673,18 @@ fn serve(
     self: Engine,
     gpa: std.mem.Allocator,
     io: Io,
-    key: anytype,
+    key: Cache.Key,
     tmp_tag: usize,
-    slot: anytype,
-    ctx: anytype,
-    comptime lowerFresh: anytype,
+    slot: *Slot,
+    fr: *const Frozen,
+    audit: bool,
 ) !void {
     const cache = self.cache;
     const mode = self.mode;
 
     if (mode == .verify) {
         var opt_out: OptOut = .{};
-        var fresh = lowerFresh(ctx, &opt_out) catch |e| {
+        var fresh = lowerCode(gpa, fr, audit, &opt_out) catch |e| {
             slot.diag = opt_out.diag;
             return e;
         };
@@ -681,7 +698,7 @@ fn serve(
             if (!std.mem.eql(u8, fb, blob)) return error.VerifyCacheMismatch;
             was_cached = true;
         } else {
-            var fresh2 = try lowerFresh(ctx, null);
+            var fresh2 = try lowerCode(gpa, fr, audit, null);
             defer fresh2.deinit(gpa);
             const fb2 = try Link.pack(gpa, fresh2);
             defer gpa.free(fb2);
@@ -709,7 +726,7 @@ fn serve(
 
     var opt_out: OptOut = .{};
     const comp_t0: i128 = if (self.probe != null) StageProbe.now(io) else 0;
-    var fc = lowerFresh(ctx, &opt_out) catch |e| {
+    var fc = lowerCode(gpa, fr, audit, &opt_out) catch |e| {
         slot.diag = opt_out.diag;
         return e;
     };
@@ -722,245 +739,6 @@ fn serve(
         if (self.probe) |p| StageProbe.lap(io, &p.put_ns, put_t0);
     }
     slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_out.stats, .ir_instrs = opt_out.ir_instrs };
-}
-
-/// Lower one SOURCE-LESS auto-derive unit (recipe→Ir→OPT→FnCode). The IR is built
-/// from the recipe + layouts (no AST) and never escapes — one-tier, like `lowerOne`.
-fn lowerSynthetic(gpa: std.mem.Allocator, frozen: anytype, d: anytype, sym: Link.SymName, opt_out: ?*OptOut) !Link.FnCode {
-    var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
-    defer diags.deinit(gpa);
-
-    const in: lower.Inputs = .{
-        .tree = frozen.tree,
-        .tokens = frozen.tokens,
-        .source = frozen.source,
-        .resolutions = frozen.resolutions,
-        .node_types = frozen.node_types, // &.{} for a derive unit — the emitter reads none
-        .callees = frozen.callees,
-        .layouts = frozen.layouts,
-        .enum_layouts = frozen.enum_layouts,
-        .names = frozen.names,
-        .sig = null,
-        .instances = frozen.instances,
-        .sigs = frozen.sigs,
-        .methods = frozen.methods,
-        .derives = frozen.derives,
-        .prelude_ids = frozen.prelude_ids,
-        .char_struct = frozen.char_struct,
-        .closure = frozen.closure,
-    };
-    var irf = try DeriveEmit.lower(gpa, in, d, sym, &diags);
-    defer irf.deinit(gpa);
-    if (diags.items.len > 0) return failLowering(diags.items, opt_out);
-
-    var opt_st: Opt.Stats = .{};
-    try Opt.run(gpa, &irf, frozen.opt, &opt_st);
-    if (opt_out) |o| o.* = .{ .stats = opt_st, .ir_instrs = Ir.instrCount(&irf) };
-
-    const fc = try CodegenIr.lowerIr(gpa, &irf, frozen.layouts, frozen.enum_layouts, false, &diags);
-    if (diags.items.len > 0) {
-        var tmp = fc;
-        tmp.deinit(gpa);
-        return failLowering(diags.items, opt_out);
-    }
-    return fc;
-}
-
-/// The per-derive-unit codegen query: a source-less sibling of `codegen`. Builds a
-/// NON-AST fingerprint from the recipe (`Fingerprint.deriveFingerprint` over the
-/// conforming type's layout + the resolved field witnesses), folds the SAME
-/// `Key.codegen(target, fp, opt, sym)` key (UNCHANGED — `symMix` separates it from real
-/// fns), and honors normal/force/verify exactly like `codegen`. The emitter is pure, so
-/// verify's double-lower is byte-identical. Fills the same `FnSlot` shape.
-pub fn codegenSynthetic(
-    self: Engine,
-    gpa: std.mem.Allocator,
-    io: Io,
-    target: []const u8,
-    frozen: anytype,
-    di: usize,
-    tmp_tag: usize,
-    slot: anytype,
-) !void {
-    const d = frozen.derives[di];
-    const sym = Link.SymName{ .kind = .user_fn, .name = d.name.? };
-
-    // The conforming type's index-free layout descriptor (mirrors the touched fold), so a
-    // field-layout edit flips the unit's key. Built by the SAME `appendTouched` path.
-    var conform_list: std.ArrayList(Fingerprint.TouchedType) = .empty;
-    defer {
-        AstWalk.freeTouched(gpa, conform_list.items);
-        conform_list.deinit(gpa);
-    }
-    try AstWalk.appendTouched(gpa, frozen, d.conform_ty, &conform_list);
-    const conform: Fingerprint.TouchedType = if (conform_list.items.len > 0) conform_list.items[0] else .{ .kind = d.conform_ty.kind };
-
-    const fp = Fingerprint.deriveFingerprint(d.protocol_name, d.kind, conform, d.field_witnesses);
-    const key = Key.codegen(target, fp, frozen.opt, sym);
-
-    const Ctx = struct {
-        gpa: std.mem.Allocator,
-        frozen: @TypeOf(frozen),
-        d: @TypeOf(d),
-        sym: Link.SymName,
-    };
-    return self.serve(gpa, io, key, tmp_tag, slot, Ctx{
-        .gpa = gpa,
-        .frozen = frozen,
-        .d = d,
-        .sym = sym,
-    }, struct {
-        fn f(c: Ctx, opt_out: ?*OptOut) !Link.FnCode {
-            return lowerSynthetic(c.gpa, c.frozen, c.d, c.sym, opt_out);
-        }
-    }.f);
-}
-
-/// Lower one ERASED hash/eq unit (type+kind→Ir→OPT→FnCode), UNCACHED. The unit is pure
-/// over `(ty, kind, layout)` and enumerated in canonical order, so it is `-jN`-deterministic
-/// without a cache key — no fingerprint, no probe. Fills the same `FnSlot` shape as
-/// `lowerSynthetic`.
-pub fn codegenErased(
-    self: Engine,
-    gpa: std.mem.Allocator,
-    io: Io,
-    target: []const u8,
-    frozen: anytype,
-    ei: usize,
-    tmp_tag: usize,
-    slot: anytype,
-) !void {
-    _ = self;
-    _ = io;
-    _ = target;
-    _ = tmp_tag;
-    const u = frozen.erased_units[ei];
-    const sym = Link.SymName{ .kind = .user_fn, .name = u.name.? };
-
-    var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
-    defer diags.deinit(gpa);
-
-    const in: lower.Inputs = .{
-        .tree = frozen.tree,
-        .tokens = frozen.tokens,
-        .source = frozen.source,
-        .resolutions = frozen.resolutions,
-        .node_types = frozen.node_types, // &.{} for an erased unit — the emitter reads none
-        .callees = frozen.callees,
-        .layouts = frozen.layouts,
-        .enum_layouts = frozen.enum_layouts,
-        .names = frozen.names,
-        .sig = null,
-        .instances = frozen.instances,
-        .sigs = frozen.sigs,
-        .methods = frozen.methods,
-        .derives = frozen.derives,
-        .prelude_ids = frozen.prelude_ids,
-        .char_struct = frozen.char_struct,
-        .closure = frozen.closure,
-    };
-    var irf = try DeriveEmit.lowerErased(gpa, in, u.ty, u.kind, sym, &diags);
-    defer irf.deinit(gpa);
-    if (diags.items.len > 0) return failLowering(diags.items, @as(?@TypeOf(slot), slot));
-
-    var opt_st: Opt.Stats = .{};
-    try Opt.run(gpa, &irf, frozen.opt, &opt_st);
-    const ir_instrs = Ir.instrCount(&irf);
-
-    const fc = try CodegenIr.lowerIr(gpa, &irf, frozen.layouts, frozen.enum_layouts, false, &diags);
-    if (diags.items.len > 0) {
-        var tmp = fc;
-        tmp.deinit(gpa);
-        return failLowering(diags.items, @as(?@TypeOf(slot), slot));
-    }
-    slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_st, .ir_instrs = ir_instrs };
-}
-
-/// A closure-class codegen unit: a lambda (its index in `frozen.closure.lambda_units`,
-/// lowered under its owner's view), a source-less adapter, or a spec unit (its index in
-/// `frozen.closure.specs.units`, lowered under its instance's view).
-pub const ClosureUnit = union(enum) { lambda: u32, adapter: Closure.Adapter, spec: u32 };
-
-/// Lower one closure-class unit, UNCACHED like `codegenErased`: it is pure over its table
-/// entry, the layouts and (for a lambda or a spec unit) its owner's frozen tables, and the
-/// tables are built serially in canonical order, so it is `-jN`-deterministic without a
-/// cache key. A lambda needs no key of its own: its body is part of its owner's
-/// fingerprint, and it is rebuilt every build. A spec unit is its instance's body with some
-/// value calls made direct, and each caller folds the spec unit's name. `--verify` runs the
-/// spill tripwire, as for AST units.
-pub fn codegenClosure(
-    self: Engine,
-    gpa: std.mem.Allocator,
-    io: Io,
-    target: []const u8,
-    frozen: anytype,
-    unit: ClosureUnit,
-    tmp_tag: usize,
-    slot: anytype,
-) !void {
-    _ = io;
-    _ = target;
-    _ = tmp_tag;
-    const sym = Link.SymName{ .kind = .user_fn, .name = switch (unit) {
-        .lambda => |ui| frozen.closure.lambda_units[ui].name,
-        .adapter => |a| a.name,
-        .spec => |si| frozen.closure.specs.units[si].name,
-    } };
-    const spec_inst: ?Mono.Instance = switch (unit) {
-        .spec => |si| frozen.instances[frozen.closure.specs.units[si].inst],
-        .lambda, .adapter => null,
-    };
-
-    var diags: std.ArrayList(CodegenIr.Diagnostic) = .empty;
-    defer diags.deinit(gpa);
-
-    const in: lower.Inputs = .{
-        .tree = frozen.tree,
-        .tokens = frozen.tokens,
-        .source = frozen.source,
-        .resolutions = frozen.resolutions,
-        .node_types = frozen.node_types,
-        .callees = frozen.callees,
-        .layouts = frozen.layouts,
-        .enum_layouts = frozen.enum_layouts,
-        .names = frozen.names,
-        .sig = if (spec_inst) |inst| .{ .kind = .user_fn, .name = sym.name, .params = inst.params, .ret = inst.ret } else null,
-        .instances = frozen.instances,
-        .sigs = frozen.sigs,
-        .methods = frozen.methods,
-        .derives = frozen.derives,
-        .prelude_ids = frozen.prelude_ids,
-        .char_struct = frozen.char_struct,
-        .closure = frozen.closure,
-    };
-    var opt_st: Opt.Stats = .{};
-    // Adapters and spec units never make a frame env, so only a lambda body can need the
-    // heap fallback.
-    var irf = switch (unit) {
-        .lambda => |ui| try lowerFitted(gpa, in, frozen.opt, LambdaBody{ .ui = ui, .sym = sym }, &diags, &opt_st),
-        .adapter => |a| try AdapterEmit.lowerAdapter(gpa, in, a, sym, &diags),
-        .spec => try lower.lowerFn(gpa, in, spec_inst.?.decl_node, sym, false, &diags),
-    };
-    defer irf.deinit(gpa);
-    if (diags.items.len > 0) return failLowering(diags.items, @as(?@TypeOf(slot), slot));
-
-    if (unit != .lambda) try Opt.run(gpa, &irf, frozen.opt, &opt_st);
-    const ir_instrs = Ir.instrCount(&irf);
-
-    const fc = try CodegenIr.lowerIr(gpa, &irf, frozen.layouts, frozen.enum_layouts, false, &diags);
-    if (diags.items.len > 0) {
-        var tmp = fc;
-        tmp.deinit(gpa);
-        return failLowering(diags.items, @as(?@TypeOf(slot), slot));
-    }
-    if (self.mode == .verify) {
-        CodegenIr.verifyRefsSpilled(gpa, &irf, frozen.layouts, frozen.enum_layouts) catch |e| {
-            var tmp = fc;
-            tmp.deinit(gpa);
-            return e;
-        };
-    }
-    slot.* = .{ .fc = fc, .cached = false, .opt_stats = opt_st, .ir_instrs = ir_instrs };
 }
 
 const testing = std.testing;

@@ -3,9 +3,9 @@
 //! lambda literal) goes to a copy of the erased instance of its own, which calls that
 //! argument directly; any other argument (a local holding a function, a field, a call
 //! result) goes through the erased instance.
-//! A peer data module like `Closure`: the driver builds the table serially before codegen,
-//! and lower and the fingerprint both pick a call's unit through `select`, so the call a
-//! body makes and the identity its key folds cannot disagree.
+//! A peer data module like `Closure`: the driver builds the table (`build`) serially before
+//! codegen, and lower and the fingerprint both pick a call's unit through `select`, so the
+//! call a body makes and the identity its key folds cannot disagree.
 
 const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
@@ -15,6 +15,10 @@ const Closure = @import("Closure.zig");
 const AstWalk = @import("../query/AstWalk.zig");
 const Callee = @import("Callee.zig").Callee;
 const Modes = @import("Modes.zig");
+const Mono = @import("Mono.zig");
+const Sig = @import("Sig.zig").Sig;
+const Resolution = @import("Resolution.zig").Resolution;
+const Method = @import("../types.zig").Method;
 
 pub const TargetKind = enum(u8) { named, lambda };
 
@@ -268,6 +272,143 @@ pub fn freeUnits(gpa: std.mem.Allocator, cands: []const Candidate) void {
     }
 }
 
+/// What `build` reads: per-module tables by module id, the rest program-wide.
+pub const Source = struct {
+    /// Each module's tree, tokens and source.
+    modules: []const AstWalk.Source,
+    resolutions: []const []const Resolution,
+    node_types: []const []const Type,
+    callees: []const []const Callee,
+    closures: []const []const Closure.FnClosures,
+    names: []const Sym.SymName,
+    sigs: []const Sig,
+    instances: []const Mono.Instance,
+    methods: []const Method,
+    lambda_units: []const Closure.LambdaUnit,
+    /// The base owners in lower order.
+    bases: []const Base,
+
+    pub const Base = struct { gid: u32, mod: u32, decl: Ast.Index };
+};
+
+/// One owner body's tables, as `AstWalk.instanceOfCall`, `targetsOf` and `eligibleMask`
+/// read them.
+const OwnerView = struct {
+    tree: Ast.Tree,
+    resolutions: []const Resolution,
+    node_types: []const Type,
+    callees: []const Callee,
+    names: []const Sym.SymName,
+    sigs: []const Sig,
+    instances: []const Mono.Instance,
+    methods: []const Method,
+    closure: struct { lambda_units: []const Closure.LambdaUnit, owner: ?Closure.Owner },
+
+    fn of(src: Source, owner: Closure.Owner, mod: u32, node_types: []const Type, callees: []const Callee) OwnerView {
+        return .{
+            .tree = src.modules[mod].tree,
+            .resolutions = src.resolutions[mod],
+            .node_types = node_types,
+            .callees = callees,
+            .names = src.names,
+            .sigs = src.sigs,
+            .instances = src.instances,
+            .methods = src.methods,
+            .closure = .{ .lambda_units = src.lambda_units, .owner = owner },
+        };
+    }
+
+    pub fn genericTemplate(self: *const OwnerView, gid: u32) ?Mono.TemplateRef {
+        return Mono.templateRef(self.sigs, gid);
+    }
+};
+
+/// The spec table: a mask per template with an eligible param, and a unit per distinct
+/// generic call site (in any lowerable owner: base fns, then instances, lambdas included)
+/// whose argument for an eligible param is a named fn or a lambda literal. Serial, and the
+/// cap and the unit order go by name, so it is identical at any `-j`.
+pub fn build(gpa: std.mem.Allocator, src: Source) error{OutOfMemory}!Table {
+    const masks = try templateMasks(gpa, src);
+    if (masks.len == 0) {
+        gpa.free(masks);
+        return .{};
+    }
+    var cands: std.ArrayList(Candidate) = .empty;
+    collectCandidates(gpa, src, masks, &cands) catch |e| {
+        freeUnits(gpa, cands.items);
+        cands.deinit(gpa);
+        gpa.free(masks);
+        return e;
+    };
+    return finish(gpa, &cands, masks);
+}
+
+/// The eligible params of each instantiated template that has one, sorted by gid. Every
+/// instance of a template shares its body, so its first instance stands for all of them.
+fn templateMasks(gpa: std.mem.Allocator, src: Source) error{OutOfMemory}![]TemplateMask {
+    var masks: std.ArrayList(TemplateMask) = .empty;
+    errdefer masks.deinit(gpa);
+    var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    defer seen.deinit(gpa);
+    for (src.instances, 0..) |inst, k| {
+        const gid = inst.template_gid;
+        if ((try seen.getOrPut(gpa, gid)).found_existing) continue;
+        if (gid >= src.sigs.len) continue;
+        const fcs: []const Closure.FnClosures = if (inst.mod < src.closures.len) src.closures[inst.mod] else &.{};
+        const view = OwnerView.of(src, .{ .instance = @intCast(k) }, inst.mod, inst.node_types, inst.callees);
+        const m = eligibleMask(src.modules[inst.mod], &view, inst.decl_node, src.sigs[gid].params, Closure.findFn(fcs, inst.decl_node) != null);
+        if (m != 0) try masks.append(gpa, .{ .gid = gid, .eligible = m });
+    }
+    std.mem.sort(TemplateMask, masks.items, {}, struct {
+        fn lt(_: void, a: TemplateMask, b: TemplateMask) bool {
+            return a.gid < b.gid;
+        }
+    }.lt);
+    return masks.toOwnedSlice(gpa);
+}
+
+fn collectCandidates(gpa: std.mem.Allocator, src: Source, masks: []const TemplateMask, cands: *std.ArrayList(Candidate)) error{OutOfMemory}!void {
+    const V = struct {
+        gpa: std.mem.Allocator,
+        view: *const OwnerView,
+        masks: Table,
+        cands: *std.ArrayList(Candidate),
+        targets: std.ArrayList(Target) = .empty,
+
+        pub fn on(self: *@This(), ev: AstWalk.Event) error{OutOfMemory}!void {
+            const e = switch (ev) {
+                .enter => |e| e,
+                else => return,
+            };
+            if (e.tag != .call or self.view.tree.nodes[e.idx.int()].lhs == Ast.none) return;
+            const site: Site = if (try AstWalk.instanceOfCall(self.gpa, self.view, e.idx)) |ii|
+                .{ .ii = ii, .self_n = 0 }
+            else
+                methodSite(self.view, e.idx) orelse return;
+            const inst = self.view.instances[site.ii];
+            const m = mask(self.masks, inst.template_gid);
+            if (m == 0) return;
+            self.targets.clearRetainingCapacity();
+            try targetsOf(self.gpa, self.view, e.idx, site, m, &self.targets);
+            if (self.targets.items.len == 0) return;
+            try addCandidate(self.gpa, self.cands, inst.template_gid, site.ii, inst.name.?, self.targets.items);
+        }
+    };
+    for (0..src.bases.len + src.instances.len) |k| {
+        const view, const mod, const decl = if (k < src.bases.len) blk: {
+            const b = src.bases[k];
+            break :blk .{ OwnerView.of(src, .{ .base = b.gid }, b.mod, src.node_types[b.mod], src.callees[b.mod]), b.mod, b.decl };
+        } else blk: {
+            const ii = k - src.bases.len;
+            const inst = src.instances[ii];
+            break :blk .{ OwnerView.of(src, .{ .instance = @intCast(ii) }, inst.mod, inst.node_types, inst.callees), inst.mod, inst.decl_node };
+        };
+        var v: V = .{ .gpa = gpa, .view = &view, .masks = .{ .masks = masks }, .cands = cands };
+        defer v.targets.deinit(gpa);
+        try AstWalk.walk(src.modules[mod], decl, &v);
+    }
+}
+
 const testing = std.testing;
 
 test "nameOf is content-derived and injective" {
@@ -300,7 +441,6 @@ test "nameOf is content-derived and injective" {
     try testing.expectEqualStrings("main.apply$int$sp0$main.add$sp1$main$l0", names.items[4]);
 
     // A spec piece is never a generic-instance arg spelling.
-    const Mono = @import("Mono.zig");
     for ([_]Type{ Type.int, Type.bool, Type.str, Type.unit, Type.float, Type.structT(3), Type.enumT(4), Type.rawptr }) |t| {
         const m = try Mono.mangle(gpa, "f", &.{t});
         defer gpa.free(m);
@@ -338,7 +478,6 @@ const Checked = struct {
     const ResolveGraph = @import("../resolve_graph.zig");
     const TypecheckGraph = @import("../types_graph.zig");
     const LowerInputs = @import("../lower.zig").ClosureInputs;
-    const Mono = @import("Mono.zig");
 
     src: []const u8,
     tokens: []Token,
