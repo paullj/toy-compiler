@@ -647,6 +647,10 @@
         "required": true,
         "types": [
           {
+            "type": "block",
+            "named": true
+          },
+          {
             "type": "boolean",
             "named": true
           },
@@ -667,11 +671,23 @@
             "named": true
           },
           {
+            "type": "for_expression",
+            "named": true
+          },
+          {
             "type": "identifier",
             "named": true
           },
           {
+            "type": "if_expression",
+            "named": true
+          },
+          {
             "type": "index_expression",
+            "named": true
+          },
+          {
+            "type": "labeled_expression",
             "named": true
           },
           {
@@ -680,6 +696,14 @@
           },
           {
             "type": "list_expression",
+            "named": true
+          },
+          {
+            "type": "loop_expression",
+            "named": true
+          },
+          {
+            "type": "match_expression",
             "named": true
           },
           {
@@ -707,7 +731,15 @@
             "named": true
           },
           {
+            "type": "unsafe_expression",
+            "named": true
+          },
+          {
             "type": "variant_expression",
+            "named": true
+          },
+          {
+            "type": "while_expression",
             "named": true
           }
         ]
@@ -934,6 +966,10 @@
         "required": true,
         "types": [
           {
+            "type": "block",
+            "named": true
+          },
+          {
             "type": "boolean",
             "named": true
           },
@@ -954,11 +990,23 @@
             "named": true
           },
           {
+            "type": "for_expression",
+            "named": true
+          },
+          {
             "type": "identifier",
             "named": true
           },
           {
+            "type": "if_expression",
+            "named": true
+          },
+          {
             "type": "index_expression",
+            "named": true
+          },
+          {
+            "type": "labeled_expression",
             "named": true
           },
           {
@@ -967,6 +1015,14 @@
           },
           {
             "type": "list_expression",
+            "named": true
+          },
+          {
+            "type": "loop_expression",
+            "named": true
+          },
+          {
+            "type": "match_expression",
             "named": true
           },
           {
@@ -994,7 +1050,15 @@
             "named": true
           },
           {
+            "type": "unsafe_expression",
+            "named": true
+          },
+          {
             "type": "variant_expression",
+            "named": true
+          },
+          {
+            "type": "while_expression",
             "named": true
           }
         ]
@@ -1639,6 +1703,10 @@
         "required": true,
         "types": [
           {
+            "type": "block",
+            "named": true
+          },
+          {
             "type": "boolean",
             "named": true
           },
@@ -1659,11 +1727,23 @@
             "named": true
           },
           {
+            "type": "for_expression",
+            "named": true
+          },
+          {
             "type": "identifier",
             "named": true
           },
           {
+            "type": "if_expression",
+            "named": true
+          },
+          {
             "type": "index_expression",
+            "named": true
+          },
+          {
+            "type": "labeled_expression",
             "named": true
           },
           {
@@ -1672,6 +1752,14 @@
           },
           {
             "type": "list_expression",
+            "named": true
+          },
+          {
+            "type": "loop_expression",
+            "named": true
+          },
+          {
+            "type": "match_expression",
             "named": true
           },
           {
@@ -1699,7 +1787,15 @@
             "named": true
           },
           {
+            "type": "unsafe_expression",
+            "named": true
+          },
+          {
             "type": "variant_expression",
+            "named": true
+          },
+          {
+            "type": "while_expression",
             "named": true
           }
         ]
@@ -3419,6 +3515,10 @@
       "required": true,
       "types": [
         {
+          "type": "block",
+          "named": true
+        },
+        {
           "type": "boolean",
           "named": true
         },
@@ -3439,11 +3539,23 @@
           "named": true
         },
         {
+          "type": "for_expression",
+          "named": true
+        },
+        {
           "type": "identifier",
           "named": true
         },
         {
+          "type": "if_expression",
+          "named": true
+        },
+        {
           "type": "index_expression",
+          "named": true
+        },
+        {
+          "type": "labeled_expression",
           "named": true
         },
         {
@@ -3452,6 +3564,14 @@
         },
         {
           "type": "list_expression",
+          "named": true
+        },
+        {
+          "type": "loop_expression",
+          "named": true
+        },
+        {
+          "type": "match_expression",
           "named": true
         },
         {
@@ -3479,7 +3599,15 @@
           "named": true
         },
         {
+          "type": "unsafe_expression",
+          "named": true
+        },
+        {
           "type": "variant_expression",
+          "named": true
+        },
+        {
+          "type": "while_expression",
           "named": true
         }
       ]

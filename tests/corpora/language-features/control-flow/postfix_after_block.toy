@@ -1,0 +1,91 @@
+# Feature: a call, a field or method access, a tuple index and `?` written directly after an `if`/`else`, a `loop`, a `match`, a block, a labeled loop or a labeled block, with no parentheses around it
+# expect: stdout "26 checks passed"
+# expect: exit 0
+# The same uses wrapped in parentheses are in aggregate_values.toy; here the postfix follows
+# the closing `}` on the same line, as an initializer, an argument, an operand and a
+# statement. Each check prints a line only when it fails.
+import std/io
+
+struct P { x: int, y: int }
+impl P { fn sum(self) -> int { self.x + self.y } }
+struct T(int, int)
+struct H { f: fn(int) -> int }
+struct U { f: fn(int) }
+
+fn inc(x: int) -> int { x + 1 }
+fn dec(x: int) -> int { x - 1 }
+
+fn check(what: str, got: int, want: int) -> int {
+    if got == want { return 1 }
+    io.println(what.concat(": got ").concat(got.to_string()).concat(", want ").concat(want.to_string()))
+    0
+}
+
+fn calls(t: bool) -> int {
+    a := if t { inc } else { dec }(41)
+    n := check("if call", a, 42)
+    b := loop { break if t { dec } else { inc } }(41)
+    n = n + check("loop call", b, 40)
+    c := match t { true -> inc, false -> dec }(1)
+    n = n + check("match call", c, 2)
+    d := { if t { inc } else { dec } }(2)
+    n = n + check("block call", d, 3)
+    n = n + check("labeled loop call", @l loop { break @l if t { dec } else { inc } }(10), 9)
+    n = n + check("labeled block call", @k { if t { inc } else { dec } }(4), 5)
+    return n
+}
+
+fn fields(t: bool, p: P, q: P, h: H) -> int {
+    n := check("if field", if t { p } else { q }.y, 2)
+    n = n + check("loop field", loop { break if t { p } else { q } }.x, 1)
+    n = n + check("match field", match t { true -> q, false -> p }.y, 40)
+    n = n + check("block field", { if t { p } else { q } }.y, 2)
+    n = n + check("labeled loop field", @l loop { break @l if t { q } else { p } }.x, 30)
+    n = n + check("labeled block field", @k { if t { p } else { q } }.x, 1)
+    n = n + check("if fn field call", if t { h } else { H { f: dec } }.f(41), 42)
+    n = n + check("loop fn field call", loop { break h }.f(1), 2)
+    return n
+}
+
+fn methods(t: bool, p: P, q: P) -> int {
+    n := check("if method", if t { p } else { q }.sum(), 3)
+    n = n + check("loop method", loop { break if t { q } else { p } }.sum(), 70)
+    n = n + check("match method", match t { true -> p, false -> q }.sum(), 3)
+    n = n + check("block method", { p }.sum(), 3)
+    n = n + check("if str method chain", if t { "abc" } else { "de" }.concat("!").len(), 4)
+    n = n + check("operand", 10 + if t { 1 } else { 2 }.to_string().len(), 11)
+    n = n + check("if tuple index", if t { T(9, 4) } else { T(1, 1) }.1, 4)
+    n = n + check("labeled block tuple index", @k { T(5, 6) }.0, 5)
+    return n
+}
+
+fn try_option(t: bool, a: Option[P], b: Option[P]) -> Option[int] {
+    v := if t { a } else { b }?.y
+    v = v + loop { break if t { a } else { b } }?.y
+    v = v + match t { true -> a, false -> b }?.x
+    v = v + { a }?.x
+    v = v + @l loop { break @l a }?.y
+    v = v + @k { if t { a } else { b } }?.x
+    return Option.some(v)
+}
+
+fn statements(t: bool, h: H) -> int {
+    m := 0
+    loop { break U { f: fn(x: int) { m = m + x } } }.f(3)
+    { fn(x: int) { m = m + x } }(4)
+    n := check("loop statement", m, 7)
+    n = n + check("try some", try_option(t, Option.some(P { x: 5, y: 6 }), Option.none).unwrap_or(0), 33)
+    n = n + check("try none", try_option(t, Option.none, Option.some(P { x: 5, y: 6 })).unwrap_or(-1), -1)
+    n = n + check("match fn field", match t { true -> h, false -> h }.f(5), 6)
+    return n
+}
+
+fn main() -> int {
+    t := true
+    p := P { x: 1, y: 2 }
+    q := P { x: 30, y: 40 }
+    h := H { f: inc }
+    n := calls(t) + fields(t, p, q, h) + methods(t, p, q) + statements(t, h)
+    io.println(n.to_string().concat(" checks passed"))
+    return 0
+}
