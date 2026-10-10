@@ -1,2 +1,3 @@
+# expect: exit 158
 import mod_99
 fn main() -> int { return mod_99.entry(7) }

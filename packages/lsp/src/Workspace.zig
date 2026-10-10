@@ -53,7 +53,7 @@ pub fn discover(ws: Workspace, gpa: std.mem.Allocator, uri: []const u8, text: []
     entry.value_ptr.* = text;
 
     const overlay: Graph.Overlay = .{ .ctx = &by_path, .getFn = lookup, .disk = ws.disk };
-    return Graph.discover(gpa, ws.io, Cache.disabled, "native", path, .{ .root = root, .overlay = overlay });
+    return Graph.discover(gpa, ws.io, Cache.disabled, toyc.Driver.default_target, path, .{ .root = root, .overlay = overlay });
 }
 
 const untitled_path = "untitled.toy";

@@ -8,7 +8,7 @@
 //!   `toyc.term.render.Renderer`; status output colourises via `toyc.term.Style`.
 //! - Colour is resolved once per phase from `--color` + a `detectTty(stdout)` probe
 //!   + the environment, so a piped/redirected/CI run resolves to `.none` and emits
-//!   zero escape bytes — the gate that keeps diff.sh and captured output byte-stable.
+//!   zero escape bytes, which keeps captured output byte-stable.
 
 const std = @import("std");
 const Io = std.Io;
@@ -318,7 +318,7 @@ const State = struct {
     check_ndjson: bool = false,
     // `check --exit-zero`: always exit 0 even with errors (editor/LSP streaming).
     check_exit_zero: bool = false,
-    target: []const u8 = "native",
+    target: []const u8 = Driver.default_target,
     out_path: ?[]const u8 = null,
     codegen_stats: bool = false,
     mode: Engine.Mode = .normal,
@@ -358,7 +358,7 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
     // order, so apply .verify first then let .force win (no script passes both).
     if (p.verify) st.mode = .verify;
     if (p.no_cache) st.mode = .force;
-    st.target = p.target orelse "native";
+    st.target = p.target orelse Driver.default_target;
     st.out_path = p.output;
     st.color_choice = switch (p.color orelse .auto) {
         .auto => .auto,
@@ -422,7 +422,7 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
 /// the build path's arg-errors (exit 1), a check-path usage error exits 2 (consistent
 /// with `check`'s missing-input-file exit 2 — a bad `--warn BOGUS` is the same class).
 fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, out: *Io.Writer, level: Style.ColorLevel, st: *State, sev_rules: *std.ArrayList(SevCfg.Rule)) !?u8 {
-    st.target = p.target orelse "native";
+    st.target = p.target orelse Driver.default_target;
     st.color_choice = switch (p.color orelse .auto) {
         .auto => .auto,
         .always => .always,

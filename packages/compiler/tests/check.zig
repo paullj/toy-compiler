@@ -34,7 +34,7 @@ fn withCheck(
     const path = dir_name ++ "/c.toy";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src });
 
-    const results = try Driver.run(gpa, io, .check, "native", &.{path});
+    const results = try Driver.run(gpa, io, .check, Driver.default_target, &.{path});
     defer {
         for (results) |*r| r.deinit(gpa);
         gpa.free(results);
@@ -221,7 +221,7 @@ fn withCheckPaths(
     defer threaded.deinit();
     const io = threaded.io();
 
-    const results = try Driver.run(gpa, io, .check, "native", paths);
+    const results = try Driver.run(gpa, io, .check, Driver.default_target, paths);
     defer {
         for (results) |*r| r.deinit(gpa);
         gpa.free(results);
@@ -285,7 +285,7 @@ test "check: a clean file mixed with a missing file still trips the hard-error g
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = ok_path, .data = "fn main() -> int {\n  return 0\n}\n" });
     const missing_path = dir_name ++ "/missing_zzq.toy";
 
-    const results = try Driver.run(gpa, io, .check, "native", &.{ ok_path, missing_path });
+    const results = try Driver.run(gpa, io, .check, Driver.default_target, &.{ ok_path, missing_path });
     defer {
         for (results) |*r| r.deinit(gpa);
         gpa.free(results);

@@ -25,23 +25,23 @@ survive comment debridement. Those are called out per entry.
 | **C8** | The codegen cache is **one-tier**: the IR (and the in-place opt) is built and freed entirely inside the per-fn `lowerOne` query and never escapes or is cached separately; only the packed aarch64 `FnCode` blob is keyed by content fingerprint and cached (then freed in the uncached relink tail). Breaking it double-caches/leaks IR or serves stale bytes. | `query/Cache.zig`, `query/Engine.zig` | `driver/Driver.zig:360` — the relink/free tail's prose says nothing about one-tier; the bare `[C8]` is the only tie from "`FnCode` is the sole cached/owned artifact" back to this invariant. |
 | **C9** | Every `FnCode` is **"always own"**: all of its names/bytes (own `sym.name`, each `.func`/`.import` reloc target name, the code, the literals) are unconditionally heap-owned regardless of provenance — freshly lowered (Codegen dupes at emit) or unpacked from a disk cache hit — so one uniform `deinit` frees it with no owned-flag and no double-free ambiguity. Breaking it double-frees borrowed memory or leaks. | `link/Link.zig` | — |
 | **C10** | The compilation target is folded into the on-disk cache key for, and only for, `Phase.targetSensitive()` phases (only codegen), so aarch64 machine-code blobs never alias across targets while target-independent phases (lex/parse) share one entry. Breaking it serves a blob built for one target as another's — a silent miscompile / link-ABI fault. | `query/Key.zig`, `query/Cache.zig` | `query/Phase.zig:63` — the only statement of the "aarch64 blobs must not alias across targets" soundness rationale. |
-| **C11** | **Determinism / byte-identity** (== `LOCK #7`). The same source always lowers to the same per-fn `FnCode` bytes regardless of dispatch (`-j1` vs `-jN`) and cache state, because every stage is pure over its inputs, ids are assigned in monotonic source order, and parallel units own disjoint write spans. Enforced by `--verify` (re-lower twice on a miss / compare to the stored blob on a hit — a real runtime check, not a debug assert compiled out under ReleaseFast). | `query/Engine.zig`, `driver/Graph.zig`, `ir/Ir.zig`, `codegen/*`, `opt/{fold,dce}.zig`, `types.zig`; gate: `examples/diff.sh` | — |
+| **C11** | **Determinism / byte-identity** (== `LOCK #7`). The same source always lowers to the same per-fn `FnCode` bytes regardless of dispatch (`-j1` vs `-jN`) and cache state, because every stage is pure over its inputs, ids are assigned in monotonic source order, and parallel units own disjoint write spans. Enforced by `--verify` (re-lower twice on a miss / compare to the stored blob on a hit — a real runtime check, not a debug assert compiled out under ReleaseFast). | `query/Engine.zig`, `driver/Graph.zig`, `ir/Ir.zig`, `codegen/*`, `opt/{fold,dce}.zig`, `types.zig`; gate: the corpus harness (`packages/compiler/tests/corpus.zig`) builds every fixture in `--verify` mode | — |
 
 ## `LOCK #N` — IR-backend design locks
 
 A separate, numbered family of IR design decisions — *not* the `[Cn]` cache/determinism
-contracts. Ruling: the **gate** locks (`#1`, `#7`) are owned by the harness
-`examples/diff.sh`; the **design** locks (`#2`/`#3`/`#4`) are self-defined inline at each
+contracts. Ruling: the **gate** locks (`#1`, `#7`) are owned by the corpus harness
+(`packages/compiler/tests/corpus.zig`); the **design** locks (`#2`/`#3`/`#4`) are self-defined inline at each
 site (no central ledger); `#6` marks dead code.
 
 | Lock | Meaning | Home |
 |---|---|---|
-| **#1** | A compiled program is output-identical (exit code + stdout match its `# expect:` directives) AND deterministic. | `examples/diff.sh` (definition) |
+| **#1** | A compiled program is output-identical (exit code + stdout match its `# expect:` directives) AND deterministic. | the corpus harness (definition) |
 | **#2** | Value model: scalar / control-flow merge values are single-definition SSA `Value`s; named locals and all aggregates live in memory slots; merges carried as block params via store-before-br ("phi = memory"). | inline (`lower.zig`, `ir/Ir.zig`, `codegen/CodegenIr.zig`, `codegen/frame/FrameLayout.zig`) |
 | **#3** | The ABI (register/stack placement, x8 sret, NGRN/NSAA) is decided in exactly one place — codegen's `Abi` module; the IR carries no registers, offsets, or calling convention. | inline (`ir/Ir.zig`, `codegen/abi/Abi.zig`) |
 | **#4** | Spill-everything frame layout: every slot AND every value gets its own never-reused, type-sized, 8-byte-aligned frame cell in one deterministic IR-order pass. | inline (`codegen/frame/FrameLayout.zig`, `codegen/CodegenIr.zig`) |
 | **#6** | The `smod` / `%` modulo opcode sketch, retained per the design but DEAD (the source has no `%`). | inline (`ir/Ir.zig`) — scheduled for removal |
-| **#7** | VERIFY byte-identity (== `[C11]`): re-lowering every fn twice asserts per-fn `FnCode` byte-identity. | `examples/diff.sh` (definition) |
+| **#7** | VERIFY byte-identity (== `[C11]`): re-lowering every fn twice asserts per-fn `FnCode` byte-identity. | the corpus harness, which builds in `--verify` mode (definition) |
 
 ## `[design N]` tags
 

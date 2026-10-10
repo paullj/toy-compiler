@@ -22,8 +22,8 @@
 # ALWAYS --no-cache: cached fns contribute 0 to --opt-stats and a stale .codegen blob
 # could otherwise serve cross-opt-level garbage.
 #
-# Run from anywhere: resolves the repo root and prefers the prebuilt
-# zig-out/bin/toy, building it via `mise exec -- zig build` if missing.
+# Run from anywhere: resolves the repo root and builds zig-out/bin/toy first, so it
+# never checks a stale compiler.
 set -u
 
 root="$(cd "$(dirname "$0")/../../.." && pwd)"
@@ -31,13 +31,18 @@ toyc="$root/zig-out/bin/toy"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
-zig() { ( cd "$root" && mise exec -- zig "$@" ); }
-
-if [ ! -x "$toyc" ]; then
-  echo "building toy (mise exec -- zig build)..."
-  zig build || { echo "build failed"; exit 1; }
-fi
+echo "building toy..."
+if command -v zig >/dev/null 2>&1; then zig="zig"
+elif command -v mise >/dev/null 2>&1; then zig="mise exec -- zig"
+else echo "build failed: no zig (and no mise to provide it)"; exit 1; fi
+( cd "$root" && $zig build ) || { echo "build failed"; exit 1; }
 [ -x "$toyc" ] || { echo "no toyc binary at $toyc"; exit 1; }
+
+# GNU timeout is `timeout`, or `gtimeout` from Homebrew coreutils; macOS ships neither,
+# so with no timeout at all a step runs unbounded rather than failing as "not found".
+if command -v timeout >/dev/null 2>&1; then limit() { timeout "$@"; }
+elif command -v gtimeout >/dev/null 2>&1; then limit() { gtimeout "$@"; }
+else limit() { shift; "$@"; }; fi
 
 fails=0
 fail() { echo "  FAIL: $*"; fails=$((fails + 1)); }
@@ -63,8 +68,8 @@ while IFS= read -r src; do
 
   b0="$work/$(basename "$src" .toy).o0"
   b1="$work/$(basename "$src" .toy).o1"
-  timeout 30 "$toyc" --no-cache -O0 -o "$b0" "$src" >/dev/null 2>&1; c0=$?
-  timeout 30 "$toyc" --no-cache -O1 -o "$b1" "$src" >/dev/null 2>&1; c1=$?
+  limit 30 "$toyc" --no-cache -O0 -o "$b0" "$src" >/dev/null 2>&1; c0=$?
+  limit 30 "$toyc" --no-cache -O1 -o "$b1" "$src" >/dev/null 2>&1; c1=$?
 
   if [ "$want_cerr" -eq 1 ]; then
     if [ "$c0" -eq 0 ] || [ "$c1" -eq 0 ]; then
@@ -77,8 +82,8 @@ while IFS= read -r src; do
     fail "$rel: compile failed (O0 rc=$c0 O1 rc=$c1)"; corpus_fail=$((corpus_fail+1)); continue
   fi
 
-  o0="$(timeout 30 "$b0")"; r0=$?
-  o1="$(timeout 30 "$b1")"; r1=$?
+  o0="$(limit 30 "$b0")"; r0=$?
+  o1="$(limit 30 "$b1")"; r1=$?
 
   ok=1
   # #expect under -O0 FIRST (independent oracle).
@@ -120,8 +125,8 @@ printf "  %-20s %-12s %-16s %s\n" "bench" "ir B->A" "emitted O0->O1" "result"
 any_ir_drop=0; any_emit_drop=0
 for b in "${benches[@]}"; do
   src="$root/tests/corpora/benchmark/$b.toy"
-  s0="$(timeout 30 "$toyc" --no-cache --opt-stats -O0 -o "$work/$b.s0" "$src" 2>&1)"
-  s1="$(timeout 30 "$toyc" --no-cache --opt-stats -O1 -o "$work/$b.s1" "$src" 2>&1)"
+  s0="$(limit 30 "$toyc" --no-cache --opt-stats -O0 -o "$work/$b.s0" "$src" 2>&1)"
+  s1="$(limit 30 "$toyc" --no-cache --opt-stats -O1 -o "$work/$b.s1" "$src" 2>&1)"
   ir_before="$(sed -nE 's/.*ir_instrs=([0-9]+)->([0-9]+).*/\1/p' <<<"$s1" | head -1)"
   ir_after="$(sed -nE 's/.*ir_instrs=([0-9]+)->([0-9]+).*/\2/p' <<<"$s1" | head -1)"
   e0="$(stat_field "$s0" emitted_instrs)"
@@ -144,13 +149,13 @@ for b in "${benches[@]}"; do
   p="$(target_pass "$b")"
   cname="$(pass_counter "$p")"
   # only the target pass on
-  sonly="$(timeout 30 "$toyc" --no-cache --opt-stats "--opt=$p" -o "$work/$b.only" "$src" 2>&1)"
+  sonly="$(limit 30 "$toyc" --no-cache --opt-stats "--opt=$p" -o "$work/$b.only" "$src" 2>&1)"
   cval="$(stat_field "$sonly" "$cname")"
   # full O1 emitted
-  sfull="$(timeout 30 "$toyc" --no-cache --opt-stats -O1 -o "$work/$b.full" "$src" 2>&1)"
+  sfull="$(limit 30 "$toyc" --no-cache --opt-stats -O1 -o "$work/$b.full" "$src" 2>&1)"
   efull="$(stat_field "$sfull" emitted_instrs)"
   # O1 with target pass removed
-  snoopt="$(timeout 30 "$toyc" --no-cache --opt-stats -O1 "--no-opt=$p" -o "$work/$b.noopt" "$src" 2>&1)"
+  snoopt="$(limit 30 "$toyc" --no-cache --opt-stats -O1 "--no-opt=$p" -o "$work/$b.noopt" "$src" 2>&1)"
   enoopt="$(stat_field "$snoopt" emitted_instrs)"
   res="ok"
   if [ -z "$cval" ] || [ "$cval" -le 0 ]; then res="FAIL(counter=$cval)"; fi
@@ -164,11 +169,11 @@ done
 # nonzero once a producer pass (fold) has created dead values. Attribute it on
 # const_arith with `--opt=fold,dce`: dced>0, and `-O1 --no-opt=dce` regresses the
 # emitted win (the folded const feeders survive as load/op/store words without it).
-sdce="$(timeout 30 "$toyc" --no-cache --opt-stats --opt=fold,dce -o "$work/dce.only" "$root/tests/corpora/benchmark/const_arith.toy" 2>&1)"
+sdce="$(limit 30 "$toyc" --no-cache --opt-stats --opt=fold,dce -o "$work/dce.only" "$root/tests/corpora/benchmark/const_arith.toy" 2>&1)"
 dval="$(stat_field "$sdce" dced)"
-sdcefull="$(timeout 30 "$toyc" --no-cache --opt-stats -O1 -o "$work/dce.full" "$root/tests/corpora/benchmark/const_arith.toy" 2>&1)"
+sdcefull="$(limit 30 "$toyc" --no-cache --opt-stats -O1 -o "$work/dce.full" "$root/tests/corpora/benchmark/const_arith.toy" 2>&1)"
 edcefull="$(stat_field "$sdcefull" emitted_instrs)"
-sdcenoopt="$(timeout 30 "$toyc" --no-cache --opt-stats -O1 --no-opt=dce -o "$work/dce.noopt" "$root/tests/corpora/benchmark/const_arith.toy" 2>&1)"
+sdcenoopt="$(limit 30 "$toyc" --no-cache --opt-stats -O1 --no-opt=dce -o "$work/dce.noopt" "$root/tests/corpora/benchmark/const_arith.toy" 2>&1)"
 edcenoopt="$(stat_field "$sdcenoopt" emitted_instrs)"
 dres="ok"
 if [ -z "$dval" ] || [ "$dval" -le 0 ]; then dres="FAIL(counter=$dval)"; fi

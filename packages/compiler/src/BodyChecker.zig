@@ -3880,8 +3880,8 @@ pub const BodyChecker = struct {
                 const cname = bc.nameText(bc.tree.nodes[(n.lhs).int()].main_token);
                 if (bc.activeStructMap().get(cname) != null)
                     try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0063 }, "use named construction '{s} {{ ... }}', not '{s}(...)'", .{ cname, cname })
-                // A module or an enum binds no fn, and resolve reports neither, so the call
-                // would otherwise pass check and fail in lower (`5 |> io` is `io(5)`).
+                    // A module or an enum binds no fn, and resolve reports neither, so the call
+                    // would otherwise pass check and fail in lower (`5 |> io` is `io(5)`).
                 else if (callee_res == .module)
                     try bc.sink.report(.{ .span = bc.spanOf(n.lhs), .code = .T0055 }, "module '{s}' is not a function; call one of its functions, as in '{s}.f(..)'", .{ cname, cname })
                 else if (bc.activeEnumMap().get(cname) != null)

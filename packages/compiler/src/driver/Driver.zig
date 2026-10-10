@@ -25,6 +25,11 @@ const version = @import("../version.zig");
 
 pub const cache_root = ".toy";
 
+/// The target a build names when `--target` is not given. Codegen cache keys fold the
+/// target name, so an in-process build that stands in for `toy build` (the corpus
+/// harness, the LSP) passes this same name rather than a spelling of the host triple.
+pub const default_target = "native";
+
 /// The buffer size the cache `dir_buf` needs: `.toy/<stamp>/cache`.
 pub const cache_dir_buf_len = cache_root.len + 1 + version.stamp_max + "/cache".len;
 

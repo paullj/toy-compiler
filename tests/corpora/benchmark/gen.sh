@@ -39,6 +39,8 @@ for k in $(seq 0 $((N - 1))); do
     echo "}"
   } >"$f"
 done
+# The corpus harness runs the checked-in medium/ (N=100) and wants a `# expect:` line, so
+# its main.toy also carries `# expect: exit 158`; a regenerated main.toy needs its own.
 {
   echo "import mod_$((N - 1))"
   echo "fn main() -> int { return mod_$((N - 1)).entry(7) }"

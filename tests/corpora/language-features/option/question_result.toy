@@ -5,7 +5,7 @@
 # copying the `str` error payload UNCHANGED across the (differently-sized) operand and
 # return enum layouts — `?` requires the SAME error type, so it is a plain copy. Any `?`
 # hitting `.err` short-circuits (the tail never runs). Two distinct Result instances plus
-# their discovery order make this a `-j1`==`-jN` determinism case (diff.sh).
+# their discovery order make this a `-j1`==`-jN` determinism case.
 # expect: exit 42
 struct Point { x: int, y: int }
 
