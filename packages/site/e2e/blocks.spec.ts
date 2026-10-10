@@ -151,7 +151,7 @@ test('hover tells how a closure holds a name, what a _ makes, and who mutates an
 test('inlay hints show what a closure captures and which argument a call mutates', async ({ page }) => {
 	const b = await live(page, 'closures.toy');
 	// Lines are matched on text the hints do not split: a line's text includes its hints.
-	// `like` is a line without hints set in the same faces (a bold face is taller).
+	// `like` is a line without hints.
 	const cases = [
 		{ line: '.fold(0,', like: '.filter(', label: 'captures count (shared)', tooltip: 'count: shared', before: 'fn(sum, x) ', after: '{' },
 		{ line: /^\s*bump\(/, like: 'count = count + 1', label: 'mut', tooltip: 'mutated by bump', before: '    bump(', after: 'count)' }
@@ -228,15 +228,20 @@ test('on a phone, live editors never widen the page', async ({ page }) => {
 	expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBe(0);
 });
 
+const heights = (lines: Element[]) => lines.map((l) => l.getBoundingClientRect().height);
+
 test('a block keeps its size and colours when it becomes an editor', async ({ page, browser }) => {
 	const noJs = await browser.newPage({ javaScriptEnabled: false });
 	await noJs.goto('/');
 	for (const file of BLOCKS) {
 		const staticBox = await block(noJs, file).boundingBox();
 		const staticKeywords = await block(noJs, file).locator('.tok-kw').allTextContents();
+		const staticLines = await block(noJs, file).locator('pre code > span').evaluateAll(heights);
 		const b = await hinted(page, file);
 		const liveBox = await b.boundingBox();
 		expect(Math.abs(liveBox!.height - staticBox!.height)).toBeLessThanOrEqual(1);
+		// Line by line, so a pixel per bold line cannot hide in the block's tolerance.
+		expect(await b.locator('.cm-line').evaluateAll(heights)).toEqual(staticLines);
 		expect(await b.locator('.tok-kw').allTextContents()).toEqual(staticKeywords);
 	}
 	await noJs.close();

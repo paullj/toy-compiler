@@ -13,7 +13,10 @@ const blockTheme = EditorView.theme({
 	'&': { color: 'var(--fg)', backgroundColor: 'transparent' },
 	'.cm-scroller': { fontFamily: 'var(--font-mono)', fontSize: '0.75rem', lineHeight: '1.625' },
 	'.cm-content': { padding: '1rem 0', caretColor: 'var(--accent)' },
-	'.cm-line': { padding: '0 1rem' },
+	// Pinned like the static render's `h-[1lh]` lines. The mono faces are `font-display:
+	// optional`, so on some loads a bold keyword is set in a fallback face whose baseline
+	// sits elsewhere, and its line box rounds up a pixel.
+	'.cm-line': { padding: '0 1rem', height: '1lh' },
 	'&.cm-focused': { outline: 'none' },
 	'.cm-cursor, .cm-dropCursor': { borderLeftColor: 'var(--accent)' },
 	'&.cm-focused .cm-selectionBackground, .cm-selectionBackground, .cm-content ::selection': {
