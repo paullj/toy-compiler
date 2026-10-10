@@ -1,5 +1,5 @@
 //! `--timings` per-stage accumulator, split into the three costs a cache-backed stage
-//! divides into: COMPUTE (the miss path — `lowerOne` for codegen, file-read+tokenize
+//! divides into: COMPUTE (the miss path — `lowerCode` for codegen, file-read+tokenize
 //! for lex, the AST build for parse), cache GET I/O (the hit-or-miss read), and cache
 //! PUT I/O (the atomic-rename temp-file write on a miss). Atomic because a stage's
 //! fan-out (codegen, and discovery's per-module queries) runs jobs in parallel and

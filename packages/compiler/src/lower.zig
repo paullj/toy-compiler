@@ -50,9 +50,8 @@ const StdNames = @import("symbols/StdNames.zig");
 const Diagnostic = @import("diagnostics/Diagnostic.zig").Diagnostic;
 const Literal = @import("types/literal.zig");
 
-/// The read-only front-end inputs a lowering needs. Mirrors the slice of
-/// `Driver.Frozen` that codegen consumes today; bundling them keeps the call
-/// site (and the eventual dual-path fork) tidy.
+/// The read-only front-end inputs one unit's lowering needs: its body's tables and the
+/// program-wide ones. A codegen job's `Engine.Frozen` carries them whole.
 pub const Inputs = struct {
     tree: Ast.Tree,
     tokens: []const Token,
@@ -119,6 +118,12 @@ pub const Inputs = struct {
     /// names a fn as a value must find its thunk, so every build site threads this,
     /// passing `ClosureInputs.none` only for a unit that reads no AST.
     closure: ClosureInputs,
+
+    /// The template facts `Mono.callInstanceRef` reads, from the callee's `Sig`, so the
+    /// fingerprint's walk can run over these inputs.
+    pub fn genericTemplate(self: *const Inputs, gid: u32) ?Mono.TemplateRef {
+        return Mono.templateRef(self.sigs, gid);
+    }
 };
 
 /// The closure tables one lowering reads, borrowed from the typecheck result.
@@ -5241,245 +5246,65 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
     try testing.expectEqualStrings(want, w.buffered());
 }
 
-/// Like `expectLowered`, but resolves fns through the GRAPH-GLOBAL fn table
-/// (`res.fns`) so a method (declared inside an `impl`, absent from the program's
-/// direct children) — and a fn that CALLS one — lower with `names`/`sig` indexed by
-/// global fn id. Mirrors `Codegen.renderGraphIr`'s single-module path. The
-/// mut-self lowering lives on the method path, which the top-level `expectLowered`
-/// cannot reach.
-fn expectLoweredG(src: []const u8, fn_name: []const u8, want: []const u8) !void {
-    const gpa = testing.allocator;
-    const Lexer = @import("lex.zig");
-    const Parser = @import("parse.zig");
+/// How `renderUnit` lowers: frame storage on (as any opt pass turns it on, here with no
+/// pass rewriting the IR), and generic calls with a known fn argument sent to spec units.
+const UnitOptions = struct { frame: bool = false, specialize: bool = false };
 
-    const tokens = try Lexer.tokenize(gpa, src);
+/// Check `src` as a one-module program, lower every unit through the driver's own path
+/// (`Codegen.renderIr` at -O0), and return the rendered IR of the unit named `name`, or of
+/// the first whose last dotted segment is `name` (a method `main.P.bump` is `bump`).
+/// gpa-owned.
+fn renderUnit(gpa: std.mem.Allocator, src: []const u8, name: []const u8, o: UnitOptions) ![]u8 {
+    const Codegen = @import("driver/Codegen.zig");
+    const tokens = try @import("lex.zig").tokenize(gpa, src);
     defer gpa.free(tokens);
-    const tree = try Parser.expectTree(gpa, tokens, src);
+    const tree = try @import("parse.zig").expectTree(gpa, tokens, src);
     defer {
         gpa.free(tree.nodes);
         gpa.free(tree.extra);
     }
-
-    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
-    defer fe.deinit(gpa);
-    const rr = fe.resolve;
-    const tc = fe.typecheck;
-
-    // Build `names` in global fn-id order (the space method dispatch/`sig` use).
-    const names = try gpa.alloc(Link.SymName, rr.fns.len);
-    defer {
-        for (names) |nm| gpa.free(nm.name);
-        gpa.free(names);
-    }
-    for (rr.fns, 0..) |gf, i| {
-        const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
-        names[i] = .{ .kind = kind, .name = try gpa.dupe(u8, gf.name) };
-    }
-
-    // Match `fn_name` against the LAST dot-segment: a top-level fn is named bare
-    // (`main`), a method is mangled (`main.P.bump` → matched by `bump`).
-    var target_gid: ?usize = null;
-    for (rr.fns, 0..) |gf, i| {
-        if (gf.decl_node == Ast.none) continue;
-        const last = if (std.mem.lastIndexOfScalar(u8, gf.name, '.')) |dot| gf.name[dot + 1 ..] else gf.name;
-        if (std.mem.eql(u8, last, fn_name)) {
-            target_gid = i;
-            break;
-        }
-    }
-    const gid = target_gid orelse return error.TestUnexpectedResult;
-
-    const in = Inputs{
-        .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
-        .tokens = tokens,
-        .source = src,
-        .resolutions = rr.resolutions[0],
-        .node_types = tc.node_types[0],
-        .callees = tc.callees[0],
-        .layouts = tc.layouts,
-        .enum_layouts = tc.enum_layouts,
-        .names = names,
-        .sig = if (gid < tc.sigs.len) tc.sigs[gid] else null,
-        .instances = tc.instances,
-        .sigs = tc.sigs,
-        .methods = tc.methods,
-        .derives = tc.derives,
-        .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) }, .boxed = Closure.ownerStorage(tc.owner_closures, .{ .base = @intCast(gid) }, false).boxed },
+    var g = try Graph.single(gpa, "main", "", src, tokens, tree.nodes, tree.extra, tree.pub_bits);
+    defer g.deinit(gpa);
+    var res = try ResolveGraph.resolveGraph(gpa, &g);
+    defer res.deinit(gpa);
+    var tc = try TypecheckGraph.checkGraph(gpa, &g, &res, null, 0);
+    defer tc.deinit(gpa);
+    const ir = switch (try Codegen.renderIr(gpa, &g, &res, &tc, .{ .opt = .O0, .specialize = o.specialize, .frame = o.frame })) {
+        .ok => |text| text,
+        .err => |e| {
+            std.debug.print("lowering failed: {s}\n", .{e.message});
+            return error.TestUnexpectedResult;
+        },
     };
-
-    var diags: std.ArrayList(Diagnostic) = .empty;
-    defer diags.deinit(gpa);
-    const is_entry = std.mem.eql(u8, fn_name, "main");
-    var func = try lowerFn(gpa, in, rr.fns[gid].decl_node, names[gid], is_entry, &diags);
-    defer func.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), diags.items.len);
-
-    var buf: [8192]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try Ir.render(&w, &func, in.layouts, in.enum_layouts);
-    try testing.expectEqualStrings(want, w.buffered());
+    defer gpa.free(ir);
+    var at: usize = 0;
+    while (std.mem.indexOfPos(u8, ir, at, "fn ")) |start| {
+        const open = std.mem.indexOfScalarPos(u8, ir, start, '(') orelse break;
+        const end = (std.mem.indexOfPos(u8, ir, start, "\n}\n") orelse break) + 3;
+        const sym = ir[start + 3 .. open];
+        if (std.mem.eql(u8, sym, name) or (std.mem.endsWith(u8, sym, name) and sym.len > name.len and sym[sym.len - name.len - 1] == '.'))
+            return gpa.dupe(u8, ir[start..end]);
+        at = end;
+    }
+    return error.TestUnexpectedResult;
 }
 
-/// Like `expectLoweredG`, but returns the rendered IR as a gpa-owned string so a test
-/// can assert on SUBSTRINGS (used for the desugar shapes, where the exact id
-/// numbering is not the point). Caller frees the returned slice.
-fn renderLoweredG(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8) ![]u8 {
-    return renderLoweredGAt(gpa, src, fn_name, false);
-}
-
-/// `renderLoweredG` with frame storage on or off, as the driver chooses it per opt level.
-fn renderLoweredGAt(gpa: std.mem.Allocator, src: []const u8, fn_name: []const u8, frame: bool) ![]u8 {
-    const Lexer = @import("lex.zig");
-    const Parser = @import("parse.zig");
-
-    const tokens = try Lexer.tokenize(gpa, src);
-    defer gpa.free(tokens);
-    const tree = try Parser.expectTree(gpa, tokens, src);
-    defer {
-        gpa.free(tree.nodes);
-        gpa.free(tree.extra);
-    }
-
-    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
-    defer fe.deinit(gpa);
-    const rr = fe.resolve;
-    const tc = fe.typecheck;
-
-    const names = try gpa.alloc(Link.SymName, rr.fns.len);
-    defer {
-        for (names) |nm| gpa.free(nm.name);
-        gpa.free(names);
-    }
-    for (rr.fns, 0..) |gf, i| {
-        const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
-        names[i] = .{ .kind = kind, .name = try gpa.dupe(u8, gf.name) };
-    }
-
-    var target_gid: ?usize = null;
-    for (rr.fns, 0..) |gf, i| {
-        if (gf.decl_node == Ast.none) continue;
-        const last = if (std.mem.lastIndexOfScalar(u8, gf.name, '.')) |dot| gf.name[dot + 1 ..] else gf.name;
-        if (std.mem.eql(u8, last, fn_name)) {
-            target_gid = i;
-            break;
-        }
-    }
-    const gid = target_gid orelse return error.TestUnexpectedResult;
-
-    const st = Closure.ownerStorage(tc.owner_closures, .{ .base = @intCast(gid) }, frame);
-    const in = Inputs{
-        .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
-        .tokens = tokens,
-        .source = src,
-        .resolutions = rr.resolutions[0],
-        .node_types = tc.node_types[0],
-        .callees = tc.callees[0],
-        .layouts = tc.layouts,
-        .enum_layouts = tc.enum_layouts,
-        .names = names,
-        .sig = if (gid < tc.sigs.len) tc.sigs[gid] else null,
-        .instances = tc.instances,
-        .sigs = tc.sigs,
-        .methods = tc.methods,
-        .derives = tc.derives,
-        .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .base = @intCast(gid) }, .boxed = st.boxed, .unboxed = st.unboxed, .frame_envs = frame },
-    };
-
-    var diags: std.ArrayList(Diagnostic) = .empty;
-    defer diags.deinit(gpa);
-    const is_entry = std.mem.eql(u8, fn_name, "main");
-    var func = try lowerFn(gpa, in, rr.fns[gid].decl_node, names[gid], is_entry, &diags);
-    defer func.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), diags.items.len);
-
-    var buf: [8192]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try Ir.render(&w, &func, in.layouts, in.enum_layouts);
-    return gpa.dupe(u8, w.buffered());
-}
-
-/// Lower the lambda unit named `unit_name` (a base owner's) and return its rendered IR,
-/// gpa-owned. Mirrors `Codegen.renderGraphIr`'s lambda class.
-fn renderLambdaG(gpa: std.mem.Allocator, src: []const u8, unit_name: []const u8) ![]u8 {
-    return renderLambdaGAt(gpa, src, unit_name, false);
-}
-
-/// `renderLambdaG` with frame storage on or off, as the driver chooses it per opt level.
-fn renderLambdaGAt(gpa: std.mem.Allocator, src: []const u8, unit_name: []const u8, frame: bool) ![]u8 {
-    const Lexer = @import("lex.zig");
-    const Parser = @import("parse.zig");
-
-    const tokens = try Lexer.tokenize(gpa, src);
-    defer gpa.free(tokens);
-    const tree = try Parser.expectTree(gpa, tokens, src);
-    defer {
-        gpa.free(tree.nodes);
-        gpa.free(tree.extra);
-    }
-
-    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
-    defer fe.deinit(gpa);
-    const rr = fe.resolve;
-    const tc = fe.typecheck;
-
-    const names = try gpa.alloc(Link.SymName, rr.fns.len);
-    defer {
-        for (names) |nm| gpa.free(nm.name);
-        gpa.free(names);
-    }
-    for (rr.fns, 0..) |gf, i| {
-        const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
-        names[i] = .{ .kind = kind, .name = try gpa.dupe(u8, gf.name) };
-    }
-
-    const ui: u32 = for (tc.lambda_units, 0..) |u, i| {
-        if (std.mem.eql(u8, u.name, unit_name)) break @intCast(i);
-    } else return error.TestUnexpectedResult;
-    const u = tc.lambda_units[ui];
-    try testing.expect(u.owner == .base);
-    const st = Closure.ownerStorage(tc.owner_closures, u.owner, frame);
-
-    const in = Inputs{
-        .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
-        .tokens = tokens,
-        .source = src,
-        .resolutions = rr.resolutions[0],
-        .node_types = tc.node_types[0],
-        .callees = tc.callees[0],
-        .layouts = tc.layouts,
-        .enum_layouts = tc.enum_layouts,
-        .names = names,
-        .instances = tc.instances,
-        .sigs = tc.sigs,
-        .methods = tc.methods,
-        .derives = tc.derives,
-        .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = u.owner, .boxed = st.boxed, .unboxed = st.unboxed, .frame_envs = frame },
-    };
-
-    var diags: std.ArrayList(Diagnostic) = .empty;
-    defer diags.deinit(gpa);
-    var func = try lowerLambda(gpa, in, ui, .{ .kind = .user_fn, .name = u.name }, &diags);
-    defer func.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), diags.items.len);
-
-    var buf: [8192]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try Ir.render(&w, &func, in.layouts, in.enum_layouts);
-    return gpa.dupe(u8, w.buffered());
+/// `renderUnit` with default options, compared to `want`.
+fn expectUnit(src: []const u8, name: []const u8, want: []const u8) !void {
+    const ir = try renderUnit(testing.allocator, src, name, .{});
+    defer testing.allocator.free(ir);
+    try testing.expectEqualStrings(want, ir);
 }
 
 test "a lambda value is fn_addr of <owner>$l0 with a null env" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\fn f() -> int {
         \\ g := fn(x: int) -> int { x + 1 }
         \\ return g(1)
         \\}
         \\
-    , "f");
+    , "f", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "fn_addr @main.f$l0") != null);
     // The env word is a null rawptr: `iconst 0` stored at +8 as rawptr.
@@ -5493,14 +5318,14 @@ test "a lambda value is fn_addr of <owner>$l0 with a null env" {
 test "a '_' capture lowers like the lambda it means; a hole pipe is a direct call" {
     const gpa = testing.allocator;
     {
-        const ir = try renderLoweredG(gpa,
+        const ir = try renderUnit(gpa,
             \\fn add(a: int, b: int) -> int { a + b }
             \\fn f() -> int {
             \\ g := add(1, _)
             \\ return g(2)
             \\}
             \\
-        , "f");
+        , "f", .{});
         defer gpa.free(ir);
         try testing.expect(std.mem.indexOf(u8, ir, "fn_addr @main.f$l0") != null);
         try testing.expect(std.mem.indexOf(u8, ir, "iconst 0\n  store %") != null);
@@ -5508,7 +5333,7 @@ test "a '_' capture lowers like the lambda it means; a hole pipe is a direct cal
         try testing.expect(std.mem.indexOf(u8, ir, "call @main.add(") == null);
     }
     {
-        const ir = try renderLoweredG(gpa,
+        const ir = try renderUnit(gpa,
             \\fn add(a: int, b: int) -> int { a + b }
             \\fn f() -> int {
             \\ a := 5
@@ -5516,7 +5341,7 @@ test "a '_' capture lowers like the lambda it means; a hole pipe is a direct cal
             \\ return g(2)
             \\}
             \\
-        , "f");
+        , "f", .{});
         defer gpa.free(ir);
         try testing.expect(std.mem.indexOf(u8, ir, "fn_addr @main.f$l0") != null);
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, ir, "call @gc_alloc("));
@@ -5532,14 +5357,14 @@ test "a '_' capture lowers like the lambda it means; a hole pipe is a direct cal
         ) != null);
     }
     {
-        const ir = try renderLoweredG(gpa,
+        const ir = try renderUnit(gpa,
             \\fn add(a: int, b: int) -> int { a + b }
             \\fn f() -> int {
             \\ x := 3
             \\ return x |> add(1, _)
             \\}
             \\
-        , "f");
+        , "f", .{});
         defer gpa.free(ir);
         try testing.expect(std.mem.indexOf(u8, ir, "fn_addr") == null);
         try testing.expect(std.mem.indexOf(u8, ir, "call @main.add(") != null);
@@ -5556,28 +5381,28 @@ test "two lambdas and a nested one get ranks 0, 1, 2 in pre-order" {
         \\}
         \\
     ;
-    const ir = try renderLoweredG(gpa, src, "f");
+    const ir = try renderUnit(gpa, src, "f", .{});
     defer gpa.free(ir);
     const l0 = std.mem.indexOf(u8, ir, "fn_addr @main.f$l0").?;
     const l1 = std.mem.indexOf(u8, ir, "fn_addr @main.f$l1").?;
     try testing.expect(l0 < l1);
     // The nested lambda is created by its parent's unit, not by `f`.
     try testing.expect(std.mem.indexOf(u8, ir, "main.f$l2") == null);
-    const outer = try renderLambdaG(gpa, src, "main.f$l1");
+    const outer = try renderUnit(gpa, src, "main.f$l1", .{});
     defer gpa.free(outer);
     try testing.expect(std.mem.indexOf(u8, outer, "fn_addr @main.f$l2") != null);
 }
 
 test "lowerLambda binds env as slot 0 and params by resolver slot" {
     const gpa = testing.allocator;
-    const ir = try renderLambdaG(gpa,
+    const ir = try renderUnit(gpa,
         \\fn f() -> int {
         \\ a := 5
         \\ g := fn(x: int, y: bool) -> int { if y { x } else { 0 } }
         \\ return a + g(1, true)
         \\}
         \\
-    , "main.f$l0");
+    , "main.f$l0", .{});
     defer gpa.free(ir);
     try testing.expectEqualStrings(
         \\fn main.f$l0(s0, s1, s2) -> int {
@@ -5604,7 +5429,7 @@ test "lowerLambda binds env as slot 0 and params by resolver slot" {
 
 test "a capturing lambda allocates its env once and stores each capture at its offset" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\fn f() -> int {
         \\ n := 5
         \\ s := "ab"
@@ -5612,7 +5437,7 @@ test "a capturing lambda allocates its env once and stores each capture at its o
         \\ return g(1)
         \\}
         \\
-    , "f");
+    , "f", .{});
     defer gpa.free(ir);
     // One 24-byte cell, allocated before it is filled: n at +0 by value, s at +8 by copy;
     // then the cell is the pair's env word.
@@ -5638,7 +5463,7 @@ test "a capturing lambda allocates its env once and stores each capture at its o
 
 test "a lambda prologue copies captures into locals" {
     const gpa = testing.allocator;
-    const ir = try renderLambdaG(gpa,
+    const ir = try renderUnit(gpa,
         \\fn f() -> int {
         \\ n := 5
         \\ s := "ab"
@@ -5646,7 +5471,7 @@ test "a lambda prologue copies captures into locals" {
         \\ return g(1)
         \\}
         \\
-    , "main.f$l0");
+    , "main.f$l0", .{});
     defer gpa.free(ir);
     try testing.expectEqualStrings(
         \\fn main.f$l0(s0, s1) -> int {
@@ -5679,7 +5504,7 @@ test "a lambda prologue copies captures into locals" {
 }
 
 test "a boxed local's reads and writes go through its cell" {
-    try expectLoweredG(
+    try expectUnit(
         \\fn f() -> int {
         \\ n := 1
         \\ g := fn() { n = n + 1 }
@@ -5741,7 +5566,7 @@ test "a boxed local's reads and writes go through its cell" {
     );
     // The lambda binds the capture as an address slot holding the pointer from its env.
     const gpa = testing.allocator;
-    const lam = try renderLambdaG(gpa,
+    const lam = try renderUnit(gpa,
         \\fn f() -> int {
         \\ n := 1
         \\ g := fn() { n = n + 1 }
@@ -5750,7 +5575,7 @@ test "a boxed local's reads and writes go through its cell" {
         \\ return n
         \\}
         \\
-    , "main.f$l0");
+    , "main.f$l0", .{});
     defer gpa.free(lam);
     try testing.expectEqualStrings(
         \\fn main.f$l0(s0) -> unit {
@@ -5780,7 +5605,7 @@ test "a boxed local's reads and writes go through its cell" {
 
 test "a boxed for variable gets a fresh box per iteration and copies back before inc" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\fn f() -> int {
         \\ s := 0
         \\ for i in 0..3 {
@@ -5791,7 +5616,7 @@ test "a boxed for variable gets a fresh box per iteration and copies back before
         \\ return s
         \\}
         \\
-    , "f");
+    , "f", .{});
     defer gpa.free(ir);
     // s1 is the hidden counter the header tests; the body starts by allocating a new cell
     // for `i` (s2) and copying the counter into it.
@@ -5832,14 +5657,14 @@ test "a boxed for variable gets a fresh box per iteration and copies back before
 
 test "a read-only capture is not boxed" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\fn f() -> int {
         \\ n := 1
         \\ g := fn() -> int { n }
         \\ return g()
         \\}
         \\
-    , "f");
+    , "f", .{});
     defer gpa.free(ir);
     // One allocation, the env; `n` is a plain int slot whose value is copied in.
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, ir, "call @gc_alloc("));
@@ -5856,7 +5681,7 @@ test "a read-only capture is not boxed" {
 test "mut self receiver lowering is unchanged" {
     // A `mut self` method that also has a boxed local: `self` stays the int pointer slot
     // s0 (loaded as int), `n` the rawptr cell slot s2 (loaded as rawptr).
-    try expectLoweredG(
+    try expectUnit(
         \\struct P { x: int, y: int }
         \\impl P {
         \\ fn step(mut self, d: int) -> int {
@@ -5970,7 +5795,7 @@ test "every binding form boxes" {
     for (cases) |case| {
         const src = try std.mem.concat(gpa, u8, &.{ case.src, "fn main() -> int { return 0 }\n" });
         defer gpa.free(src);
-        const ir = if (case.lambda) try renderLambdaG(gpa, src, case.unit) else try renderLoweredG(gpa, src, case.unit);
+        const ir = if (case.lambda) try renderUnit(gpa, src, case.unit, .{}) else try renderUnit(gpa, src, case.unit, .{});
         defer gpa.free(ir);
         try testing.expectEqual(case.cells, std.mem.count(u8, ir, "call @gc_alloc("));
         try testing.expect(std.mem.indexOf(u8, ir, ":rawptr") != null);
@@ -5979,14 +5804,14 @@ test "every binding form boxes" {
 
 test "a fn value lowers to fn_addr of its thunk and a null env" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\fn g(x: int) -> int { return x }
         \\fn f() -> int {
         \\ h := g
         \\ return h(1)
         \\}
         \\
-    , "f");
+    , "f", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "fn_addr @main.g$fnval\n") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "iconst 0\n") != null);
@@ -5996,10 +5821,10 @@ test "a fn value lowers to fn_addr of its thunk and a null env" {
 
 test "a value call passes env as argument 0" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\fn apply(f: fn(int, bool) -> int, x: int) -> int { return f(x, true) }
         \\
-    , "apply");
+    , "apply", .{});
     defer gpa.free(ir);
     // The code is the pair's word at +0 and the env its rawptr word at +8, both loaded
     // before the args are evaluated.
@@ -6015,20 +5840,20 @@ test "a value call passes env as argument 0" {
 
 test "fn identity == compares both words, no Eq call" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\fn same(a: fn(int) -> int, b: fn(int) -> int) -> bool { return a == b }
         \\fn diff(a: fn(int) -> int, b: fn(int) -> int) -> bool { return a != b }
         \\
-    , "same");
+    , "same", .{});
     defer gpa.free(ir);
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, ir, "bxor"));
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, ir, "bor"));
     try testing.expect(std.mem.indexOf(u8, ir, "icmp eq") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "call") == null);
-    const ne = try renderLoweredG(gpa,
+    const ne = try renderUnit(gpa,
         \\fn diff(a: fn(int) -> int, b: fn(int) -> int) -> bool { return a != b }
         \\
-    , "diff");
+    , "diff", .{});
     defer gpa.free(ne);
     try testing.expect(std.mem.indexOf(u8, ne, "icmp ne") != null);
     try testing.expect(std.mem.indexOf(u8, ne, "call") == null);
@@ -6036,12 +5861,12 @@ test "fn identity == compares both words, no Eq call" {
 
 test "struct == lowers to a call to the Eq witness (no inline icmp)" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\struct P { x: int }
         \\impl P has Eq { fn eq(self, o: P) -> bool { self.x == o.x } }
         \\fn cmp(p: P, q: P) -> bool { p == q }
         \\
-    , "cmp");
+    , "cmp", .{});
     defer gpa.free(ir);
     // Dispatches to the witness call; the struct compare itself has no inline icmp.
     try testing.expect(std.mem.indexOf(u8, ir, "call @") != null);
@@ -6051,10 +5876,10 @@ test "struct == lowers to a call to the Eq witness (no inline icmp)" {
 
 test "str == lowers to a heap-free len-compare + per-byte load_byte loop" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\fn cmp(a: str, b: str) -> bool { a == b }
         \\
-    , "cmp");
+    , "cmp", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "load_byte") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "icmp ge") != null); // the i >= len loop guard
@@ -6063,23 +5888,23 @@ test "str == lowers to a heap-free len-compare + per-byte load_byte loop" {
 
 test "unit == folds to bconst true" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\fn nothing() { return }
         \\fn cmp() -> bool { nothing() == nothing() }
         \\
-    , "cmp");
+    , "cmp", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "bconst true") != null);
 }
 
 test "!= wraps the Eq result in bnot" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\struct P { x: int }
         \\impl P has Eq { fn eq(self, o: P) -> bool { self.x == o.x } }
         \\fn cmp(p: P, q: P) -> bool { p != q }
         \\
-    , "cmp");
+    , "cmp", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "call @") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "bnot") != null);
@@ -6087,10 +5912,10 @@ test "!= wraps the Eq result in bnot" {
 
 test "int == stays a single inline icmp eq (regression pin: bytes unchanged)" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\fn cmp(a: int, b: int) -> bool { a == b }
         \\
-    , "cmp");
+    , "cmp", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "icmp eq") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "call") == null);
@@ -6100,10 +5925,10 @@ test "int == stays a single inline icmp eq (regression pin: bytes unchanged)" {
 
 test "int != stays a single inline icmp ne (regression pin: no bnot)" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\fn cmp(a: int, b: int) -> bool { a != b }
         \\
-    , "cmp");
+    , "cmp", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "icmp ne") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "bnot") == null);
@@ -6121,7 +5946,7 @@ const ord_impl_src =
 
 test "struct `<` lowers to the cmp witness call + get_tag + `icmp eq` (no bnot)" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa, ord_impl_src ++ "fn use_lt(p: P, q: P) -> bool { p < q }\n", "use_lt");
+    const ir = try renderUnit(gpa, ord_impl_src ++ "fn use_lt(p: P, q: P) -> bool { p < q }\n", "use_lt", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "call @") != null); // the cmp witness
     try testing.expect(std.mem.indexOf(u8, ir, "cmp$Ord(") != null);
@@ -6133,7 +5958,7 @@ test "struct `<` lowers to the cmp witness call + get_tag + `icmp eq` (no bnot)"
 
 test "struct `>=` lowers to the cmp witness call + get_tag + `icmp ne`" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa, ord_impl_src ++ "fn use_ge(p: P, q: P) -> bool { p >= q }\n", "use_ge");
+    const ir = try renderUnit(gpa, ord_impl_src ++ "fn use_ge(p: P, q: P) -> bool { p >= q }\n", "use_ge", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "call @") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "get_tag") != null);
@@ -6150,7 +5975,7 @@ test "int `<`/`<=`/`>`/`>=` stay a single inline icmp (regression pin: bytes unc
         .{ .src = "fn f(a: int, b: int) -> bool { a >= b }\n", .want = "icmp ge" },
     };
     for (cases) |c| {
-        const ir = try renderLoweredG(gpa, c.src, "f");
+        const ir = try renderUnit(gpa, c.src, "f", .{});
         defer gpa.free(ir);
         try testing.expect(std.mem.indexOf(u8, ir, c.want) != null);
         try testing.expect(std.mem.indexOf(u8, ir, "call") == null);
@@ -6162,7 +5987,7 @@ test "int `<`/`<=`/`>`/`>=` stay a single inline icmp (regression pin: bytes unc
 
 test "str `<` lowers to a heap-free lexicographic load_byte loop (no witness call)" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa, "fn use_lt(a: str, b: str) -> bool { a < b }\n", "use_lt");
+    const ir = try renderUnit(gpa, "fn use_lt(a: str, b: str) -> bool { a < b }\n", "use_lt", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "load_byte") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "call") == null); // no witness fn, no heap
@@ -6172,7 +5997,7 @@ test "str `<` lowers to a heap-free lexicographic load_byte loop (no witness cal
 
 test "bool `<` stays an inline icmp (false<true), no call/load_byte" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa, "fn f(a: bool, b: bool) -> bool { a < b }\n", "f");
+    const ir = try renderUnit(gpa, "fn f(a: bool, b: bool) -> bool { a < b }\n", "f", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "icmp lt") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "call") == null);
@@ -6182,7 +6007,7 @@ test "bool `<` stays an inline icmp (false<true), no call/load_byte" {
 
 test "Ord refines Eq — `==` on an Ord-only struct lowers via a cmp call + `icmp eq`" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa, ord_impl_src ++ "fn use_eq(p: P, q: P) -> bool { p == q }\n", "use_eq");
+    const ir = try renderUnit(gpa, ord_impl_src ++ "fn use_eq(p: P, q: P) -> bool { p == q }\n", "use_eq", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "call @") != null); // the cmp witness (no `eq` witness)
     try testing.expect(std.mem.indexOf(u8, ir, "cmp$Ord(") != null);
@@ -6193,7 +6018,7 @@ test "Ord refines Eq — `==` on an Ord-only struct lowers via a cmp call + `icm
 
 test "Ord refines Eq — `!=` on an Ord-only struct lowers via a cmp call + `icmp ne` (no bnot)" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa, ord_impl_src ++ "fn use_ne(p: P, q: P) -> bool { p != q }\n", "use_ne");
+    const ir = try renderUnit(gpa, ord_impl_src ++ "fn use_ne(p: P, q: P) -> bool { p != q }\n", "use_ne", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "call @") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "get_tag") != null);
@@ -6205,11 +6030,11 @@ test "derivable struct `<` lowers to the derived cmp call + get_tag + `icmp eq`"
     const gpa = testing.allocator;
     // No `impl P has Ord` — the checker records a derive request and the barrier synthesizes
     // `Ord$cmp$s0`; `p < q` resolves the DERIVED cmp witness (fn_id==0) and calls it.
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\struct P { x: int }
         \\fn use_lt(p: P, q: P) -> bool { p < q }
         \\
-    , "use_lt");
+    , "use_lt", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "call @Ord$cmp$s0") != null); // the derived witness
     try testing.expect(std.mem.indexOf(u8, ir, "get_tag") != null); // read the Ordering tag
@@ -6221,7 +6046,7 @@ test "`==` on a derivable-Ord struct lowers via the derived cmp call + `icmp eq`
     const gpa = testing.allocator;
     // `<` derives Ord, which fills `(Eq, P)`; `==` then routes through the same derived cmp
     // (no separate Eq witness) — the refinement path over a SOURCE-LESS witness.
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\struct P { x: int }
         \\fn use_both(p: P, q: P) -> int {
         \\ if p < q { return 1 }
@@ -6229,7 +6054,7 @@ test "`==` on a derivable-Ord struct lowers via the derived cmp call + `icmp eq`
         \\ return 0
         \\}
         \\
-    , "use_both");
+    , "use_both", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "call @Ord$cmp$s0") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "get_tag") != null);
@@ -6248,7 +6073,7 @@ const add_impl_src =
 
 test "struct `+` lowers to a call to the Add witness (aggregate return, no inline add)" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa, add_impl_src ++ "fn use_add(p: V2, q: V2) -> V2 { p + q }\n", "use_add");
+    const ir = try renderUnit(gpa, add_impl_src ++ "fn use_add(p: V2, q: V2) -> V2 { p + q }\n", "use_add", .{});
     defer gpa.free(ir);
     // Dispatches to the `add` witness; its aggregate result lands in a ret_slot. The
     // top-level `+` itself must NOT emit an inline machine `add` (only the witness BODY
@@ -6269,7 +6094,7 @@ test "struct `-`/`*`/`/` dispatch to the Sub/Mul/Div witness (sibling protocols)
     for (cases) |c| {
         const src = try std.fmt.allocPrint(gpa, "{s}{s}", .{ add_impl_src, c.use });
         defer gpa.free(src);
-        const ir = try renderLoweredG(gpa, src, "f");
+        const ir = try renderUnit(gpa, src, "f", .{});
         defer gpa.free(ir);
         try testing.expect(std.mem.indexOf(u8, ir, "call @") != null);
         try testing.expect(std.mem.indexOf(u8, ir, c.method) != null);
@@ -6286,7 +6111,7 @@ test "int `+`/`-`/`*`/`/` stay a single inline op (regression pin: bytes unchang
         .{ .src = "fn f(a: int, b: int) -> int { a / b }\n", .want = "sdiv %" },
     };
     for (cases) |c| {
-        const ir = try renderLoweredG(gpa, c.src, "f");
+        const ir = try renderUnit(gpa, c.src, "f", .{});
         defer gpa.free(ir);
         try testing.expect(std.mem.indexOf(u8, ir, c.want) != null);
         try testing.expect(std.mem.indexOf(u8, ir, "call") == null);
@@ -6312,7 +6137,7 @@ const from_impl_src =
 
 test "a `?` that WIDENS the error emits a call to the From witness in the residual" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa, from_impl_src, "outer");
+    const ir = try renderUnit(gpa, from_impl_src, "outer", .{});
     defer gpa.free(ir);
     // The err residual materializes the operand error, calls `BigErr.from(smallErr)`, and
     // copies the widened error into the return's err payload.
@@ -6322,7 +6147,7 @@ test "a `?` that WIDENS the error emits a call to the From witness in the residu
 
 test "a `?` on a SAME-error-type Result stays a plain copy (no From witness call)" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa, from_impl_src, "same");
+    const ir = try renderUnit(gpa, from_impl_src, "same", .{});
     defer gpa.free(ir);
     // The identity path: the err payload is copied unchanged across the two layouts —
     // no `from` witness is resolved or called.
@@ -6331,9 +6156,9 @@ test "a `?` on a SAME-error-type Result stays a plain copy (no From witness call
 
 test "`?` on a unit-payload Result still emits the residual early-return (no codegen diagnostic)" {
     const gpa = testing.allocator;
-    // renderLoweredG asserts zero diagnostics; before the fix lowerTryValue had no `.unit`
+    // renderUnit fails on any lowering diagnostic; before the fix lowerTryValue had no `.unit`
     // arm and dropped a note here, so a checker-accepted program aborted at codegen.
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\fn inner() -> Result[(), int] { return Result[(), int].err(7) }
         \\fn outer() -> Result[int, int] {
         \\ inner()?
@@ -6341,7 +6166,7 @@ test "`?` on a unit-payload Result still emits the residual early-return (no cod
         \\}
         \\fn main() -> int { return 0 }
         \\
-    , "outer");
+    , "outer", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir, "get_tag") != null);
     try testing.expect(std.mem.indexOf(u8, ir, "cond_br") != null);
@@ -6745,7 +6570,7 @@ test "lower-aggregates: labeled-block break of a struct produces into a temp slo
 test "lower-aggregates: a value call on an if reads the fn pair from its temp slot" {
     // A join block param has no address to load the pair's code and env from; the temp
     // slot both arms copy into does.
-    try expectLoweredG(
+    try expectUnit(
         \\fn inc(x: int) -> int { x + 1 }
         \\fn dec(x: int) -> int { x - 1 }
         \\fn f(c: bool) -> int { (if c { inc } else { dec })(41) }
@@ -6861,7 +6686,7 @@ test "lower-diagnostics: an unknown string escape fails to lower" {
 }
 
 test "a mut-self method body loads self through the pointer slot (s0:int)" {
-    try expectLoweredG(
+    try expectUnit(
         "struct P { x: int, y: int }\n" ++
             "impl P { fn bump(mut self, d: int) { self.x = self.x + d } }\n" ++
             "fn main() -> int { p := P{ x: 40, y: 0 }\n p.bump(2)\n return p.x }\n",
@@ -6891,7 +6716,7 @@ test "a mut-self method body loads self through the pointer slot (s0:int)" {
 }
 
 test "a mut param loads and stores through its int slot" {
-    try expectLoweredG(
+    try expectUnit(
         "fn bump(mut n: int) { n = n + 1 }\n" ++
             "fn main() -> int { c := 1\n bump(c)\n return c }\n",
         "bump",
@@ -6914,7 +6739,7 @@ test "a mut param loads and stores through its int slot" {
 }
 
 test "a mut argument passes the place address" {
-    try expectLoweredG(
+    try expectUnit(
         "struct P { x: int, y: int }\n" ++
             "fn bump(mut n: int) { n = n + 1 }\n" ++
             "fn main() -> int { c := 1\n p := P{ x: 2, y: 3 }\n bump(c)\n bump(p.y)\n return c + p.y }\n",
@@ -6951,7 +6776,7 @@ test "a mut argument passes the place address" {
 }
 
 test "a forwarded mut param passes the address it holds" {
-    try expectLoweredG(
+    try expectUnit(
         "fn bump(mut n: int) { n = n + 1 }\n" ++
             "fn twice(mut n: int) { bump(n)\n bump(n) }\n" ++
             "fn main() -> int { c := 1\n twice(c)\n return c }\n",
@@ -6973,7 +6798,7 @@ test "a forwarded mut param passes the address it holds" {
 }
 
 test "a whole assignment to a mut aggregate param builds the value aside, then copies it to the caller's storage" {
-    try expectLoweredG(
+    try expectUnit(
         "struct P { x: int, y: int }\n" ++
             "fn set(mut p: P) { p = P{ x: 5, y: 6 } }\n" ++
             "fn main() -> int { q := P{ x: 1, y: 2 }\n set(q)\n return q.x }\n",
@@ -7000,7 +6825,7 @@ test "a whole assignment to a mut aggregate param builds the value aside, then c
 }
 
 test "a mut self method with no other mut param still produces a whole assignment in place" {
-    try expectLoweredG(
+    try expectUnit(
         "struct P { x: int, y: int }\n" ++
             "impl P { fn set(mut self) { self = P{ x: 5, y: 6 } } }\n" ++
             "fn main() -> int { q := P{ x: 1, y: 2 }\n q.set()\n return q.x }\n",
@@ -7024,7 +6849,7 @@ test "a mut self method with no other mut param still produces a whole assignmen
 }
 
 test "a by-value read of a local some call passes as a mut argument copies it on the spot" {
-    try expectLoweredG(
+    try expectUnit(
         "struct Q { a: int, b: int }\n" ++
             "fn touch(mut p: Q) -> int { p.a = 50\n 0 }\n" ++
             "fn hq(v: Q, k: int) -> int { v.a + k }\n" ++
@@ -7054,7 +6879,7 @@ test "a by-value read of a local some call passes as a mut argument copies it on
 }
 
 test "the caller passes the receiver place ADDRESS as arg 0 (a scalar value)" {
-    try expectLoweredG(
+    try expectUnit(
         "struct P { x: int, y: int }\n" ++
             "impl P { fn bump(mut self, d: int) { self.x = self.x + d } }\n" ++
             "fn main() -> int { p := P{ x: 40, y: 0 }\n p.bump(2)\n return p.x }\n",
@@ -7083,7 +6908,7 @@ test "the caller passes the receiver place ADDRESS as arg 0 (a scalar value)" {
 }
 
 test "whole-self value read copies the pointee into a fresh temp" {
-    try expectLoweredG(
+    try expectUnit(
         "struct P { x: int, y: int }\n" ++
             "impl P { fn ident(mut self) -> P { return self } }\n" ++
             "fn main() -> int { p := P{ x: 1, y: 2 }\n q := p.ident()\n return q.x }\n",
@@ -7244,7 +7069,7 @@ test "a local fn's prologue materializes its self value" {
         \\}
         \\
     ;
-    const unit_ir = try renderLambdaG(gpa, src, "main.f$l0");
+    const unit_ir = try renderUnit(gpa, src, "main.f$l0", .{});
     defer gpa.free(unit_ir);
     // `down` is s2: the pair of the unit's own code and the env it was called with, so the
     // recursive call is an ordinary value call.
@@ -7286,7 +7111,7 @@ test "a local fn's prologue materializes its self value" {
         \\
     , unit_ir);
     // The owner makes the closure straight into the name's home slot, s0.
-    const owner_ir = try renderLoweredG(gpa, src, "f");
+    const owner_ir = try renderUnit(gpa, src, "f", .{});
     defer gpa.free(owner_ir);
     try testing.expectEqualStrings(
         \\fn main.f() -> int {
@@ -7324,7 +7149,7 @@ test "a bound method creates {adapter, env} and the adapter calls the witness" {
         \\}
         \\
     ;
-    const ir = try renderLoweredG(gpa, src, "f");
+    const ir = try renderUnit(gpa, src, "f", .{});
     defer gpa.free(ir);
     // The env is a fresh cell holding a copy of `acc`, made once; the pair's code is the
     // adapter, which `adapter_emit` lowers to a call of `main.Acc.plus` with that copy.
@@ -7375,7 +7200,7 @@ test "a bound mut self method passes the box pointer" {
         \\}
         \\
     ;
-    const ir = try renderLoweredG(gpa, src, "f");
+    const ir = try renderUnit(gpa, src, "f", .{});
     defer gpa.free(ir);
     // `c` lives in a cell (s0 holds its pointer), and the env holds that pointer, so the
     // adapter's `bump` and the later `c.n` reach the same storage.
@@ -7422,86 +7247,24 @@ test "a bound mut self method passes the box pointer" {
     , ir);
 }
 
-/// Lower instance `inst_name` as a spec unit with `targets` and return its rendered IR,
-/// gpa-owned. Mirrors `Codegen.renderGraphIr`'s spec class.
-fn renderSpecG(gpa: std.mem.Allocator, src: []const u8, inst_name: []const u8, targets: []const Spec.Target) ![]u8 {
-    const Lexer = @import("lex.zig");
-    const Parser = @import("parse.zig");
-
-    const tokens = try Lexer.tokenize(gpa, src);
-    defer gpa.free(tokens);
-    const tree = try Parser.expectTree(gpa, tokens, src);
-    defer {
-        gpa.free(tree.nodes);
-        gpa.free(tree.extra);
-    }
-
-    var fe = try frontEnd(gpa, tokens, .{ .nodes = tree.nodes, .extra = tree.extra }, src);
-    defer fe.deinit(gpa);
-    const rr = fe.resolve;
-    const tc = fe.typecheck;
-
-    const names = try gpa.alloc(Link.SymName, rr.fns.len);
-    defer {
-        for (names) |nm| gpa.free(nm.name);
-        gpa.free(names);
-    }
-    for (rr.fns, 0..) |gf, i| {
-        const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
-        names[i] = .{ .kind = kind, .name = try gpa.dupe(u8, gf.name) };
-    }
-
-    const k: u32 = for (tc.instances, 0..) |inst, i| {
-        if (std.mem.eql(u8, inst.name.?, inst_name)) break @intCast(i);
-    } else return error.TestUnexpectedResult;
-    const inst = tc.instances[k];
-    const in = Inputs{
-        .tree = .{ .nodes = tree.nodes, .extra = tree.extra },
-        .tokens = tokens,
-        .source = src,
-        .resolutions = rr.resolutions[0],
-        .node_types = inst.node_types,
-        .callees = inst.callees,
-        .layouts = tc.layouts,
-        .enum_layouts = tc.enum_layouts,
-        .names = names,
-        .sig = .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret },
-        .instances = tc.instances,
-        .sigs = tc.sigs,
-        .methods = tc.methods,
-        .derives = tc.derives,
-        .prelude_ids = tc.prelude_ids,
-        .closure = .{ .adapters = tc.adapters, .lambda_units = tc.lambda_units, .owner = .{ .instance = k }, .boxed = inst.boxed, .spec_targets = targets },
-    };
-
-    var diags: std.ArrayList(Diagnostic) = .empty;
-    defer diags.deinit(gpa);
-    var func = try lowerFn(gpa, in, inst.decl_node, .{ .kind = .user_fn, .name = "spec" }, false, &diags);
-    defer func.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), diags.items.len);
-
-    var buf: [8192]u8 = undefined;
-    var w = std.Io.Writer.fixed(&buf);
-    try Ir.render(&w, &func, in.layouts, in.enum_layouts);
-    return gpa.dupe(u8, w.buffered());
-}
-
-const spec_src =
+/// `both`, called from `main` with `args`; a local holding a fn is no spec target.
+fn specSrc(comptime args: []const u8) []const u8 {
+    return
     \\fn add(x: int, y: int) -> int { x + y }
     \\fn both[T](f: fn(T, T) -> T, g: fn(T, T) -> T, x: T) -> T { g(f(x, x), x) }
-    \\fn main() -> int { both(add, add, 1) }
-    \\
-;
+    \\fn main() -> int {
+    \\    h := add
+    ++ "\n    both(" ++ args ++ ")\n}\n";
+}
 
 test "a spec unit calls its named target directly" {
     const gpa = testing.allocator;
-    const add: Link.SymName = .{ .kind = .user_fn, .name = "main.add" };
-    const ir = try renderSpecG(gpa, spec_src, "main.both$int", &.{.{ .param = 1, .kind = .named, .sym = add }});
+    const ir = try renderUnit(gpa, specSrc("h, add, 1"), "main.both$int$sp1$main.add", .{ .specialize = true });
     defer gpa.free(ir);
     // `g` (param 1) is a direct call without an env; `f` (param 0, no target) stays a value
     // call through its pair.
     try testing.expectEqualStrings(
-        \\fn spec(s0, s1, s2) -> int {
+        \\fn main.both$int$sp1$main.add(s0, s1, s2) -> int {
         \\  slots: s0:fn$int$int$int s1:fn$int$int$int s2:int
         \\b0:
         \\  %1 = slot_addr s0
@@ -7526,13 +7289,12 @@ test "a spec unit calls its named target directly" {
 
 test "a lambda target receives the env from the pair" {
     const gpa = testing.allocator;
-    const lam: Link.SymName = .{ .kind = .user_fn, .name = "main$l0" };
-    const ir = try renderSpecG(gpa, spec_src, "main.both$int", &.{.{ .param = 0, .kind = .lambda, .sym = lam }});
+    const ir = try renderUnit(gpa, specSrc("fn(x: int, y: int) -> int { x + y }, h, 1"), "main.both$int$sp0$main$l0", .{ .specialize = true });
     defer gpa.free(ir);
     // The env word at +8 of `f`'s pair is the lambda unit's hidden first arg; there is no
     // code load and no indirect call for `f`.
     try testing.expectEqualStrings(
-        \\fn spec(s0, s1, s2) -> int {
+        \\fn main.both$int$sp0$main$l0(s0, s1, s2) -> int {
         \\  slots: s0:fn$int$int$int s1:fn$int$int$int s2:int
         \\b0:
         \\  %1 = slot_addr s1
@@ -7569,10 +7331,10 @@ test "with frame storage a non-escaping env is a frame slot and its mutated capt
         \\}
         \\
     ;
-    const heap = try renderLoweredGAt(gpa, src, "main", false);
+    const heap = try renderUnit(gpa, src, "main", .{ .frame = false });
     defer gpa.free(heap);
     try testing.expectEqual(@as(usize, 2), std.mem.count(u8, heap, "call @gc_alloc"));
-    const frame = try renderLoweredGAt(gpa, src, "main", true);
+    const frame = try renderUnit(gpa, src, "main", .{ .frame = true });
     defer gpa.free(frame);
     try testing.expect(std.mem.indexOf(u8, frame, "call @gc_alloc") == null);
     try testing.expect(std.mem.indexOf(u8, frame, "s0:int s1:env$main$l0 s2:fn$unit") != null);
@@ -7595,7 +7357,7 @@ test "with frame storage a by-value read of an unboxed aggregate copies it first
         \\}
         \\
     ;
-    const frame = try renderLoweredGAt(gpa, src, "main", true);
+    const frame = try renderUnit(gpa, src, "main", .{ .frame = true });
     defer gpa.free(frame);
     try testing.expect(std.mem.indexOf(u8, frame, "call @gc_alloc") == null);
     try testing.expect(std.mem.indexOf(u8, frame, "copy ") != null);
@@ -7621,11 +7383,11 @@ test "with frame storage an unboxed capture is an int place slot in the lambda w
         \\}
         \\
     ;
-    const cell = try renderLambdaGAt(gpa, src, "main.f$l0", false);
+    const cell = try renderUnit(gpa, src, "main.f$l0", .{ .frame = false });
     defer gpa.free(cell);
     try testing.expect(std.mem.indexOf(u8, cell, "slots: s0:rawptr s1:int s2:rawptr") != null);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, cell, "copy "));
-    const addr = try renderLambdaGAt(gpa, src, "main.f$l0", true);
+    const addr = try renderUnit(gpa, src, "main.f$l0", .{ .frame = true });
     defer gpa.free(addr);
     try testing.expect(std.mem.indexOf(u8, addr, "slots: s0:rawptr s1:int s2:int") != null);
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, addr, "copy "));
@@ -7658,17 +7420,17 @@ test "a .ref capture is an int place slot in the lambda, and a non-self .ref sta
     ;
     // The env word is the caller's address, read as an int into a place slot; the new
     // value is built whole in a temp and then copied through that address.
-    const lam = try renderLambdaG(gpa, src, "main.swap$l0");
+    const lam = try renderUnit(gpa, src, "main.swap$l0", .{});
     defer gpa.free(lam);
     try testing.expect(std.mem.indexOf(u8, lam, "slots: s0:rawptr s1:int s2:P\n") != null);
     try testing.expect(std.mem.indexOf(u8, lam, "%2 = field_addr %1, 0 : int\n  %3 = load %2 : int\n  %4 = slot_addr s1\n  store %4, %3 : int\n") != null);
     try testing.expect(std.mem.indexOf(u8, lam, "copy %6 <- %18 : P\n") != null);
-    const own = try renderLoweredG(gpa, src, "swap2");
+    const own = try renderUnit(gpa, src, "swap2", .{});
     defer gpa.free(own);
     try testing.expect(std.mem.indexOf(u8, own, "slots: s0:int s1:P\n") != null);
     try testing.expect(std.mem.indexOf(u8, own, "copy %1 <- %13 : P\n") != null);
     // A `mut self` owner writes its receiver in place, so its lambda does too.
-    const self_lam = try renderLambdaG(gpa, src, "main.P.flip$l0");
+    const self_lam = try renderUnit(gpa, src, "main.P.flip$l0", .{});
     defer gpa.free(self_lam);
     try testing.expect(std.mem.indexOf(u8, self_lam, "slots: s0:rawptr s1:int\n") != null);
     try testing.expect(std.mem.indexOf(u8, self_lam, "copy ") == null);
@@ -7676,7 +7438,7 @@ test "a .ref capture is an int place slot in the lambda, and a non-self .ref sta
 
 test "a bound value on a mut param stores the place address in an 8-byte heap env" {
     const gpa = testing.allocator;
-    const ir = try renderLoweredG(gpa,
+    const ir = try renderUnit(gpa,
         \\struct P { x: int }
         \\impl P { fn get(self) -> int { self.x } }
         \\fn f(mut c: P) -> int {
@@ -7688,7 +7450,7 @@ test "a bound value on a mut param stores the place address in an 8-byte heap en
         \\ return f(c)
         \\}
         \\
-    , "f");
+    , "f", .{});
     defer gpa.free(ir);
     try testing.expect(std.mem.indexOf(u8, ir,
         \\  %2 = iconst 8
@@ -7737,7 +7499,7 @@ test "Escape.callTarget names the unit lowerCall calls" {
         \\}
         \\
     ;
-    const ir = try renderLoweredG(gpa, src, "main");
+    const ir = try renderUnit(gpa, src, "main", .{});
     defer gpa.free(ir);
 
     const tokens = try Lexer.tokenize(gpa, src);
