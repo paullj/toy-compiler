@@ -36,6 +36,7 @@ pub const ResolveGraph = @import("resolve_graph.zig");
 pub const Typecheck = @import("types.zig");
 pub const Derive = @import("symbols/Derive.zig");
 pub const Mono = @import("symbols/Mono.zig");
+pub const Mangle = @import("symbols/Mangle.zig");
 pub const ControlFlow = @import("ControlFlow.zig");
 pub const TypecheckGraph = @import("types_graph.zig");
 pub const LayoutEngine = @import("layout/Engine.zig");
@@ -100,6 +101,7 @@ test {
     _ = ResolveGraph;
     _ = Typecheck;
     _ = Derive;
+    _ = Mangle;
     _ = ControlFlow;
     _ = TypecheckGraph;
     _ = LayoutEngine;

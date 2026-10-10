@@ -52,24 +52,13 @@ pub fn substTy(bc: *BodyChecker, ty: Type, targs: []const Type) Type {
         const ord = ty.typeVarOrd();
         return if (ord < targs.len) targs[ord] else Type.invalid;
     }
-    if (ty.isFunc()) {
-        const parts = Composite.fnParts(bc.composite.at(ty.funcIdx()));
-        var buf: [8]Type = undefined;
-        const sub: []Type = if (parts.params.len <= buf.len) buf[0..parts.params.len] else (bc.gpa.alloc(Type, parts.params.len) catch return Type.invalid);
-        defer if (parts.params.len > buf.len) bc.gpa.free(sub);
-        for (parts.params, 0..) |p, i| sub[i] = substTy(bc, p, targs);
-        return refs.internFn(bc, sub, substTy(bc, parts.ret, targs));
-    }
-    if (ty.isApp()) {
-        const e = bc.composite.at(ty.appIdx());
-        var buf: [8]Type = undefined;
-        const sub: []Type = if (e.args.len <= buf.len) buf[0..e.args.len] else (bc.gpa.alloc(Type, e.args.len) catch return Type.invalid);
-        defer if (e.args.len > buf.len) bc.gpa.free(sub);
-        for (e.args, 0..) |a, i| sub[i] = substTy(bc, a, targs);
-        const idx = bc.composite.intern(bc.gpa, e.ctor, sub, e.ctor_is_enum) catch return Type.invalid;
-        return Type.app(idx);
-    }
-    return ty;
+    return refs.mapComposite(bc, ty, struct {
+        bc: *BodyChecker,
+        targs: []const Type,
+        pub fn map(m: @This(), x: Type) Type {
+            return substTy(m.bc, x, m.targs);
+        }
+    }{ .bc = bc, .targs = targs });
 }
 
 /// True when `ty` is a concrete value type usable as a monomorphization type-arg. This
@@ -1041,7 +1030,7 @@ pub const BodyChecker = struct {
             // A `Vec` that reached this module through another one (`m.keys()`) still has
             // its methods, but the sugar names `Vec` as this module sees it.
             if (vec_ctor == null and bc.isStdVec(e))
-                try bc.sink.report(.{ .span = bc.spanOf(site), .code = .T0066 }, "indexing a 'Vec' needs 'Vec' in scope; add 'import std/vec'", .{})
+                try bc.sink.report(.{ .span = bc.spanOf(site), .code = .T0066 }, "indexing a 'Vec' needs 'Vec' in scope; " ++ StdNames.add_import, .{"vec"})
             else
                 try bc.sink.report(.{ .span = bc.spanOf(site), .code = .T0057 }, "cannot index a value of type '{s}'", .{bc.typeName(rt)});
             return Type.invalid;
@@ -1288,7 +1277,7 @@ pub const BodyChecker = struct {
                 const elems = Ast.rangeSlice(bc.tree, n.rhs.int());
                 const vec_ctor = bc.activeStructMap().get(StdNames.vec_struct) orelse {
                     for (elems) |ei| _ = try bc.typeOf(ei);
-                    try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0066 }, "a list literal needs 'Vec' in scope; add 'import std/vec'", .{});
+                    try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0066 }, "a list literal needs 'Vec' in scope; " ++ StdNames.add_import, .{"vec"});
                     break :blk Type.invalid;
                 };
                 var seed: ?Type = null;
@@ -3018,7 +3007,7 @@ pub const BodyChecker = struct {
     /// "; add 'import std/<module>'" into `buf` for `stdMethodModule`, else "".
     fn importHint(buf: []u8, module: ?[]const u8) []const u8 {
         const m = module orelse return "";
-        return std.fmt.bufPrint(buf, "; add 'import std/{s}'", .{m}) catch "";
+        return std.fmt.bufPrint(buf, "; " ++ StdNames.add_import, .{m}) catch "";
     }
 
     fn typeOfCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
@@ -4212,7 +4201,7 @@ pub const BodyChecker = struct {
     /// receiver, its ctor's template methods (so `xs.pushh(1)` on a Vec suggests `push`).
     fn emitNoMethod(bc: *BodyChecker, at: Span, member: []const u8, recv_ty: Type) error{OutOfMemory}!void {
         if (bc.methodFamily(recv_ty)) |fam| if (bc.stdMethodModule(fam, member)) |module|
-            return bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'; add 'import std/{s}'", .{ member, bc.typeName(recv_ty), module });
+            return bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'; " ++ StdNames.add_import, .{ member, bc.typeName(recv_ty), module });
         var iter = MethodNameIter{ .methods = bc.model.methods, .recv = recv_ty };
         if (recv_ty.isApp()) {
             const e = bc.composite.at(recv_ty.appIdx());

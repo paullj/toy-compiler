@@ -95,25 +95,14 @@ fn select(
         .method, .bound_method => |i| {
             if (i >= tc.methods.len) return null;
             const meth = tc.methods[i];
-            // A derive's `fn_id` is 0, so it must be read before any fn-table lookup.
-            if (meth.derive) |di| {
-                if (di >= tc.derives.len) return null;
-                const d = tc.derives[di];
-                return .{ .name = name, .params = d.params, .param_names = selfNames(d.params.len), .ret = d.ret, .has_self = true };
-            }
+            // The derive, instance or fn the call lowers to, as the compiler picks it.
+            const sig = toyc.Typecheck.witnessSig(meth, tc.derives, tc.instances, tc.sigs) orelse return null;
+            // A derive's `fn_id` is 0: it has no declaration to name its params.
+            if (meth.derive != null) return .{ .name = name, .params = sig.params, .param_names = selfNames(sig.params.len), .ret = sig.ret, .has_self = true };
             if (meth.fn_id >= res.fns.len) return null;
             const gf = res.fns[meth.fn_id];
             const names = try declParamNames(a, graph, gf.module, gf.decl_node);
             const decl: ?CalleeSig.Decl = if (gf.decl_node == Ast.none) null else .{ .module = gf.module, .node = gf.decl_node.int() };
-            if (meth.fn_id >= tc.sigs.len) return null;
-            const sig = tc.sigs[meth.fn_id];
-            // A generic template's own sig is over type_vars; the instance is concrete. A
-            // reified row's `fn_id` is its template's, whose modes hold for every instance.
-            if (meth.instance) |ii| {
-                if (ii >= tc.instances.len) return null;
-                const inst = tc.instances[ii];
-                return .{ .name = name, .params = inst.params, .param_names = names, .ret = inst.ret, .has_self = !meth.is_static, .mut_mask = sig.mut_mask, .decl = decl };
-            }
             return .{ .name = name, .params = sig.params, .param_names = names, .ret = sig.ret, .has_self = !meth.is_static, .mut_mask = sig.mut_mask, .decl = decl };
         },
         .protocol => |p| {

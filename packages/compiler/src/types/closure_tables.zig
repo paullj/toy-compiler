@@ -13,6 +13,7 @@ const Modes = @import("../symbols/Modes.zig");
 const Escape = @import("../symbols/Escape.zig");
 const Body = @import("../symbols/Body.zig");
 const Mono = @import("../symbols/Mono.zig");
+const Mangle = @import("../symbols/Mangle.zig");
 const Walk = @import("../ast/Walk.zig");
 const LayoutEngine = @import("../layout/Engine.zig");
 const Abi = @import("../codegen/abi/Abi.zig");
@@ -83,7 +84,7 @@ pub fn buildAdapters(
             .fn_value => a.* = .{
                 .kind = .fn_value,
                 .key = k.key,
-                .name = try Closure.adapterName(gpa, fns[k.key].name, .fn_value),
+                .name = try Mangle.adapter(gpa, fns[k.key].name, .fn_value),
                 .target = .{ .kind = fns[k.key].kind, .name = fns[k.key].name },
                 .sig = .{ .params = sigs[k.key].params, .ret = sigs[k.key].ret },
             },
@@ -94,7 +95,7 @@ pub fn buildAdapters(
                 a.* = .{
                     .kind = k.kind,
                     .key = k.key,
-                    .name = try Closure.adapterName(gpa, target.name, k.kind),
+                    .name = try Mangle.adapter(gpa, target.name, k.kind),
                     .target = target,
                     .sig = .{ .params = sig.params[@min(sig.params.len, 1)..], .ret = sig.ret },
                     .recv = m.recv,
@@ -417,7 +418,7 @@ fn appendLambdaUnits(
         if (!LayoutEngine.isFnStruct(t, layouts)) continue;
         const fs = layouts[t.struct_id].fn_sig.?;
         const proto = Ast.protoAt(mc.tree, mc.tree.nodes[bd.node.int()].lhs.int());
-        const name = try Closure.lambdaName(gpa, b.sig.name, bd.rank);
+        const name = try Mangle.lambda(gpa, b.sig.name, bd.rank);
         errdefer gpa.free(name);
         const params = try gpa.dupe(Type, fs.params);
         errdefer gpa.free(params);

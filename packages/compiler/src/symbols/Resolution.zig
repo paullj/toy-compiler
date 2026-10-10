@@ -51,6 +51,50 @@ pub fn leftmostHeadIsValue(tree: Ast.Tree, resolutions: []const Resolution, head
     return false;
 }
 
+/// The local a place (`x`, `x.f`, `x.0`, or a chain of them) is rooted at: its resolver
+/// slot, or null for a place rooted anywhere else (an index, a call), whose store writes
+/// no local. The one walker the checker, lower and the LSP share.
+pub fn placeRoot(tree: Ast.Tree, resolutions: []const Resolution, place: Ast.Index) ?u32 {
+    var cur = place;
+    while (cur != Ast.none and cur.int() < resolutions.len) {
+        const n = tree.nodes[cur.int()];
+        switch (n.tag) {
+            .field_access, .tuple_field => cur = n.lhs,
+            .identifier => return switch (resolutions[cur.int()]) {
+                .local => |slot| slot,
+                else => null,
+            },
+            else => return null,
+        }
+    }
+    return null;
+}
+
+test placeRoot {
+    const std = @import("std");
+    const Node = Ast.Node;
+    const idx = Ast.Index.from;
+
+    // 0: identifier (local 3)  1: field_access(0)  2: tuple_field(1)
+    // 3: identifier (module)  4: field_access(3)  5: call
+    var nodes = [_]Node{
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .field_access, .main_token = 1, .lhs = idx(0), .rhs = Ast.none },
+        .{ .tag = .tuple_field, .main_token = 2, .lhs = idx(1), .rhs = Ast.none },
+        .{ .tag = .identifier, .main_token = 3, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .field_access, .main_token = 4, .lhs = idx(3), .rhs = Ast.none },
+        .{ .tag = .call, .main_token = 5, .lhs = idx(0), .rhs = Ast.none },
+    };
+    const tree: Ast.Tree = .{ .nodes = &nodes, .extra = &.{} };
+    const res = [_]Resolution{ .{ .local = 3 }, .unresolved, .unresolved, .{ .module = 0 }, .unresolved, .unresolved };
+
+    try std.testing.expectEqual(@as(?u32, 3), placeRoot(tree, &res, idx(0)));
+    try std.testing.expectEqual(@as(?u32, 3), placeRoot(tree, &res, idx(2)));
+    try std.testing.expectEqual(@as(?u32, null), placeRoot(tree, &res, idx(4)));
+    try std.testing.expectEqual(@as(?u32, null), placeRoot(tree, &res, idx(5)));
+    try std.testing.expectEqual(@as(?u32, null), placeRoot(tree, &res, Ast.none));
+}
+
 test leftmostHeadIsValue {
     const std = @import("std");
     const Node = Ast.Node;

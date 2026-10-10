@@ -13,6 +13,7 @@ const std = @import("std");
 const Span = @import("../diagnostics/model.zig").Span;
 const Ast = @import("../ast/Ast.zig");
 const Mono = @import("../symbols/Mono.zig");
+const Mangle = @import("../symbols/Mangle.zig");
 const Composite = @import("../symbols/Composite.zig");
 const LayoutEngine = @import("../layout/Engine.zig");
 const Typecheck = @import("../types.zig");
@@ -123,7 +124,7 @@ fn fnStructFor(t: *Typecheck, params: []const Type, ret: Type) error{OutOfMemory
     defer t.gpa.free(sig_args);
     @memcpy(sig_args[0..params.len], params);
     sig_args[params.len] = ret;
-    const name = try Mono.mangle(t.gpa, "fn", sig_args);
+    const name = try Mangle.instance(t.gpa, "fn", sig_args);
     try t.reified_names.append(t.gpa, name); // owns the minted name (freed at teardown)
     {
         const fnames = try t.gpa.dupe([]const u8, &.{ "code", "env" });
@@ -167,7 +168,7 @@ fn reifyAppToStruct(t: *Typecheck, app_idx: u32) error{OutOfMemory}!u32 {
     const sid: u32 = @intCast(t.structs.items.len);
     try t.reify_map.put(t.gpa, app_idx, Type.structT(sid));
 
-    const name = try Mono.mangle(t.gpa, tmpl.name, cargs);
+    const name = try Mangle.instance(t.gpa, tmpl.name, cargs);
     try t.reified_names.append(t.gpa, name); // owns the minted name (freed at teardown)
     // Claim `sid` with a placeholder BEFORE `substReify` runs: a generic-struct-typed
     // field (`struct Wrapper[T] { b: Box[T] }`) makes `substReify` recurse into
@@ -215,7 +216,7 @@ fn reifyAppToEnum(t: *Typecheck, app_idx: u32) error{OutOfMemory}!Type {
     const eid: u32 = @intCast(t.enums.items.len);
     try t.reify_map.put(t.gpa, app_idx, Type.enumT(eid));
 
-    const name = try Mono.mangle(t.gpa, tmpl.name, cargs);
+    const name = try Mangle.instance(t.gpa, tmpl.name, cargs);
     try t.reified_names.append(t.gpa, name); // owns the minted name (freed at teardown)
     // Claim `eid` with a placeholder BEFORE substituting variants: a variant payload
     // that re-applies a generic (`w(Box[T])` / `cons(T, L[Box[T]])`) makes `substReify`

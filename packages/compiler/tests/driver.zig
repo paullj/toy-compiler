@@ -25,7 +25,7 @@ const Graph = toyc.Graph;
 const Opt = toyc.Opt;
 const lower = toyc.lower;
 const version = toyc.version;
-const Mono = toyc.Mono;
+const Mangle = toyc.Mangle;
 const AstWalk = toyc.AstWalk;
 const Fingerprint = toyc.Fingerprint;
 
@@ -4599,9 +4599,9 @@ test "cross-serializer parity: every int-aware identity serializer folds int_des
             try Typecheck.coherence.appendKeyType(gpa, &cb, b);
             try testing.expectEqual(same, std.mem.eql(u8, ca.items, cb.items));
 
-            const ma = try Mono.mangle(gpa, "id", &.{a});
+            const ma = try Mangle.instance(gpa, "id", &.{a});
             defer gpa.free(ma);
-            const mb = try Mono.mangle(gpa, "id", &.{b});
+            const mb = try Mangle.instance(gpa, "id", &.{b});
             defer gpa.free(mb);
             try testing.expectEqual(same, std.mem.eql(u8, ma, mb));
 

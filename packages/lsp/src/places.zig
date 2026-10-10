@@ -232,34 +232,15 @@ pub const Facts = struct {
                 .var_decl, .local_fn => if (resolutions[i] == .local and resolutions[i].local == slot) {
                     binder = @intCast(i);
                 },
-                .assign => if (f.placeSlot(n.lhs) == slot) return null,
+                .assign => if (toyc.Resolve.placeRoot(m.tree(), resolutions, n.lhs) == slot) return null,
                 else => {},
             }
         }
         for (try f.mutArgs(a)) |ma| {
             const at = m.tokens[m.nodes[ma.node].main_token].start;
-            if (at >= sp.start and at < sp.end and f.placeSlot(Ast.Index.from(ma.node)) == slot) return null;
+            if (at >= sp.start and at < sp.end and toyc.Resolve.placeRoot(m.tree(), resolutions, Ast.Index.from(ma.node)) == slot) return null;
         }
         return binder;
-    }
-
-    /// The local a place (a local, or a field / tuple-field chain rooted at one) is rooted at.
-    fn placeSlot(f: Facts, place: Ast.Index) ?u32 {
-        const m = f.module();
-        const resolutions = f.res.resolutions[f.entry()];
-        var cur = place;
-        while (cur != Ast.none and cur.int() < resolutions.len) {
-            const n = m.nodes[cur.int()];
-            switch (n.tag) {
-                .field_access, .tuple_field => cur = n.lhs,
-                .identifier => return switch (resolutions[cur.int()]) {
-                    .local => |s| s,
-                    else => null,
-                },
-                else => return null,
-            }
-        }
-        return null;
     }
 
     /// The smallest lambda or local fn around `tok` that captures `slot`. Slots number a

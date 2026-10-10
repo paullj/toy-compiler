@@ -5,11 +5,11 @@
 //! monomorphization tail produces the table; codegen enumerates it as extra
 //! lowerable units; the checker's call seal records each generic call's instance
 //! (`instanceOf`) on its callee slot, and every later reader takes it from there. This
-//! module is the SINGLE home for the canonical logic (`find`, the sort key, the mangled
-//! `SymName`) so the consumers cannot drift.
+//! module is the SINGLE home for the canonical logic (`find`, the sort key) so the
+//! consumers cannot drift; the instance's symbol is `Mangle.instance`.
 //!
 //! Determinism is SACRED: `lessThan` is a total order over `(template gid, arg
-//! bytes)` and `mangle` is a pure function of the template name + the arg tuple,
+//! bytes)` and `Mangle.instance` is a pure function of the template name + the arg tuple,
 //! so the instance list, its ids, and its mangled symbols are a pure function of
 //! source (never hashmap/thread order).
 
@@ -284,33 +284,6 @@ pub fn writeKey(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), gid: u32, args:
     for (args) |a| try a.appendKeyBytes(gpa, buf);
 }
 
-/// The mangled instance symbol: `<template>$<arg0>$<arg1>...`. `$` is not a valid
-/// source identifier char, so a mangled name can never collide with a user fn.
-/// Struct/enum args mangle to `s<id>`/`e<id>` (the global id is a deterministic
-/// function of source); the id is only a SEPARATION layer — a struct-layout edit
-/// that keeps the id still flips the instance's fingerprint via the type-arg
-/// layout fold, so the mangled name never needs to encode the layout.
-pub fn mangle(gpa: std.mem.Allocator, template_name: []const u8, args: []const Type) ![]u8 {
-    var buf: std.ArrayList(u8) = .empty;
-    errdefer buf.deinit(gpa);
-    try buf.appendSlice(gpa, template_name);
-    var nb: [16]u8 = undefined;
-    for (args) |a| {
-        try buf.append(gpa, '$');
-        switch (a.kind) {
-            .int => try buf.appendSlice(gpa, a.intName()),
-            .bool => try buf.appendSlice(gpa, "bool"),
-            .str => try buf.appendSlice(gpa, "str"),
-            .unit => try buf.appendSlice(gpa, "unit"),
-            .float => try buf.appendSlice(gpa, "float"),
-            .@"struct" => try buf.appendSlice(gpa, std.fmt.bufPrint(&nb, "s{d}", .{a.nominalId()}) catch unreachable),
-            .@"enum" => try buf.appendSlice(gpa, std.fmt.bufPrint(&nb, "e{d}", .{a.nominalId()}) catch unreachable),
-            else => try buf.appendSlice(gpa, "x"),
-        }
-    }
-    return buf.toOwnedSlice(gpa);
-}
-
 const testing = std.testing;
 
 /// A view over a tiny tree whose template facts answer for exactly one gid (below 10).
@@ -434,37 +407,6 @@ test "callInstanceRef returns null for a value-method field_access callee" {
     var refs: [10]?TemplateRef = undefined;
     const view = fakeView(tree, &resolutions, &node_types, &refs, 5, &params, 1);
     try testing.expectEqual(@as(?CallRef, null), try callInstanceRef(gpa, view, nodes[3]));
-}
-
-test "mangle is index-free-ish and distinct per arg tuple" {
-    const gpa = testing.allocator;
-    const a = try mangle(gpa, "id", &.{Type.int});
-    defer gpa.free(a);
-    try testing.expectEqualStrings("id$int", a);
-    const b = try mangle(gpa, "id", &.{Type.structT(0)});
-    defer gpa.free(b);
-    try testing.expectEqualStrings("id$s0", b);
-    try testing.expect(!std.mem.eql(u8, a, b));
-    const c = try mangle(gpa, "pair", &.{ Type.int, Type.bool });
-    defer gpa.free(c);
-    try testing.expectEqualStrings("pair$int$bool", c);
-}
-
-test "mangle encodes integer width/sign distinctly" {
-    const gpa = testing.allocator;
-    const i8m = try mangle(gpa, "id", &.{Type.int8});
-    defer gpa.free(i8m);
-    try testing.expectEqualStrings("id$int8", i8m);
-    const u32m = try mangle(gpa, "id", &.{Type.uint32});
-    defer gpa.free(u32m);
-    try testing.expectEqualStrings("id$uint32", u32m);
-    const im = try mangle(gpa, "id", &.{Type.int});
-    defer gpa.free(im);
-    // Plain int is byte-identical to before; the widths never collide with it.
-    try testing.expectEqualStrings("id$int", im);
-    try testing.expect(!std.mem.eql(u8, i8m, im));
-    try testing.expect(!std.mem.eql(u8, u32m, im));
-    try testing.expect(!std.mem.eql(u8, i8m, u32m));
 }
 
 /// A decomposer over a static decomposed table, so `callInstanceRef` can infer a container

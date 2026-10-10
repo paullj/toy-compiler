@@ -576,6 +576,19 @@ pub fn isMutParam(tree: Tree, tokens: []const Token, param_idx: Index) bool {
     return n.tag == .param and n.main_token > 0 and tokens[n.main_token - 1].tag == .kw_mut;
 }
 
+/// True when token `i` is the identifier `self`: a method's receiver, recognized by its
+/// text like `mut` by adjacency (see `isMutParam`).
+pub fn isSelfTok(tokens: []const Token, src: []const u8, i: usize) bool {
+    return tokens[i].tag == .identifier and std.mem.eql(u8, tokens[i].text(src), "self");
+}
+
+/// True when the `param` node at `param_idx` is named `self`. Only a method's leading
+/// receiver is: the parser takes `self` there and nowhere else.
+pub fn isSelfParam(tree: Tree, tokens: []const Token, src: []const u8, param_idx: Index) bool {
+    const n = tree.nodes[param_idx.int()];
+    return n.tag == .param and isSelfTok(tokens, src, n.main_token);
+}
+
 /// True when the `call` at `idx` came from `x |> f(..)` (see the `.call` tag). A
 /// synthetic call's `main_token` 0 is excluded, since `tokens[0]` is unrelated to it.
 pub fn isPipedCall(tree: Tree, tokens: []const Token, idx: Index) bool {

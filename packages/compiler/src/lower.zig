@@ -381,7 +381,7 @@ pub fn lowerFn(
         const is_place = Ast.isMutParam(in.tree, in.tokens, pn);
         const pty = if (is_place) Typecheck.Type.int else paramType(in, proto, @intCast(i));
         const sid = try b.addSlot(pty);
-        if (is_place and !(i == 0 and std.mem.eql(u8, in.tokens[in.tree.nodes[pn.int()].main_token].text(in.source), "self")))
+        if (is_place and !(i == 0 and Ast.isSelfParam(in.tree, in.tokens, in.source, pn)))
             b.staged_places = true;
         try params.append(gpa, sid);
         // resolve assigns local slot indices in declaration order, params FIRST
@@ -2795,7 +2795,7 @@ pub fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Type
         // classified as enum-valued are variant constructions, NOT field reads /
         // real calls. Detect by enum type + shape.
         .field_access => {
-            if (ty.kind == .@"enum" and !places.isLocalRootedPlace(b, expr)) {
+            if (ty.kind == .@"enum" and symbols_res.placeRoot(b.in.tree, b.in.resolutions, expr) == null) {
                 try lowerEnumInitInto(b, expr, dst_ptr, ty);
             } else {
                 try copyAggInto(b, expr, dst_ptr, ty);
@@ -3052,7 +3052,7 @@ fn lowerFieldAccess(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{
     }
     // A qualified enum unit-variant `N.V` reaches here as field_access but is a
     // construction, not a field read.
-    if (ty.kind == .@"enum" and !places.isLocalRootedPlace(b, node_idx)) {
+    if (ty.kind == .@"enum" and symbols_res.placeRoot(b.in.tree, b.in.resolutions, node_idx) == null) {
         return try aggregateValue(b, node_idx, ty);
     }
     const addr = try places.lowerPlaceAddr(b, node_idx);

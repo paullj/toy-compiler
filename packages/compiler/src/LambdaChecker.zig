@@ -2,6 +2,7 @@ const std = @import("std");
 const Ast = @import("ast/Ast.zig");
 const Closure = @import("symbols/Closure.zig");
 const Modes = @import("symbols/Modes.zig");
+const symbols_res = @import("symbols/Resolution.zig");
 const Composite = @import("symbols/Composite.zig");
 const Type = @import("layout/Type.zig").Type;
 
@@ -90,32 +91,15 @@ fn sortedSet(items: []u32) []const u32 {
     return items[0..n];
 }
 
-/// The local whose own storage a place `x`, `x.f` or `x.0` names. Null for a place
-/// rooted anywhere else (an index, a call): a store there does not write a local.
-fn placeRoot(bc: *const BodyChecker, place: Ast.Index) ?u32 {
-    var cur = place;
-    while (true) {
-        const nn = bc.tree.nodes[cur.int()];
-        switch (nn.tag) {
-            .field_access, .tuple_field => cur = nn.lhs,
-            .identifier => return switch (bc.resolutions[cur.int()]) {
-                .local => |slot| slot,
-                else => null,
-            },
-            else => return null,
-        }
-    }
-}
-
 /// Record the local an assignment to `place` writes.
 pub fn noteAssignedRoot(bc: *BodyChecker, place: Ast.Index) error{OutOfMemory}!void {
-    if (placeRoot(bc, place)) |slot| try bc.assigned_roots.append(bc.gpa, slot);
+    if (symbols_res.placeRoot(bc.tree, bc.resolutions, place)) |slot| try bc.assigned_roots.append(bc.gpa, slot);
 }
 
 /// Record the local a call writes through: the root of a `mut self` receiver place or
 /// of a `mut` argument.
 pub fn noteMutatedRoot(bc: *BodyChecker, place: Ast.Index) error{OutOfMemory}!void {
-    if (placeRoot(bc, place)) |slot| try bc.mutated_roots.append(bc.gpa, slot);
+    if (symbols_res.placeRoot(bc.tree, bc.resolutions, place)) |slot| try bc.mutated_roots.append(bc.gpa, slot);
 }
 
 /// `fn(params) -> R { body }`: a value of type `fn(P..) -> R`. A param's type is its

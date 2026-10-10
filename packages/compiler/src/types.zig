@@ -38,6 +38,7 @@ const Escape = @import("symbols/Escape.zig");
 const Body = @import("symbols/Body.zig");
 const symbols = @import("symbols/Sym.zig");
 const Mono = @import("symbols/Mono.zig");
+const Mangle = @import("symbols/Mangle.zig");
 const Derive = @import("symbols/Derive.zig");
 pub const DeriveRecipe = Derive.Derive;
 
@@ -237,7 +238,7 @@ pub const refs = struct {
         // it falls through to the bare message unchanged.
         if (StdNames.importHintFor(name)) |hint| {
             if (hint.spelling == null) {
-                self.sink.report(.{ .span = refs.tokSpan(self, tok), .code = .T0001 }, err_unknown_type ++ "; add 'import std/{s}'", .{ name, hint.module }) catch {};
+                self.sink.report(.{ .span = refs.tokSpan(self, tok), .code = .T0001 }, err_unknown_type ++ "; " ++ StdNames.add_import, .{ name, hint.module }) catch {};
                 return .invalid;
             }
         }
@@ -284,6 +285,31 @@ pub const refs = struct {
         };
         const idx = self.composite.internFn(self.gpa, params, ret, name) catch return .invalid;
         return Type.func(idx);
+    }
+
+    /// `ty` rebuilt with `mapper.map(t)` applied to each param and the return of a fn type,
+    /// or to each arg of an `App`, then re-interned; any other type is returned as is. The
+    /// one rebuild of a composite type: each caller maps the leaves (its type variables) and
+    /// recurses through `mapper`. Out of memory poisons to `.invalid`.
+    pub fn mapComposite(self: anytype, ty: Type, mapper: anytype) Type {
+        if (ty.isFunc()) {
+            const parts = Composite.fnParts(self.composite.at(ty.funcIdx()));
+            var buf: [8]Type = undefined;
+            const sub: []Type = if (parts.params.len <= buf.len) buf[0..parts.params.len] else (self.gpa.alloc(Type, parts.params.len) catch return Type.invalid);
+            defer if (parts.params.len > buf.len) self.gpa.free(sub);
+            for (parts.params, 0..) |p, i| sub[i] = mapper.map(p);
+            return refs.internFn(self, sub, mapper.map(parts.ret));
+        }
+        if (ty.isApp()) {
+            const e = self.composite.at(ty.appIdx());
+            var buf: [8]Type = undefined;
+            const sub: []Type = if (e.args.len <= buf.len) buf[0..e.args.len] else (self.gpa.alloc(Type, e.args.len) catch return Type.invalid);
+            defer if (e.args.len > buf.len) self.gpa.free(sub);
+            for (e.args, 0..) |a, i| sub[i] = mapper.map(a);
+            const idx = self.composite.intern(self.gpa, e.ctor, sub, e.ctor_is_enum) catch return Type.invalid;
+            return Type.app(idx);
+        }
+        return ty;
     }
 
     /// `fn(A, B) -> R`, with a unit `-> ()` left off as in the source spelling.
@@ -346,7 +372,7 @@ pub const refs = struct {
             } else {
                 if (StdNames.importHintFor(bname)) |hint| {
                     if (hint.spelling == null) {
-                        self.sink.report(.{ .span = refs.tokSpan(self, base.main_token), .code = .T0001 }, err_unknown_type ++ "; add 'import std/{s}'", .{ bname, hint.module }) catch {};
+                        self.sink.report(.{ .span = refs.tokSpan(self, base.main_token), .code = .T0001 }, err_unknown_type ++ "; " ++ StdNames.add_import, .{ bname, hint.module }) catch {};
                         return .invalid;
                     }
                 }
@@ -2415,24 +2441,13 @@ fn substType(t: *Typecheck, ty: Type, args: []const Type) Type {
         const ord = ty.typeVarOrd();
         return if (ord < args.len) args[ord] else Type.invalid;
     }
-    if (ty.isFunc()) {
-        const parts = Composite.fnParts(t.composite.at(ty.funcIdx()));
-        var buf: [8]Type = undefined;
-        const sub: []Type = if (parts.params.len <= buf.len) buf[0..parts.params.len] else (t.gpa.alloc(Type, parts.params.len) catch return Type.invalid);
-        defer if (parts.params.len > buf.len) t.gpa.free(sub);
-        for (parts.params, 0..) |p, i| sub[i] = t.substType(p, args);
-        return refs.internFn(t, sub, t.substType(parts.ret, args));
-    }
-    if (ty.isApp()) {
-        const e = t.composite.at(ty.appIdx());
-        var buf: [8]Type = undefined;
-        const sub: []Type = if (e.args.len <= buf.len) buf[0..e.args.len] else (t.gpa.alloc(Type, e.args.len) catch return Type.invalid);
-        defer if (e.args.len > buf.len) t.gpa.free(sub);
-        for (e.args, 0..) |a, i| sub[i] = t.substType(a, args);
-        const idx = t.internApp(e.ctor, sub, e.ctor_is_enum) catch return Type.invalid;
-        return Type.app(idx);
-    }
-    return ty;
+    return refs.mapComposite(t, ty, struct {
+        t: *Typecheck,
+        args: []const Type,
+        pub fn map(m: @This(), x: Type) Type {
+            return m.t.substType(x, m.args);
+        }
+    }{ .t = t, .args = args });
 }
 
 /// The serial monomorphization tail. Seeds a worklist from every generic call site
@@ -2491,7 +2506,7 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     // Reification: mint a fresh concrete `struct_id` for every reachable ground
     // `App` (in all node_types + instance sigs + non-generic fn sigs) and REWRITE
     // every `.app` to that `structT`. Serial, BEFORE the sort/mangle (so instance
-    // args are plain `structT` for `Mono.mangle`) and BEFORE the layout snapshot (so
+    // args are plain `structT` for `Mangle.instance`) and BEFORE the layout snapshot (so
     // codegen/fingerprint/cache see only concrete structs). Ids are assigned in an
     // index-INDEPENDENT structural-key order, so they are a pure function of source.
     try reify.reifyApps(t, nts);
@@ -2501,7 +2516,7 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     std.mem.sort(Mono.Instance, t.mono.items, {}, Mono.lessThan);
     for (t.mono.items) |*inst| {
         const tname = if (t.gph_fn_names) |fns| fns[inst.template_gid] else t.nameText(t.tree.nodes[model.fns[inst.template_gid].decl_node.int()].main_token);
-        inst.name = try Mono.mangle(t.gpa, tname, inst.args);
+        inst.name = try Mangle.instance(t.gpa, tname, inst.args);
     }
     // A mangled name is a pure function of (template name, arg tuple); two distinct
     // instances therefore never collide (Debug/ReleaseSafe guard).
@@ -3688,24 +3703,14 @@ pub fn groundProtoType(ty: Type, recv: Type, protocol_args: []const Type) Type {
 /// verdicts are byte-identical. A bad intern degrades to `.invalid` (already an error path).
 pub fn groundProtoTypeDeep(t: *Typecheck, ty: Type, recv: Type, protocol_args: []const Type) Type {
     if (ty.isTypeVar()) return groundProtoType(ty, recv, protocol_args);
-    if (ty.isFunc()) {
-        const parts = Composite.fnParts(t.composite.at(ty.funcIdx()));
-        var buf: [8]Type = undefined;
-        const sub: []Type = if (parts.params.len <= buf.len) buf[0..parts.params.len] else (t.gpa.alloc(Type, parts.params.len) catch return Type.invalid);
-        defer if (parts.params.len > buf.len) t.gpa.free(sub);
-        for (parts.params, 0..) |p, i| sub[i] = groundProtoTypeDeep(t, p, recv, protocol_args);
-        return refs.internFn(t, sub, groundProtoTypeDeep(t, parts.ret, recv, protocol_args));
-    }
-    if (ty.isApp()) {
-        const e = t.composite.at(ty.appIdx());
-        var buf: [8]Type = undefined;
-        const sub: []Type = if (e.args.len <= buf.len) buf[0..e.args.len] else (t.gpa.alloc(Type, e.args.len) catch return Type.invalid);
-        defer if (e.args.len > buf.len) t.gpa.free(sub);
-        for (e.args, 0..) |a, i| sub[i] = groundProtoTypeDeep(t, a, recv, protocol_args);
-        const idx = t.composite.intern(t.gpa, e.ctor, sub, e.ctor_is_enum) catch return Type.invalid;
-        return Type.app(idx);
-    }
-    return ty;
+    return refs.mapComposite(t, ty, struct {
+        t: *Typecheck,
+        recv: Type,
+        protocol_args: []const Type,
+        pub fn map(m: @This(), x: Type) Type {
+            return groundProtoTypeDeep(m.t, x, m.recv, m.protocol_args);
+        }
+    }{ .t = t, .recv = recv, .protocol_args = protocol_args });
 }
 
 /// Decode one fn's signature (param + return types) and append a `FnSym` to the
@@ -3821,7 +3826,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
         // syntactic receiver marker (the leading param the parser named `self`), not off a
         // params[0]-equals-receiver type test — an associated fn whose first parameter
         // happens to be the receiver type (`fn combine(other: Box[T])`) is still self-less.
-        const has_self = proto.params.len > 0 and std.mem.eql(u8, t.nameText(t.tree.nodes[proto.params[0].int()].main_token), "self");
+        const has_self = proto.params.len > 0 and Ast.isSelfParam(t.tree, t.tokens, t.source, proto.params[0]);
         // A static method's `mut` first param is a place param, not a receiver.
         const mut_self = has_self and Modes.isMut(mut_mask, 0);
         if (self_ty.isApp()) {

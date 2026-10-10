@@ -251,12 +251,19 @@ pub fn compute(
 }
 
 /// One projected root: its sp-relative byte offset plus a TAG the collector reads to pick
-/// a trace strategy on the first pop. `tag == 1` marks a `gc_array` container header (the
-/// collector reads its self-describing shape + element/K/V descriptors and runs the precise
-/// container walk); `tag == 0` marks everything else (`Ref`/`rawptr`/`str` — conservatively
-/// word-scanned, always a sound superset). Only the container earns a non-zero tag; a `Ref`
-/// referent is reached by the conservative scan without demanding its descriptor here.
-pub const Root = struct { off: u32, tag: u32 };
+/// a trace strategy on the first pop.
+pub const Root = struct {
+    off: u32,
+    tag: Tag,
+
+    /// `container` marks a `gc_array` container header (the collector reads its
+    /// self-describing shape + element/K/V descriptors and runs the precise container
+    /// walk); `word` marks everything else (`Ref`/`rawptr`/`str` — conservatively
+    /// word-scanned, always a sound superset). Only the container earns a non-zero tag; a
+    /// `Ref` referent is reached by the conservative scan without demanding its descriptor
+    /// here. The values are the runtime's.
+    pub const Tag = enum(u32) { word = 0, container = 1 };
+};
 
 /// Append the managed roots of a cell of type `ty` based at sp-offset `base` to `out`,
 /// RECURSIVELY. The precise-root authority: a managed box (`Ref`/`gc_array`) is a LEAF —
@@ -281,11 +288,11 @@ fn projectCell(
 ) error{OutOfMemory}!void {
     if (types.isRefStruct(ty, layouts)) {
         const fam = layouts[ty.struct_id].native_family;
-        try out.append(gpa, .{ .off = base, .tag = if (fam == .gc_array) 1 else 0 });
+        try out.append(gpa, .{ .off = base, .tag = if (fam == .gc_array) .container else .word });
         return;
     }
     switch (ty.kind) {
-        .rawptr, .str => try out.append(gpa, .{ .off = base, .tag = 0 }),
+        .rawptr, .str => try out.append(gpa, .{ .off = base, .tag = .word }),
         .@"struct" => {
             if (ty.struct_id >= layouts.len) return;
             const l = layouts[ty.struct_id];
@@ -307,13 +314,13 @@ fn projectCell(
                 bounds[k] = out.items.len;
             }
             for (out.items[bounds[0]..]) |*r| {
-                if (r.tag != 1) continue;
+                if (r.tag != .container) continue;
                 for (bounds[0..e.variants.len], bounds[1..]) |lo, hi| {
                     const agrees = for (out.items[lo..hi]) |o| {
-                        if (o.off == r.off and o.tag == 1) break true;
+                        if (o.off == r.off and o.tag == .container) break true;
                     } else false;
                     if (!agrees) {
-                        r.tag = 0;
+                        r.tag = .word;
                         break;
                     }
                 }
@@ -323,40 +330,41 @@ fn projectCell(
     }
 }
 
-/// The per-fn ROOT BITMAP: a byproduct of the (pure) frame layout that names every
-/// frame word holding a managed pointer, so the collector enumerates roots by lookup
-/// rather than a conservative whole-frame scan. Walks `func.slots` (each based at
-/// `fl.slot_off[i]`) then `func.values` (`fl.value_off[i]`) in index order, projecting
-/// each cell's managed roots, and serializes them as a count-prefixed packed list of
-/// `(sp_off, tag)` pairs: `[u32 n][{u32 sp_off, u32 tag} × n]`, little-endian. A
-/// successfully-lowered fn always yields ≥4 bytes (`[u32 0]` when root-less); an empty
-/// payload is the collector's "treat this frame conservatively" signal, reserved for
-/// unmapped frames (builtins / failed lowers) that never run this. Pure over the IR +
-/// read-only layouts, so it is content-fingerprint cacheable and `-jN` byte-identical.
-/// Caller owns the result.
-pub fn projectRoots(
+/// The per-fn ROOTS: a byproduct of the (pure) frame layout that names every frame word
+/// holding a managed pointer, so the collector enumerates roots by lookup rather than a
+/// conservative whole-frame scan. Walks `func.slots` (each based at `fl.slot_off[i]`)
+/// then `func.values` (`fl.value_off[i]`) in index order, projecting each cell's managed
+/// roots. Pure over the IR + read-only layouts, so it is content-fingerprint cacheable and
+/// `-jN` byte-identical. Caller owns the result.
+pub fn collectRoots(
     gpa: std.mem.Allocator,
     func: *const Ir.Function,
     fl: *const FrameLayout,
     layouts: []const Layout,
     enum_layouts: []const EnumLayout,
-) error{OutOfMemory}![]u8 {
+) error{OutOfMemory}![]Root {
     var roots: std.ArrayList(Root) = .empty;
-    defer roots.deinit(gpa);
-
+    errdefer roots.deinit(gpa);
     for (func.slots, 0..) |slot, i| {
         try projectCell(slot.type, fl.slot_off[i], layouts, enum_layouts, &roots, gpa);
     }
     for (func.values, 0..) |vdef, i| {
         try projectCell(vdef.type, fl.value_off[i], layouts, enum_layouts, &roots, gpa);
     }
+    return roots.toOwnedSlice(gpa);
+}
 
-    const buf = try gpa.alloc(u8, 4 + roots.items.len * 8);
-    errdefer gpa.free(buf);
-    std.mem.writeInt(u32, buf[0..4], @intCast(roots.items.len), .little);
-    for (roots.items, 0..) |r, i| {
+/// The ROOT MAP the runtime reads: `roots` as a count-prefixed packed list of
+/// `(sp_off, tag)` pairs, `[u32 n][{u32 sp_off, u32 tag} × n]`, little-endian. A
+/// successfully-lowered fn always yields ≥4 bytes (`[u32 0]` when root-less); an empty
+/// payload is the collector's "treat this frame conservatively" signal, reserved for
+/// unmapped frames (builtins / failed lowers) that never run this. Caller owns the result.
+pub fn encodeRoots(gpa: std.mem.Allocator, roots: []const Root) error{OutOfMemory}![]u8 {
+    const buf = try gpa.alloc(u8, 4 + roots.len * 8);
+    std.mem.writeInt(u32, buf[0..4], @intCast(roots.len), .little);
+    for (roots, 0..) |r, i| {
         std.mem.writeInt(u32, buf[4 + i * 8 ..][0..4], r.off, .little);
-        std.mem.writeInt(u32, buf[4 + i * 8 + 4 ..][0..4], r.tag, .little);
+        std.mem.writeInt(u32, buf[4 + i * 8 + 4 ..][0..4], @intFromEnum(r.tag), .little);
     }
     return buf;
 }
@@ -678,17 +686,6 @@ test "frame: ParamOffsetTooLarge when an incoming stack-arg offset exceeds imm12
     try testing.expect(res == error.FrameTooLarge or res == error.ParamOffsetTooLarge);
 }
 
-// Decode a `[u32 n][{u32 off, u32 tag} × n]` root bitmap.
-fn rootCount(bm: []const u8) u32 {
-    return std.mem.readInt(u32, bm[0..4], .little);
-}
-fn rootAt(bm: []const u8, i: usize) u32 {
-    return std.mem.readInt(u32, bm[4 + i * 8 ..][0..4], .little);
-}
-fn tagAt(bm: []const u8, i: usize) u32 {
-    return std.mem.readInt(u32, bm[4 + i * 8 + 4 ..][0..4], .little);
-}
-
 // A `Layout` with the given fields (owned arrays freed by the caller).
 fn mkLayoutFields(gpa: std.mem.Allocator, fts: []const Type, offs: []const u32, size: u32, fam: NativeFam) !Layout {
     return .{
@@ -710,10 +707,12 @@ test "roots: scalar-only fn yields [u32 0]" {
     defer func.deinit(gpa);
     var fl = try compute(gpa, &func, &.{}, &.{});
     defer fl.deinit(gpa);
-    const bm = try projectRoots(gpa, &func, &fl, &.{}, &.{});
+    const bm = try collectRoots(gpa, &func, &fl, &.{}, &.{});
     defer gpa.free(bm);
-    try testing.expectEqual(@as(u32, 0), rootCount(bm));
-    try testing.expectEqual(@as(usize, 4), bm.len);
+    try testing.expectEqual(@as(usize, 0), bm.len);
+    const bytes = try encodeRoots(gpa, bm);
+    defer gpa.free(bytes);
+    try testing.expectEqualSlices(u8, &.{ 0, 0, 0, 0 }, bytes);
 }
 
 test "roots: a lone rawptr VALUE is projected at its value cell" {
@@ -723,12 +722,16 @@ test "roots: a lone rawptr VALUE is projected at its value cell" {
     defer func.deinit(gpa);
     var fl = try compute(gpa, &func, &.{}, &.{});
     defer fl.deinit(gpa);
-    const bm = try projectRoots(gpa, &func, &fl, &.{}, &.{});
+    const bm = try collectRoots(gpa, &func, &fl, &.{}, &.{});
     defer gpa.free(bm);
-    try testing.expectEqual(@as(u32, 1), rootCount(bm));
-    try testing.expectEqual(fl.value_off[0], rootAt(bm, 0));
-    try testing.expectEqual(@as(u32, 0), tagAt(bm, 0)); // rawptr → conservative tag 0
-    try testing.expectEqual(@as(usize, 12), bm.len); // [u32 n][{off,tag}]
+    try testing.expectEqual(@as(usize, 1), bm.len);
+    try testing.expectEqual(fl.value_off[0], bm[0].off);
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(bm[0].tag)); // rawptr → conservative tag 0
+    const bytes = try encodeRoots(gpa, bm);
+    defer gpa.free(bytes);
+    try testing.expectEqual(@as(usize, 12), bytes.len); // [u32 n][{off,tag}]
+    try testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, bytes[0..4], .little));
+    try testing.expectEqual(fl.value_off[0], std.mem.readInt(u32, bytes[4..8], .little));
 }
 
 test "roots: a str slot projects the ptr half only (base+0), not the len at +8" {
@@ -737,11 +740,11 @@ test "roots: a str slot projects the ptr half only (base+0), not the len at +8" 
     defer func.deinit(gpa);
     var fl = try compute(gpa, &func, &.{}, &.{});
     defer fl.deinit(gpa);
-    const bm = try projectRoots(gpa, &func, &fl, &.{}, &.{});
+    const bm = try collectRoots(gpa, &func, &fl, &.{}, &.{});
     defer gpa.free(bm);
-    try testing.expectEqual(@as(u32, 1), rootCount(bm));
-    try testing.expectEqual(fl.slot_off[1], rootAt(bm, 0)); // the str slot's ptr half
-    try testing.expectEqual(@as(u32, 0), tagAt(bm, 0)); // str → conservative tag 0
+    try testing.expectEqual(@as(usize, 1), bm.len);
+    try testing.expectEqual(fl.slot_off[1], bm[0].off); // the str slot's ptr half
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(bm[0].tag)); // str → conservative tag 0
 }
 
 test "roots: a by-value aggregate recurses to its contained box (Bag{Vec[int], int})" {
@@ -761,13 +764,13 @@ test "roots: a by-value aggregate recurses to its contained box (Bag{Vec[int], i
     defer func.deinit(gpa);
     var fl = try compute(gpa, &func, &ls, &.{});
     defer fl.deinit(gpa);
-    const bm = try projectRoots(gpa, &func, &fl, &ls, &.{});
+    const bm = try collectRoots(gpa, &func, &fl, &ls, &.{});
     defer gpa.free(bm);
     // Bag → Vec@0 → box@0: one recursed root at the Bag slot's base (offset 0 within),
     // carrying the gc_array container tag (1) recovered from the inner box's family.
-    try testing.expectEqual(@as(u32, 1), rootCount(bm));
-    try testing.expectEqual(fl.slot_off[0], rootAt(bm, 0));
-    try testing.expectEqual(@as(u32, 1), tagAt(bm, 0)); // gc_array container → tag 1
+    try testing.expectEqual(@as(usize, 1), bm.len);
+    try testing.expectEqual(fl.slot_off[0], bm[0].off);
+    try testing.expectEqual(@as(u32, 1), @intFromEnum(bm[0].tag)); // gc_array container → tag 1
 }
 
 test "roots: an enum unions its variants' box payload offsets; a () field contributes nothing" {
@@ -796,11 +799,11 @@ test "roots: an enum unions its variants' box payload offsets; a () field contri
     defer func.deinit(gpa);
     var fl = try compute(gpa, &func, &ls, &el);
     defer fl.deinit(gpa);
-    const bm = try projectRoots(gpa, &func, &fl, &ls, &el);
+    const bm = try collectRoots(gpa, &func, &fl, &ls, &el);
     defer gpa.free(bm);
-    try testing.expectEqual(@as(u32, 1), rootCount(bm));
-    try testing.expectEqual(fl.slot_off[0] + 8, rootAt(bm, 0)); // payload_off within the enum slot
-    try testing.expectEqual(@as(u32, 0), tagAt(bm, 0)); // a Ref box → conservative tag 0
+    try testing.expectEqual(@as(usize, 1), bm.len);
+    try testing.expectEqual(fl.slot_off[0] + 8, bm[0].off); // payload_off within the enum slot
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(bm[0].tag)); // a Ref box → conservative tag 0
 }
 
 test "roots: an enum container keeps tag 1 only where every variant has one there" {
@@ -846,10 +849,10 @@ test "roots: an enum container keeps tag 1 only where every variant has one ther
         defer func.deinit(gpa);
         var fl = try compute(gpa, &func, &ls, &el);
         defer fl.deinit(gpa);
-        const bm = try projectRoots(gpa, &func, &fl, &ls, &el);
+        const bm = try collectRoots(gpa, &func, &fl, &ls, &el);
         defer gpa.free(bm);
-        try testing.expectEqual(@as(u32, @intCast(c.tags.len)), rootCount(bm));
-        for (c.tags, 0..) |t, i| try testing.expectEqual(t, tagAt(bm, i));
+        try testing.expectEqual(c.tags.len, bm.len);
+        for (c.tags, 0..) |t, i| try testing.expectEqual(t, @intFromEnum(bm[i].tag));
     }
 }
 
@@ -868,11 +871,11 @@ test "a fn-pair struct slot projects one root at +8" {
     defer func.deinit(gpa);
     var fl = try compute(gpa, &func, &ls, &.{});
     defer fl.deinit(gpa);
-    const bm = try projectRoots(gpa, &func, &fl, &ls, &.{});
+    const bm = try collectRoots(gpa, &func, &fl, &ls, &.{});
     defer gpa.free(bm);
-    try testing.expectEqual(@as(u32, 1), rootCount(bm));
-    try testing.expectEqual(fl.slot_off[0] + 8, rootAt(bm, 0));
-    try testing.expectEqual(@as(u32, 0), tagAt(bm, 0));
+    try testing.expectEqual(@as(usize, 1), bm.len);
+    try testing.expectEqual(fl.slot_off[0] + 8, bm[0].off);
+    try testing.expectEqual(@as(u32, 0), @intFromEnum(bm[0].tag));
 }
 
 test "roots: an env struct's Vec word is tag 1; str, rawptr, Ref, fn-pair env and Option[Vec] words tag 0; an int none" {
@@ -907,15 +910,15 @@ test "roots: an env struct's Vec word is tag 1; str, rawptr, Ref, fn-pair env an
     defer func.deinit(gpa);
     var fl = try compute(gpa, &func, &ls, &el);
     defer fl.deinit(gpa);
-    const bm = try projectRoots(gpa, &func, &fl, &ls, &el);
+    const bm = try collectRoots(gpa, &func, &fl, &ls, &el);
     defer gpa.free(bm);
     const base = fl.slot_off[0];
     const want_off = [_]u32{ 0, 8, 24, 32, 48, 72 };
     const want_tag = [_]u32{ 1, 0, 0, 0, 0, 0 };
-    try testing.expectEqual(@as(u32, want_off.len), rootCount(bm));
+    try testing.expectEqual(@as(usize, want_off.len), bm.len);
     for (want_off, want_tag, 0..) |o, tg, i| {
-        try testing.expectEqual(base + o, rootAt(bm, i));
-        try testing.expectEqual(tg, tagAt(bm, i));
+        try testing.expectEqual(base + o, bm[i].off);
+        try testing.expectEqual(tg, @intFromEnum(bm[i].tag));
     }
 }
 
@@ -925,9 +928,13 @@ test "roots: projection is deterministic (two calls byte-identical)" {
     defer func.deinit(gpa);
     var fl = try compute(gpa, &func, &.{}, &.{});
     defer fl.deinit(gpa);
-    const a = try projectRoots(gpa, &func, &fl, &.{}, &.{});
+    const ra = try collectRoots(gpa, &func, &fl, &.{}, &.{});
+    defer gpa.free(ra);
+    const rb = try collectRoots(gpa, &func, &fl, &.{}, &.{});
+    defer gpa.free(rb);
+    const a = try encodeRoots(gpa, ra);
     defer gpa.free(a);
-    const b = try projectRoots(gpa, &func, &fl, &.{}, &.{});
+    const b = try encodeRoots(gpa, rb);
     defer gpa.free(b);
     try testing.expectEqualSlices(u8, a, b);
 }

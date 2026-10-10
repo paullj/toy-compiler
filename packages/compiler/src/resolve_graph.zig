@@ -1041,9 +1041,9 @@ const GraphResolve = struct {
                     // already returned above, so it is never overridden here.
                     if (StdNames.importHintFor(name)) |hint| {
                         if (hint.spelling) |sp|
-                            try g.sink.report(.{ .span = off, .code = .R0001, .scope = g.cur_mod }, "undeclared identifier '{s}'; use '{s}' and add 'import std/{s}'", .{ name, sp, hint.module })
+                            try g.sink.report(.{ .span = off, .code = .R0001, .scope = g.cur_mod }, "undeclared identifier '{s}'; use '{s}' and " ++ StdNames.add_import, .{ name, sp, hint.module })
                         else
-                            try g.sink.report(.{ .span = off, .code = .R0001, .scope = g.cur_mod }, "undeclared identifier '{s}'; add 'import std/{s}'", .{ name, hint.module });
+                            try g.sink.report(.{ .span = off, .code = .R0001, .scope = g.cur_mod }, "undeclared identifier '{s}'; " ++ StdNames.add_import, .{ name, hint.module });
                     }
                     // If an in-scope name is a close typo of the undeclared one, append a
                     // "did you mean" hint (message-embedded — no note channel yet). The
