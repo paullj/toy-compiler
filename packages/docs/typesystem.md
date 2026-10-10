@@ -536,6 +536,13 @@ protocol is **T0021**. A protocol stores its method NAMES only; the per-impl
 signature-compatibility check (params/return vs the protocol) is **deferred**
 (the builtin `Eq` below is signature-correct by construction).
 
+**Receiver mode.** A conformance method takes its receiver as its protocol method
+declares it, `self` or `mut self`; otherwise **T0076** at the method's receiver. The two
+pass the receiver differently (a copy, or the caller's address), and a desugar that
+calls a witness (`==`/`!=`, `<`, `+`, `Display`, a `Map` key's `Hash`, `for`'s `next`)
+has only the protocol to go by. Every prelude protocol declares `self`; `std/iter`'s
+`Iterator.next` declares `mut self`.
+
 **Prelude.** Protocol/type names that must be universally in scope with no
 import (`Eq`, later `Ord`/`Option`/...) are delivered by **native compiler
 registration** — the same mechanism as the synthesized `print`, chosen over an

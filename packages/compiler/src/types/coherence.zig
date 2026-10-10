@@ -179,6 +179,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
                 }
                 if (mismatch)
                     try t.sink.report(.{ .span = sigSpan(t, method_node), .code = .T0024 }, "impl method '{s}' has a signature incompatible with protocol '{s}'", .{ req, prot.name });
+                try checkReceiverMode(t, prot, j, method_node);
                 // STAMP this witness `Method` entry with the conformance's
                 // `(protocol_id, protocol_args)` so the multi-conformance resolver can pick
                 // it by args. Runs BEFORE `buildModel` (the Model aliases `t.methods.items`
@@ -304,6 +305,7 @@ fn recordGenericConformance(
         }
         if (mismatch)
             try t.sink.report(.{ .span = sigSpan(t, method_node), .code = .T0024 }, "impl method '{s}' has a signature incompatible with protocol '{s}'", .{ req, prot.name });
+        try checkReceiverMode(t, prot, j, method_node);
     }
 
     // Duplicate detection: a 'G'-tagged key so it never aliases a concrete
@@ -321,6 +323,25 @@ fn recordGenericConformance(
     }
     gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items);
     try t.template_conformances.append(t.gpa, .{ .protocol_id = pid, .recv_ctor = e.ctor, .recv_is_enum = e.ctor_is_enum, .protocol_args = try t.gpa.dupe(Type, pargs) });
+}
+
+/// T0076: the conformance method at `fn_idx` must take its receiver the way protocol
+/// method `j` declares it, `self` or `mut self`. The two pass the receiver differently
+/// (a copy, or the caller's address), and a desugar that calls the witness (`==`, `+`,
+/// `io.println`, a `Map` key's hash, `for`'s `next`) has only the protocol to go by.
+fn checkReceiverMode(t: *Typecheck, prot: Typecheck.ProtocolSym, j: usize, fn_idx: Ast.Index) !void {
+    const proto = Ast.protoAt(t.tree, t.tree.nodes[fn_idx.int()].lhs.int());
+    if (proto.params.len == 0 or !Ast.isSelfParam(t.tree, t.tokens, t.source, proto.params[0])) return;
+    const want = prot.requiresMutSelf(j);
+    const self_tok = t.tree.nodes[proto.params[0].int()].main_token;
+    const has_mut = Ast.isMutParam(t.tree, t.tokens, proto.params[0]);
+    if (has_mut == want) return;
+    const span: Span = .{ .start = t.byteOf(if (has_mut) self_tok - 1 else self_tok), .end = t.tokens[self_tok].end };
+    const name = t.nameText(t.tree.nodes[fn_idx.int()].main_token);
+    if (want)
+        try t.sink.report(.{ .span = span, .code = .T0076 }, "impl method '{s}' takes 'self', but protocol '{s}' declares 'mut self'; write 'mut self'", .{ name, prot.name })
+    else
+        try t.sink.report(.{ .span = span, .code = .T0076 }, "impl method '{s}' takes 'mut self', but protocol '{s}' declares 'self'; write 'self'", .{ name, prot.name });
 }
 
 /// `impl T has P`: the header of a conformance block, short of its methods. The decl
@@ -479,5 +500,22 @@ test "coherence diagnostics span the impl or signature at fault" {
         .{ .src = "protocol Show { fn show(self) -> int }\nstruct A { x: int }\nimpl A has Show { fn show(self, _y: int) -> bool { return true } }\n", .key = "incompatible with protocol", .want = "show(self, _y: int) -> bool" },
         .{ .src = "struct A { x: int }\nimpl A has Nope[int] { fn f(self) -> int { return 1 } }\n", .key = "is not a declared protocol", .want = "Nope" },
         .{ .src = "protocol Conv[U] { fn conv(self) -> U }\nstruct A { x: int }\nimpl A has Conv[int, bool] { fn conv(self) -> int { return 1 } }\n", .key = "protocol 'Conv' expects", .want = "Conv[int, bool]" },
+        .{ .src = "struct A { x: int }\nimpl A has Eq { fn eq(mut self, o: A) -> bool { self.x == o.x } }\n", .key = "declares 'self'", .want = "mut self" },
+        .{ .src = "protocol Step { fn step(mut self) -> int }\nstruct A { x: int }\nimpl A has Step { fn step(self) -> int { self.x } }\n", .key = "declares 'mut self'", .want = "self" },
+        .{ .src = "protocol Step[U] { fn step(mut self) -> U }\nstruct B[T] { x: int }\nimpl B[T] has Step[int] { fn step(self) -> int { self.x } }\n", .key = "declares 'mut self'", .want = "self" },
     });
+}
+
+test "a conformance method's receiver mode must be its protocol's (T0076)" {
+    const Case = struct { src: []const u8, t0076: usize };
+    for ([_]Case{
+        // The prelude protocols declare `self`.
+        .{ .src = "struct A { x: int }\nimpl A has Eq { fn eq(mut self, o: A) -> bool { self.x == o.x } }\nimpl A has Display { fn display(mut self) -> str { \"a\" } }\n", .t0076 = 2 },
+        .{ .src = "struct A { x: int }\nimpl A has Eq { fn eq(self, o: A) -> bool { self.x == o.x } }\n", .t0076 = 0 },
+        // A user protocol's `mut self`, on a plain and a generic receiver.
+        .{ .src = "protocol Step { fn step(mut self) -> int }\nstruct A { x: int }\nimpl A has Step { fn step(mut self) -> int { self.x } }\n", .t0076 = 0 },
+        .{ .src = "protocol Step { fn step(mut self) -> int }\nstruct A { x: int }\nimpl A has Step { fn step(self) -> int { self.x } }\n", .t0076 = 1 },
+        .{ .src = "protocol Step { fn step(mut self) -> int }\nstruct B[T] { x: int }\nimpl B[T] has Step { fn step(mut self) -> int { self.x } }\n", .t0076 = 0 },
+        .{ .src = "protocol Step { fn step(self) -> int }\nstruct B[T] { x: int }\nimpl B[T] has Step { fn step(mut self) -> int { self.x } }\n", .t0076 = 1 },
+    }) |c| try Typecheck.expectCodeCount(c.src, .T0076, c.t0076);
 }
