@@ -18,17 +18,18 @@ pub const Callee = extern struct {
     /// protocol id. `.fn_ref`: the referenced fn's global id.
     id: u32 = 0,
 
-    /// `.pending` is checker-internal: the method row only exists once the mono tail
-    /// has reified the receiver, so the seal resolves it (to `.bound_method` when `sub`
-    /// is 1, else `.method`, picking by the call's arg types when `sub` is
-    /// `pending_call_sub`); no consumer ever sees it.
+    /// The three `pending_*` tags are checker-internal: the method row only exists once
+    /// the mono tail has reified the receiver, so the seal resolves them; no consumer ever
+    /// sees one. `.pending_method` becomes `.method`, `.pending_bound` `.bound_method`,
+    /// and `.pending_call` (a call of a method with its own type params, `id` the call
+    /// node) the `.method` row the call's arg types pick.
     /// `.value`: a call of a function-typed value (`f(1)`, `h.run(4)`, `fs[i](x)`).
     /// `.fn_ref`: a named function used as a value (`f := add`), on the name's node.
     /// `.bound_method`: a method used as a value (`f := acc.plus`), on the `field_access`.
     /// `.template`: a call of a method with its own type params that selected no instance
     /// (its args did not check). It views as `.none`; only `templateFn` reads it, so the
     /// LSP can still show the method a half-typed `xs.map(` names.
-    pub const Tag = enum(u8) { none, method, protocol, builtin, pending, value, fn_ref, bound_method, template };
+    pub const Tag = enum(u8) { none, method, protocol, builtin, pending_method, pending_bound, pending_call, value, fn_ref, bound_method, template };
 
     /// The compiler-provided methods that have no `methods` row. The four `opt_*`
     /// ops mirror `Typecheck.OptResultMethod` (`opt_is_tag0` is `is_some`/`is_ok`);
@@ -61,18 +62,22 @@ pub const Callee = extern struct {
         bound_method: u32,
     };
 
-    pub const pending: Callee = .{ .tag = .pending };
+    pub const pending: Callee = .{ .tag = .pending_method };
 
     /// A bound method on a generic-type receiver, resolved by the seal like `pending`.
-    pub const pending_bound: Callee = .{ .tag = .pending, .sub = 1 };
+    pub const pending_bound: Callee = .{ .tag = .pending_bound };
 
     /// A call of a method with its own type params. One instance row per instantiation
-    /// shares the receiver and name, so the seal picks the row by the call's arg types;
-    /// `id` is the call node.
-    pub const pending_call_sub: u8 = 2;
-
+    /// shares the receiver and name, so the seal picks the row by the call's arg types.
     pub fn pendingCall(call: Ast.Index) Callee {
-        return .{ .tag = .pending, .sub = pending_call_sub, .id = call.int() };
+        return .{ .tag = .pending_call, .id = call.int() };
+    }
+
+    pub fn isPending(c: Callee) bool {
+        return switch (c.tag) {
+            .pending_method, .pending_bound, .pending_call => true,
+            else => false,
+        };
     }
 
     pub const value_call: Callee = .{ .tag = .value };
@@ -110,7 +115,7 @@ pub const Callee = extern struct {
     /// The only way a consumer reads a slot.
     pub fn view(c: Callee) View {
         return switch (c.tag) {
-            .none, .pending, .template => .none,
+            .none, .pending_method, .pending_bound, .pending_call, .template => .none,
             .method => .{ .method = c.id },
             .protocol => .{ .protocol = .{ .protocol = c.id, .method = c.aux } },
             .builtin => .{ .builtin = @enumFromInt(c.sub) },
@@ -183,6 +188,8 @@ test "pendingCall views as none and keeps its call" {
     try std.testing.expect(!std.meta.eql(c, Callee.pending));
     try std.testing.expect(!std.meta.eql(c, Callee.pending_bound));
     try std.testing.expectEqual(@as(u32, 42), c.id);
+    for ([_]Callee{ c, Callee.pending, Callee.pending_bound }) |p| try std.testing.expect(p.isPending());
+    try std.testing.expect(!Callee.method(1).isPending() and !(Callee{}).isPending());
 }
 
 test "a template callee views as none and only templateFn reads it" {

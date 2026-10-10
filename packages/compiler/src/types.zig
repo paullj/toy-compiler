@@ -35,6 +35,7 @@ pub const Callee = @import("symbols/Callee.zig").Callee;
 const Closure = @import("symbols/Closure.zig");
 const Modes = @import("symbols/Modes.zig");
 const Escape = @import("symbols/Escape.zig");
+const Body = @import("symbols/Body.zig");
 const symbols = @import("symbols/Sym.zig");
 const Mono = @import("symbols/Mono.zig");
 const Derive = @import("symbols/Derive.zig");
@@ -490,6 +491,12 @@ pub const GraphResult = struct {
     lambda_units: []Closure.LambdaUnit = &.{},
     /// The boxed locals of each lowerable owner that has one, sorted by owner. Owned.
     owner_closures: []Closure.OwnerClosure = &.{},
+    /// Every lowered body written in source, in canonical order (see `Body`): a body's
+    /// index here is its closure owner, its escape unit and its codegen unit. The list is
+    /// owned; each body borrows its tables from this result.
+    bodies: Body.List = .{},
+    /// Each fn's boxed locals by global id, which its body borrows. Owned.
+    fn_boxed: []const []const u32 = &.{},
 
     pub fn deinit(self: *GraphResult, gpa: std.mem.Allocator) void {
         for (self.node_types) |nt| gpa.free(nt);
@@ -556,6 +563,8 @@ pub const GraphResult = struct {
         freeAdapters(gpa, self.adapters);
         Closure.freeLambdaUnits(gpa, self.lambda_units);
         Closure.freeOwnerClosures(gpa, self.owner_closures);
+        gpa.free(self.bodies.items);
+        freeFnBoxed(gpa, self.fn_boxed);
         self.* = undefined;
     }
 };
@@ -563,6 +572,46 @@ pub const GraphResult = struct {
 fn freeAdapters(gpa: std.mem.Allocator, adapters: []const Closure.Adapter) void {
     for (adapters) |a| gpa.free(a.name);
     gpa.free(adapters);
+}
+
+/// The body list: every non-generic user fn with a body in global id order (a generic one
+/// is lowered only through its instances), then every instance in instance order. Each
+/// body borrows its tables from the result.
+fn buildBodies(
+    gpa: std.mem.Allocator,
+    fns: []const GraphFnInput,
+    fsyms: []const FnSym,
+    sigs: []const Sig,
+    node_types: []const []const Type,
+    callees: []const []const Callee,
+    fn_boxed: []const []const u32,
+    instances: []const Mono.Instance,
+) !Body.List {
+    var list: std.ArrayList(Body) = .empty;
+    errdefer list.deinit(gpa);
+    for (fns, fsyms, 0..) |f, fs, gid| {
+        if (f.decl_node == Ast.none or f.kind != .user_fn or fs.isGeneric()) continue;
+        try list.append(gpa, .{
+            .of = .{ .base = @intCast(gid) },
+            .mod = f.module,
+            .decl = f.decl_node,
+            .sig = sigs[gid],
+            .node_types = node_types[f.module],
+            .callees = callees[f.module],
+            .boxed = if (gid < fn_boxed.len) fn_boxed[gid] else &.{},
+        });
+    }
+    const n_base: u32 = @intCast(list.items.len);
+    for (instances, 0..) |inst, k| try list.append(gpa, .{
+        .of = .{ .instance = @intCast(k) },
+        .mod = inst.mod,
+        .decl = inst.decl_node,
+        .sig = .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret, .mut_mask = sigs[inst.template_gid].mut_mask },
+        .node_types = inst.node_types,
+        .callees = inst.callees,
+        .boxed = inst.boxed,
+    });
+    return .{ .items = try list.toOwnedSlice(gpa), .n_base = n_base };
 }
 
 /// The adapter table, sorted by `(kind, key)` and deduped: one `.fn_value` thunk per fn a
@@ -573,14 +622,13 @@ fn freeAdapters(gpa: std.mem.Allocator, adapters: []const Closure.Adapter) void 
 fn buildAdapters(
     gpa: std.mem.Allocator,
     graph: *const GraphCtx,
+    bodies: Body.List,
     callees: []const []const Callee,
     instances: []const Mono.Instance,
     fns: []const GraphFnInput,
-    fsyms: []const FnSym,
     sigs: []const Sig,
     methods: []const Method,
     derives: []const DeriveRecipe,
-    base_boxed: []const []const u32,
 ) ![]Closure.Adapter {
     const Key = struct { kind: Closure.AdapterKind, key: u32 };
     var keys: std.ArrayList(Key) = .empty;
@@ -598,15 +646,7 @@ fn buildAdapters(
     };
     // Whether a bound value boxes depends on its owner's boxed list, so bound values are
     // found per owner, by walking the owner's body.
-    if (any_bound) {
-        for (fns, 0..) |f, gid| {
-            if (!isBaseOwner(f, fsyms[gid])) continue;
-            const mc = &graph.mods[f.module];
-            const boxed: []const u32 = if (gid < base_boxed.len) base_boxed[gid] else &.{};
-            try collectBound(gpa, mc, f.decl_node, callees[f.module], boxed, &keys);
-        }
-        for (instances) |inst| try collectBound(gpa, &graph.mods[inst.mod], inst.decl_node, inst.callees, inst.boxed, &keys);
-    }
+    if (any_bound) for (bodies.items) |b| try collectBound(gpa, &graph.mods[b.mod], b, &keys);
     std.mem.sort(Key, keys.items, {}, struct {
         fn lt(_: void, a: Key, b: Key) bool {
             if (a.kind != b.kind) return @intFromEnum(a.kind) < @intFromEnum(b.kind);
@@ -654,57 +694,47 @@ fn buildAdapters(
     return out;
 }
 
-/// Append the `(kind, method)` adapter key of every bound method value in the body at
-/// `decl` (its lambdas included), read from `callees`, the owner's own slice.
+/// Append the `(kind, method)` adapter key of every bound method value in body `b` (its
+/// lambdas included), read from its own callees.
 fn collectBound(
     gpa: std.mem.Allocator,
     mc: *const GraphCtx.ModuleCtx,
-    decl: Ast.Index,
-    callees: []const Callee,
-    boxed: []const u32,
+    b: Body,
     keys: anytype,
 ) error{OutOfMemory}!void {
     const V = struct {
         gpa: std.mem.Allocator,
         tree: Ast.Tree,
         resolutions: []const Resolution,
-        callees: []const Callee,
-        boxed: []const u32,
-        places: u64,
+        body: Body,
         keys: @TypeOf(keys),
         pub fn on(self: *@This(), ev: AstWalk.Event) error{OutOfMemory}!void {
             const e = switch (ev) {
                 .enter => |e| e,
                 else => return,
             };
-            if (e.idx.int() >= self.callees.len) return;
-            switch (self.callees[e.idx.int()].view()) {
+            if (e.idx.int() >= self.body.callees.len) return;
+            switch (self.body.callees[e.idx.int()].view()) {
                 .bound_method => |mi| try self.keys.append(self.gpa, .{
-                    .kind = Closure.boundKind(Closure.boundRecvLocal(self.tree, self.resolutions, e.idx), self.boxed, self.places),
+                    .kind = Closure.boundKind(Closure.boundRecvLocal(self.tree, self.resolutions, e.idx), self.body.boxed, self.body.sig.mut_mask),
                     .key = mi,
                 }),
                 .none, .method, .protocol, .builtin, .value, .fn_ref => {},
             }
         }
     };
-    const places = Modes.ofProto(mc.tree, mc.tokens, Ast.protoAt(mc.tree, mc.tree.nodes[decl.int()].lhs.int()));
-    var v: V = .{ .gpa = gpa, .tree = mc.tree, .resolutions = mc.resolutions, .callees = callees, .boxed = boxed, .places = places, .keys = keys };
-    try AstWalk.walk(.{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, decl, &v);
+    var v: V = .{ .gpa = gpa, .tree = mc.tree, .resolutions = mc.resolutions, .body = b, .keys = keys };
+    try AstWalk.walk(.{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, b.decl, &v);
 }
 
-/// The lambda-unit table: for each lowerable owner in canonical order (non-generic fns by
-/// global id, then instances in instance order), one unit per lambda or local fn in its
-/// body, in node order. Each unit's signature is the reified pair the lambda's node types
-/// to, and its env is laid out here once, for both the body that makes the closure and the
-/// unit that reads it. Serial over the finished tables, so it is identical at any `-j`.
+/// The lambda-unit table: for each body in order, one unit per lambda or local fn in it, in
+/// node order. Each unit's signature is the reified pair the lambda's node types to, and
+/// its env is laid out here once, for both the body that makes the closure and the unit
+/// that reads it. Serial over the finished tables, so it is identical at any `-j`.
 fn buildLambdaUnits(
     gpa: std.mem.Allocator,
     graph: *const GraphCtx,
-    fns: []const GraphFnInput,
-    fsyms: []const FnSym,
-    base_boxed: []const []const u32,
-    node_types: []const []const Type,
-    instances: []const Mono.Instance,
+    bodies: Body.List,
     layouts: []const Layout,
     enum_layouts: []const EnumLayout,
 ) ![]Closure.LambdaUnit {
@@ -713,25 +743,12 @@ fn buildLambdaUnits(
         for (units.items) |u| Closure.freeLambdaUnit(gpa, u);
         units.deinit(gpa);
     }
-    for (fns, 0..) |f, gid| {
-        if (!isBaseOwner(f, fsyms[gid])) continue;
-        const mc = &graph.mods[f.module];
-        const fc = Closure.findFn(mc.closures, f.decl_node) orelse continue;
-        const boxed: []const u32 = if (gid < base_boxed.len) base_boxed[gid] else &.{};
-        try appendLambdaUnits(gpa, &units, .{ .base = @intCast(gid) }, f.module, f.name, fc, mc, node_types[f.module], boxed, layouts, enum_layouts);
-    }
-    for (instances, 0..) |inst, k| {
-        const mc = &graph.mods[inst.mod];
-        const fc = Closure.findFn(mc.closures, inst.decl_node) orelse continue;
-        try appendLambdaUnits(gpa, &units, .{ .instance = @intCast(k) }, inst.mod, inst.name.?, fc, mc, inst.node_types, inst.boxed, layouts, enum_layouts);
+    for (bodies.items, 0..) |b, i| {
+        const mc = &graph.mods[b.mod];
+        const fc = Closure.findFn(mc.closures, b.decl) orelse continue;
+        try appendLambdaUnits(gpa, &units, @intCast(i), b, fc, mc, layouts, enum_layouts);
     }
     return units.toOwnedSlice(gpa);
-}
-
-/// Whether global fn `f` is lowered as a base owner: a non-generic user fn with a body
-/// (a generic one is lowered only through its instances).
-fn isBaseOwner(f: GraphFnInput, fsym: FnSym) bool {
-    return f.decl_node != Ast.none and f.kind == .user_fn and !fsym.isGeneric();
 }
 
 /// Whether global fn `f` is a generic user fn with a body: a template, lowered only
@@ -740,17 +757,9 @@ fn isTemplateOwner(f: GraphFnInput, fsym: FnSym) bool {
     return f.decl_node != Ast.none and f.kind == .user_fn and fsym.isGeneric();
 }
 
-/// The owner-closure table: each lowerable owner with a boxed local, in canonical owner
-/// order (base fns by global id, then instances in instance order), its boxed slots.
+/// The owner-closure table: each body with a boxed local, in body order, its boxed slots.
 /// Serial over the finished tables, so it is identical at any `-j`.
-fn buildOwnerClosures(
-    gpa: std.mem.Allocator,
-    fns: []const GraphFnInput,
-    fsyms: []const FnSym,
-    base_boxed: []const []const u32,
-    instances: []const Mono.Instance,
-    unboxable: []const []const u32,
-) ![]Closure.OwnerClosure {
+fn buildOwnerClosures(gpa: std.mem.Allocator, bodies: Body.List, unboxable: []const []const u32) ![]Closure.OwnerClosure {
     var out: std.ArrayList(Closure.OwnerClosure) = .empty;
     errdefer {
         for (out.items) |oc| {
@@ -760,15 +769,10 @@ fn buildOwnerClosures(
         }
         out.deinit(gpa);
     }
-    for (base_boxed, 0..) |bx, gid| {
-        if (bx.len == 0 or !isBaseOwner(fns[gid], fsyms[gid])) continue;
+    for (bodies.items, unboxable, 0..) |b, ub, i| {
+        if (b.boxed.len == 0) continue;
         try out.ensureUnusedCapacity(gpa, 1);
-        out.appendAssumeCapacity(try ownerClosure(gpa, .{ .base = @intCast(gid) }, bx, unboxable[gid]));
-    }
-    for (instances, 0..) |inst, k| {
-        if (inst.boxed.len == 0) continue;
-        try out.ensureUnusedCapacity(gpa, 1);
-        out.appendAssumeCapacity(try ownerClosure(gpa, .{ .instance = @intCast(k) }, inst.boxed, unboxable[fns.len + k]));
+        out.appendAssumeCapacity(try ownerClosure(gpa, @intCast(i), b.boxed, ub));
     }
     return out.toOwnedSlice(gpa);
 }
@@ -787,9 +791,9 @@ fn ownerClosure(gpa: std.mem.Allocator, owner: Closure.Owner, boxed: []const u32
     return .{ .owner = owner, .boxed = bx, .unboxable = ub, .kept_boxed = kept };
 }
 
-/// The escape pass's results for the closure tables: each lowered body's unboxable slots
-/// (indexed by `Escape.Units` number, empty for most), and each lambda unit's frame-env
-/// eligibility (indexed like the unit table).
+/// The escape pass's results for the closure tables: each body's unboxable slots (indexed
+/// like the body list, empty for most), and each lambda unit's frame-env eligibility
+/// (indexed like the unit table).
 const EscapeTables = struct {
     unboxable: [][]u32,
     frame: []bool,
@@ -802,34 +806,31 @@ const EscapeTables = struct {
     }
 };
 
-/// One lowered body's read-only tables, as `Escape.factsOf` reads them.
-pub const EscapeView = struct {
-    tree: Ast.Tree,
-    resolutions: []const Resolution,
+/// One escape unit: a body, or a generic template read for T0052 alone.
+const EscapeUnit = struct {
+    mod: u32,
+    decl: Ast.Index,
+    /// Its `mut` params, `mut self` first.
+    modes: u64,
+    params: []const Type,
     node_types: []const Type,
     callees: []const Callee,
-    sigs: []const Sig,
-    instances: []const Mono.Instance,
-    methods: []const Method,
-    layouts: []const Layout,
-
-    pub fn genericTemplate(self: *const EscapeView, gid: u32) ?Mono.TemplateRef {
-        return Mono.templateRef(self.sigs, gid);
-    }
 };
 
-/// The escape pass, serial over the finished tables in canonical owner order (so identical
-/// at any `-j`) and run at every opt level, since it decides legality: a closure that
-/// escapes cannot capture a `mut` param or `mut self` (T0052, at the first such capture in
-/// rank order), and a bound method value on one cannot escape either. It also finds the
-/// boxed slots that only non-escaping closures capture and the lambdas whose env may live
-/// in a frame (non-escaping, within the owner's budget).
+/// The escape pass, serial over the finished tables in body order (so identical at any
+/// `-j`) and run at every opt level, since it decides legality: a closure that escapes
+/// cannot capture a `mut` param or `mut self` (T0052, at the first such capture in rank
+/// order), and a bound method value on one cannot escape either. It also finds the boxed
+/// slots that only non-escaping closures capture and the lambdas whose env may live in a
+/// frame (non-escaping, within the owner's budget). Units `[0, bodies)` are the bodies;
+/// the templates follow, and no call targets one.
 fn analyzeEscapes(
     t: *Typecheck,
     fns: []const GraphFnInput,
     sigs: []const Sig,
     node_types: []const []const Type,
     callees: []const []const Callee,
+    bodies: Body.List,
     instances: []const Mono.Instance,
     methods: []const Method,
     lambda_units: []const Closure.LambdaUnit,
@@ -837,53 +838,43 @@ fn analyzeEscapes(
     enum_layouts: []const EnumLayout,
 ) !EscapeTables {
     const gpa = t.gpa;
-    const is_base = try gpa.alloc(bool, fns.len);
-    defer gpa.free(is_base);
-    for (fns, t.fns.items, is_base) |f, fs, *b| b.* = isBaseOwner(f, fs);
-    const units: Escape.Units = .{ .is_base = is_base };
-    const n_units = fns.len + instances.len;
+    var units: std.ArrayList(EscapeUnit) = .empty;
+    defer units.deinit(gpa);
+    for (bodies.items) |b| try units.append(gpa, .{ .mod = b.mod, .decl = b.decl, .modes = b.sig.mut_mask, .params = b.sig.params, .node_types = b.node_types, .callees = b.callees });
+    for (fns, t.fns.items, 0..) |f, fs, gid| {
+        if (!isTemplateOwner(f, fs)) continue;
+        try units.append(gpa, .{ .mod = f.module, .decl = f.decl_node, .modes = fs.mut_mask, .params = sigs[gid].params, .node_types = node_types[f.module], .callees = callees[f.module] });
+    }
+    const n_bodies = bodies.items.len;
+    const prog: Body.ProgramView = .{ .sigs = sigs, .methods = methods, .instances = instances, .layouts = layouts };
 
-    const facts = try gpa.alloc(?Escape.Facts, n_units);
+    const facts = try gpa.alloc(?Escape.Facts, units.items.len);
     @memset(facts, null);
     defer {
         for (facts) |*f| if (f.*) |*ff| ff.deinit(gpa);
         gpa.free(facts);
     }
-    for (0..n_units) |u| {
-        const inst: ?*const Mono.Instance = if (u < fns.len) null else &instances[u - fns.len];
-        const template = inst == null and !is_base[u] and isTemplateOwner(fns[u], t.fns.items[u]);
-        if (inst == null and !is_base[u] and !template) continue;
-        const mod = if (inst) |i| i.mod else fns[u].module;
-        const decl = if (inst) |i| i.decl_node else fns[u].decl_node;
-        const mc = &t.graph.mods[mod];
+    for (units.items, 0..) |eu, u| {
+        const template = u >= n_bodies;
+        const mc = &t.graph.mods[eu.mod];
         // Only a body with a closure, a param a closure can be passed to, or a `mut` param a
         // bound method value can hold needs facts.
-        const fc = Closure.findFn(mc.closures, decl);
-        const proto = Ast.protoAt(mc.tree, mc.tree.nodes[decl.int()].lhs.int());
-        const has_mut = Modes.ofProto(mc.tree, mc.tokens, proto) != 0;
+        const fc = Closure.findFn(mc.closures, eu.decl);
+        const has_mut = eu.modes != 0;
         // A template is read for T0052 alone, which needs a closure and a `mut` param.
         if (template and (fc == null or !has_mut)) continue;
-        const params = if (inst) |i| i.params else sigs[u].params;
-        const takes_fn = for (params) |p| {
+        const takes_fn = for (eu.params) |p| {
             if (LayoutEngine.isFnStruct(p, layouts)) break true;
         } else false;
         if (fc == null and !takes_fn and !has_mut) continue;
-        const view: EscapeView = .{
-            .tree = mc.tree,
-            .resolutions = mc.resolutions,
-            .node_types = if (inst) |i| i.node_types else node_types[mod],
-            .callees = if (inst) |i| i.callees else callees[mod],
-            .sigs = sigs,
-            .instances = instances,
-            .methods = methods,
-            .layouts = layouts,
-        };
-        facts[u] = try Escape.factsOf(gpa, .{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, &view, units, decl, @intCast(proto.params.len), fc, if (template) .template else .lowered);
+        const proto = Ast.protoAt(mc.tree, mc.tree.nodes[eu.decl.int()].lhs.int());
+        const body: Body.BodyView = .{ .tree = mc.tree, .resolutions = mc.resolutions, .node_types = eu.node_types, .callees = eu.callees };
+        facts[u] = try Escape.factsOf(gpa, .{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, body, prog, bodies, eu.decl, @intCast(proto.params.len), fc, if (template) .template else .lowered);
     }
     var sol = try Escape.solve(gpa, facts);
     defer sol.deinit(gpa);
 
-    const unboxable = try gpa.alloc([]u32, n_units);
+    const unboxable = try gpa.alloc([]u32, n_bodies);
     for (unboxable) |*x| x.* = &.{};
     errdefer {
         for (unboxable) |x| gpa.free(x);
@@ -898,16 +889,12 @@ fn analyzeEscapes(
     var escaping_slots: std.ArrayList(u32) = .empty;
     defer escaping_slots.deinit(gpa);
     var ui: usize = 0;
-    for (0..n_units) |u| {
+    for (units.items, 0..) |eu, u| {
         const f = facts[u] orelse continue;
-        const inst: ?*const Mono.Instance = if (u < fns.len) null else &instances[u - fns.len];
-        const mod = if (inst) |i| i.mod else fns[u].module;
-        const decl = if (inst) |i| i.decl_node else fns[u].decl_node;
-        const mc = &t.graph.mods[mod];
-        const places = Modes.ofProto(mc.tree, mc.tokens, Ast.protoAt(mc.tree, mc.tree.nodes[decl.int()].lhs.int()));
+        const mc = &t.graph.mods[eu.mod];
         reported.clearRetainingCapacity();
         escaping_slots.clearRetainingCapacity();
-        const fc = Closure.findFn(mc.closures, decl);
+        const fc = Closure.findFn(mc.closures, eu.decl);
         const by_rank = try gpa.alloc(u32, if (fc) |c| c.boundaries.len else 0);
         defer gpa.free(by_rank);
         if (fc) |c| for (c.boundaries, 0..) |b, i| {
@@ -919,35 +906,34 @@ fn analyzeEscapes(
             if (!sol.siteEscapes(f, @intCast(u), use)) continue;
             for (b.captures) |c| {
                 try escaping_slots.append(gpa, c.slot);
-                if (!Modes.isMut(places, c.slot) or std.mem.indexOfScalar(u32, reported.items, c.slot) != null) continue;
+                if (!Modes.isMut(eu.modes, c.slot) or std.mem.indexOfScalar(u32, reported.items, c.slot) != null) continue;
                 try reported.append(gpa, c.slot);
-                try reportEscapingCapture(t, mc, mod, c.first_use);
+                try reportEscapingCapture(t, mc, eu.mod, c.first_use);
             }
         }
         // A bound value on a `mut` param holds its address too: in node order, its first
         // escaping one, unless a closure already reported the param.
         for (f.sites) |site| {
             const p = site.recv orelse continue;
-            if (site.kind != .bound or !Modes.isMut(places, p) or std.mem.indexOfScalar(u32, reported.items, p) != null) continue;
+            if (site.kind != .bound or !Modes.isMut(eu.modes, p) or std.mem.indexOfScalar(u32, reported.items, p) != null) continue;
             if (!sol.siteEscapes(f, @intCast(u), site.use)) continue;
             try reported.append(gpa, p);
-            try reportEscapingCapture(t, mc, mod, mc.tree.nodes[site.node.int()].lhs);
+            try reportEscapingCapture(t, mc, eu.mod, mc.tree.nodes[site.node.int()].lhs);
         }
         // A template has no storage of its own to decide: only its instances are lowered.
-        if (inst == null and !is_base[u]) continue;
+        if (u >= n_bodies) continue;
         const fcl = fc orelse continue;
 
         // This owner's units are one run of the (owner, node)-sorted table.
-        const owner: Closure.Owner = if (inst != null) .{ .instance = @intCast(u - fns.len) } else .{ .base = @intCast(u) };
-        while (ui < lambda_units.len and Closure.ownerLess(lambda_units[ui].owner, owner)) ui += 1;
+        const owner: Closure.Owner = @intCast(u);
+        while (ui < lambda_units.len and lambda_units[ui].owner < owner) ui += 1;
         const lo = ui;
-        while (ui < lambda_units.len and std.meta.eql(lambda_units[ui].owner, owner)) ui += 1;
+        while (ui < lambda_units.len and lambda_units[ui].owner == owner) ui += 1;
         const run = lambda_units[lo..ui];
 
-        const boxed: []const u32 = if (inst) |i| i.boxed else if (u < t.base_boxed.len) t.base_boxed[u] else &.{};
         var ub: std.ArrayList(u32) = .empty;
         errdefer ub.deinit(gpa);
-        for (boxed) |sl| {
+        for (bodies.items[u].boxed) |sl| {
             if (std.mem.indexOfScalar(u32, escaping_slots.items, sl) != null or Closure.contains(f.bound_recv, sl)) continue;
             // A slot of 16 B or less never makes the frame bigger than at -O0: it adds at
             // most 8 slot bytes and drops the 16 bytes of values its box costs, so only
@@ -987,18 +973,14 @@ fn reportEscapingCapture(t: *Typecheck, mc: *const GraphCtx.ModuleCtx, mod: u32,
 /// Append one env struct per frame-env lambda unit to `layouts` (after every existing id,
 /// so no id moves) and point the unit at it. Returns the grown table, which replaces
 /// `layouts` (freed) only on success.
-fn appendEnvLayouts(gpa: std.mem.Allocator, layouts: []Layout, lambda_units: []Closure.LambdaUnit, esc: EscapeTables, n_base: usize) ![]Layout {
+fn appendEnvLayouts(gpa: std.mem.Allocator, layouts: []Layout, lambda_units: []Closure.LambdaUnit, esc: EscapeTables) ![]Layout {
     var envs: std.ArrayList(Layout) = .empty;
     defer envs.deinit(gpa);
     errdefer for (envs.items) |l| Closure.freeEnvStruct(gpa, l);
     for (lambda_units, esc.frame) |lu, s| {
         if (!s) continue;
-        const u = switch (lu.owner) {
-            .base => |gid| gid,
-            .instance => |ii| n_base + ii,
-        };
         try envs.ensureUnusedCapacity(gpa, 1);
-        envs.appendAssumeCapacity(try Closure.envStruct(gpa, lu, esc.unboxable[u]));
+        envs.appendAssumeCapacity(try Closure.envStruct(gpa, lu, esc.unboxable[lu.owner]));
     }
     if (envs.items.len == 0) return layouts;
     const out = try gpa.alloc(Layout, layouts.len + envs.items.len);
@@ -1018,23 +1000,19 @@ fn appendLambdaUnits(
     gpa: std.mem.Allocator,
     units: *std.ArrayList(Closure.LambdaUnit),
     owner: Closure.Owner,
-    mod: u32,
-    owner_sym: []const u8,
+    b: Body,
     fc: *const Closure.FnClosures,
     mc: *const GraphCtx.ModuleCtx,
-    node_types: []const Type,
-    boxed: []const u32,
     layouts: []const Layout,
     enum_layouts: []const EnumLayout,
 ) !void {
-    const places = Modes.ofProto(mc.tree, mc.tokens, Ast.protoAt(mc.tree, mc.tree.nodes[fc.fn_node.int()].lhs.int()));
-    for (fc.boundaries) |b| {
-        const t = node_types[b.node.int()];
+    for (fc.boundaries) |bd| {
+        const t = b.node_types[bd.node.int()];
         // Only a program with type errors leaves a lambda untyped, and it is never lowered.
         if (!LayoutEngine.isFnStruct(t, layouts)) continue;
         const fs = layouts[t.struct_id].fn_sig.?;
-        const proto = Ast.protoAt(mc.tree, mc.tree.nodes[b.node.int()].lhs.int());
-        const name = try Closure.lambdaName(gpa, owner_sym, b.rank);
+        const proto = Ast.protoAt(mc.tree, mc.tree.nodes[bd.node.int()].lhs.int());
+        const name = try Closure.lambdaName(gpa, b.sig.name, bd.rank);
         errdefer gpa.free(name);
         const params = try gpa.dupe(Type, fs.params);
         errdefer gpa.free(params);
@@ -1044,19 +1022,19 @@ fn appendLambdaUnits(
             .local => |l| l,
             else => std.math.maxInt(u32),
         };
-        const env = try gpa.alloc(Closure.EnvSlot, b.captures.len);
+        const env = try gpa.alloc(Closure.EnvSlot, bd.captures.len);
         errdefer gpa.free(env);
-        const env_size = try layoutCaptureEnv(gpa, b.captures, node_types, boxed, places, layouts, enum_layouts, env);
+        const env_size = try layoutCaptureEnv(gpa, bd.captures, b.node_types, b.boxed, b.sig.mut_mask, layouts, enum_layouts, env);
         try units.append(gpa, .{
             .owner = owner,
-            .mod = mod,
+            .mod = b.mod,
             .fn_node = fc.fn_node,
-            .node = b.node,
-            .rank = b.rank,
+            .node = bd.node,
+            .rank = bd.rank,
             .name = name,
             .sig = .{ .params = params, .ret = fs.ret },
             .param_slots = slots,
-            .self_slot = b.self_slot,
+            .self_slot = bd.self_slot,
             .env = env,
             .env_size = env_size,
         });
@@ -2013,7 +1991,7 @@ bound_poisoned: []bool = &.{},
 
 /// Per-global-fn-id boxed locals (`Closure.OwnerClosure`), moved out of each body's
 /// check in fn-id order by `checkBodies`; each list owned. Empty until then.
-base_boxed: [][]u32 = &.{},
+fn_boxed: [][]u32 = &.{},
 
 /// Graph context. Always set in practice: `checkGraph` is the ONE entry and
 /// it drives one shared `Typecheck` across the whole module graph (a lone source
@@ -2418,8 +2396,8 @@ pub fn checkGraph(
         t.erased_units.deinit(gpa);
         // The per-fn bound-poison flags (owned; empty until checkBodies ran).
         if (t.bound_poisoned.len > 0) gpa.free(t.bound_poisoned);
-        for (t.base_boxed) |bx| gpa.free(bx);
-        if (t.base_boxed.len > 0) gpa.free(t.base_boxed);
+        for (t.fn_boxed) |bx| gpa.free(bx);
+        if (t.fn_boxed.len > 0) gpa.free(t.fn_boxed);
         // The method table's backing array (entries' names are borrowed source
         // slices). Each entry may own a `protocol_args` dupe (freed here). On success
         // `toOwnedSlice` empties it, so both are a no-op there (the result frees them).
@@ -2551,7 +2529,13 @@ pub fn checkGraph(
         gpa.free(erased_units);
     }
 
-    const adapters = try buildAdapters(gpa, t.graph, callees, instances, fns, t.fns.items, sigs, methods, derives, t.base_boxed);
+    const fn_boxed = t.fn_boxed;
+    t.fn_boxed = &.{};
+    errdefer freeFnBoxed(gpa, fn_boxed);
+    const bodies = try buildBodies(gpa, fns, t.fns.items, sigs, node_types, callees, fn_boxed, instances);
+    errdefer gpa.free(bodies.items);
+
+    const adapters = try buildAdapters(gpa, t.graph, bodies, callees, instances, fns, sigs, methods, derives);
     errdefer freeAdapters(gpa, adapters);
 
     var layouts = try LayoutEngine.snapshotLayouts(gpa, t.structs.items);
@@ -2559,13 +2543,14 @@ pub fn checkGraph(
     const enum_layouts = try LayoutEngine.snapshotEnumLayouts(gpa, t.enums.items);
     errdefer LayoutEngine.freeEnumLayouts(gpa, enum_layouts);
 
-    const lambda_units = try buildLambdaUnits(gpa, t.graph, fns, t.fns.items, t.base_boxed, node_types, instances, layouts, enum_layouts);
+    const lambda_units = try buildLambdaUnits(gpa, t.graph, bodies, layouts, enum_layouts);
     errdefer Closure.freeLambdaUnits(gpa, lambda_units);
-    var esc = try t.analyzeEscapes(fns, sigs, node_types, callees, instances, methods, lambda_units, layouts, enum_layouts);
+    var esc = try t.analyzeEscapes(fns, sigs, node_types, callees, bodies, instances, methods, lambda_units, layouts, enum_layouts);
     defer esc.deinit(gpa);
-    layouts = try appendEnvLayouts(gpa, layouts, lambda_units, esc, fns.len);
-    const owner_closures = try buildOwnerClosures(gpa, fns, t.fns.items, t.base_boxed, instances, esc.unboxable);
+    layouts = try appendEnvLayouts(gpa, layouts, lambda_units, esc);
+    const owner_closures = try buildOwnerClosures(gpa, bodies, esc.unboxable);
     errdefer Closure.freeOwnerClosures(gpa, owner_closures);
+    if (builtin.mode == .Debug) checkOwners(bodies, lambda_units, owner_closures);
 
     // Diagnostics already carry their owning module in `scope`, sorted by
     // runGraph. Hand the owned slices to the result.
@@ -2591,7 +2576,30 @@ pub fn checkGraph(
         .adapters = adapters,
         .lambda_units = lambda_units,
         .owner_closures = owner_closures,
+        .bodies = bodies,
+        .fn_boxed = fn_boxed,
     };
+}
+
+/// Every closure table names its owner by body index: a lambda unit sits in its owner's
+/// decl and module, and owners ascend through both tables as the bodies do.
+fn checkOwners(bodies: Body.List, lambda_units: []const Closure.LambdaUnit, owner_closures: []const Closure.OwnerClosure) void {
+    for (bodies.items[0..bodies.n_base], 0..) |b, i| std.debug.assert(b.of == .base and (i == 0 or bodies.items[i - 1].of.base < b.of.base));
+    for (bodies.items[bodies.n_base..], 0..) |b, k| std.debug.assert(b.of.instance == k);
+    for (lambda_units, 0..) |u, i| {
+        const b = bodies.items[u.owner];
+        std.debug.assert(b.decl == u.fn_node and b.mod == u.mod);
+        std.debug.assert(i == 0 or lambda_units[i - 1].owner <= u.owner);
+    }
+    for (owner_closures, 0..) |oc, i| {
+        std.debug.assert(std.mem.eql(u32, bodies.items[oc.owner].boxed, oc.boxed));
+        std.debug.assert(i == 0 or owner_closures[i - 1].owner < oc.owner);
+    }
+}
+
+fn freeFnBoxed(gpa: std.mem.Allocator, fn_boxed: []const []const u32) void {
+    for (fn_boxed) |bx| gpa.free(bx);
+    gpa.free(fn_boxed);
 }
 
 /// The graph driver: register all types globally, lay them out, decode all fn
@@ -2856,9 +2864,14 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     // generic calls, reading the Pass-C-populated per-module node_types.
     const nts = t.gph_node_types orelse return; // graph mode always sets it
     const cs = t.gph_callees.?;
+    // Each template's facts as the checker holds them: `generic_params.len` is the count.
+    const template_refs = try t.gpa.alloc(?Mono.TemplateRef, model.fns.len);
+    defer t.gpa.free(template_refs);
+    for (model.fns, template_refs) |f, *r| r.* = if (f.isGeneric()) .{ .params = f.params, .count = @intCast(f.generic_params.len) } else null;
+    const templates: Mono.Templates = .{ .refs = .{ .of = template_refs, .decomposer = t.composite.decomposer() } };
     for (model.fns) |f| {
         if (f.kind != .user_fn or f.isGeneric()) continue; // bodyless builtins/externs have no calls
-        try t.scanCalls(model, f.mod, nts[f.mod], cs[f.mod], &worklist, &seen);
+        try t.scanCalls(model, templates, f.mod, nts[f.mod], cs[f.mod], &worklist, &seen);
     }
 
     var capped = false;
@@ -2878,7 +2891,7 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
         const inst = try t.recheck(model, p.gid, p.args);
         try t.mono.append(t.gpa, inst);
         // Discover nested generic calls in the instance body (its own node_types).
-        try t.scanCalls(model, inst.mod, inst.node_types, inst.callees, &worklist, &seen);
+        try t.scanCalls(model, templates, inst.mod, inst.node_types, inst.callees, &worklist, &seen);
     }
 
     // Reification: mint a fresh concrete `struct_id` for every reachable ground
@@ -2966,7 +2979,7 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     t.sink.sort();
 }
 
-/// Resolve every `.pending` slot: only now are receiver types reified and every method row appended.
+/// Resolve every pending slot: only now are receiver types reified and every method row appended.
 fn sealCallees(t: *Typecheck) void {
     for (t.gph_node_types.?, t.gph_callees.?, 0..) |nts, cs, m| t.sealSlice(@intCast(m), nts, cs);
     for (t.mono.items) |inst| t.sealSlice(inst.mod, inst.node_types, inst.callees);
@@ -2982,15 +2995,15 @@ fn sealSlice(t: *const Typecheck, mod: u32, nts: []const Type, cs: []Callee) voi
     const mc = &t.graph.mods[mod];
     const site = Site.of(mc.bundled);
     for (cs, 0..) |*c, i| {
-        if (c.tag != .pending) continue;
+        if (!c.isPending()) continue;
         const fa = mc.tree.nodes[i];
         const member = mc.tokens[fa.main_token].text(mc.source);
-        if (c.sub == Callee.pending_call_sub) {
+        if (c.tag == .pending_call) {
             c.* = t.pickInstanceRow(mc, nts, fa, member, c.id);
             continue;
         }
         c.* = switch (pickMethodIndex(t.methods.items, nts[fa.lhs.int()], member, null, null, site)) {
-            .one => |mi| if (c.sub == Callee.pending_bound.sub) Callee.boundMethod(mi) else Callee.method(mi),
+            .one => |mi| if (c.tag == .pending_bound) Callee.boundMethod(mi) else Callee.method(mi),
             .none, .ambiguous => .{},
         };
     }
@@ -3165,40 +3178,17 @@ fn ownGenericArgs(gpa: std.mem.Allocator, composite: *Composite, mf: FnSym, has_
     return Infer.infer(gpa, @intCast(mf.generic_params.len), params, arg_types, composite.decomposer());
 }
 
-/// The read-only view mono discovery hands `Mono.callInstanceRef`: the module's
-/// tree/resolutions + the pass's `node_types`, plus `genericTemplate` derived from
-/// the `FnSym` (`generic_params.len` is the inference count — the fingerprint side
-/// derives the same count from the `Sig`).
-const DiscoveryView = struct {
-    tree: Ast.Tree,
-    resolutions: []const Resolution,
-    node_types: []const Type,
-    model: *const Model,
-    composite: *Composite,
-    pub fn genericTemplate(self: DiscoveryView, gid: u32) ?Mono.TemplateRef {
-        if (gid >= self.model.fns.len) return null;
-        const f = self.model.fns[gid];
-        if (!f.isGeneric()) return null;
-        return .{ .params = f.params, .count = @intCast(f.generic_params.len) };
-    }
-    /// The live-composite decomposer, so a bare container call `total(xs)` infers its
-    /// hidden type-arg here (compute regime) exactly as Pass C does.
-    pub fn decomposer(self: DiscoveryView) Infer.Decomposer {
-        return self.composite.decomposer();
-    }
-};
-
 /// Scan module `mod`'s nodes for call-position generic calls (and generic-type methods
 /// bound as values, from `callees`), reading `node_types` for the concrete type-args,
 /// and enqueue each new `(gid, args)`. Uniform for the
 /// base seed (module node_types) and an instance re-check (the instance's own
 /// node_types — other fns' nodes stay `.invalid` there, so only THIS body's calls
 /// are seen).
-fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const Type, callees: []const Callee, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void)) !void {
+fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod: u32, node_types: []const Type, callees: []const Callee, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void)) !void {
     const mc = &t.graph.mods[mod];
     const tree = mc.tree;
     const resolutions = mc.resolutions;
-    const view = DiscoveryView{ .tree = tree, .resolutions = resolutions, .node_types = node_types, .model = model, .composite = t.composite };
+    const view: Mono.CallView = .{ .tree = tree, .resolutions = resolutions, .node_types = node_types, .templates = templates };
     for (tree.nodes, 0..) |n, ci| {
         if (n.tag != .call or n.lhs == Ast.none) continue;
         const call_at: Anchor = .{ .node = Ast.Index.from(@intCast(ci)) };
@@ -3298,7 +3288,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, mod: u32, node_types: []const T
             },
             // A bound method on a generic-type receiver (`get := b.get`) calls the method's
             // instance from its adapter, though no call names it.
-            .field_access => if (i < callees.len and std.meta.eql(callees[i], Callee.pending_bound)) {
+            .field_access => if (i < callees.len and callees[i].tag == .pending_bound) {
                 const member = mc.tokens[n.main_token].text(mc.source);
                 try t.discoverRecvMethod(model, node_types[n.lhs.int()], member, Site.of(mc.bundled), worklist, seen, .{ .node = Ast.Index.from(@intCast(i)) }, mod);
             },
@@ -3625,7 +3615,7 @@ const BodyResult = struct {
     conv_char_byte_result: ?Type = null,
     conv_float_int_result: ?Type = null,
     /// This fn's boxed locals, ascending. OWNED (moved out of the `BodyChecker`); moved
-    /// into `t.base_boxed[fid]` by `checkBodies`.
+    /// into `t.fn_boxed[fid]` by `checkBodies`.
     boxed: []u32 = &.{},
 };
 
@@ -3679,8 +3669,8 @@ fn checkBodies(t: *Typecheck, model: *const Model) !void {
     // instantiated (see `enqueueInstance`). Freed at teardown.
     t.bound_poisoned = try gpa.alloc(bool, n);
     for (slots, 0..) |s, i| t.bound_poisoned[i] = s.poisoned;
-    t.base_boxed = try gpa.alloc([]u32, n);
-    for (slots, t.base_boxed) |*s, *bx| {
+    t.fn_boxed = try gpa.alloc([]u32, n);
+    for (slots, t.fn_boxed) |*s, *bx| {
         bx.* = s.boxed;
         s.boxed = &.{};
     }
@@ -5006,7 +4996,8 @@ test "Modes.argMask agrees with every call shape" {
     );
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
-    const view = .{ .tree = c.tree, .resolutions = c.resolve.resolutions[0], .callees = c.result.callees[0], .sigs = c.result.sigs, .methods = c.result.methods };
+    const body: Body.BodyView = .{ .tree = c.tree, .resolutions = c.resolve.resolutions[0], .node_types = c.result.node_types[0], .callees = c.result.callees[0] };
+    const prog: Body.ProgramView = .{ .sigs = c.result.sigs, .methods = c.result.methods, .instances = c.result.instances };
     const cases = [_]struct { name: []const u8, nth: usize, mask: u64 }{
         .{ .name = "bump", .nth = 0, .mask = 0b1 }, // direct
         .{ .name = "swap", .nth = 0, .mask = 0b11 }, // turbofish generic
@@ -5020,7 +5011,7 @@ test "Modes.argMask agrees with every call shape" {
     };
     for (cases) |k| {
         const call = try nthCallOf(&c, k.name, k.nth);
-        testing.expectEqual(k.mask, Modes.argMask(view, call)) catch |e| {
+        testing.expectEqual(k.mask, Modes.argMask(body, prog, call)) catch |e| {
             std.debug.print("call {s}#{d}\n", .{ k.name, k.nth });
             return e;
         };
@@ -9631,8 +9622,8 @@ fn calleeMethod(c: *const Checked, member: []const u8, nth: usize) !Method {
 }
 
 fn expectNoPending(r: *const GraphResult) !void {
-    for (r.callees) |cs| for (cs) |x| try testing.expect(x.tag != .pending);
-    for (r.instances) |inst| for (inst.callees) |x| try testing.expect(x.tag != .pending);
+    for (r.callees) |cs| for (cs) |x| try testing.expect(!x.isPending());
+    for (r.instances) |inst| for (inst.callees) |x| try testing.expect(!x.isPending());
 }
 
 test "pickMethodIndex selects what resolveConformanceMethod returns" {
@@ -11070,7 +11061,7 @@ test "an instance recheck writes its own boxed list" {
     try testing.expectEqual(@as(usize, 2), c.result.instances.len);
     const ocs = c.result.owner_closures;
     try testing.expectEqual(@as(usize, 1), ocs.len);
-    const k = ocs[0].owner.instance;
+    const k = c.result.bodies.items[ocs[0].owner].of.instance;
     const inst = c.result.instances[k];
     try testing.expectEqualStrings("A", c.result.layouts[inst.args[0].struct_id].name);
     try testing.expectEqualSlices(u32, &.{0}, inst.boxed);
@@ -11078,7 +11069,7 @@ test "an instance recheck writes its own boxed list" {
     try testing.expectEqual(@as(usize, 0), c.result.instances[1 - k].boxed.len);
     for (c.result.lambda_units) |u| {
         try testing.expectEqual(@as(usize, 1), u.env.len);
-        const want: Closure.CaptureMode = if (u.owner.instance == k) .box else .copy;
+        const want: Closure.CaptureMode = if (c.result.bodies.items[u.owner].of.instance == k) .box else .copy;
         try testing.expectEqual(want, u.env[0].mode);
     }
 }
@@ -11375,15 +11366,16 @@ test "lambda units: one per boundary per lowerable owner, named by rank" {
     // main's three lambdas (outer-first ranks, node order), then one per wrap instance.
     try testing.expectEqual(@as(usize, 5), units.len);
     for (units[1..], units[0 .. units.len - 1]) |cur, prev| {
-        try testing.expect(Closure.ownerLess(prev.owner, cur.owner) or (std.meta.eql(prev.owner, cur.owner) and prev.node.int() < cur.node.int()));
+        try testing.expect(prev.owner < cur.owner or (prev.owner == cur.owner and prev.node.int() < cur.node.int()));
     }
     try testing.expectEqualStrings("main$l0", units[0].name);
     try testing.expectEqualStrings("main$l2", units[1].name); // the inner `fn() { 2 }` precedes its parent
     try testing.expectEqualStrings("main$l1", units[2].name);
-    try testing.expect(units[0].owner == .base and units[1].owner == .base);
-    try testing.expect(units[3].owner == .instance and units[4].owner == .instance);
+    const bodies = c.result.bodies.items;
+    try testing.expect(bodies[units[0].owner].of == .base and bodies[units[1].owner].of == .base);
+    try testing.expect(bodies[units[3].owner].of == .instance and bodies[units[4].owner].of == .instance);
     for (units[3..]) |u| {
-        const inst = c.result.instances[u.owner.instance];
+        const inst = c.result.instances[bodies[u.owner].of.instance];
         try testing.expect(std.mem.endsWith(u8, u.name, "$l0"));
         try testing.expect(std.mem.startsWith(u8, u.name, inst.name.?));
         try testing.expectEqual(@as(usize, 1), u.sig.params.len);
@@ -11704,7 +11696,7 @@ test "b.get on Box[int] seals to the instance method" {
     try testing.expectEqual(Kind.int, fs.ret.kind);
     try testing.expectEqual(@as(usize, 1), c.result.adapters.len);
     try testing.expectEqualStrings(c.result.instances[ii].name.?, c.result.adapters[0].target.name);
-    for (c.result.callees[0]) |x| try testing.expect(x.tag != .pending);
+    for (c.result.callees[0]) |x| try testing.expect(!x.isPending());
 }
 
 test "a mut self bound method boxes its local receiver" {

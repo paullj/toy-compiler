@@ -15,10 +15,8 @@ const Closure = @import("Closure.zig");
 const AstWalk = @import("../query/AstWalk.zig");
 const Callee = @import("Callee.zig").Callee;
 const Modes = @import("Modes.zig");
-const Mono = @import("Mono.zig");
-const Sig = @import("Sig.zig").Sig;
 const Resolution = @import("Resolution.zig").Resolution;
-const Method = @import("../types.zig").Method;
+const Body = @import("Body.zig");
 
 pub const TargetKind = enum(u8) { named, lambda };
 
@@ -62,10 +60,7 @@ pub const cap_per_template: u32 = 8;
 /// param (a spec unit assumes the param still holds the caller's argument at every call of
 /// it), and below 64. A template with a lambda or local fn (`has_closures`) specializes
 /// nothing, so every lambda unit belongs to exactly one lowered body.
-///
-/// `view` supplies `.tree`, `.resolutions`, `.callees`, `.sigs` and `.methods` (see
-/// `Modes.argMask`).
-pub fn eligibleMask(src: AstWalk.Source, view: anytype, fn_decl: Ast.Index, params: []const Type, has_closures: bool) u64 {
+pub fn eligibleMask(src: AstWalk.Source, body: Body.BodyView, prog: Body.ProgramView, fn_decl: Ast.Index, params: []const Type, has_closures: bool) u64 {
     if (has_closures) return 0;
     var fn_params: u64 = 0;
     for (params[0..@min(params.len, 64)], 0..) |p, i| {
@@ -73,13 +68,14 @@ pub fn eligibleMask(src: AstWalk.Source, view: anytype, fn_decl: Ast.Index, para
     }
     if (fn_params == 0) return 0;
     const V = struct {
-        view: @TypeOf(view),
+        body: Body.BodyView,
+        prog: Body.ProgramView,
         mask: u64,
 
         fn clearLocal(self: *@This(), node: Ast.Index) void {
-            const tree = self.view.tree;
-            if (tree.nodes[node.int()].tag != .identifier or node.int() >= self.view.resolutions.len) return;
-            switch (self.view.resolutions[node.int()]) {
+            const tree = self.body.tree;
+            if (tree.nodes[node.int()].tag != .identifier or node.int() >= self.body.resolutions.len) return;
+            switch (self.body.resolutions[node.int()]) {
                 .local => |slot| if (slot < 64) {
                     self.mask &= ~(@as(u64, 1) << @intCast(slot));
                 },
@@ -89,49 +85,49 @@ pub fn eligibleMask(src: AstWalk.Source, view: anytype, fn_decl: Ast.Index, para
 
         pub fn on(self: *@This(), ev: AstWalk.Event) void {
             switch (ev) {
-                .enter => |e| if (e.tag == .assign) self.clearLocal(self.view.tree.nodes[e.idx.int()].lhs),
+                .enter => |e| if (e.tag == .assign) self.clearLocal(self.body.tree.nodes[e.idx.int()].lhs),
                 .callee => |c| {
-                    const arg_mut = Modes.argMask(self.view, c.call);
+                    const arg_mut = Modes.argMask(self.body, self.prog, c.call);
                     if (arg_mut == 0) return;
-                    const args = Ast.rangeSlice(self.view.tree, self.view.tree.nodes[c.call.int()].rhs.int());
+                    const args = Ast.rangeSlice(self.body.tree, self.body.tree.nodes[c.call.int()].rhs.int());
                     for (args, 0..) |a, i| if (Modes.isMut(arg_mut, i)) self.clearLocal(a);
                 },
                 else => {},
             }
         }
     };
-    var v: V = .{ .view = view, .mask = fn_params };
+    var v: V = .{ .body = body, .prog = prog, .mask = fn_params };
     AstWalk.walk(src, fn_decl, &v) catch unreachable;
     return v.mask;
 }
 
+/// The lambda units a body's lambda literals lower to: those of its owner.
+pub const Lambdas = struct { owner: ?Closure.Owner, units: []const Closure.LambdaUnit };
+
 /// The targets of generic call `call` resolving to instance `ii`, ascending by param: for
 /// each eligible param, an argument naming a fn (`callees[arg]` is `.fn_ref`) or a lambda
-/// literal of the view's owner. A local fn is a local holding a function, like any other
+/// literal of the body's owner. A local fn is a local holding a function, like any other
 /// variable, so it is not a target. Argument `a` is param `a + self_n`.
-///
-/// `view` supplies `.tree`, `.callees`, `.names`, `.instances` and `.closure` (its
-/// `lambda_units` and `owner`).
-pub fn targetsOf(gpa: std.mem.Allocator, view: anytype, call: Ast.Index, site: Site, eligible: u64, out: *std.ArrayList(Target)) error{OutOfMemory}!void {
-    const tree = view.tree;
+pub fn targetsOf(gpa: std.mem.Allocator, body: Body.BodyView, prog: Body.ProgramView, lambdas: Lambdas, call: Ast.Index, site: Site, eligible: u64, out: *std.ArrayList(Target)) error{OutOfMemory}!void {
+    const tree = body.tree;
     const args = Ast.rangeSlice(tree, tree.nodes[call.int()].rhs.int());
-    const nparams = view.instances[site.ii].params.len;
+    const nparams = prog.instances[site.ii].params.len;
     for (args, @as(usize, site.self_n)..) |arg, p| {
         if (p >= nparams or p >= 64) break;
         if (eligible & (@as(u64, 1) << @intCast(p)) == 0) continue;
         const an = tree.nodes[arg.int()];
         switch (an.tag) {
             .identifier, .field_access => {
-                if (arg.int() >= view.callees.len) continue;
-                switch (view.callees[arg.int()].view()) {
-                    .fn_ref => |gid| if (gid < view.names.len) try out.append(gpa, .{ .param = @intCast(p), .kind = .named, .sym = view.names[gid] }),
+                if (arg.int() >= body.callees.len) continue;
+                switch (body.callees[arg.int()].view()) {
+                    .fn_ref => |gid| if (gid < prog.names.len) try out.append(gpa, .{ .param = @intCast(p), .kind = .named, .sym = prog.names[gid] }),
                     .none, .method, .protocol, .builtin, .value, .bound_method => {},
                 }
             },
             .lambda => {
-                const owner = view.closure.owner orelse continue;
-                const ui = Closure.findUnit(view.closure.lambda_units, owner, arg) orelse continue;
-                try out.append(gpa, .{ .param = @intCast(p), .kind = .lambda, .sym = .{ .kind = .user_fn, .name = view.closure.lambda_units[ui].name } });
+                const owner = lambdas.owner orelse continue;
+                const ui = Closure.findUnit(lambdas.units, owner, arg) orelse continue;
+                try out.append(gpa, .{ .param = @intCast(p), .kind = .lambda, .sym = .{ .kind = .user_fn, .name = lambdas.units[ui].name } });
             },
             else => {},
         }
@@ -170,29 +166,26 @@ pub fn mask(t: Table, gid: u32) u64 {
 }
 
 /// The site of method call `call` when its method is one of a generic type's instances
-/// (`b.apply(f)` on a `Box[int]`), or null. `view` supplies `.tree`, `.callees` and
-/// `.methods`.
-pub fn methodSite(view: anytype, call: Ast.Index) ?Site {
-    const fa = Callee.memberNode(view.tree, view.tree.nodes[call.int()]) orelse return null;
-    if (fa.int() >= view.callees.len) return null;
-    const v = view.callees[fa.int()].view();
-    if (v != .method or v.method >= view.methods.len) return null;
-    const m = view.methods[v.method];
+/// (`b.apply(f)` on a `Box[int]`), or null.
+pub fn methodSite(body: Body.BodyView, prog: Body.ProgramView, call: Ast.Index) ?Site {
+    const fa = Callee.memberNode(body.tree, body.tree.nodes[call.int()]) orelse return null;
+    if (fa.int() >= body.callees.len) return null;
+    const v = body.callees[fa.int()].view();
+    if (v != .method or v.method >= prog.methods.len) return null;
+    const m = prog.methods[v.method];
     return .{ .ii = m.instance orelse return null, .self_n = @intFromBool(!m.is_static) };
 }
 
-/// The spec unit generic call `call` at `site` goes to, or null for the erased instance;
-/// the name is borrowed from the table. `view` is as for `targetsOf`, plus
-/// `.closure.specs`.
-pub fn select(gpa: std.mem.Allocator, view: anytype, call: Ast.Index, site: Site) error{OutOfMemory}!?[]const u8 {
-    const t: Table = view.closure.specs;
+/// The spec unit of `t` generic call `call` at `site` goes to, or null for the erased
+/// instance; the name is borrowed from the table.
+pub fn select(gpa: std.mem.Allocator, t: Table, body: Body.BodyView, prog: Body.ProgramView, lambdas: Lambdas, call: Ast.Index, site: Site) error{OutOfMemory}!?[]const u8 {
     if (t.units.len == 0) return null;
-    const inst = view.instances[site.ii];
+    const inst = prog.instances[site.ii];
     const m = mask(t, inst.template_gid);
     if (m == 0) return null;
     var targets: std.ArrayList(Target) = .empty;
     defer targets.deinit(gpa);
-    try targetsOf(gpa, view, call, site, m, &targets);
+    try targetsOf(gpa, body, prog, lambdas, call, site, m, &targets);
     if (targets.items.len == 0) return null;
     const name = try nameOf(gpa, inst.name.?, targets.items);
     defer gpa.free(name);
@@ -272,61 +265,26 @@ pub fn freeUnits(gpa: std.mem.Allocator, cands: []const Candidate) void {
     }
 }
 
-/// What `build` reads: per-module tables by module id, the rest program-wide.
+/// What `build` reads: per-module tables by module id, the bodies, and the program-wide
+/// tables.
 pub const Source = struct {
     /// Each module's tree, tokens and source.
     modules: []const AstWalk.Source,
     resolutions: []const []const Resolution,
-    node_types: []const []const Type,
-    callees: []const []const Callee,
     closures: []const []const Closure.FnClosures,
-    names: []const Sym.SymName,
-    sigs: []const Sig,
-    instances: []const Mono.Instance,
-    methods: []const Method,
+    bodies: Body.List,
+    prog: Body.ProgramView,
     lambda_units: []const Closure.LambdaUnit,
-    /// The base owners in lower order.
-    bases: []const Base,
 
-    pub const Base = struct { gid: u32, mod: u32, decl: Ast.Index };
-};
-
-/// One owner body's tables, as `AstWalk.instanceOfCall`, `targetsOf` and `eligibleMask`
-/// read them.
-const OwnerView = struct {
-    tree: Ast.Tree,
-    resolutions: []const Resolution,
-    node_types: []const Type,
-    callees: []const Callee,
-    names: []const Sym.SymName,
-    sigs: []const Sig,
-    instances: []const Mono.Instance,
-    methods: []const Method,
-    closure: struct { lambda_units: []const Closure.LambdaUnit, owner: ?Closure.Owner },
-
-    fn of(src: Source, owner: Closure.Owner, mod: u32, node_types: []const Type, callees: []const Callee) OwnerView {
-        return .{
-            .tree = src.modules[mod].tree,
-            .resolutions = src.resolutions[mod],
-            .node_types = node_types,
-            .callees = callees,
-            .names = src.names,
-            .sigs = src.sigs,
-            .instances = src.instances,
-            .methods = src.methods,
-            .closure = .{ .lambda_units = src.lambda_units, .owner = owner },
-        };
-    }
-
-    pub fn genericTemplate(self: *const OwnerView, gid: u32) ?Mono.TemplateRef {
-        return Mono.templateRef(self.sigs, gid);
+    fn view(src: Source, b: Body) Body.BodyView {
+        return b.view(src.modules[b.mod].tree, src.resolutions[b.mod]);
     }
 };
 
 /// The spec table: a mask per template with an eligible param, and a unit per distinct
-/// generic call site (in any lowerable owner: base fns, then instances, lambdas included)
-/// whose argument for an eligible param is a named fn or a lambda literal. Serial, and the
-/// cap and the unit order go by name, so it is identical at any `-j`.
+/// generic call site (in any body, its lambdas included) whose argument for an eligible
+/// param is a named fn or a lambda literal. Serial, and the cap and the unit order go by
+/// name, so it is identical at any `-j`.
 pub fn build(gpa: std.mem.Allocator, src: Source) error{OutOfMemory}!Table {
     const masks = try templateMasks(gpa, src);
     if (masks.len == 0) {
@@ -350,13 +308,13 @@ fn templateMasks(gpa: std.mem.Allocator, src: Source) error{OutOfMemory}![]Templ
     errdefer masks.deinit(gpa);
     var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
     defer seen.deinit(gpa);
-    for (src.instances, 0..) |inst, k| {
+    for (src.prog.instances, 0..) |inst, k| {
         const gid = inst.template_gid;
         if ((try seen.getOrPut(gpa, gid)).found_existing) continue;
-        if (gid >= src.sigs.len) continue;
+        if (gid >= src.prog.sigs.len) continue;
         const fcs: []const Closure.FnClosures = if (inst.mod < src.closures.len) src.closures[inst.mod] else &.{};
-        const view = OwnerView.of(src, .{ .instance = @intCast(k) }, inst.mod, inst.node_types, inst.callees);
-        const m = eligibleMask(src.modules[inst.mod], &view, inst.decl_node, src.sigs[gid].params, Closure.findFn(fcs, inst.decl_node) != null);
+        const b = src.bodies.items[src.bodies.ofInstance(@intCast(k))];
+        const m = eligibleMask(src.modules[inst.mod], src.view(b), src.prog, inst.decl_node, src.prog.sigs[gid].params, Closure.findFn(fcs, inst.decl_node) != null);
         if (m != 0) try masks.append(gpa, .{ .gid = gid, .eligible = m });
     }
     std.mem.sort(TemplateMask, masks.items, {}, struct {
@@ -370,7 +328,9 @@ fn templateMasks(gpa: std.mem.Allocator, src: Source) error{OutOfMemory}![]Templ
 fn collectCandidates(gpa: std.mem.Allocator, src: Source, masks: []const TemplateMask, cands: *std.ArrayList(Candidate)) error{OutOfMemory}!void {
     const V = struct {
         gpa: std.mem.Allocator,
-        view: *const OwnerView,
+        body: Body.BodyView,
+        prog: Body.ProgramView,
+        lambdas: Lambdas,
         masks: Table,
         cands: *std.ArrayList(Candidate),
         targets: std.ArrayList(Target) = .empty,
@@ -380,32 +340,31 @@ fn collectCandidates(gpa: std.mem.Allocator, src: Source, masks: []const Templat
                 .enter => |e| e,
                 else => return,
             };
-            if (e.tag != .call or self.view.tree.nodes[e.idx.int()].lhs == Ast.none) return;
-            const site: Site = if (try AstWalk.instanceOfCall(self.gpa, self.view, e.idx)) |ii|
+            if (e.tag != .call or self.body.tree.nodes[e.idx.int()].lhs == Ast.none) return;
+            const site: Site = if (try AstWalk.instanceOfCall(self.gpa, self.body, self.prog, e.idx)) |ii|
                 .{ .ii = ii, .self_n = 0 }
             else
-                methodSite(self.view, e.idx) orelse return;
-            const inst = self.view.instances[site.ii];
+                methodSite(self.body, self.prog, e.idx) orelse return;
+            const inst = self.prog.instances[site.ii];
             const m = mask(self.masks, inst.template_gid);
             if (m == 0) return;
             self.targets.clearRetainingCapacity();
-            try targetsOf(self.gpa, self.view, e.idx, site, m, &self.targets);
+            try targetsOf(self.gpa, self.body, self.prog, self.lambdas, e.idx, site, m, &self.targets);
             if (self.targets.items.len == 0) return;
             try addCandidate(self.gpa, self.cands, inst.template_gid, site.ii, inst.name.?, self.targets.items);
         }
     };
-    for (0..src.bases.len + src.instances.len) |k| {
-        const view, const mod, const decl = if (k < src.bases.len) blk: {
-            const b = src.bases[k];
-            break :blk .{ OwnerView.of(src, .{ .base = b.gid }, b.mod, src.node_types[b.mod], src.callees[b.mod]), b.mod, b.decl };
-        } else blk: {
-            const ii = k - src.bases.len;
-            const inst = src.instances[ii];
-            break :blk .{ OwnerView.of(src, .{ .instance = @intCast(ii) }, inst.mod, inst.node_types, inst.callees), inst.mod, inst.decl_node };
+    for (src.bodies.items, 0..) |b, i| {
+        var v: V = .{
+            .gpa = gpa,
+            .body = src.view(b),
+            .prog = src.prog,
+            .lambdas = .{ .owner = @intCast(i), .units = src.lambda_units },
+            .masks = .{ .masks = masks },
+            .cands = cands,
         };
-        var v: V = .{ .gpa = gpa, .view = &view, .masks = .{ .masks = masks }, .cands = cands };
         defer v.targets.deinit(gpa);
-        try AstWalk.walk(src.modules[mod], decl, &v);
+        try AstWalk.walk(src.modules[b.mod], b.decl, &v);
     }
 }
 
@@ -441,6 +400,7 @@ test "nameOf is content-derived and injective" {
     try testing.expectEqualStrings("main.apply$int$sp0$main.add$sp1$main$l0", names.items[4]);
 
     // A spec piece is never a generic-instance arg spelling.
+    const Mono = @import("Mono.zig");
     for ([_]Type{ Type.int, Type.bool, Type.str, Type.unit, Type.float, Type.structT(3), Type.enumT(4), Type.rawptr }) |t| {
         const m = try Mono.mangle(gpa, "f", &.{t});
         defer gpa.free(m);
@@ -477,7 +437,6 @@ const Checked = struct {
     const Graph = @import("../driver/Graph.zig");
     const ResolveGraph = @import("../resolve_graph.zig");
     const TypecheckGraph = @import("../types_graph.zig");
-    const LowerInputs = @import("../lower.zig").ClosureInputs;
 
     src: []const u8,
     tokens: []Token,
@@ -529,40 +488,32 @@ const Checked = struct {
         return error.TestExpectedFn;
     }
 
-    /// The eligible mask of template `name`, as the driver computes it.
+    /// The eligible mask of template `name`, read over its module's tables.
     fn templateMask(self: *const Checked, name: []const u8) !u64 {
         const g = try self.gid(name);
         const f = self.res.fns[g];
         const has_closures = Closure.findFn(self.res.closures[f.module], f.decl_node) != null;
-        const mv = .{ .tree = self.tree, .resolutions = self.res.resolutions[0], .callees = self.tc.callees[0], .sigs = self.tc.sigs, .methods = self.tc.methods };
-        return eligibleMask(.{ .tree = self.tree, .tokens = self.tokens, .source = self.src }, mv, f.decl_node, self.tc.sigs[g].params, has_closures);
+        return eligibleMask(.{ .tree = self.tree, .tokens = self.tokens, .source = self.src }, self.body(), self.prog(), f.decl_node, self.tc.sigs[g].params, has_closures);
     }
 
-    const View = struct {
-        tree: Ast.Tree,
-        callees: []const @import("Callee.zig").Callee,
-        names: []const Sym.SymName,
-        instances: []const Mono.Instance,
-        methods: []const @import("../types.zig").Method,
-        closure: LowerInputs,
-    };
+    fn body(self: *const Checked) Body.BodyView {
+        return .{ .tree = self.tree, .resolutions = self.res.resolutions[0], .node_types = self.tc.node_types[0], .callees = self.tc.callees[0] };
+    }
 
-    fn view(self: *const Checked, owner: []const u8) !View {
-        return .{
-            .tree = self.tree,
-            .callees = self.tc.callees[0],
-            .names = self.names,
-            .instances = self.tc.instances,
-            .methods = self.tc.methods,
-            .closure = .{ .adapters = self.tc.adapters, .lambda_units = self.tc.lambda_units, .owner = .{ .base = try self.gid(owner) } },
-        };
+    fn prog(self: *const Checked) Body.ProgramView {
+        return .{ .sigs = self.tc.sigs, .methods = self.tc.methods, .instances = self.tc.instances, .names = self.names, .layouts = self.tc.layouts };
+    }
+
+    /// The lambda units of fn `owner`'s body.
+    fn lambdasOf(self: *const Checked, owner: []const u8) !Lambdas {
+        return .{ .owner = self.tc.bodies.ofFn(try self.gid(owner)).?, .units = self.tc.lambda_units };
     }
 
     /// The targets of every call in fn `owner` of an instance of `template`, all params
-    /// eligible, read under `owner`'s view.
+    /// eligible, read in `owner`'s body.
     fn targetsIn(self: *const Checked, gpa: std.mem.Allocator, owner: []const u8, template: []const u8, out: *std.ArrayList(Target)) !void {
         const tg = try self.gid(template);
-        const v = try self.view(owner);
+        const lambdas = try self.lambdasOf(owner);
         for (self.tree.nodes, 0..) |n, i| {
             if (n.tag != .call) continue;
             const callee = self.tree.nodes[n.lhs.int()];
@@ -571,7 +522,7 @@ const Checked = struct {
             const ii = for (self.tc.instances, 0..) |inst, k| {
                 if (inst.template_gid == tg) break k;
             } else return error.TestExpectedInstance;
-            try targetsOf(gpa, &v, Ast.Index.from(@intCast(i)), .{ .ii = ii, .self_n = 0 }, ~@as(u64, 0), out);
+            try targetsOf(gpa, self.body(), self.prog(), lambdas, Ast.Index.from(@intCast(i)), .{ .ii = ii, .self_n = 0 }, ~@as(u64, 0), out);
         }
     }
 };
@@ -673,18 +624,20 @@ test "a generic method's fn argument is a target at its param, after self and ea
         \\
     );
     defer fx.destroy(gpa);
-    const v = try fx.view("main");
+    const body = fx.body();
+    const prog = fx.prog();
+    const lambdas = try fx.lambdasOf("main");
     var sites: usize = 0;
     for (fx.tree.nodes, 0..) |n, i| {
         if (n.tag != .call) continue;
         const call = Ast.Index.from(@intCast(i));
-        const site = methodSite(&v, call) orelse continue;
+        const site = methodSite(body, prog, call) orelse continue;
         sites += 1;
         try testing.expectEqual(@as(u32, 1), site.self_n);
         try testing.expectEqualStrings("main.Box.twice$int", fx.tc.instances[site.ii].name.?);
         var targets: std.ArrayList(Target) = .empty;
         defer targets.deinit(gpa);
-        try targetsOf(gpa, &v, call, site, ~@as(u64, 0), &targets);
+        try targetsOf(gpa, body, prog, lambdas, call, site, ~@as(u64, 0), &targets);
         try testing.expectEqual(@as(usize, 1), targets.items.len);
         try testing.expectEqual(@as(u32, 2), targets.items[0].param);
         try testing.expectEqualStrings("main.inc", targets.items[0].sym.name);

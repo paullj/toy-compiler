@@ -25,6 +25,7 @@ const Ast = toyc.Ast;
 const Abi = toyc.Abi;
 const Callee = toyc.Callee;
 const Closure = toyc.Closure;
+const Body = toyc.Body;
 const Modes = toyc.Modes;
 const Graph = toyc.Graph;
 const ResolveGraph = toyc.ResolveGraph;
@@ -173,11 +174,12 @@ pub const Facts = struct {
         const m = f.module();
         const tree = m.tree();
         const e = f.entry();
-        const view = .{ .tree = tree, .resolutions = f.res.resolutions[e], .callees = f.tc.callees[e], .sigs = f.tc.sigs, .methods = f.tc.methods };
+        const body: Body.BodyView = .{ .tree = tree, .resolutions = f.res.resolutions[e], .node_types = f.tc.node_types[e], .callees = f.tc.callees[e] };
+        const prog: Body.ProgramView = .{ .sigs = f.tc.sigs, .methods = f.tc.methods, .instances = f.tc.instances };
         var out: std.ArrayList(MutArg) = .empty;
         for (m.nodes, 0..) |n, c| {
             if (n.tag != .call) continue;
-            const mask = Modes.argMask(view, Ast.Index.from(@intCast(c)));
+            const mask = Modes.argMask(body, prog, Ast.Index.from(@intCast(c)));
             const recv = f.mutReceiver(n);
             if (mask == 0 and recv == null) continue;
             const name = f.calleeName(n) orelse continue;
@@ -314,19 +316,17 @@ pub const Facts = struct {
     /// adapter. A boxed receiver keeps its cell in every build (bound values keep heap
     /// envs), so it is never just "shared".
     fn boundHold(f: Facts, tok: u32, recv: u32, slot: u32) Hold {
-        const m = f.module();
-        const fn_node = f.enclosingFn(tok) orelse return .unknown;
-        const places = Modes.ofProto(m.tree(), m.tokens, Ast.protoAt(m.tree(), m.nodes[fn_node].lhs.int()));
-        if (Modes.isMut(places, slot)) return .by_address;
+        const fn_node = Ast.Index.from(f.enclosingFn(tok) orelse return .unknown);
         const e = f.entry();
         const gid = for (f.res.fns, 0..) |gf, g| {
-            if (gf.module == e and gf.decl_node == Ast.Index.from(fn_node)) break g;
+            if (gf.module == e and gf.decl_node == fn_node) break g;
         } else return .unknown;
-        if (toyc.Mono.templateRef(f.tc.sigs, @intCast(gid)) == null) return f.receiverHold(.{ .base = @intCast(gid) }, f.tc.node_types[e], recv, slot);
+        if (Modes.isMut(f.tc.sigs[gid].mut_mask, slot)) return .by_address;
+        // One body for a non-generic fn, one per instance of a generic one.
         var hold: ?Hold = null;
-        for (f.tc.instances, 0..) |inst, k| {
-            if (inst.mod != e or inst.decl_node != Ast.Index.from(fn_node)) continue;
-            const h = f.receiverHold(.{ .instance = @intCast(k) }, inst.node_types, recv, slot);
+        for (f.tc.bodies.items, 0..) |b, i| {
+            if (b.mod != e or b.decl != fn_node) continue;
+            const h = f.receiverHold(@intCast(i), b.node_types, recv, slot);
             hold = if (hold) |prev| prev.merge(h) else h;
         }
         return hold orelse .unknown;

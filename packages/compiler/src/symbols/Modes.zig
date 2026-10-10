@@ -8,6 +8,7 @@ const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
 const Token = @import("../ast/Token.zig").Token;
 const Callee = @import("Callee.zig").Callee;
+const Body = @import("Body.zig");
 
 /// The parser rejects `mut` past this many params, so every mode fits one mask (Spec's
 /// eligibility masks are 64-bit for the same reason).
@@ -18,7 +19,9 @@ pub fn isMut(mask: u64, i: usize) bool {
     return i < max_params and mask & (@as(u64, 1) << @intCast(i)) != 0;
 }
 
-/// The mode mask of a fn's own declaration, one bit per `mut` param.
+/// The mode mask of a fn's own declaration, one bit per `mut` param. Read once per fn,
+/// when its signature is decoded (`FnSym.mut_mask`, copied to `Sig.mut_mask` and each
+/// body's sig); the resolver, which runs before any signature exists, reads it too.
 pub fn ofProto(tree: Ast.Tree, tokens: []const Token, proto: Ast.FnProto) u64 {
     var mask: u64 = 0;
     for (proto.params[0..@min(proto.params.len, max_params)], 0..) |p, i| {
@@ -31,29 +34,27 @@ pub fn ofProto(tree: Ast.Tree, tokens: []const Token, proto: Ast.FnProto) u64 {
 /// value arg `i`, so a method's receiver bit is shifted out). It mirrors the callee
 /// selection `lowerCall` makes; a value call, a builtin and a protocol call carry no
 /// modes (the checker keeps `mut` off every such path).
-///
-/// `view` supplies `.tree`, `.resolutions`, `.callees`, `.sigs` and `.methods`.
-pub fn argMask(view: anytype, call: Ast.Index) u64 {
-    const tree = view.tree;
+pub fn argMask(body: Body.BodyView, prog: Body.ProgramView, call: Ast.Index) u64 {
+    const tree = body.tree;
     const n = tree.nodes[call.int()];
     const slot = Callee.callSlot(tree, n) orelse return 0;
-    if (slot.int() >= view.callees.len) return 0;
-    switch (view.callees[slot.int()].view()) {
+    if (slot.int() >= body.callees.len) return 0;
+    switch (body.callees[slot.int()].view()) {
         .method => |mi| {
-            if (mi >= view.methods.len) return 0;
-            const m = view.methods[mi];
+            if (mi >= prog.methods.len) return 0;
+            const m = prog.methods[mi];
             // A reified generic-impl row's `fn_id` is its template's, whose modes hold for
             // every instance (they are syntactic).
-            if (m.derive != null or m.fn_id >= view.sigs.len) return 0;
-            const mask = view.sigs[m.fn_id].mut_mask;
+            if (m.derive != null or m.fn_id >= prog.sigs.len) return 0;
+            const mask = prog.sigs[m.fn_id].mut_mask;
             return if (m.is_static) mask else mask >> 1;
         },
         .none => {
             const head_node = tree.nodes[n.lhs.int()];
             const head = if (head_node.tag == .type_app) head_node.lhs else n.lhs;
-            if (head == Ast.none or head.int() >= view.resolutions.len) return 0;
-            return switch (view.resolutions[head.int()]) {
-                .func => |gid| if (gid < view.sigs.len) view.sigs[gid].mut_mask else 0,
+            if (head == Ast.none or head.int() >= body.resolutions.len) return 0;
+            return switch (body.resolutions[head.int()]) {
+                .func => |gid| if (gid < prog.sigs.len) prog.sigs[gid].mut_mask else 0,
                 else => 0,
             };
         },

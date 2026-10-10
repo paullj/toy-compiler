@@ -16,6 +16,7 @@ const Callee = @import("Callee.zig").Callee;
 const Closure = @import("Closure.zig");
 const Modes = @import("Modes.zig");
 const LayoutEngine = @import("../layout/Engine.zig");
+const Body = @import("Body.zig");
 
 /// The env bytes one owner may keep in frames, over all its lambdas; a unit past it keeps a
 /// GC cell, so frame envs grow a frame by at most this much.
@@ -26,50 +27,35 @@ pub const frame_budget: u32 = 256;
 /// never grows a frame.
 pub const unbox_max: u32 = 16;
 
-/// The lowered bodies, numbered: a base fn by its global id, instance `i` as
-/// `is_base.len + i`.
-pub const Units = struct {
-    /// Indexed by global fn id: whether the fn is lowered as a base body.
-    is_base: []const bool,
-
-    pub fn base(u: Units, gid: u32) ?u32 {
-        return if (gid < u.is_base.len and u.is_base[gid]) gid else null;
-    }
-
-    pub fn instance(u: Units, ii: usize) u32 {
-        return @intCast(u.is_base.len + ii);
-    }
-};
-
-/// The body a call runs, and how many params precede its first argument (1 for a method's
-/// receiver).
+/// The body a call runs, by its index in the body list (its escape unit), and how many
+/// params precede its first argument (1 for a method's receiver). A generic template read
+/// for T0052 alone is a unit past the bodies, and no call targets one.
 pub const Target = struct { unit: u32, self_n: u32 };
 
 /// The body `call` runs, or null when it is not known here: a call of a function value, a
 /// builtin, a protocol method, a derive, or a fn with no lowered body (an extern, an
-/// intrinsic). `view` supplies `.tree`, `.resolutions`, `.node_types`, `.callees`,
-/// `.methods`, `.instances` and `genericTemplate(gid)`, as `AstWalk.instanceOfCall` reads them.
-pub fn callTarget(gpa: std.mem.Allocator, view: anytype, units: Units, call: Ast.Index) error{OutOfMemory}!?Target {
-    const tree = view.tree;
+/// intrinsic).
+pub fn callTarget(gpa: std.mem.Allocator, body: Body.BodyView, prog: Body.ProgramView, bodies: Body.List, call: Ast.Index) error{OutOfMemory}!?Target {
+    const tree = body.tree;
     const n = tree.nodes[call.int()];
     const slot = Callee.callSlot(tree, n) orelse return null;
-    if (slot.int() >= view.callees.len) return null;
-    switch (view.callees[slot.int()].view()) {
+    if (slot.int() >= body.callees.len) return null;
+    switch (body.callees[slot.int()].view()) {
         .method => |mi| {
-            if (mi >= view.methods.len) return null;
-            const m = view.methods[mi];
+            if (mi >= prog.methods.len) return null;
+            const m = prog.methods[mi];
             if (m.derive != null) return null;
             const self_n: u32 = @intFromBool(!m.is_static);
-            if (m.instance) |ii| return .{ .unit = units.instance(ii), .self_n = self_n };
-            return .{ .unit = units.base(m.fn_id) orelse return null, .self_n = self_n };
+            if (m.instance) |ii| return .{ .unit = bodies.ofInstance(ii), .self_n = self_n };
+            return .{ .unit = bodies.ofFn(m.fn_id) orelse return null, .self_n = self_n };
         },
         .none => {
-            if (try AstWalk.instanceOfCall(gpa, view, call)) |ii| return .{ .unit = units.instance(ii), .self_n = 0 };
+            if (try AstWalk.instanceOfCall(gpa, body, prog, call)) |ii| return .{ .unit = bodies.ofInstance(@intCast(ii)), .self_n = 0 };
             const head_node = tree.nodes[n.lhs.int()];
             const head = if (head_node.tag == .type_app) head_node.lhs else n.lhs;
-            if (head.int() >= view.resolutions.len) return null;
-            return switch (view.resolutions[head.int()]) {
-                .func => |gid| .{ .unit = units.base(gid) orelse return null, .self_n = 0 },
+            if (head.int() >= body.resolutions.len) return null;
+            return switch (body.resolutions[head.int()]) {
+                .func => |gid| .{ .unit = bodies.ofFn(gid) orelse return null, .self_n = 0 },
                 else => null,
             };
         },
@@ -164,15 +150,15 @@ pub const Mode = enum {
     template,
 };
 
-/// Walk the body at `decl` once. `closures` is its lambdas as the resolver saw them;
-/// `view` is as for `callTarget`, plus `.sigs` (see `Modes.argMask`) and `.layouts`. In a
+/// Walk the body at `decl` once. `closures` is its lambdas as the resolver saw them. In a
 /// lowered body only a call that passes a function value is resolved: no other argument can
 /// carry a closure.
 pub fn factsOf(
     gpa: std.mem.Allocator,
     src: AstWalk.Source,
-    view: anytype,
-    units: Units,
+    body: Body.BodyView,
+    prog: Body.ProgramView,
+    bodies: Body.List,
     decl: Ast.Index,
     nparams: u32,
     closures: ?*const Closure.FnClosures,
@@ -182,8 +168,9 @@ pub fn factsOf(
     const Role = union(enum) { value_callee, arg: ?Dep, opaque_arg, init: u32 };
     const V = struct {
         gpa: std.mem.Allocator,
-        view: @TypeOf(view),
-        units: Units,
+        body: Body.BodyView,
+        prog: Body.ProgramView,
+        bodies: Body.List,
         mode: Mode,
         roles: std.AutoHashMapUnmanaged(u32, Role) = .empty,
         escapes: std.DynamicBitSetUnmanaged = .{},
@@ -193,8 +180,8 @@ pub fn factsOf(
         bound_recv: std.ArrayList(u32) = .empty,
 
         fn local(self: *const @This(), node: Ast.Index) ?u32 {
-            if (node.int() >= self.view.resolutions.len) return null;
-            return switch (self.view.resolutions[node.int()]) {
+            if (node.int() >= self.body.resolutions.len) return null;
+            return switch (self.body.resolutions[node.int()]) {
                 .local => |s| s,
                 else => null,
             };
@@ -220,22 +207,22 @@ pub fn factsOf(
                 .enter => |e| e,
                 else => return,
             };
-            const tree = self.view.tree;
+            const tree = self.body.tree;
             const n = tree.nodes[e.idx.int()];
             switch (e.tag) {
                 .call => {
                     if (n.lhs == Ast.none) return;
-                    if (Callee.callSlot(tree, n)) |slot| if (slot.int() < self.view.callees.len and self.view.callees[slot.int()].view() == .value)
+                    if (Callee.callSlot(tree, n)) |slot| if (slot.int() < self.body.callees.len and self.body.callees[slot.int()].view() == .value)
                         try self.roles.put(self.gpa, n.lhs.int(), .value_callee);
                     const args = Ast.rangeSlice(tree, n.rhs.int());
                     if (self.mode == .template) return self.templateCall(e.idx, n, args);
                     const passes_fn = for (args) |a| {
-                        if (a.int() < self.view.node_types.len and LayoutEngine.isFnStruct(self.view.node_types[a.int()], self.view.layouts)) break true;
+                        if (a.int() < self.body.node_types.len and LayoutEngine.isFnStruct(self.body.node_types[a.int()], self.prog.layouts)) break true;
                     } else false;
                     if (!passes_fn) return;
-                    const target = try callTarget(self.gpa, self.view, self.units, e.idx);
+                    const target = try callTarget(self.gpa, self.body, self.prog, self.bodies, e.idx);
                     if (target) |t| try self.calls.append(self.gpa, t.unit);
-                    const mask = Modes.argMask(self.view, e.idx);
+                    const mask = Modes.argMask(self.body, self.prog, e.idx);
                     for (args, 0..) |a, i| {
                         const dep: ?Dep = if (target) |t| blk: {
                             const p = i + t.self_n;
@@ -256,8 +243,8 @@ pub fn factsOf(
                 },
                 .lambda => try self.sites.append(self.gpa, .{ .node = e.idx, .use = self.roleUse(e.idx), .kind = .lambda }),
                 .local_fn => try self.sites.append(self.gpa, .{ .node = e.idx, .use = if (self.local(e.idx)) |s| .{ .local = s } else .escapes, .kind = .local_fn }),
-                .field_access => if (e.idx.int() < self.view.callees.len and self.view.callees[e.idx.int()].view() == .bound_method) {
-                    const recv = Closure.boundRecvLocal(tree, self.view.resolutions, e.idx);
+                .field_access => if (e.idx.int() < self.body.callees.len and self.body.callees[e.idx.int()].view() == .bound_method) {
+                    const recv = Closure.boundRecvLocal(tree, self.body.resolutions, e.idx);
                     if (recv) |s| try self.bound_recv.append(self.gpa, s);
                     try self.sites.append(self.gpa, .{ .node = e.idx, .use = self.roleUse(e.idx), .kind = .bound, .recv = recv });
                 },
@@ -269,9 +256,9 @@ pub fn factsOf(
         /// directly, and a local in callee position is a function value it calls.
         fn templateCall(self: *@This(), call: Ast.Index, n: Ast.Node, args: []const Ast.Index) error{OutOfMemory}!void {
             if (self.local(n.lhs) != null) try self.roles.put(self.gpa, n.lhs.int(), .value_callee);
-            const target = try callTarget(self.gpa, self.view, self.units, call);
+            const target = try callTarget(self.gpa, self.body, self.prog, self.bodies, call);
             if (target) |t| try self.calls.append(self.gpa, t.unit);
-            const mask = Modes.argMask(self.view, call);
+            const mask = Modes.argMask(self.body, self.prog, call);
             for (args, 0..) |a, i| {
                 const role: Role = if (target) |t| blk: {
                     const p = i + t.self_n;
@@ -282,7 +269,7 @@ pub fn factsOf(
             }
         }
     };
-    var v: V = .{ .gpa = gpa, .view = view, .units = units, .mode = mode };
+    var v: V = .{ .gpa = gpa, .body = body, .prog = prog, .bodies = bodies, .mode = mode };
     defer v.roles.deinit(gpa);
     errdefer {
         v.escapes.deinit(gpa);
@@ -504,8 +491,6 @@ test "a bound method site takes its use from its position, like a lambda in that
     const Graph = @import("../driver/Graph.zig");
     const ResolveGraph = @import("../resolve_graph.zig");
     const TypecheckGraph = @import("../types_graph.zig");
-    const Typecheck = @import("../types.zig");
-    const Mono = @import("Mono.zig");
     const src =
         \\struct P { x: int }
         \\struct H { f: fn() -> int }
@@ -537,33 +522,18 @@ test "a bound method site takes its use from its position, like a lambda in that
     defer tc.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), tc.diags.len);
 
-    const View = struct {
-        tree: Ast.Tree,
-        resolutions: []const @import("Resolution.zig").Resolution,
-        node_types: []const @import("../layout/Type.zig").Type,
-        callees: []const Callee,
-        sigs: []const @import("Sig.zig").Sig,
-        instances: []const Mono.Instance,
-        methods: []const Typecheck.Method,
-        layouts: []const LayoutEngine.Layout,
-
-        pub fn genericTemplate(self: *const @This(), gid: u32) ?Mono.TemplateRef {
-            return Mono.templateRef(self.sigs, gid);
-        }
-    };
-    const view: View = .{ .tree = tree, .resolutions = res.resolutions[0], .node_types = tc.node_types[0], .callees = tc.callees[0], .sigs = tc.sigs, .instances = tc.instances, .methods = tc.methods, .layouts = tc.layouts };
-    const is_base = try gpa.alloc(bool, res.fns.len);
-    defer gpa.free(is_base);
     var main_gid: ?u32 = null;
     var run_gid: ?u32 = null;
-    for (res.fns, is_base, 0..) |f, *b, i| {
-        b.* = f.decl_node != Ast.none;
+    for (res.fns, 0..) |f, i| {
         if (std.mem.eql(u8, f.name, "main")) main_gid = @intCast(i);
         if (std.mem.eql(u8, f.name, "main.run")) run_gid = @intCast(i);
     }
+    const body: Body.BodyView = .{ .tree = tree, .resolutions = res.resolutions[0], .node_types = tc.node_types[0], .callees = tc.callees[0] };
+    const prog: Body.ProgramView = .{ .sigs = tc.sigs, .methods = tc.methods, .instances = tc.instances, .layouts = tc.layouts };
     const decl = res.fns[main_gid.?].decl_node;
-    var f = try factsOf(gpa, .{ .tree = tree, .tokens = tokens, .source = src }, &view, .{ .is_base = is_base }, decl, 0, Closure.findFn(res.closures[0], decl), .lowered);
+    var f = try factsOf(gpa, .{ .tree = tree, .tokens = tokens, .source = src }, body, prog, tc.bodies, decl, 0, Closure.findFn(res.closures[0], decl), .lowered);
     defer f.deinit(gpa);
+    const run_unit = tc.bodies.ofFn(run_gid.?).?;
 
     // Pair each bound site with the lambda in the same position, in source order.
     var bound: std.ArrayList(Site) = .empty;
@@ -582,8 +552,8 @@ test "a bound method site takes its use from its position, like a lambda in that
         try testing.expectEqual(std.meta.activeTag(l.use), std.meta.activeTag(b.use));
     }
     try testing.expect(bound.items[0].use == .local);
-    try testing.expectEqual(Dep{ .unit = run_gid.?, .param = 0 }, bound.items[1].use.arg);
-    try testing.expectEqual(Dep{ .unit = run_gid.?, .param = 0 }, lambdas.items[1].use.arg);
+    try testing.expectEqual(Dep{ .unit = run_unit, .param = 0 }, bound.items[1].use.arg);
+    try testing.expectEqual(Dep{ .unit = run_unit, .param = 0 }, lambdas.items[1].use.arg);
     try testing.expect(bound.items[2].use == .escapes);
     try testing.expectEqualSlices(u32, &.{ 0, 0, 0 }, f.bound_recv);
 }

@@ -19,6 +19,7 @@ const Type = @import("../layout/Type.zig").Type;
 const Callee = @import("Callee.zig").Callee;
 const Infer = @import("Infer.zig");
 const Sig = @import("Sig.zig").Sig;
+const Resolution = @import("Resolution.zig").Resolution;
 
 /// One resolved bound `[T has P]` on a monomorphized instance: the witnessing
 /// `impl <conform_ty> has P` chosen at the mono worklist by conformance lookup. This
@@ -84,19 +85,51 @@ pub const Instance = struct {
     boxed: []const u32 = &.{},
 };
 
-/// A generic template's inference facts, supplied by the caller's read-only view
-/// (`params` is the template's value params; `count` is the generic-param count fed
-/// to `Infer.infer` and used as the explicit-turbofish arity). Discovery derives it
-/// from the `FnSym` (`generic_params.len`); the fingerprint fold from the `Sig`
-/// (`Sig.genericParamCount`) — they agree for any call that survives Pass C.
+/// A generic template's inference facts: `params` is the template's value params; `count`
+/// is the generic-param count fed to `Infer.infer` and used as the explicit-turbofish
+/// arity. Discovery derives it from the `FnSym` (`generic_params.len`); later readers from
+/// the `Sig` (`Sig.genericParamCount`) — they agree for any call that survives Pass C.
 pub const TemplateRef = struct { params: []const Type, count: u32 };
 
-/// Fn `gid`'s template facts from the `Sig` table, or null when it is no generic
-/// template: the `genericTemplate` of every view that has only the sigs on hand.
+/// Fn `gid`'s template facts from the `Sig` table, or null when it is no generic template.
 pub fn templateRef(sigs: []const Sig, gid: u32) ?TemplateRef {
     if (gid >= sigs.len or !sigs[gid].isGenericTemplate()) return null;
     return .{ .params = sigs[gid].params, .count = sigs[gid].genericParamCount() };
 }
+
+/// Where `callInstanceRef` learns a callee's template facts.
+pub const Templates = union(enum) {
+    /// After the check, from each fn's `Sig`. The composite is gone, so a container param
+    /// cannot be re-inferred: such a call resolves by `findByReifiedParams` instead.
+    sigs: []const Sig,
+    /// Per fn id, its facts as the caller holds them (null for a fn that is no generic
+    /// template), and during discovery the live composite, so inference sees through a
+    /// container param (`Vec[T]`) exactly as the body check did.
+    refs: struct { of: []const ?TemplateRef, decomposer: ?Infer.Decomposer = null },
+
+    fn of(t: Templates, gid: u32) ?TemplateRef {
+        return switch (t) {
+            .sigs => |sigs| templateRef(sigs, gid),
+            .refs => |r| if (gid < r.of.len) r.of[gid] else null,
+        };
+    }
+
+    fn decomposer(t: Templates) ?Infer.Decomposer {
+        return switch (t) {
+            .sigs => null,
+            .refs => |r| r.decomposer,
+        };
+    }
+};
+
+/// What `callInstanceRef` reads: one body's tree, resolutions and node types, and where
+/// its callees' template facts come from.
+pub const CallView = struct {
+    tree: Ast.Tree,
+    resolutions: []const Resolution,
+    node_types: []const Type,
+    templates: Templates,
+};
 
 /// A recovered generic call site: the template `gid` and its concrete type-args
 /// (OWNED — the caller frees `args`).
@@ -117,11 +150,9 @@ pub const CallRef = struct { gid: u32, args: []Type };
 /// conformance witness — genuinely different leaves) and a same-module `N.V` variant
 /// access is `.unresolved` too, so both still return null here.
 ///
-/// `view` supplies `.tree`, `.resolutions`, `.node_types`, and
-/// `genericTemplate(gid) -> ?TemplateRef` (returns null for a non-generic callee,
-/// which filters both shapes). Returns null for any non-generic / non-`.func` /
-/// out-of-range / uninferable call; on `.ok` the caller owns `.args`.
-pub fn callInstanceRef(gpa: std.mem.Allocator, view: anytype, call_node: Ast.Node) error{OutOfMemory}!?CallRef {
+/// Returns null for any non-generic / non-`.func` / out-of-range / uninferable call; on
+/// `.ok` the caller owns `.args`.
+pub fn callInstanceRef(gpa: std.mem.Allocator, view: CallView, call_node: Ast.Node) error{OutOfMemory}!?CallRef {
     if (call_node.tag != .call or call_node.lhs == Ast.none) return null;
     const tree = view.tree;
     const callee = tree.nodes[call_node.lhs.int()];
@@ -130,7 +161,7 @@ pub fn callInstanceRef(gpa: std.mem.Allocator, view: anytype, call_node: Ast.Nod
             const bres = view.resolutions[callee.lhs.int()];
             if (bres != .func) return null;
             const gid = bres.func;
-            if (view.genericTemplate(gid) == null) return null;
+            if (view.templates.of(gid) == null) return null;
             const targ_nodes = Ast.rangeSlice(tree, callee.rhs.int());
             const args = try gpa.alloc(Type, targ_nodes.len);
             errdefer gpa.free(args);
@@ -147,7 +178,7 @@ pub fn callInstanceRef(gpa: std.mem.Allocator, view: anytype, call_node: Ast.Nod
             const bres = view.resolutions[call_node.lhs.int()];
             if (bres != .func) return null;
             const gid = bres.func;
-            const tmpl = view.genericTemplate(gid) orelse return null;
+            const tmpl = view.templates.of(gid) orelse return null;
             const value_args = Ast.rangeSlice(tree, call_node.rhs.int());
             const arg_types = try gpa.alloc(Type, value_args.len);
             defer gpa.free(arg_types);
@@ -155,32 +186,11 @@ pub fn callInstanceRef(gpa: std.mem.Allocator, view: anytype, call_node: Ast.Nod
                 if (va.int() >= view.node_types.len) return null; // pre-typecheck view
                 arg_types[k] = view.node_types[va.int()];
             }
-            // A composite-backed view (compute regime) exposes `decomposer()`, letting
-            // inference see through a container param (`Vec[T]`); a find-regime view
-            // (no composite) passes `null` and container calls resolve via
-            // `findByReifiedParams` instead.
-            const dec = viewDecomposer(view);
-            const targs = (try Infer.infer(gpa, tmpl.count, tmpl.params, arg_types, dec)) orelse return null;
+            const targs = (try Infer.infer(gpa, tmpl.count, tmpl.params, arg_types, view.templates.decomposer())) orelse return null;
             return .{ .gid = gid, .args = targs };
         },
         else => return null,
     }
-}
-
-/// The view's composite-backed decomposer, or `null` when it has none. A view in the
-/// COMPUTE regime (discovery) carries the live composite and declares `decomposer()`;
-/// a FIND-regime view (the fingerprint's frozen view) has no composite, so structural
-/// inference degrades to the flat rule and container calls resolve via
-/// `findByReifiedParams`. The `@hasDecl` is comptime, so only the taken branch is
-/// analyzed — a view without the decl never needs to define it.
-fn viewDecomposer(view: anytype) ?Infer.Decomposer {
-    const V = @TypeOf(view);
-    const Container = switch (@typeInfo(V)) {
-        .pointer => |p| p.child,
-        else => V,
-    };
-    if (@hasDecl(Container, "decomposer")) return view.decomposer();
-    return null;
 }
 
 /// Find the instance whose reified value-PARAMS accept the call's reified value-ARG
@@ -279,22 +289,12 @@ pub fn mangle(gpa: std.mem.Allocator, template_name: []const u8, args: []const T
 
 const testing = std.testing;
 
-const Resolution = @import("Resolution.zig").Resolution;
-
-/// A hand-built read-only view over a tiny tree, matching the `anytype` interface
-/// `callInstanceRef` reads. `genericTemplate` answers for exactly one gid.
-const FakeView = struct {
-    tree: Ast.Tree,
-    resolutions: []const Resolution,
-    node_types: []const Type,
-    gen_gid: u32,
-    gen_params: []const Type,
-    gen_count: u32,
-    fn genericTemplate(self: FakeView, gid: u32) ?TemplateRef {
-        if (gid != self.gen_gid) return null;
-        return .{ .params = self.gen_params, .count = self.gen_count };
-    }
-};
+/// A view over a tiny tree whose template facts answer for exactly one gid (below 10).
+fn fakeView(tree: Ast.Tree, resolutions: []const Resolution, node_types: []const Type, refs: *[10]?TemplateRef, gen_gid: u32, gen_params: []const Type, gen_count: u32) CallView {
+    refs.* = .{null} ** 10;
+    refs[gen_gid] = .{ .params = gen_params, .count = gen_count };
+    return .{ .tree = tree, .resolutions = resolutions, .node_types = node_types, .templates = .{ .refs = .{ .of = refs } } };
+}
 
 test "callInstanceRef recovers (gid, args) from an explicit turbofish callee" {
     const gpa = testing.allocator;
@@ -312,7 +312,8 @@ test "callInstanceRef recovers (gid, args) from an explicit turbofish callee" {
     var resolutions = [_]Resolution{.unresolved} ** 5;
     resolutions[0] = .{ .func = 7 };
     const node_types = [_]Type{ Type.invalid, Type.int, Type.invalid, Type.invalid, Type.invalid };
-    const view = FakeView{ .tree = tree, .resolutions = &resolutions, .node_types = &node_types, .gen_gid = 7, .gen_params = &.{}, .gen_count = 1 };
+    var refs: [10]?TemplateRef = undefined;
+    const view = fakeView(tree, &resolutions, &node_types, &refs, 7, &.{}, 1);
 
     const ref = (try callInstanceRef(gpa, view, nodes[4])).?;
     defer gpa.free(ref.args);
@@ -335,7 +336,8 @@ test "callInstanceRef infers (gid, args) from a bare generic callee" {
     resolutions[0] = .{ .func = 5 };
     const node_types = [_]Type{ Type.invalid, Type.int, Type.invalid };
     const params = [_]Type{Type.typeVar(0)};
-    const view = FakeView{ .tree = tree, .resolutions = &resolutions, .node_types = &node_types, .gen_gid = 5, .gen_params = &params, .gen_count = 1 };
+    var refs: [10]?TemplateRef = undefined;
+    const view = fakeView(tree, &resolutions, &node_types, &refs, 5, &params, 1);
 
     const ref = (try callInstanceRef(gpa, view, nodes[2])).?;
     defer gpa.free(ref.args);
@@ -357,7 +359,8 @@ test "callInstanceRef returns null for a non-generic or non-func callee" {
     resolutions[0] = .{ .func = 5 };
     const node_types = [_]Type{ Type.invalid, Type.int, Type.invalid };
     // gen_gid 9 != the callee's gid 5 -> genericTemplate is null -> not a template.
-    const view = FakeView{ .tree = tree, .resolutions = &resolutions, .node_types = &node_types, .gen_gid = 9, .gen_params = &.{}, .gen_count = 1 };
+    var refs: [10]?TemplateRef = undefined;
+    const view = fakeView(tree, &resolutions, &node_types, &refs, 9, &.{}, 1);
     try testing.expectEqual(@as(?CallRef, null), try callInstanceRef(gpa, view, nodes[2]));
 }
 
@@ -378,7 +381,8 @@ test "callInstanceRef infers (gid, args) from a qualified bare generic callee" {
     resolutions[1] = .{ .func = 5 };
     const node_types = [_]Type{ Type.invalid, Type.invalid, Type.int, Type.invalid };
     const params = [_]Type{Type.typeVar(0)};
-    const view = FakeView{ .tree = tree, .resolutions = &resolutions, .node_types = &node_types, .gen_gid = 5, .gen_params = &params, .gen_count = 1 };
+    var refs: [10]?TemplateRef = undefined;
+    const view = fakeView(tree, &resolutions, &node_types, &refs, 5, &params, 1);
 
     const ref = (try callInstanceRef(gpa, view, nodes[3])).?;
     defer gpa.free(ref.args);
@@ -403,7 +407,8 @@ test "callInstanceRef returns null for a value-method field_access callee" {
     const resolutions = [_]Resolution{.unresolved} ** 4;
     const node_types = [_]Type{ Type.invalid, Type.invalid, Type.int, Type.invalid };
     const params = [_]Type{Type.typeVar(0)};
-    const view = FakeView{ .tree = tree, .resolutions = &resolutions, .node_types = &node_types, .gen_gid = 5, .gen_params = &params, .gen_count = 1 };
+    var refs: [10]?TemplateRef = undefined;
+    const view = fakeView(tree, &resolutions, &node_types, &refs, 5, &params, 1);
     try testing.expectEqual(@as(?CallRef, null), try callInstanceRef(gpa, view, nodes[3]));
 }
 
@@ -438,33 +443,23 @@ test "mangle encodes integer width/sign distinctly" {
     try testing.expect(!std.mem.eql(u8, i8m, u32m));
 }
 
-/// A composite-backed view whose `decomposer()` reads a static decomposed table, so
-/// `callInstanceRef` can infer a container type-arg WITHOUT a real `Composite`.
-const FakeGenericView = struct {
-    tree: Ast.Tree,
-    resolutions: []const Resolution,
-    node_types: []const Type,
-    gen_gid: u32,
-    gen_params: []const Type,
-    gen_count: u32,
+/// A decomposer over a static decomposed table, so `callInstanceRef` can infer a container
+/// type-arg WITHOUT a real `Composite`.
+const FakeComposite = struct {
     entries: []const Infer.Decomposed,
-    fn genericTemplate(self: FakeGenericView, gid: u32) ?TemplateRef {
-        if (gid != self.gen_gid) return null;
-        return .{ .params = self.gen_params, .count = self.gen_count };
-    }
     fn thunk(ctx: *anyopaque, ty: Type) ?Infer.Decomposed {
         if (!ty.isApp()) return null;
-        const self: *const FakeGenericView = @ptrCast(@alignCast(ctx));
+        const self: *const FakeComposite = @ptrCast(@alignCast(ctx));
         const idx = ty.appIdx();
         if (idx >= self.entries.len) return null;
         return self.entries[idx];
     }
-    fn decomposer(self: *const FakeGenericView) Infer.Decomposer {
+    fn decomposer(self: *const FakeComposite) Infer.Decomposer {
         return .{ .ctx = @constCast(self), .func = thunk };
     }
 };
 
-test "callInstanceRef infers a CONTAINER type-arg via the view's decomposer" {
+test "callInstanceRef infers a CONTAINER type-arg through the live decomposer" {
     const gpa = testing.allocator;
     // `total(xs)`: n0=id, n1=xs(value-arg, typed Vec[int] = app(1)), n2=call.
     var nodes = [_]Ast.Node{
@@ -483,7 +478,10 @@ test "callInstanceRef infers a CONTAINER type-arg via the view's decomposer" {
         .{ .ctor = 1, .is_enum = false, .args = &.{Type.typeVar(0)} }, // 0: Vec[T]
         .{ .ctor = 1, .is_enum = false, .args = &.{Type.int} }, // 1: Vec[int]
     };
-    const view = FakeGenericView{ .tree = tree, .resolutions = &resolutions, .node_types = &node_types, .gen_gid = 5, .gen_params = &params, .gen_count = 1, .entries = &entries };
+    const composite: FakeComposite = .{ .entries = &entries };
+    var refs: [10]?TemplateRef = undefined;
+    var view = fakeView(tree, &resolutions, &node_types, &refs, 5, &params, 1);
+    view.templates.refs.decomposer = composite.decomposer();
 
     const ref = (try callInstanceRef(gpa, view, nodes[2])).?;
     defer gpa.free(ref.args);
