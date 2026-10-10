@@ -205,6 +205,8 @@ const GraphResolve = struct {
     bound_names: std.StringHashMapUnmanaged(void) = .empty,
     /// The next lambda's rank in this fn (pre-order).
     next_rank: u32 = 0,
+    /// The fn being resolved: its type params (an impl's included) name no value.
+    cur_fn: Ast.Index = Ast.none,
     /// Per module: the fns holding a lambda, in resolve (= node) order.
     closures: []std.ArrayList(Closure.FnClosures) = &.{},
 
@@ -640,6 +642,7 @@ const GraphResolve = struct {
         const decl = g.nodes()[fn_idx.int()];
         const proto = Ast.protoAt(g.tree(g.cur_mod), decl.lhs.int());
         g.mut_params = Modes.ofProto(g.tree(g.cur_mod), g.tokens(), proto);
+        g.cur_fn = fn_idx;
 
         try g.pushScope();
         for (proto.params) |param_idx| {
@@ -1034,6 +1037,12 @@ const GraphResolve = struct {
                         try g.sink.report(.{ .span = off, .code = .R0001, .scope = g.cur_mod }, "undeclared identifier '{s}'; the local function '{s}' is declared later in this block, and a local function can be named only after its declaration", .{ name, name });
                         return;
                     }
+                    // A declared type-level name is no value, so it is not undeclared either;
+                    // the checker reports the same T0056 for a struct or enum name.
+                    if (g.typeLevelKind(name)) |kind| {
+                        try g.sink.report(.{ .span = off, .code = .T0056, .scope = g.cur_mod }, "{s} '{s}' is not a value", .{ kind, name });
+                        return;
+                    }
                     // An EXACT stdlib name (checked before the fuzzy suggester) means the
                     // import is missing, not that the name is a typo — name the module to
                     // import. Only an exact match hints, so a genuine typo still falls
@@ -1140,6 +1149,30 @@ const GraphResolve = struct {
             .lambda => try g.resolveLambda(node_idx, n),
             else => {},
         }
+    }
+
+    /// What `name` names when it is a type-level name other than a struct or enum: a
+    /// builtin type (the checker's prelude `char` and `byte` included), an alias or
+    /// protocol of this module, or a type parameter of the fn being resolved.
+    fn typeLevelKind(g: *GraphResolve, name: []const u8) ?[]const u8 {
+        if (builtin_type_names.has(name) or std.mem.eql(u8, name, "char") or std.mem.eql(u8, name, "byte")) return "type";
+        const t = g.tree(g.cur_mod);
+        if (g.cur_fn != Ast.none) {
+            const proto = Ast.protoAt(t, g.nodes()[g.cur_fn.int()].lhs.int());
+            for (proto.generic_params) |gp| {
+                if (std.mem.eql(u8, g.nameText(g.nodes()[gp.int()].main_token), name)) return "type parameter";
+            }
+        }
+        for (Ast.rangeSlice(t, g.nodes()[Ast.root(g.nodes()).int()].lhs.int())) |decl_idx| {
+            const decl = g.nodes()[decl_idx.int()];
+            const kind: []const u8 = switch (decl.tag) {
+                .type_alias_decl => "type",
+                .protocol_decl => "protocol",
+                else => continue,
+            };
+            if (std.mem.eql(u8, g.nameText(decl.main_token), name)) return kind;
+        }
+        return null;
     }
 
     /// A bracket's content where a value index and type args look alike (`fs[i](x)`,
@@ -3705,6 +3738,31 @@ test "a '_' that is not the hole reads the '_' local, which the capture then cap
             try testing.expectEqual(Closure.Capture{ .slot = 0, .first_use = read }, b.captures[0]);
         }
     }.run);
+}
+
+test "a type-level name used as a value is T0056, not undeclared (R0001)" {
+    const cases = .{
+        .{ "fn main() -> int {\n _x := int\n return 0\n}\n", "type 'int' is not a value" },
+        .{ "fn main() -> int {\n _x := char\n return 0\n}\n", "type 'char' is not a value" },
+        .{ "fn main() -> int {\n _x := byte\n return 0\n}\n", "type 'byte' is not a value" },
+        .{ "fn main() -> int {\n return 5 |> str\n}\n", "type 'str' is not a value" },
+        .{ "type A = int\nfn main() -> int {\n _x := A\n return 0\n}\n", "type 'A' is not a value" },
+        .{ "protocol Pr { fn f(self) -> int }\nfn main() -> int {\n _x := Pr\n return 0\n}\n", "protocol 'Pr' is not a value" },
+        .{ "fn f[T](x: T) -> T {\n _y := T\n x\n}\nfn main() -> int { f(1) }\n", "type parameter 'T' is not a value" },
+        .{ "struct Box[T] { v: T }\nimpl Box[T] {\n fn g(self) -> int {\n  _y := T\n  0\n }\n}\nfn main() -> int { Box { v: 1 }.g() }\n", "type parameter 'T' is not a value" },
+        // Another fn's type param is not in scope here: still undeclared.
+        .{ "fn f[T](x: T) -> T { x }\nfn main() -> int {\n _y := T\n return f(1)\n}\n", "undeclared identifier 'T'" },
+    };
+    inline for (cases) |case| {
+        try withResolvedSource(case[0], struct {
+            fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+                const d = firstError(r);
+                try testing.expectEqualStrings(case[1], d.message);
+                const want: codes.Code = if (std.mem.startsWith(u8, case[1], "undeclared")) .R0001 else .T0056;
+                try testing.expectEqual(want, d.code);
+            }
+        }.run);
+    }
 }
 
 test "a '_' that is not the hole, with no '_' local, is R0001 with the capture hint" {

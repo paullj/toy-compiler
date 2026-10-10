@@ -1085,6 +1085,58 @@ pub const BodyChecker = struct {
         return .invalid;
     }
 
+    /// The struct or enum a type-named node names: a bare `K` the resolver left
+    /// unresolved, or a qualified `lib.K`. Both null when the node is neither.
+    const TypeIds = struct { s: ?u32 = null, e: ?u32 = null };
+    fn typeIdsNamed(bc: *const BodyChecker, idx: Ast.Index) TypeIds {
+        const r = bc.tree.nodes[idx.int()];
+        switch (r.tag) {
+            .identifier => {
+                if (bc.resolutions[idx.int()] != .unresolved) return .{};
+                const name = bc.nameText(r.main_token);
+                return .{ .s = bc.activeStructMap().get(name), .e = bc.activeEnumMap().get(name) };
+            },
+            .field_access => {
+                const inner = bc.tree.nodes[r.lhs.int()];
+                if (inner.tag != .identifier or bc.resolutions[r.lhs.int()] != .module) return .{};
+                const g = bc.model.graph;
+                const target = g.namespaceOfIn(bc.graph_mod, bc.nameText(inner.main_token)) orelse return .{};
+                const name = bc.nameText(r.main_token);
+                return .{ .s = g.mods[target].struct_ids.get(name), .e = g.mods[target].enum_ids.get(name) };
+            },
+            else => return .{},
+        }
+    }
+
+    /// T0056 at `idx`, a struct or enum name used as a value, an enum's with a hint that
+    /// names a variant; false when `idx` names neither.
+    fn reportTypeNotValue(bc: *BodyChecker, idx: Ast.Index) error{OutOfMemory}!bool {
+        const ids = bc.typeIdsNamed(idx);
+        const sp = bc.spanOf(idx);
+        const name = bc.source[sp.start..sp.end];
+        const at: DiagnosticSink.Report = .{ .span = sp, .code = .T0056 };
+        // A struct gets no hint: its name as a value is as often a mistaken associated
+        // call (`Set.from(..)`) as a missing construction, and a std struct or another
+        // module's is not built with `S { .. }` at all.
+        if (ids.s != null) {
+            try bc.sink.report(at, "type '{s}' is not a value", .{name});
+            return true;
+        }
+        const eid = ids.e orelse return false;
+        const variants = bc.model.enums[eid].variants;
+        if (variants.len == 0) {
+            try bc.sink.report(at, "type '{s}' is not a value", .{name});
+            return true;
+        }
+        const shape = switch (variants[0].form) {
+            .unit => "",
+            .tuple => "(..)",
+            .@"struct" => " { .. }",
+        };
+        try bc.sink.report(at, "type '{s}' is not a value; name one of its variants, as in '{s}.{s}{s}'", .{ name, name, variants[0].name, shape });
+        return true;
+    }
+
     pub fn typeOf(bc: *BodyChecker, node_idx: Ast.Index) error{OutOfMemory}!Type {
         if (node_idx == Ast.none) return .invalid; // structural poison: no emit (exempt)
         const n = bc.tree.nodes[(node_idx).int()];
@@ -1098,15 +1150,12 @@ pub const BodyChecker = struct {
                 .local => |slot| bc.slotType(slot),
                 .func => |gid| try bc.typeOfFnValue(node_idx, gid, n.main_token),
                 .unresolved => blk: {
-                    // Resolve quietly skips a struct-named identifier (it expects this
-                    // to be a struct type-name in a position it doesn't bind, or a
-                    // positional `Point(...)` callee it diagnoses elsewhere). A BARE
-                    // struct name used as a value (`q := P`, `P.x`) reaches here with
-                    // no diagnostic — report it so it never escapes to codegen.
-                    if (bc.activeStructMap().get(bc.nameText(n.main_token)) != null) {
-                        try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0056 }, "type '{s}' is not a value", .{bc.nameText(n.main_token)});
-                        break :blk bc.poison();
-                    }
+                    // Resolve quietly skips a struct- or enum-named identifier (a type
+                    // name in a position it doesn't bind: a constructor, a variant or an
+                    // associated call). Used BARE as a value (`q := P`, `id(Shape)`) it
+                    // reaches here with no diagnostic, so report it here or it reaches
+                    // lowering.
+                    if (try bc.reportTypeNotValue(node_idx)) break :blk bc.poison();
                     // Else: an ordinary undeclared name already reported by resolve
                     // (this branch emits nothing) — keep plain poison, no guard.
                     break :blk Type.invalid;
@@ -1547,6 +1596,7 @@ pub const BodyChecker = struct {
             .func => |gid| return bc.typeOfFnValue(node_idx, gid, n.main_token),
             else => {},
         }
+        if (try bc.reportTypeNotValue(node_idx)) return bc.poison();
         // A qualified UNIT-variant reference `N.V`: the receiver is an enum type-name
         // identifier (resolved quietly to .unresolved). Treat it as construction.
         const recv = bc.tree.nodes[(n.lhs).int()];
@@ -2872,23 +2922,7 @@ pub const BodyChecker = struct {
     /// or a qualified `lib.K`), or null when the receiver is a value, a module or a generic
     /// type.
     fn concreteTypeNamed(bc: *BodyChecker, recv_idx: Ast.Index) ?Type {
-        const r = bc.tree.nodes[recv_idx.int()];
-        const ids: struct { s: ?u32, e: ?u32 } = switch (r.tag) {
-            .identifier => blk: {
-                if (bc.resolutions[recv_idx.int()] != .unresolved) return null;
-                const name = bc.nameText(r.main_token);
-                break :blk .{ .s = bc.activeStructMap().get(name), .e = bc.activeEnumMap().get(name) };
-            },
-            .field_access => blk: {
-                const inner = bc.tree.nodes[r.lhs.int()];
-                if (inner.tag != .identifier or bc.resolutions[r.lhs.int()] != .module) return null;
-                const g = bc.model.graph;
-                const target = g.namespaceOfIn(bc.graph_mod, bc.nameText(inner.main_token)) orelse return null;
-                const name = bc.nameText(r.main_token);
-                break :blk .{ .s = g.mods[target].struct_ids.get(name), .e = g.mods[target].enum_ids.get(name) };
-            },
-            else => return null,
-        };
+        const ids = bc.typeIdsNamed(recv_idx);
         if (ids.s) |sid| return if (sid < bc.structSyms().len and !bc.structSyms()[sid].is_generic) Type.structT(sid) else null;
         if (ids.e) |eid| return if (!bc.model.enums[eid].is_generic) Type.enumT(eid) else null;
         return null;

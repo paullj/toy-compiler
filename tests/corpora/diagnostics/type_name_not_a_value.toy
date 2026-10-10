@@ -1,0 +1,20 @@
+# A builtin type, an alias, a protocol or a type parameter is no value either: T0056, not
+# "undeclared identifier".
+type Count = int
+
+protocol Named {
+    fn name(self) -> str
+}
+
+fn first[T](x: T) -> T {
+    _t := T  #~ ERROR [T0056] type parameter 'T' is not a value
+    x
+}
+
+fn main() -> int {
+    _a := int  #~ ERROR [T0056] type 'int' is not a value
+    _b := 5 |> str  #~ ERROR [T0056] type 'str' is not a value
+    _c := Count  #~ ERROR [T0056] type 'Count' is not a value
+    _d := Named  #~ ERROR [T0056] protocol 'Named' is not a value
+    return first(0)
+}
