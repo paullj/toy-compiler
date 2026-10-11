@@ -26,11 +26,9 @@
 //!   * A local's binding is followed only when nothing writes the local again; any write
 //!     (an assignment, a `mut` argument) leaves its calls labelled by their type. A param, a
 //!     field or an element is always labelled by its type.
-//!   * A builtin method on a concrete receiver inside a bounded template (`(3).eq(`) shows
-//!     no receiver type: the template's node types are scratch, so its param renders `?`.
-//!   * A method call or a function value's call inside a generic body can yield no help at
-//!     all (issue #33), and a generic protocol's method shows the protocol's own params: see
-//!     `Analysis.CalleeSig`'s limitations.
+//!   * A method call in a generic body reads what the body's instances selected; with no
+//!     instance it yields no help, and a generic protocol's method shows the protocol's own
+//!     params: see `Analysis.CalleeSig`'s limitations.
 //!   * A bare pipe target `x |> f` has no `(`, so it yields no help of its own.
 //!   * A parse error OTHER than the appended closers (or a stray unmatched closer) re-triggers
 //!     discovery's whole-tree discard -> null (the single-edit repair limit, as in completion).
@@ -344,7 +342,7 @@ fn help(a: std.mem.Allocator, an: *Analysis, enc: Enclosing) !?protocol.Signatur
         },
         .method => |hm| {
             const ms = hm.sig;
-            if (ms.decl != null and an.spelledFromDecl(hm.node))
+            if (ms.decl != null and ms.spell != .checked)
                 try renderDeclLabel(a, &label, &an.graph.modules[ms.decl.?.module], ms.decl.?.node, ms.name, ms.has_self, &ranges)
             else
                 try renderLabel(a, &label, ms.name, ms.params[@intFromBool(ms.has_self)..], ms.mut_mask >> @intFromBool(ms.has_self), ms.ret, tc.layouts, tc.enum_layouts, ms.var_names, &ranges);
@@ -1011,4 +1009,24 @@ test "signatureHelpAt: a generic fn's call shows the instance it runs, explicit 
     const boxed = "struct Box[T] { v: T }\nimpl Box[T] { fn wrap[U](self, u: U, t: T) -> U { u } }\nfn main() -> int {\n    b := Box { v: 1 }\n";
     // Incomplete, so it picked no instance: shown as declared.
     try expectHelpAfter(boxed, "    x := b.wrap[str](", "fn wrap(U, T) -> U", 0);
+}
+
+test "signatureHelpAt: method calls inside generic bodies (#33), and free fn calls there" {
+    const src = test_util.generic_body_fixture;
+    try expectHelp(src, "self.get(", "fn get() -> T", 0);
+    try expectHelp(src, "b.get(", "fn get() -> int", 0);
+    try expectHelp(src, "{ b.get(", "fn get() -> T", 0);
+    try expectHelp(src, "acc.plus(", "fn plus(int) -> int", 0);
+    const free =
+        \\fn id[T](x: T) -> T { x }
+        \\fn dbl(x: int) -> int { x * 2 }
+        \\fn wrap[T](v: T) -> T {
+        \\    k := dbl(1)
+        \\    id(v)
+        \\}
+        \\fn main() -> int { return wrap(1) + wrap("s").len() }
+        \\
+    ;
+    try expectHelp(free, "dbl(", "fn dbl(int) -> int", 0);
+    try expectHelp(free, "    id(", "fn id(T) -> T", 0);
 }

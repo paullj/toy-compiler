@@ -485,10 +485,10 @@ test "hover on a generic method call whose args do not check shows the method as
     const p = @import("test_util.zig").posAfterLast(src, "z := b.");
     var h = (try hoverAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse return error.NoHover;
     defer h.deinit();
-    try testing.expectEqualStrings("```toy\nfn map(self, f: fn(T) -> U) -> Box[U]\n```", h.value);
+    try testing.expectEqualStrings("```toy\nfn map(self: Box[T], f: fn(T) -> U) -> Box[U]\n```", h.value);
 }
 
-test "hover inside a bounded template: a prelude bound spells Self, a scratch receiver shows its name" {
+test "hover inside a bounded template: a prelude bound spells Self, a concrete receiver shows its type" {
     const gpa = testing.allocator;
     var docs: @import("Documents.zig") = .{};
     defer docs.deinit(gpa);
@@ -514,8 +514,8 @@ test "hover inside a bounded template: a prelude bound spells Self, a scratch re
         .{ .at = test_util.posOf(src, "cmp(w)"), .want = "fn cmp(self: Self, other: Self) -> Ordering" },
         // A one-line protocol's method shows without the protocol's braces.
         .{ .at = test_util.posOf(src, "one() }"), .want = "fn one(self) -> int" },
-        // The template body's node types are scratch, so the receiver type is unknown here.
-        .{ .at = test_util.posOf(src, "eq(3)"), .want = "fn eq(self, other) -> bool" },
+        // The template body's own node types are scratch; its one instance knows the receiver.
+        .{ .at = test_util.posOf(src, "eq(3)"), .want = "fn eq(self: int, other: int) -> bool" },
     };
     for (cases) |c| {
         var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse {
@@ -708,6 +708,41 @@ test "hover on a generic fn: a call shows the instance it runs, its declaration 
         var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse return error.NoHover;
         defer h.deinit();
         const want = try std.fmt.allocPrint(gpa, "```toy\n{s}\n```", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}
+
+test "hover on method calls inside generic bodies (#33)" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const test_util = @import("test_util.zig");
+    const src = test_util.generic_body_fixture;
+    const P = @import("protocol.zig").Position;
+    const after = struct {
+        fn f(p: P, n: u32) P {
+            return .{ .line = p.line, .character = p.character + n };
+        }
+    }.f;
+    const cases = [_]struct { at: P, want: []const u8 }{
+        // A generic method's call follows the template's params: shown as declared.
+        .{ .at = after(test_util.posOf(src, "self.get()"), 5), .want = "fn get(self: Box[T]) -> T\n```" },
+        .{ .at = after(test_util.posOf(src, "b.get() }"), 2), .want = "fn get(self: Box[T]) -> T\n```" },
+        // A concrete type's method is the same in every instance.
+        .{ .at = test_util.posOf(src, "plus(2)"), .want = "fn plus(self: Acc, k: int) -> int\n```" },
+        .{ .at = test_util.posOf(src, "plus\n"), .want = "fn plus(self: Acc, k: int) -> int\n```\n\nbound method of Acc" },
+        // Outside a generic body, unchanged.
+        .{ .at = test_util.posOf(src, "get()\n"), .want = "fn get(self: Box[int]) -> int\n```" },
+    };
+    for (cases) |c| {
+        var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no hover for '{s}'\n", .{c.want});
+            return error.NoHover;
+        };
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}", .{c.want});
         defer gpa.free(want);
         try testing.expectEqualStrings(want, h.value);
     }

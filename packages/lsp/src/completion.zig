@@ -27,7 +27,8 @@
 //!     it (wherever declared) + all visible top-level decls + the language keywords. Outside
 //!     any fn's source, only the top-level decls and keywords.
 //!   * Scalar / `str` builtin methods are not surfaced; a generic type's methods show as
-//!     declared (`fn map(self, f: fn(T) -> U) -> Vec[U]`), not over the receiver's args.
+//!     declared (`fn map(self: Vec[T], f: fn(T) -> U) -> Vec[U]`), not over the receiver's
+//!     args.
 
 const std = @import("std");
 const toyc = @import("toy_compiler");
@@ -589,13 +590,13 @@ test "completion offers a generic std type's methods as declared, and no associa
     var got = try completeAt(gpa, src);
     defer got.deinit();
     const want = [_]struct { label: []const u8, detail: []const u8 }{
-        .{ .label = "map", .detail = "fn map(self, f: fn(T) -> U) -> Vec[U]" },
-        .{ .label = "filter", .detail = "fn filter(self, f: fn(T) -> bool) -> Vec[T]" },
-        .{ .label = "fold", .detail = "fn fold(self, init: A, f: fn(A, T) -> A) -> A" },
-        .{ .label = "each", .detail = "fn each(self, f: fn(T)) -> ()" },
+        .{ .label = "map", .detail = "fn map(self: Vec[T], f: fn(T) -> U) -> Vec[U]" },
+        .{ .label = "filter", .detail = "fn filter(self: Vec[T], f: fn(T) -> bool) -> Vec[T]" },
+        .{ .label = "fold", .detail = "fn fold(self: Vec[T], init: A, f: fn(A, T) -> A) -> A" },
+        .{ .label = "each", .detail = "fn each(self: Vec[T], f: fn(T)) -> ()" },
         // Called by the list literal, so an instance row exists; it still shows as declared.
-        .{ .label = "push", .detail = "fn push(self, x: T) -> ()" },
-        .{ .label = "sort", .detail = "fn sort(self) -> ()" },
+        .{ .label = "push", .detail = "fn push(self: Vec[T], x: T) -> ()" },
+        .{ .label = "sort", .detail = "fn sort(self: Vec[T]) -> ()" },
     };
     for (want) |w| try testing.expectEqualStrings(w.detail, detailOf(got.items, w.label) orelse {
         std.debug.print("no '{s}'\n", .{w.label});

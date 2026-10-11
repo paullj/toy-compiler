@@ -14,8 +14,9 @@
 //! KNOWN LIMITATIONS:
 //!   * A closure in a generic fn has an env only per instance. With no instance its
 //!     captures show no mode, and a copy's size shows only when every instance agrees.
-//!   * A method call inside an unbounded generic body records no selection (see
-//!     `Analysis.CalleeSig`), so its `mut` arguments and receiver are not reported.
+//!   * A call inside a generic body is read from the body's own table, which records no
+//!     method selection for an unbounded body (only its instances check it), so its `mut`
+//!     arguments and receiver are not reported.
 
 const std = @import("std");
 const toyc = @import("toy_compiler");

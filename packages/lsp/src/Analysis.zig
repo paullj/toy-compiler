@@ -355,14 +355,51 @@ pub const FreeCallee = union(enum) {
 };
 
 /// The free fn the call whose slot is `slot` runs, from its Callee; null for any other
-/// call. In a generic template's own body an instance pick is no instance's (the body was
-/// checked over no concrete types), so the fn shows as declared there.
+/// call. In a generic template's body, which only its instances check, a generic fn shows
+/// as declared (its types follow the template's params, and the body's own instance pick
+/// was made over no concrete types), and a non-generic one as every instance's.
 pub fn freeCallee(an: *const Analysis, slot: u32) ?FreeCallee {
     const t = an.tc();
-    return switch (an.callees()[slot].view()) {
+    const own = an.callees()[slot];
+    if (an.inTemplate(slot)) {
+        var agreed: ?Callee = null;
+        var it = an.instancesOf(an.fnOf(an.module().nodes[slot].main_token));
+        const same = while (it.next()) |inst| {
+            if (slot >= inst.callees.len or inst.callees[slot].view() == .none) continue;
+            if (agreed) |p| if (!std.meta.eql(p, inst.callees[slot])) break false;
+            agreed = inst.callees[slot];
+        } else true;
+        if (same) if (agreed) |c| if (c.view() == .direct) return .{ .direct = c.view().direct };
+        // A fn the resolver names but no instance agrees on: as declared.
+        const gid: u32 = switch (own.view()) {
+            .direct, .generic => |g| g,
+            .instance => |ii| if (ii < t.instances.len) t.instances[ii].template_gid else return null,
+            else => an.headFn(slot) orelse return null,
+        };
+        return if (gid < t.sigs.len and t.sigs[gid].isGenericTemplate()) .{ .generic = gid } else .{ .direct = gid };
+    }
+    return freeOf(t, own);
+}
+
+fn freeOf(t: *const TypecheckGraph.GraphResult, c: Callee) ?FreeCallee {
+    return switch (c.view()) {
         .direct => |g| .{ .direct = g },
         .generic => |g| .{ .generic = g },
-        .instance => |ii| if (ii >= t.instances.len) null else if (an.inTemplate(slot)) .{ .generic = t.instances[ii].template_gid } else .{ .instance = ii },
+        .instance => |ii| if (ii < t.instances.len) .{ .instance = ii } else null,
+        else => null,
+    };
+}
+
+/// The fn the resolver says the call at `slot` names: its own, or the head of its
+/// explicit type args.
+fn headFn(an: *const Analysis, slot: u32) ?u32 {
+    const n = an.module().nodes[slot];
+    const head = if (n.tag == .type_app) n.lhs else Ast.Index.from(slot);
+    if (head == Ast.none) return null;
+    const rs = an.resolutions();
+    if (head.int() >= rs.len) return null;
+    return switch (rs[head.int()]) {
+        .func => |g| g,
         else => null,
     };
 }
@@ -497,16 +534,13 @@ fn localDeclToken(an: *const Analysis, use_tok: u32, slot: u32) ?u32 {
 
 /// The signature of the method a `recv.m(..)` call selected, or a `recv.m` bound method
 /// value binds, read from the checker's Callee table, so hover, definition and signature
-/// help agree on which method a call invokes.
+/// help agree on which method a call invokes. In a generic template's body, which only its
+/// instances check, it is read from the instances' tables (see `instanceSelect`).
 ///
 /// KNOWN LIMITATIONS:
-///   * No selection is recorded, so this is null, for a method call inside an unbounded
-///     generic fn or impl body (`self.get()` in `impl Box[T]`): such a body is checked only
-///     per instance, never on its own.
-///   * The same holds inside a bounded template for a call whose method row exists only
-///     once instances are made (a generic type's method such as `xs.len()` with
-///     `xs: Vec[int]`, an associated fn, a derived `hash`): the template's receiver types
-///     are scratch, so its pick is never resolved.
+///   * A method call in a generic body that no instance reaches has no selection: the
+///     checker checks an unbounded body only per instance, and a bounded one over scratch
+///     types that resolve no generic type's method.
 ///   * A generic protocol's method on a bounded receiver keeps the protocol's own params
 ///     (`U`, not `int`, for `T has Scale[int]`): the Callee names the protocol method, not
 ///     the bound's arguments.
@@ -526,8 +560,19 @@ pub const CalleeSig = struct {
     var_names: []const []const u8 = &.{},
     /// The source `fn_decl` the call reaches, when one exists.
     decl: ?Decl = null,
+    /// How it is shown: by its checked types, or, where those are opaque once typecheck is
+    /// done, as its declaration spells it.
+    spell: Spell = .checked,
 
     pub const Decl = struct { module: u32, node: u32 };
+
+    pub const Spell = enum {
+        checked,
+        /// A user protocol's method signature, as written.
+        protocol,
+        /// A generic method's header, as written (`fn map(self: Vec[T], f: fn(T) -> U)`).
+        template,
+    };
 };
 
 /// The selected method of the call whose member node is `fa`, or the method the bound
@@ -542,26 +587,107 @@ pub fn calleeAt(an: *const Analysis, a: std.mem.Allocator, fa: u32) !?CalleeSig 
 }
 
 fn selectCallee(an: *const Analysis, a: std.mem.Allocator, fa: u32) !?CalleeSig {
+    const cs = an.callees();
+    if (fa >= cs.len) return null;
+    const c = cs[fa];
+    // A bounded receiver's protocol method is the template body's own answer, the same in
+    // every instance; anything else its instances know better.
+    if (c.view() != .protocol and c.templateFn() == null and an.inTemplate(fa)) {
+        if (try an.instanceSelect(a, fa)) |sig| return sig;
+    }
+    return an.selectFrom(a, fa, c, an.nodeTypes());
+}
+
+/// The method at member `fa`, in a generic template's body, as the template's instances
+/// selected it. A pick that reaches a generic method shows that method as declared: its
+/// types follow the template's own params, which no one instance shows. Any other pick is
+/// shown as made when every instance made it on the same receiver type (a concrete type's
+/// method, a builtin). Null when no instance reaches the body or the instances reach
+/// different methods.
+fn instanceSelect(an: *const Analysis, a: std.mem.Allocator, fa: u32) !?CalleeSig {
+    const recv = an.module().nodes[fa].lhs;
+    var first: ?*const toyc.Mono.Instance = null;
+    var same = true;
+    var reach: ?u32 = null;
+    var one_reach = true;
+    var it = an.instancesOf(an.fnOf(an.module().nodes[fa].main_token));
+    while (it.next()) |inst| {
+        if (fa >= inst.callees.len) continue;
+        const c = inst.callees[fa];
+        if (c.view() == .none) continue;
+        if (first) |f| {
+            if (!std.meta.eql(f.callees[fa], c)) same = false;
+            if (recv != Ast.none and !Type.eql(f.node_types[recv.int()], inst.node_types[recv.int()])) same = false;
+        } else first = inst;
+        const g = an.declaredFn(c);
+        if (g == null or (reach != null and reach.? != g.?)) one_reach = false;
+        if (reach == null) reach = g;
+    }
+    const f = first orelse return null;
+    if (same and !an.reifiesGeneric(f.callees[fa])) return an.selectFrom(a, fa, f.callees[fa], f.node_types);
+    if (!one_reach) return null;
+    return an.templateSig(a, fa, reach orelse return null);
+}
+
+/// Whether method pick `c` is a generic method's instance.
+fn reifiesGeneric(an: *const Analysis, c: Callee) bool {
+    const mi = switch (c.view()) {
+        .method, .bound_method => |mi| mi,
+        else => return false,
+    };
+    return mi < an.tc().methods.len and an.tc().methods[mi].instance != null;
+}
+
+/// The fn a method pick runs as its source declares it: the generic method an instance's
+/// row reifies, else the row's own fn. Null for a derive and any pick that is no method.
+fn declaredFn(an: *const Analysis, c: Callee) ?u32 {
+    const t = an.tc();
+    const mi = switch (c.view()) {
+        .method, .bound_method => |mi| mi,
+        else => return null,
+    };
+    if (mi >= t.methods.len) return null;
+    const meth = t.methods[mi];
+    if (meth.derive != null) return null;
+    if (meth.instance) |ii| return if (ii < t.instances.len) t.instances[ii].template_gid else null;
+    return meth.fn_id;
+}
+
+/// Generic method `gid`, called through member `fa`, as its declaration spells it.
+fn templateSig(an: *const Analysis, a: std.mem.Allocator, fa: u32, gid: u32) !?CalleeSig {
     const t = an.tc();
     const r = an.res();
-    const mod = an.entry();
-    if (fa >= t.callees[mod].len) return null;
+    if (gid >= r.fns.len or gid >= t.sigs.len) return null;
+    const gf = r.fns[gid];
+    if (gf.decl_node == Ast.none) return null;
+    const m = an.module();
+    const sig = t.sigs[gid];
+    const names = try an.declParamNames(a, gf.module, gf.decl_node);
+    const has_self = names.len > 0 and std.mem.eql(u8, names[0], "self");
+    return .{
+        .name = m.tokens[m.nodes[fa].main_token].text(m.source),
+        .params = sig.params,
+        .param_names = names,
+        .ret = sig.ret,
+        .has_self = has_self,
+        .mut_mask = sig.mut_mask,
+        .decl = .{ .module = gf.module, .node = gf.decl_node.int() },
+        .spell = .template,
+    };
+}
+
+/// What callee `c` at member `fa` selects, reading node types from `nts` (the module's, or
+/// an instance's).
+fn selectFrom(an: *const Analysis, a: std.mem.Allocator, fa: u32, c: Callee, nts: []const Type) !?CalleeSig {
+    const t = an.tc();
+    const r = an.res();
     const m = an.module();
     const fa_node = m.nodes[fa];
     const name = m.tokens[fa_node.main_token].text(m.source);
-    switch (t.callees[mod][fa].view()) {
+    switch (c.view()) {
         // A generic method whose call did not check (`xs.map(` mid-typing) picked no
         // instance; its template still names what the user is calling.
-        .none => {
-            const gid = t.callees[mod][fa].templateFn() orelse return null;
-            if (gid >= r.fns.len or gid >= t.sigs.len) return null;
-            const gf = r.fns[gid];
-            if (gf.decl_node == Ast.none) return null;
-            const sig = t.sigs[gid];
-            const names = try an.declParamNames(a, gf.module, gf.decl_node);
-            const has_self = names.len > 0 and std.mem.eql(u8, names[0], "self");
-            return .{ .name = name, .params = sig.params, .param_names = names, .ret = sig.ret, .has_self = has_self, .mut_mask = sig.mut_mask, .decl = .{ .module = gf.module, .node = gf.decl_node.int() } };
-        },
+        .none => return an.templateSig(a, fa, c.templateFn() orelse return null),
         // A function value's signature is its type, not a declaration's; a free fn call's
         // slot is not a member call's.
         .value, .fn_ref, .direct, .instance, .generic => return null,
@@ -605,12 +731,12 @@ fn selectCallee(an: *const Analysis, a: std.mem.Allocator, fa: u32) !?CalleeSig 
             const node = sig_nodes[p.method];
             sig.param_names = try an.declParamNames(a, proto.mod, node);
             sig.decl = .{ .module = proto.mod, .node = node.int() };
+            sig.spell = .protocol;
             return sig;
         },
         .builtin => |k| {
-            const nts = t.node_types[mod];
             const recv: Type = if (fa_node.lhs != Ast.none and fa_node.lhs.int() < nts.len) nts[fa_node.lhs.int()] else .invalid;
-            const call_ty: Type = if (an.callOfMember(fa)) |c| (if (c < nts.len) nts[c] else .invalid) else .invalid;
+            const call_ty: Type = if (an.callOfMember(fa)) |call| (if (call < nts.len) nts[call] else .invalid) else .invalid;
             // Kept here rather than as a compiler table: a new `Builtin` breaks this switch
             // at compile time, and the compiler grows no LSP-only API.
             const shape: struct { params: []const Type, ret: Type, names: []const []const u8 } = switch (k) {
@@ -628,14 +754,6 @@ fn selectCallee(an: *const Analysis, a: std.mem.Allocator, fa: u32) !?CalleeSig 
             return .{ .name = name, .params = shape.params, .param_names = shape.names, .ret = shape.ret, .has_self = true };
         },
     }
-}
-
-/// Whether the method `fa` calls is best shown as its declaration spells it: a user
-/// protocol's method or a generic method's template, whose checked types are opaque once
-/// typecheck is done.
-pub fn spelledFromDecl(an: *const Analysis, fa: u32) bool {
-    const c = an.callees()[fa];
-    return c.view() == .protocol or c.templateFn() != null;
 }
 
 /// The names of a source-less method's params (a derive, a prelude protocol's method): a
@@ -857,7 +975,16 @@ test "a discovery that fails leaves only diagnostics" {
     try testing.expect(an.diagnostics.len > 0);
 }
 
-test "hover, definition and signature help agree on what each token of the method fixture is" {
+test "hover, definition and signature help agree on what each token of the method fixtures is" {
+    for ([_]struct { src: []const u8, calls: usize }{
+        // plus (twice), make, get, concat, eq, unwrap, unwrap_or, hash, len, dbl (twice), twice.
+        .{ .src = test_util.method_fixture, .calls = 13 },
+        // get (three times), plus, twice, use_box, with_acc (twice).
+        .{ .src = test_util.generic_body_fixture, .calls = 8 },
+    }) |fx| try expectAgreement(fx.src, fx.calls);
+}
+
+fn expectAgreement(src: []const u8, want_calls: usize) !void {
     const gpa = testing.allocator;
     const hover = @import("hover.zig");
     const definition = @import("definition.zig");
@@ -865,7 +992,7 @@ test "hover, definition and signature help agree on what each token of the metho
     var docs: @import("Documents.zig") = .{};
     defer docs.deinit(gpa);
     const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
-    const an = try test_util.analyzeIn(gpa, ws, "file:///p/main.toy", test_util.method_fixture);
+    const an = try test_util.analyzeIn(gpa, ws, "file:///p/main.toy", src);
     defer an.deinit();
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -924,8 +1051,7 @@ test "hover, definition and signature help agree on what each token of the metho
             try testing.expect(is_fn);
         }
     }
-    // plus (twice), make, get, concat, eq, unwrap, unwrap_or, hash, len, dbl (twice), twice.
-    try testing.expectEqual(@as(usize, 13), calls);
+    try testing.expectEqual(want_calls, calls);
 }
 
 test "a bound method value in a generic fn: its instances say it binds, and agree or not on its receiver" {

@@ -202,10 +202,16 @@ pub const Describer = struct {
     /// like the protocol-decl hover.
     fn callee(d: *Describer, fa: u32) !bool {
         const sig = (try d.an.calleeAt(d.a, fa)) orelse return false;
-        if (d.an.spelledFromDecl(fa)) if (sig.decl) |decl| {
-            const dm = &d.an.graph.modules[decl.module];
-            if (d.an.callees()[fa].templateFn() != null) try render.appendFnHeader(d.a, &d.buf, dm, decl.node, sig.name) else try d.appendNodeText(dm, decl.node);
-            return true;
+        if (sig.decl) |decl| switch (sig.spell) {
+            .checked => {},
+            .protocol => {
+                try d.appendNodeText(&d.an.graph.modules[decl.module], decl.node);
+                return true;
+            },
+            .template => {
+                try render.appendFnHeader(d.a, &d.buf, &d.an.graph.modules[decl.module], decl.node, sig.name);
+                return true;
+            },
         };
         try d.buf.print(d.a, "fn {s}(", .{sig.name});
         for (sig.params, 0..) |p, k| {

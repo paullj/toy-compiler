@@ -136,8 +136,9 @@ pub fn appendNodeText(a: std.mem.Allocator, buf: *std.ArrayList(u8), m: *const t
     try appendCollapsed(a, buf, m.source[sp.start..sp.end]);
 }
 
-/// A fn declaration's header as written (`fn map(self, f: fn(T) -> U) -> Vec[U]`), without
-/// its generic params or its body, named `name`.
+/// A fn declaration's header as written (`fn map(self: Vec[T], f: fn(T) -> U) -> Vec[U]`),
+/// without its generic params or its body, named `name`. A method's `self` is typed as its
+/// impl names the receiver.
 pub fn appendFnHeader(a: std.mem.Allocator, buf: *std.ArrayList(u8), m: *const toyc.Graph.Module, decl: u32, name: []const u8) !void {
     const Ast = toyc.Ast;
     const tree = m.tree();
@@ -148,13 +149,33 @@ pub fn appendFnHeader(a: std.mem.Allocator, buf: *std.ArrayList(u8), m: *const t
         if (Ast.isMutParam(tree, m.tokens, p)) try buf.appendSlice(a, "mut ");
         const pn = m.nodes[p.int()];
         try buf.appendSlice(a, m.tokens[pn.main_token].text(m.source));
-        // The receiver's type is synthesized from the impl, not written.
-        if (pn.lhs == Ast.none or (k == 0 and Ast.isSelfParam(tree, m.tokens, m.source, p))) continue;
+        if (pn.lhs == Ast.none) continue;
         try buf.appendSlice(a, ": ");
-        try appendNodeText(a, buf, m, pn.lhs.int());
+        try appendTypeRef(a, buf, m, pn.lhs.int());
     }
     try buf.appendSlice(a, ") -> ");
     if (proto.ret_type == Ast.none) try buf.appendSlice(a, "()") else try appendNodeText(a, buf, m, proto.ret_type.int());
+}
+
+/// Type-ref node `i` as written, except that a generic param is spelled by its name: a
+/// method's `self` type is synthesized from its impl's header, whose params may carry a
+/// bound (`impl Vec[T has Ord]` gives `self: Vec[T]`).
+fn appendTypeRef(a: std.mem.Allocator, buf: *std.ArrayList(u8), m: *const toyc.Graph.Module, i: u32) error{OutOfMemory}!void {
+    const Ast = toyc.Ast;
+    const n = m.nodes[i];
+    switch (n.tag) {
+        .generic_param => try buf.appendSlice(a, m.tokens[n.main_token].text(m.source)),
+        .type_app => {
+            try appendTypeRef(a, buf, m, n.lhs.int());
+            try buf.append(a, '[');
+            for (Ast.rangeSlice(m.tree(), n.rhs.int()), 0..) |arg, k| {
+                if (k != 0) try buf.appendSlice(a, ", ");
+                try appendTypeRef(a, buf, m, arg.int());
+            }
+            try buf.append(a, ']');
+        },
+        else => try appendNodeText(a, buf, m, i),
+    }
 }
 
 /// A symbol name minus the `$…` suffix the compiler mints for a generic instance or a
