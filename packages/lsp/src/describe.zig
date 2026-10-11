@@ -53,7 +53,11 @@ pub const Describer = struct {
         var decl: ?u32 = null;
         for (d.an.nodesAt(tok)) |i| {
             const n = m.nodes[i];
-            if (resolutions[i] == .func) if (try d.function(resolutions[i].func)) return true;
+            if (resolutions[i] == .func) {
+                // A call of a generic fn shows the instance it runs.
+                if (d.an.freeCallee(d.an.callSlotOf(i))) |fc| if (fc == .instance) if (try d.instance(fc.instance)) return true;
+                if (try d.function(resolutions[i].func)) return true;
+            }
             // Before the variant fallback: a method never shows as a same-named variant.
             if (n.tag == .field_access and resolutions[i] != .func) if (try d.callee(i)) return true;
             if (ty == null and isRenderable(node_types[i])) ty = node_types[i];
@@ -150,22 +154,47 @@ pub const Describer = struct {
         return null;
     }
 
+    /// Fn `f` as `fn name(p: P, ..) -> R`. A generic fn's checked types are opaque, so it
+    /// shows as its declaration spells it.
     fn function(d: *Describer, f: u32) !bool {
         if (f >= d.tc().sigs.len) return false;
         const sig = d.tc().sigs[f];
-        const names = try d.paramNames(f);
-        try d.buf.appendSlice(d.a, "fn ");
-        try d.buf.appendSlice(d.a, unmangled(bareName(sig.name)));
-        try d.buf.append(d.a, '(');
-        for (sig.params, 0..) |p, k| {
+        const name = unmangled(bareName(sig.name));
+        if (sig.isGenericTemplate()) if (d.fnDecl(f)) |decl| {
+            try render.appendFnHeader(d.a, &d.buf, decl.module, decl.node, name);
+            return true;
+        };
+        return d.signature(name, try d.paramNames(f), sig.params, sig.mut_mask, sig.ret);
+    }
+
+    /// The instance a call of a generic fn runs, with its concrete types.
+    fn instance(d: *Describer, ii: u32) !bool {
+        const t = d.tc();
+        if (ii >= t.instances.len) return false;
+        const inst = t.instances[ii];
+        if (inst.template_gid >= t.sigs.len) return false;
+        const sig = t.sigs[inst.template_gid];
+        return d.signature(unmangled(bareName(sig.name)), try d.paramNames(inst.template_gid), inst.params, sig.mut_mask, inst.ret);
+    }
+
+    fn signature(d: *Describer, name: []const u8, names: []const []const u8, params: []const Type, mut_mask: u64, ret: Type) !bool {
+        try d.buf.print(d.a, "fn {s}(", .{name});
+        for (params, 0..) |p, k| {
             if (k != 0) try d.buf.appendSlice(d.a, ", ");
-            if (toyc.Modes.isMut(sig.mut_mask, k)) try d.buf.appendSlice(d.a, "mut ");
+            if (toyc.Modes.isMut(mut_mask, k)) try d.buf.appendSlice(d.a, "mut ");
             if (k < names.len) try d.buf.print(d.a, "{s}: ", .{names[k]});
             try renderType(d.a, &d.buf, p, d.tc().layouts, d.tc().enum_layouts);
         }
         try d.buf.appendSlice(d.a, ") -> ");
-        try renderType(d.a, &d.buf, sig.ret, d.tc().layouts, d.tc().enum_layouts);
+        try renderType(d.a, &d.buf, ret, d.tc().layouts, d.tc().enum_layouts);
         return true;
+    }
+
+    /// Fn `f`'s declaration, when it has source.
+    fn fnDecl(d: *const Describer, f: u32) ?struct { module: *const Graph.Module, node: u32 } {
+        const fns = d.an.res().fns;
+        if (f >= fns.len or fns[f].decl_node == Ast.none) return null;
+        return .{ .module = &d.an.graph.modules[fns[f].module], .node = fns[f].decl_node.int() };
     }
 
     /// The method the call headed by member node `fa` selected, or the bound method value
@@ -175,7 +204,7 @@ pub const Describer = struct {
         const sig = (try d.an.calleeAt(d.a, fa)) orelse return false;
         if (d.an.spelledFromDecl(fa)) if (sig.decl) |decl| {
             const dm = &d.an.graph.modules[decl.module];
-            if (d.an.callees()[fa].templateFn() != null) try d.appendFnHeader(dm, decl.node, sig.name) else try d.appendNodeText(dm, decl.node);
+            if (d.an.callees()[fa].templateFn() != null) try render.appendFnHeader(d.a, &d.buf, dm, decl.node, sig.name) else try d.appendNodeText(dm, decl.node);
             return true;
         };
         try d.buf.print(d.a, "fn {s}(", .{sig.name});
@@ -217,54 +246,19 @@ pub const Describer = struct {
     /// A type's declaration as written (generic parameters and all), found in whichever
     /// module declares it; the entry module wins a name clash.
     fn typeDefinition(d: *Describer, name: []const u8) !bool {
-        var found: ?struct { mod: *const Graph.Module, node: u32 } = null;
-        for (d.an.graph.modules, 0..) |*tm, mi| {
-            for (tm.nodes, 0..) |n, i| switch (n.tag) {
-                .struct_decl, .enum_decl, .protocol_decl => {
-                    const t = tm.tokens[n.main_token];
-                    if (!std.mem.eql(u8, tm.source[t.start..t.end], name)) continue;
-                    if (found == null or mi == d.an.entry()) found = .{ .mod = tm, .node = @intCast(i) };
-                },
-                else => {},
-            };
-        }
-        const f = found orelse {
+        const td = d.an.typeDecl(name) orelse {
             for (native_enums) |e| if (std.mem.eql(u8, e.name, name)) {
                 try d.buf.appendSlice(d.a, e.decl);
                 return true;
             };
             return false;
         };
-        try d.appendNodeText(f.mod, f.node);
+        try render.appendNodeText(d.a, &d.buf, &d.an.graph.modules[td.module], td.node);
         return true;
     }
 
-    /// Node `i`'s source as written, whitespace collapsed: a declaration spread over lines
-    /// reads as one signature.
-    /// A method declaration's header as written (`fn map(self, f: fn(T) -> U) -> Vec[U]`),
-    /// without its body.
-    fn appendFnHeader(d: *Describer, m: *const Graph.Module, decl: u32, name: []const u8) !void {
-        const tree = m.tree();
-        const proto = Ast.protoAt(tree, m.nodes[decl].lhs.int());
-        try d.buf.print(d.a, "fn {s}(", .{name});
-        for (proto.params, 0..) |p, k| {
-            if (k != 0) try d.buf.appendSlice(d.a, ", ");
-            if (Ast.isMutParam(tree, m.tokens, p)) try d.buf.appendSlice(d.a, "mut ");
-            const pn = m.nodes[p.int()];
-            const pname = m.tokens[pn.main_token].text(m.source);
-            try d.buf.appendSlice(d.a, pname);
-            // The receiver's type is synthesized from the impl, not written.
-            if (pn.lhs == Ast.none or (k == 0 and Ast.isSelfParam(tree, m.tokens, m.source, p))) continue;
-            try d.buf.appendSlice(d.a, ": ");
-            try d.appendNodeText(m, pn.lhs.int());
-        }
-        try d.buf.appendSlice(d.a, ") -> ");
-        if (proto.ret_type == Ast.none) try d.buf.appendSlice(d.a, "()") else try d.appendNodeText(m, proto.ret_type.int());
-    }
-
     fn appendNodeText(d: *Describer, m: *const Graph.Module, i: u32) !void {
-        const sp = toyc.Walk.nodeSpan(.{ .tree = m.tree(), .tokens = m.tokens, .source = m.source }, Ast.Index.from(i));
-        try render.appendCollapsed(d.a, &d.buf, m.source[sp.start..sp.end]);
+        try render.appendNodeText(d.a, &d.buf, m, i);
     }
 
     /// A variant as `Enum.Variant(payload)`. The enum is the node's own type (a construction

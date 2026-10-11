@@ -2,7 +2,8 @@
 //!
 //! Three contexts are served: SCOPE (a bare identifier position → in-scope locals /
 //! params / visible top-level fns + types + keywords), MEMBER (`recv.` → the receiver
-//! type's fields + methods), and MODULE (`imported_ns.` → that module's pub members).
+//! type's fields + methods; only methods after `x |> .`), and MODULE (`imported_ns.` →
+//! that module's pub members).
 //! The active context returns ONLY its own candidates — a member/module context never
 //! falls back to scope, so a `p.` never leaks globals.
 //!
@@ -25,8 +26,8 @@
 //!     the params of the top-level fn around the cursor + every `:=` local and local fn in
 //!     it (wherever declared) + all visible top-level decls + the language keywords. Outside
 //!     any fn's source, only the top-level decls and keywords.
-//!   * Scalar / `str` / generic-template methods are not surfaced (only concrete
-//!     `methods`-table entries are).
+//!   * Scalar / `str` builtin methods are not surfaced; a generic type's methods show as
+//!     declared (`fn map(self, f: fn(T) -> U) -> Vec[U]`), not over the receiver's args.
 
 const std = @import("std");
 const toyc = @import("toy_compiler");
@@ -60,6 +61,8 @@ const Detected = struct {
     /// Member with an already-typed (partial) field name after the `.`: the source START
     /// offset of that field-name token, used to locate the existing `field_access`.
     partial_start: u32 = 0,
+    /// A `x |> .m(..)` step: only a method can follow its `.`.
+    methods_only: bool = false,
 };
 
 /// The completion candidates at (`line`, `character`) in `doc`'s document, allocated in
@@ -92,7 +95,7 @@ fn collect(a: std.mem.Allocator, an: *Analysis, det: Detected, toks: []const Tok
         .scope => try collectScope(&col, an, toks, off),
         .member => {
             const recv = locateReceiver(an.module(), det) orelse return &.{};
-            try collectMember(&col, an, recv);
+            try collectMember(&col, an, recv, det.methods_only);
         },
     }
     return col.items.toOwnedSlice(a);
@@ -150,16 +153,23 @@ fn classify(tokens: []const Token, off: u32) Detected {
     const p0 = lastBefore(tokens, off) orelse return .{ .context = .none };
     const p = skipNewlineBack(tokens, p0) orelse return .{ .context = .none };
     switch (tokens[p].tag) {
-        .dot => return .{ .context = .member, .repair = true },
+        .dot => return .{ .context = .member, .repair = true, .methods_only = pipedAt(tokens, p) },
         .identifier => {
             const q0 = lastBefore(tokens, tokens[p].start) orelse return .{ .context = .scope };
             const q = skipNewlineBack(tokens, q0) orelse return .{ .context = .scope };
             if (tokens[q].tag == .dot)
-                return .{ .context = .member, .partial_start = tokens[p].start };
+                return .{ .context = .member, .partial_start = tokens[p].start, .methods_only = pipedAt(tokens, q) };
             return .{ .context = .scope };
         },
         else => return .{ .context = .none },
     }
+}
+
+/// Whether the `.` at `dot` follows a `|>`.
+fn pipedAt(tokens: []const Token, dot: usize) bool {
+    if (dot == 0) return false;
+    const p = skipNewlineBack(tokens, dot - 1) orelse return false;
+    return tokens[p].tag == .pipe_gt;
 }
 
 /// Locate the receiver NODE index of the target `field_access`. For a repaired buffer the
@@ -182,12 +192,13 @@ fn locateReceiver(m: *const Graph.Module, det: Detected) ?u32 {
 /// Member/module enumeration. Decides module vs value by the receiver's RESOLUTION FIRST
 /// (a `.module` receiver must not be misread as a value), then hard-returns without a
 /// scope fallback so unrelated globals never leak into a `recv.` completion.
-fn collectMember(col: *Collector, an: *const Analysis, recv: u32) !void {
+fn collectMember(col: *Collector, an: *const Analysis, recv: u32, methods_only: bool) !void {
     const res = an.res();
     const tc = an.tc();
     const resolutions = an.resolutions();
     if (recv < resolutions.len and resolutions[recv] == .module) {
-        try collectModule(col, an.graph.modules, res, resolutions[recv].module);
+        // A module is no value, so it cannot be piped.
+        if (!methods_only) try collectModule(col, an.graph.modules, res, resolutions[recv].module);
         return;
     }
 
@@ -196,7 +207,7 @@ fn collectMember(col: *Collector, an: *const Analysis, recv: u32) !void {
     const rt = node_types[recv];
     if (rt.kind != .@"struct" and rt.kind != .@"enum") return;
 
-    if (rt.kind == .@"struct" and rt.struct_id < tc.layouts.len) {
+    if (!methods_only and rt.kind == .@"struct" and rt.struct_id < tc.layouts.len) {
         const layout = tc.layouts[rt.struct_id];
         for (layout.field_names, layout.field_types) |fname, fty| {
             var buf: std.ArrayList(u8) = .empty;
@@ -205,16 +216,57 @@ fn collectMember(col: *Collector, an: *const Analysis, recv: u32) !void {
         }
     }
 
+    // A generic type's methods are its templates, shown as declared: an instance row
+    // exists only for a method some body already calls on these args.
+    const template = templateOf(tc, rt);
+    if (template) |tm| for (tc.templates) |t| {
+        if (t.recv_ctor != tm.ctor or t.recv_is_enum != tm.is_enum or !t.has_self or t.fn_id >= res.fns.len) continue;
+        const gf = res.fns[t.fn_id];
+        if (gf.decl_node == Ast.none) continue;
+        var buf: std.ArrayList(u8) = .empty;
+        try render.appendFnHeader(col.a, &buf, &an.graph.modules[gf.module], gf.decl_node.int(), t.name);
+        try col.add(t.name, kind.method, buf.items);
+    };
+
     for (tc.methods) |mth| {
-        if (!Type.eql(mth.recv, rt)) continue;
+        if (!Type.eql(mth.recv, rt) or mth.is_static) continue;
+        if (template != null and mth.instance != null) continue;
         var detail: ?[]const u8 = null;
         var buf: std.ArrayList(u8) = .empty;
-        if (mth.fn_id < tc.sigs.len) {
-            try render.renderSig(col.a, &buf, tc.sigs[mth.fn_id], tc.layouts, tc.enum_layouts);
+        // The fn, instance or derive the method runs; its row names it as the user does.
+        if (toyc.Typecheck.witnessSig(mth, tc.derives, tc.instances, tc.sigs)) |sig| {
+            try render.renderSig(col.a, &buf, .{ .name = mth.name, .params = sig.params, .ret = sig.ret, .mut_mask = sig.mut_mask }, tc.layouts, tc.enum_layouts);
             detail = buf.items;
         }
         try col.add(render.bareName(mth.name), kind.method, detail);
     }
+}
+
+/// The generic type `rt` is an instance of, as the template-method table keys it, or null
+/// for a type that is no instance.
+fn templateOf(tc: *const toyc.TypecheckGraph.GraphResult, rt: Type) ?struct { ctor: u32, is_enum: bool } {
+    // A method some body calls on `rt` names its template exactly.
+    for (tc.methods) |mth| {
+        if (!Type.eql(mth.recv, rt)) continue;
+        const ii = mth.instance orelse continue;
+        if (ii >= tc.instances.len) continue;
+        for (tc.templates) |t| if (t.fn_id == tc.instances[ii].template_gid) return .{ .ctor = t.recv_ctor, .is_enum = t.recv_is_enum };
+    }
+    // Else by name: an instance is named `Template$args`, and only an unambiguous name
+    // counts.
+    const is_enum = rt.kind == .@"enum";
+    if (if (is_enum) rt.enum_id >= tc.enum_layouts.len else rt.struct_id >= tc.layouts.len) return null;
+    const name = render.bareName(if (is_enum) tc.enum_layouts[rt.enum_id].name else tc.layouts[rt.struct_id].name);
+    const base = name[0 .. std.mem.indexOfScalar(u8, name, '$') orelse return null];
+    var found: ?u32 = null;
+    for (tc.templates) |t| {
+        if (t.recv_is_enum != is_enum or t.recv_ctor >= (if (is_enum) tc.enum_layouts.len else tc.layouts.len)) continue;
+        const tname = if (is_enum) tc.enum_layouts[t.recv_ctor].name else tc.layouts[t.recv_ctor].name;
+        if (!std.mem.eql(u8, render.bareName(tname), base)) continue;
+        if (found) |f| if (f != t.recv_ctor) return null;
+        found = t.recv_ctor;
+    }
+    return .{ .ctor = found orelse return null, .is_enum = is_enum };
 }
 
 /// A module's pub members: its pub fns (from the global fn table) plus its pub types
@@ -288,11 +340,27 @@ fn collectScope(col: *Collector, an: *const Analysis, toks: []const Token, off: 
     try collectEnclosing(col, an, @intCast(typed));
 }
 
-/// Add the enclosing fn's params + `:=` locals + local fns. The resolver keeps no
-/// positional scope, so every local of the fn is offered, wherever it is declared.
+/// Add the params of each lambda and local fn around the cursor, then the enclosing fn's
+/// params + `:=` locals + local fns. The resolver keeps no positional scope, so every local
+/// of the fn is offered, wherever it is declared.
 fn collectEnclosing(col: *Collector, an: *const Analysis, typed: u32) !void {
     const m = an.module();
     const tc = an.tc();
+    var scope = an.scopeOf(typed);
+    while (scope) |sc| : (scope = an.scopeParent(sc)) {
+        if (m.nodes[sc].tag == .fn_decl) break;
+        // A closure's param types are its own fn type's: its params' slots stay untyped.
+        const fs = render.fnSigOf(an.nodeTypes()[sc], tc.layouts);
+        for (Ast.protoAt(m.tree(), m.nodes[sc].lhs.int()).params, 0..) |p, k| {
+            var detail: ?[]const u8 = null;
+            var buf: std.ArrayList(u8) = .empty;
+            if (fs) |f| if (k < f.params.len and render.isRenderable(f.params[k])) {
+                try render.renderType(col.a, &buf, f.params[k], tc.layouts, tc.enum_layouts);
+                detail = buf.items;
+            };
+            try col.add(m.tokens[m.nodes[p.int()].main_token].text(m.source), kind.variable, detail);
+        }
+    }
     const fn_node = an.fnOf(typed) orelse return;
     const decl = m.nodes[fn_node];
     const proto = Ast.protoAt(m.tree(), decl.lhs.int());
@@ -439,4 +507,115 @@ test "completion: a local fn before the cursor keeps the enclosing fn's params a
         try testing.expect(!std.mem.eql(u8, it.label, "x"));
         try testing.expect(!std.mem.eql(u8, it.label, "k"));
     }
+}
+
+/// The candidates at `@` in `src`, whose `@` is dropped, with no other document open.
+fn completeAt(gpa: std.mem.Allocator, marked: []const u8) !Completions {
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const cut = std.mem.indexOfScalar(u8, marked, '@').?;
+    const src = try std.mem.concat(gpa, u8, &.{ marked[0..cut], marked[cut + 1 ..] });
+    defer gpa.free(src);
+    const p = @import("test_util.zig").posAfterLast(src, marked[0..cut]);
+    return completionsAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy");
+}
+
+fn detailOf(items: []const protocol.CompletionItem, label: []const u8) ?[]const u8 {
+    for (items) |it| if (std.mem.eql(u8, it.label, label)) return it.detail orelse "";
+    return null;
+}
+
+const gaps_fixture =
+    \\import std/vec
+    \\struct Acc { n: int }
+    \\impl Acc {
+    \\    fn plus(self, k: int) -> int { self.n + k }
+    \\    fn zero() -> Acc { Acc { n: 0 } }
+    \\}
+    \\protocol Area { fn area(self) -> int }
+    \\struct Sq { side: int }
+    \\impl Sq has Area { fn area(self) -> int { self.side * self.side } }
+    \\fn apply(f: fn(int, str) -> int) -> int { f(1, "s") }
+    \\fn main() -> int {
+    \\    acc := Acc { n: 1 }
+    \\    xs := [1, 2]
+    \\    sq := Sq { side: 2 }
+    \\
+;
+
+test "completion inside a lambda or a local fn offers its params, and none outside it" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { tail: []const u8, has: []const []const u8, not: []const []const u8 }{
+        .{ .tail = "    k := apply(fn(a, b) { a@ })\n    return k\n}\n", .has = &.{ "a", "b", "acc" }, .not = &.{"z"} },
+        .{ .tail = "    k := apply(fn(a, b) {\n        fn inner(z: int) -> int { z@ }\n        inner(a)\n    })\n    return k\n}\n", .has = &.{ "z", "a", "b", "inner" }, .not = &.{} },
+        .{ .tail = "    k := apply(fn(a, b) { a })\n    return k@\n}\n", .has = &.{"acc"}, .not = &.{ "a", "b" } },
+    };
+    for (cases) |c| {
+        const src = try std.mem.concat(gpa, u8, &.{ gaps_fixture, c.tail });
+        defer gpa.free(src);
+        var got = try completeAt(gpa, src);
+        defer got.deinit();
+        for (c.has) |l| if (detailOf(got.items, l) == null) {
+            std.debug.print("no '{s}' in '{s}'\n", .{ l, c.tail });
+            return error.MissingCompletion;
+        };
+        for (c.not) |l| try testing.expect(detailOf(got.items, l) == null);
+    }
+    const src = try std.mem.concat(gpa, u8, &.{ gaps_fixture, cases[0].tail });
+    defer gpa.free(src);
+    var got = try completeAt(gpa, src);
+    defer got.deinit();
+    try testing.expectEqualStrings("int", detailOf(got.items, "a").?);
+    try testing.expectEqualStrings("str", detailOf(got.items, "b").?);
+}
+
+test "completion after a method pipe offers methods only" {
+    const gpa = testing.allocator;
+    for ([_][]const u8{ "    k := acc |> .@\n    return 0\n}\n", "    k := acc\n        |> .pl@\n    return 0\n}\n" }) |tail| {
+        const src = try std.mem.concat(gpa, u8, &.{ gaps_fixture, tail });
+        defer gpa.free(src);
+        var got = try completeAt(gpa, src);
+        defer got.deinit();
+        try testing.expectEqualStrings("fn plus(Acc, int) -> int", detailOf(got.items, "plus").?);
+        try testing.expect(detailOf(got.items, "n") == null);
+    }
+}
+
+test "completion offers a generic std type's methods as declared, and no associated fn on a value" {
+    const gpa = testing.allocator;
+    const src = try std.mem.concat(gpa, u8, &.{ gaps_fixture, "    k := xs.@\n    return 0\n}\n" });
+    defer gpa.free(src);
+    var got = try completeAt(gpa, src);
+    defer got.deinit();
+    const want = [_]struct { label: []const u8, detail: []const u8 }{
+        .{ .label = "map", .detail = "fn map(self, f: fn(T) -> U) -> Vec[U]" },
+        .{ .label = "filter", .detail = "fn filter(self, f: fn(T) -> bool) -> Vec[T]" },
+        .{ .label = "fold", .detail = "fn fold(self, init: A, f: fn(A, T) -> A) -> A" },
+        .{ .label = "each", .detail = "fn each(self, f: fn(T)) -> ()" },
+        // Called by the list literal, so an instance row exists; it still shows as declared.
+        .{ .label = "push", .detail = "fn push(self, x: T) -> ()" },
+        .{ .label = "sort", .detail = "fn sort(self) -> ()" },
+    };
+    for (want) |w| try testing.expectEqualStrings(w.detail, detailOf(got.items, w.label) orelse {
+        std.debug.print("no '{s}'\n", .{w.label});
+        return error.MissingCompletion;
+    });
+    try testing.expect(detailOf(got.items, "new") == null);
+
+    const src2 = try std.mem.concat(gpa, u8, &.{ gaps_fixture, "    k := acc.@\n    return 0\n}\n" });
+    defer gpa.free(src2);
+    var got2 = try completeAt(gpa, src2);
+    defer got2.deinit();
+    try testing.expect(detailOf(got2.items, "plus") != null);
+    try testing.expect(detailOf(got2.items, "zero") == null);
+}
+
+test "completion names a protocol witness as written" {
+    const gpa = testing.allocator;
+    const src = try std.mem.concat(gpa, u8, &.{ gaps_fixture, "    k := sq.@\n    return 0\n}\n" });
+    defer gpa.free(src);
+    var got = try completeAt(gpa, src);
+    defer got.deinit();
+    try testing.expectEqualStrings("fn area(Sq) -> int", detailOf(got.items, "area").?);
 }

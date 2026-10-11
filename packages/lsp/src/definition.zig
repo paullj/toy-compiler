@@ -10,9 +10,9 @@
 //!
 //! CROSS-FILE go-to-definition is supported for imported PUB fns: a `mod.fn` field-access
 //! resolves to a global `.func` carrying its owning module + decl node, which maps to that
-//! module's real `file` and thus a real `file://` uri. Cross-file TYPES are out of scope: the
-//! resolver leaves an imported type name `.unresolved`, so there is no owning-module handle to
-//! follow — a type use navigates only within the entry module.
+//! module's real `file` and thus a real `file://` uri. The resolver leaves a type name
+//! `.unresolved`, so a type use navigates by its name (`Analysis.typeDecl`): to the entry's
+//! type of that name, else an imported module's.
 //!
 //! A broken import (`graph.err != null`, e.g. a typo'd import path) disables go-to-def for the
 //! WHOLE buffer — there is then no sound tree to resolve against.
@@ -40,13 +40,12 @@ pub fn at(a: std.mem.Allocator, an: *Analysis, line: u32, character: u32) !?prot
         return .{ .uri = try a.dupe(u8, an.uri), .range = an.rangeOf(t.start, t.end) };
     }
 
+    // `declOf` already refused a bundled module.
     const tm = &an.graph.modules[site.module];
-    // A bundled module's `file` is the relative `<bundled>/…` marker, which no client can
-    // open; every real module file is absolute.
-    if (!std.fs.path.isAbsolute(tm.file)) return null;
+    const uri = (try lsp_uri.pathToUri(a, tm.file)) orelse return null;
     var tsm = try SourceMap.init(a, tm.file, tm.source);
     defer tsm.deinit(a);
-    return .{ .uri = try lsp_uri.pathToUri(a, tm.file), .range = rangeOfToken(&tsm, tm.tokens, site.tok, an.encoding) };
+    return .{ .uri = uri, .range = rangeOfToken(&tsm, tm.tokens, site.tok, an.encoding) };
 }
 
 fn rangeOfToken(sm: *const SourceMap, tokens: []const Token, t: u32, enc: position.Encoding) protocol.Range {
@@ -272,6 +271,43 @@ test "definition: a local fn and its params jump to their bindings; the enclosin
         const use = posOf(src, c.use);
         const d = (try definitionAt(gpa, ws, src, use.line, use.character + c.skip, "file:///p/main.toy")) orelse {
             std.debug.print("no definition for '{s}'+{d}\n", .{ c.use, c.skip });
+            return error.NoDefinition;
+        };
+        defer gpa.free(d.uri);
+        const want = posOf(src, c.decl);
+        try testing.expectEqual(want.line, d.range.start.line);
+        try testing.expectEqual(want.character, d.range.start.character);
+    }
+}
+
+test "definition: a bound method value jumps to its method; a protocol name to its declaration" {
+    const gpa = testing.allocator;
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\protocol Area { fn area(self) -> int }
+        \\struct Sq { side: int }
+        \\impl Sq has Area { fn area(self) -> int { self.side * self.side } }
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, k: int) -> int { self.n + k } }
+        \\fn total[T has Area](v: T) -> int { v.area() }
+        \\fn main() -> int {
+        \\    acc := Acc { n: 1 }
+        \\    g := acc.plus
+        \\    return g(1) + total(Sq { side: 2 })
+        \\}
+        \\
+    ;
+    const cases = [_]struct { use: []const u8, decl: []const u8 }{
+        .{ .use = "plus\n", .decl = "plus(self" },
+        .{ .use = "Area { fn area(self) -> int { self", .decl = "Area {" },
+        .{ .use = "Area](v", .decl = "Area {" },
+    };
+    for (cases) |c| {
+        const use = posOf(src, c.use);
+        const d = (try definitionAt(gpa, ws, src, use.line, use.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no definition for '{s}'\n", .{c.use});
             return error.NoDefinition;
         };
         defer gpa.free(d.uri);

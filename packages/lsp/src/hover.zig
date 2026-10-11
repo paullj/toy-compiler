@@ -38,16 +38,12 @@ pub fn at(a: std.mem.Allocator, an: *Analysis, line: u32, character: u32) !?[]co
 fn appendValueNotes(a: std.mem.Allocator, buf: *std.ArrayList(u8), an: *const Analysis, tok: u32) !void {
     const m = an.module();
     const nts = an.nodeTypes();
-    const callees = an.callees();
     const tc = an.tc();
     for (an.nodesAt(tok)) |i| {
         if (i >= nts.len) continue;
         const n = m.nodes[i];
         const ty: Type, const what: []const u8 = switch (n.tag) {
-            .field_access => if (i < callees.len and callees[i].view() == .bound_method and n.lhs.int() < nts.len)
-                .{ nts[n.lhs.int()], "bound method of " }
-            else
-                continue,
+            .field_access => .{ an.boundReceiver(i) orelse continue, "bound method of " },
             .lambda => if (toyc.Ast.isCaptureLambda(m.tree(), m.tokens, toyc.Ast.Index.from(i)))
                 .{ nts[i], "capture: " }
             else
@@ -680,6 +676,38 @@ test "hover on a mut argument or a mut self receiver names the call that mutates
         var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse return error.NoHover;
         defer h.deinit();
         const want = try std.fmt.allocPrint(gpa, "```toy\n{s}", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}
+
+test "hover on a generic fn: a call shows the instance it runs, its declaration and a call in a template body as declared" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const test_util = @import("test_util.zig");
+    const src =
+        \\fn id[T](x: T) -> T { x }
+        \\fn pair[T has Hash](v: T) -> int { id(v).hash() }
+        \\fn main() -> int {
+        \\    a := id(7)
+        \\    b := id[str]("s")
+        \\    return a + b.len() + pair(3)
+        \\}
+        \\
+    ;
+    const cases = [_]struct { at: @import("protocol.zig").Position, want: []const u8 }{
+        .{ .at = test_util.posOf(src, "id(7)"), .want = "fn id(x: int) -> int" },
+        .{ .at = test_util.posOf(src, "id[str]"), .want = "fn id(x: str) -> str" },
+        .{ .at = test_util.posOf(src, "id[T]"), .want = "fn id(x: T) -> T" },
+        .{ .at = test_util.posOf(src, "id(v)"), .want = "fn id(x: T) -> T" },
+        .{ .at = test_util.posOf(src, "pair(3)"), .want = "fn pair(v: int) -> int" },
+    };
+    for (cases) |c| {
+        var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse return error.NoHover;
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}\n```", .{c.want});
         defer gpa.free(want);
         try testing.expectEqualStrings(want, h.value);
     }

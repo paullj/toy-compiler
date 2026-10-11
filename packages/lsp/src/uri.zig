@@ -12,9 +12,11 @@
 
 const std = @import("std");
 
-/// `file://` + `path` verbatim. Caller owns the returned bytes.
-pub fn pathToUri(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
-    return std.fmt.allocPrint(gpa, "file://{s}", .{path});
+/// `file://` + `path` verbatim, or null for a relative path, which no file uri names.
+/// Caller owns the returned bytes.
+pub fn pathToUri(gpa: std.mem.Allocator, path: []const u8) !?[]u8 {
+    if (!std.fs.path.isAbsolute(path)) return null;
+    return try std.fmt.allocPrint(gpa, "file://{s}", .{path});
 }
 
 /// The filesystem path of a `file://` uri (percent-decoded), or null if `uri` is not a
@@ -63,11 +65,12 @@ fn hexNibble(c: u8) ?u8 {
 
 const testing = std.testing;
 
-test "pathToUri prefixes file:// verbatim" {
+test "pathToUri prefixes file:// verbatim; a relative path has no uri" {
     const gpa = testing.allocator;
-    const u = try pathToUri(gpa, "/a/b.toy");
+    const u = (try pathToUri(gpa, "/a/b.toy")).?;
     defer gpa.free(u);
     try testing.expectEqualStrings("file:///a/b.toy", u);
+    try testing.expect((try pathToUri(gpa, "b.toy")) == null);
 }
 
 test "uriToPath decodes %XX escapes" {

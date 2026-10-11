@@ -118,7 +118,7 @@ pub fn renderNominal(a: std.mem.Allocator, buf: *std.ArrayList(u8), name: []cons
 /// so this stays decoupled from the symbol module's surface.
 pub fn renderSig(a: std.mem.Allocator, buf: *std.ArrayList(u8), sig: anytype, layouts: []const Layout, enum_layouts: []const EnumLayout) !void {
     try buf.appendSlice(a, "fn ");
-    try buf.appendSlice(a, bareName(sig.name));
+    try buf.appendSlice(a, unmangled(bareName(sig.name)));
     try buf.append(a, '(');
     for (sig.params, 0..) |p, i| {
         if (i != 0) try buf.appendSlice(a, ", ");
@@ -127,6 +127,34 @@ pub fn renderSig(a: std.mem.Allocator, buf: *std.ArrayList(u8), sig: anytype, la
     }
     try buf.appendSlice(a, ") -> ");
     try renderType(a, buf, sig.ret, layouts, enum_layouts);
+}
+
+/// Node `i` of module `m` as written, whitespace collapsed: a declaration spread over lines
+/// reads as one signature.
+pub fn appendNodeText(a: std.mem.Allocator, buf: *std.ArrayList(u8), m: *const toyc.Graph.Module, i: u32) !void {
+    const sp = toyc.Walk.nodeSpan(.{ .tree = m.tree(), .tokens = m.tokens, .source = m.source }, toyc.Ast.Index.from(i));
+    try appendCollapsed(a, buf, m.source[sp.start..sp.end]);
+}
+
+/// A fn declaration's header as written (`fn map(self, f: fn(T) -> U) -> Vec[U]`), without
+/// its generic params or its body, named `name`.
+pub fn appendFnHeader(a: std.mem.Allocator, buf: *std.ArrayList(u8), m: *const toyc.Graph.Module, decl: u32, name: []const u8) !void {
+    const Ast = toyc.Ast;
+    const tree = m.tree();
+    const proto = Ast.protoAt(tree, m.nodes[decl].lhs.int());
+    try buf.print(a, "fn {s}(", .{name});
+    for (proto.params, 0..) |p, k| {
+        if (k != 0) try buf.appendSlice(a, ", ");
+        if (Ast.isMutParam(tree, m.tokens, p)) try buf.appendSlice(a, "mut ");
+        const pn = m.nodes[p.int()];
+        try buf.appendSlice(a, m.tokens[pn.main_token].text(m.source));
+        // The receiver's type is synthesized from the impl, not written.
+        if (pn.lhs == Ast.none or (k == 0 and Ast.isSelfParam(tree, m.tokens, m.source, p))) continue;
+        try buf.appendSlice(a, ": ");
+        try appendNodeText(a, buf, m, pn.lhs.int());
+    }
+    try buf.appendSlice(a, ") -> ");
+    if (proto.ret_type == Ast.none) try buf.appendSlice(a, "()") else try appendNodeText(a, buf, m, proto.ret_type.int());
 }
 
 /// A symbol name minus the `$…` suffix the compiler mints for a generic instance or a

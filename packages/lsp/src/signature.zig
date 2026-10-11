@@ -10,8 +10,10 @@
 //! an arity error on the repaired call must not suppress the declared signature.
 //!
 //! The call is found by its `(`, so any callee shape gets help. A free fn's signature is
-//! read from `resolutions` -> `sigs` (the same path hover uses for a callee), rendered
-//! through `render.bareName` so the module qualifier never leaks. A method call's comes from
+//! the one its Callee names (`Analysis.freeCallee`, as hover reads it): a non-generic fn's,
+//! the concrete one of the instance a generic call runs, or a generic fn's as declared when
+//! no instance is known (in a template's own body, or mid-typing), rendered through
+//! `render.bareName` so the module qualifier never leaks. A method call's comes from
 //! the checker's Callee table (`Analysis.calleeAt`), shown without its `self`: the receiver
 //! is left of the `.`, never inside the parens. A call of a function value (`f(`, `h.run(`,
 //! `fs[0](`, `mk()(`) shows the value's type, `fn(int) -> int`, whose params are labelled by
@@ -21,8 +23,6 @@
 //! rendered label.
 //!
 //! KNOWN LIMITATIONS (documented, not bugs):
-//!   * A call with explicit type args (`id[int](`, `v.into[i64](`) yields no help. Free fns
-//!     and module-qualified free fns (`io.f(`) are correct.
 //!   * A local's binding is followed only when nothing writes the local again; any write
 //!     (an assignment, a `mut` argument) leaves its calls labelled by their type. A param, a
 //!     field or an element is always labelled by its type.
@@ -169,9 +169,9 @@ fn renderLabel(
     try render.renderTypeNamed(a, buf, ret, layouts, enum_layouts, var_names);
 }
 
-/// A user protocol method's label spelled from its declaration, as hover shows it: a
-/// protocol's generic types (`Option[int]`) are opaque once typecheck is done, so the
-/// checked types would render `?`.
+/// A label spelled from its declaration, as hover shows it: a user protocol's method, or a
+/// generic fn. Their generic types (`Option[int]`, `T`) are opaque once typecheck is done,
+/// so the checked types would render `?`.
 fn renderDeclLabel(
     a: std.mem.Allocator,
     buf: *std.ArrayList(u8),
@@ -204,8 +204,11 @@ fn appendTypeText(a: std.mem.Allocator, buf: *std.ArrayList(u8), pm: *const toyc
 
 /// What a call reaches, as its label spells it.
 const Hit = union(enum) {
-    /// A free fn: its global id.
+    /// A free fn: its global id. A generic one whose instance is not known shows as
+    /// declared.
     func: u32,
+    /// A generic fn's instance, with its concrete types.
+    instance: u32,
     /// A method, and the member node whose Callee selected it (a bound method value's own
     /// `field_access` for a local bound to one).
     method: struct { sig: Analysis.CalleeSig, node: u32 },
@@ -236,33 +239,34 @@ fn hitOf(a: std.mem.Allocator, an: *Analysis, call: u32) !?Hit {
     const m = an.module();
     const tree = m.tree();
     const resolutions = an.resolutions();
-    const sigs = an.tc().sigs;
+    const callees = an.callees();
+    const tc = an.tc();
     const cn = m.nodes[call];
-    if (cn.lhs.int() < resolutions.len) switch (resolutions[cn.lhs.int()]) {
-        .func => |gid| return if (gid < sigs.len) .{ .func = gid } else null,
-        else => {},
+    const slot = (Callee.callSlot(tree, cn) orelse return null).int();
+    if (slot >= callees.len) return null;
+    if (an.freeCallee(slot)) |fc| return switch (fc) {
+        .direct, .generic => |gid| if (gid < tc.sigs.len) .{ .func = gid } else null,
+        .instance => |ii| .{ .instance = ii },
     };
+    // A free fn call the checker selected nothing for (one in a generic body, which only its
+    // instances check) still names its fn.
+    if (resolutions[slot] == .func) return if (resolutions[slot].func < tc.sigs.len) .{ .func = resolutions[slot].func } else null;
     if (Callee.memberNode(tree, cn)) |fa| {
         if (try an.calleeAt(a, fa.int())) |ms| return .{ .method = .{ .sig = ms, .node = fa.int() } };
     }
     // The callee's type, not the `.value` tag: a call with an argument error, mid-typing,
     // still has a typed callee.
-    const slot = (Callee.callSlot(tree, cn) orelse return null).int();
     const nts = an.nodeTypes();
-    if (slot >= nts.len) return null;
-    const fs = render.fnSigOf(nts[slot], an.tc().layouts) orelse return null;
+    const fs = render.fnSigOf(nts[slot], tc.layouts) orelse return null;
     if (m.nodes[slot].tag == .identifier) if (try places.soleBinding(an, slot)) |b| {
         const bn = m.nodes[b];
         if (bn.tag == .local_fn) return .{ .value = .{ .name = m.tokens[bn.main_token].text(m.source), .sig = fs } };
         const init = bn.lhs.int();
-        if (init < resolutions.len) switch (resolutions[init]) {
-            .func => |gid| if (gid < sigs.len) return .{ .func = gid },
+        if (init < callees.len) switch (callees[init].view()) {
+            .fn_ref => |gid| if (gid < tc.sigs.len) return .{ .func = gid },
+            .bound_method => if (try an.calleeAt(a, init)) |ms| return .{ .method = .{ .sig = ms, .node = init } },
             else => {},
         };
-        const callees = an.callees();
-        if (init < callees.len and callees[init].view() == .bound_method) {
-            if (try an.calleeAt(a, init)) |ms| return .{ .method = .{ .sig = ms, .node = init } };
-        }
     };
     return .{ .value = .{ .name = null, .sig = fs } };
 }
@@ -325,7 +329,18 @@ fn help(a: std.mem.Allocator, an: *Analysis, enc: Enclosing) !?protocol.Signatur
     switch (callee) {
         .func => |fid| {
             const sig = tc.sigs[fid];
-            try renderLabel(a, &label, render.bareName(sig.name), sig.params, sig.mut_mask, sig.ret, tc.layouts, tc.enum_layouts, &.{}, &ranges);
+            const name = render.unmangled(render.bareName(sig.name));
+            const gf = an.res().fns[fid];
+            // A generic fn's checked types are opaque: it shows as declared.
+            if (sig.isGenericTemplate() and gf.decl_node != toyc.Ast.none)
+                try renderDeclLabel(a, &label, &an.graph.modules[gf.module], gf.decl_node.int(), name, false, &ranges)
+            else
+                try renderLabel(a, &label, name, sig.params, sig.mut_mask, sig.ret, tc.layouts, tc.enum_layouts, &.{}, &ranges);
+        },
+        .instance => |ii| {
+            const inst = tc.instances[ii];
+            const sig = tc.sigs[inst.template_gid];
+            try renderLabel(a, &label, render.unmangled(render.bareName(sig.name)), inst.params, sig.mut_mask, inst.ret, tc.layouts, tc.enum_layouts, &.{}, &ranges);
         },
         .method => |hm| {
             const ms = hm.sig;
@@ -977,4 +992,23 @@ test "signatureHelpAt: a paren that opens no call yields null" {
         const r = try signatureHelpAt(gpa, ws, src, p.line, p.character + @as(u32, @intCast(after.len)), "file:///p/main.toy");
         try testing.expect(r == null);
     }
+}
+
+test "signatureHelpAt: a generic fn's call shows the instance it runs, explicit type args too; in a template body, as declared" {
+    const src =
+        \\fn id[T](x: T) -> T { x }
+        \\fn pair[T has Hash](v: T) -> int { id(v).hash() }
+        \\fn main() -> int {
+        \\    a := id(7)
+        \\    b := id[str]("s")
+        \\    return a + b.len() + pair(3)
+        \\}
+        \\
+    ;
+    try expectHelp(src, "a := id(", "fn id(int) -> int", 0);
+    try expectHelp(src, "id[str](", "fn id(str) -> str", 0);
+    try expectHelp(src, "{ id(", "fn id(T) -> T", 0);
+    const boxed = "struct Box[T] { v: T }\nimpl Box[T] { fn wrap[U](self, u: U, t: T) -> U { u } }\nfn main() -> int {\n    b := Box { v: 1 }\n";
+    // Incomplete, so it picked no instance: shown as declared.
+    try expectHelpAfter(boxed, "    x := b.wrap[str](", "fn wrap(U, T) -> U", 0);
 }
