@@ -1,18 +1,19 @@
 //! textDocument/signatureHelp: when the cursor sits inside a call's argument list, the
 //! callee's signature plus the ACTIVE PARAMETER index.
 //!
-//! Checks through the same `Workspace` as hover, but detection runs FIRST over a
-//! fault-tolerant raw LEX of the buffer — the enclosing call is found from the token stream,
-//! so an outside-any-call cursor is rejected before any compile. Like completion, this must survive a broken buffer: signature help
-//! fires mid-type (`add(1, ` with no closing paren), so an unterminated call is REPAIRED by
-//! appending its missing closers at EOF (offset-preserving) and resolve/type errors are
-//! tolerated — an arity error on the repaired call must not suppress the declared signature.
+//! Detection runs FIRST over a fault-tolerant raw LEX of the buffer: the enclosing call is
+//! found from the token stream, so an outside-any-call cursor is rejected before any
+//! compile. Like completion, this must survive a broken buffer: signature help fires
+//! mid-type (`add(1, ` with no closing paren), so an unterminated call is REPAIRED by
+//! appending its missing closers at EOF (offset-preserving) and checked as its own
+//! `Analysis`; a balanced buffer reads the document's. Resolve/type errors are tolerated —
+//! an arity error on the repaired call must not suppress the declared signature.
 //!
 //! The call is found by its `(`, so any callee shape gets help. A free fn's signature is
 //! read from `resolutions` -> `sigs` (the same path hover uses for a callee), rendered
 //! through `render.bareName` so the module qualifier never leaks. A method call's comes from
-//! the checker's Callee table (`callee_sig`), shown without its `self`: the receiver is left
-//! of the `.`, never inside the parens. A call of a function value (`f(`, `h.run(`,
+//! the checker's Callee table (`Analysis.calleeAt`), shown without its `self`: the receiver
+//! is left of the `.`, never inside the parens. A call of a function value (`f(`, `h.run(`,
 //! `fs[0](`, `mk()(`) shows the value's type, `fn(int) -> int`, whose params are labelled by
 //! type, since a fn type has no param names. A local bound once to a named fn or a bound
 //! method (`f := add`, `g := acc.plus`) shows that fn's or method's label instead, as a call
@@ -29,7 +30,7 @@
 //!     no receiver type: the template's node types are scratch, so its param renders `?`.
 //!   * A method call or a function value's call inside a generic body can yield no help at
 //!     all (issue #33), and a generic protocol's method shows the protocol's own params: see
-//!     `callee_sig`'s limitations.
+//!     `Analysis.CalleeSig`'s limitations.
 //!   * A bare pipe target `x |> f` has no `(`, so it yields no help of its own.
 //!   * A parse error OTHER than the appended closers (or a stray unmatched closer) re-triggers
 //!     discovery's whole-tree discard -> null (the single-edit repair limit, as in completion).
@@ -39,29 +40,15 @@ const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
 const position = @import("position.zig");
 const render = @import("render.zig");
-const callee_sig = @import("callee_sig.zig");
 const places = @import("places.zig");
+const Analysis = @import("Analysis.zig");
 const Workspace = @import("Workspace.zig");
 
 const Callee = toyc.Callee;
-const ResolveGraph = toyc.ResolveGraph;
-const TypecheckGraph = toyc.TypecheckGraph;
 const Token = toyc.Token;
 const Type = toyc.Typecheck.Type;
 const Layout = toyc.Typecheck.Layout;
 const EnumLayout = toyc.Typecheck.EnumLayout;
-const SourceMap = toyc.term.render.SourceMap;
-
-/// Owns the arena backing `help`. The compiler results it was rendered from have already
-/// been torn down by the time this is returned.
-pub const Result = struct {
-    arena: std.heap.ArenaAllocator,
-    help: protocol.SignatureHelp,
-
-    pub fn deinit(self: *Result) void {
-        self.arena.deinit();
-    }
-};
 
 /// `lparen` is the source offset of the call's `(`.
 const Enclosing = struct { lparen: u32, active: u32 };
@@ -221,17 +208,22 @@ const Hit = union(enum) {
     func: u32,
     /// A method, and the member node whose Callee selected it (a bound method value's own
     /// `field_access` for a local bound to one).
-    method: struct { sig: callee_sig.CalleeSig, node: u32 },
+    method: struct { sig: Analysis.CalleeSig, node: u32 },
     /// A function value: its type, and the name of the local fn it is, if it is one.
     value: struct { name: ?[]const u8, sig: toyc.LayoutEngine.FnSig },
 };
 
-/// The call node whose `(` starts at `lparen`: its own main token, or the `(` after the
-/// `|>` of a piped call.
-fn callAt(m: *const toyc.Graph.Module, lparen: u32) ?u32 {
+/// The call node whose `(` starts at `lparen`: the call it heads, or the piped call whose
+/// `|>` it follows.
+fn callAt(an: *const Analysis, lparen: u32) ?u32 {
+    const m = an.module();
+    if (position.tokenAt(m.tokens, lparen)) |t| for (an.nodesAt(t)) |i| {
+        const n = m.nodes[i];
+        if (n.tag == .call and n.lhs != toyc.Ast.none) return i;
+    };
     for (m.nodes, 0..) |n, i| {
-        if (n.tag != .call or n.lhs == toyc.Ast.none) continue;
-        const open = if (m.tokens[n.main_token].tag == .pipe_gt) toyc.Ast.pipeArgsOpen(m.tokens, n.main_token) orelse continue else n.main_token;
+        if (n.tag != .call or n.lhs == toyc.Ast.none or m.tokens[n.main_token].tag != .pipe_gt) continue;
+        const open = toyc.Ast.pipeArgsOpen(m.tokens, n.main_token) orelse continue;
         if (m.tokens[open].start == lparen) return @intCast(i);
     }
     return null;
@@ -240,36 +232,36 @@ fn callAt(m: *const toyc.Graph.Module, lparen: u32) ?u32 {
 /// What `call` reaches. A function value's label is its type, which has no parameter
 /// names. A local bound once to a named fn or a bound method (`f := add`, `g := acc.plus`)
 /// is labelled as a call of that fn or method would be, and a local fn by its own name.
-fn hitOf(a: std.mem.Allocator, f: places.Facts, call: u32) !?Hit {
-    const m = f.graph.entry();
-    const entry = f.graph.entry_index;
+fn hitOf(a: std.mem.Allocator, an: *Analysis, call: u32) !?Hit {
+    const m = an.module();
     const tree = m.tree();
-    const resolutions = f.res.resolutions[entry];
+    const resolutions = an.resolutions();
+    const sigs = an.tc().sigs;
     const cn = m.nodes[call];
     if (cn.lhs.int() < resolutions.len) switch (resolutions[cn.lhs.int()]) {
-        .func => |gid| return if (gid < f.tc.sigs.len) .{ .func = gid } else null,
+        .func => |gid| return if (gid < sigs.len) .{ .func = gid } else null,
         else => {},
     };
     if (Callee.memberNode(tree, cn)) |fa| {
-        if (try callee_sig.of(a, f.graph, f.res, f.tc, entry, fa.int())) |ms| return .{ .method = .{ .sig = ms, .node = fa.int() } };
+        if (try an.calleeAt(a, fa.int())) |ms| return .{ .method = .{ .sig = ms, .node = fa.int() } };
     }
     // The callee's type, not the `.value` tag: a call with an argument error, mid-typing,
     // still has a typed callee.
     const slot = (Callee.callSlot(tree, cn) orelse return null).int();
-    const nts = f.tc.node_types[entry];
+    const nts = an.nodeTypes();
     if (slot >= nts.len) return null;
-    const fs = render.fnSigOf(nts[slot], f.tc.layouts) orelse return null;
-    if (m.nodes[slot].tag == .identifier) if (try f.soleBinding(a, slot)) |b| {
+    const fs = render.fnSigOf(nts[slot], an.tc().layouts) orelse return null;
+    if (m.nodes[slot].tag == .identifier) if (try places.soleBinding(an, slot)) |b| {
         const bn = m.nodes[b];
         if (bn.tag == .local_fn) return .{ .value = .{ .name = m.tokens[bn.main_token].text(m.source), .sig = fs } };
         const init = bn.lhs.int();
         if (init < resolutions.len) switch (resolutions[init]) {
-            .func => |gid| if (gid < f.tc.sigs.len) return .{ .func = gid },
+            .func => |gid| if (gid < sigs.len) return .{ .func = gid },
             else => {},
         };
-        const callees = f.tc.callees[entry];
+        const callees = an.callees();
         if (init < callees.len and callees[init].view() == .bound_method) {
-            if (try callee_sig.of(a, f.graph, f.res, f.tc, entry, init)) |ms| return .{ .method = .{ .sig = ms, .node = init } };
+            if (try an.calleeAt(a, init)) |ms| return .{ .method = .{ .sig = ms, .node = init } };
         }
     };
     return .{ .value = .{ .name = null, .sig = fs } };
@@ -298,55 +290,28 @@ fn renderFnTypeLabel(
     try render.renderType(a, buf, fs.ret, layouts, enum_layouts);
 }
 
-/// The signature help at (`line`, `character`) in `source`, or null when the cursor is not
-/// inside a resolvable call. Never errors on a compile problem — only a hard I/O / OOM fault
-/// propagates.
-pub fn signatureHelpAt(
-    gpa: std.mem.Allocator,
-    ws: Workspace,
-    source: []const u8,
-    line: u32,
-    character: u32,
-    doc_uri: []const u8,
-) !?Result {
-    const toks = try toyc.Lexer.tokenize(gpa, source);
-    defer gpa.free(toks);
+/// The signature help at (`line`, `character`) in `doc`'s document, allocated in `a`, or
+/// null when the cursor is not inside a resolvable call. A repaired buffer is checked with
+/// `gpa` in `ws` and torn down before this returns.
+pub fn at(a: std.mem.Allocator, gpa: std.mem.Allocator, ws: Workspace, doc: *Analysis, line: u32, character: u32) !?protocol.SignatureHelp {
+    const source = doc.text;
+    const toks = try toyc.Lexer.tokenize(a, source);
+    const off = doc.offsetAt(line, character) orelse return null;
+    const enc = (try enclosingCall(a, toks, off)) orelse return null;
 
-    var sm = try SourceMap.init(gpa, "s", source);
-    defer sm.deinit(gpa);
+    const repaired = (try repair(a, source, toks)) orelse return null;
+    if (repaired.ptr == source.ptr) return help(a, doc, enc);
+    const an = try Analysis.init(gpa, ws, doc.uri, repaired, doc.version);
+    defer an.deinit();
+    return help(a, an, enc);
+}
 
-    const off = position.positionToOffset(&sm, line, character, ws.encoding) orelse return null;
-    const enc = (try enclosingCall(gpa, toks, off)) orelse return null;
-
-    const repaired = (try repair(gpa, source, toks)) orelse return null;
-    defer if (repaired.ptr != source.ptr) gpa.free(repaired);
-
-    var graph = try ws.discover(gpa, doc_uri, repaired);
-    defer graph.deinit(gpa);
-    if (graph.err != null) return null;
-
-    var res = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer res.deinit(gpa);
-    // UNCONDITIONAL: a repaired arity error must not suppress the declared signature.
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, ws.io, 0);
-    defer tc.deinit(gpa);
-
-    const entry = graph.entry_index;
-    const m = graph.entry();
-
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    errdefer arena.deinit();
-    const a = arena.allocator();
-
-    const call = callAt(m, enc.lparen) orelse {
-        arena.deinit();
-        return null;
-    };
-    const f: places.Facts = .{ .graph = &graph, .res = &res, .tc = &tc };
-    const callee = (try hitOf(a, f, call)) orelse {
-        arena.deinit();
-        return null;
-    };
+fn help(a: std.mem.Allocator, an: *Analysis, enc: Enclosing) !?protocol.SignatureHelp {
+    if (an.checked == null) return null;
+    const m = an.module();
+    const tc = an.tc();
+    const call = callAt(an, enc.lparen) orelse return null;
+    const callee = (try hitOf(a, an, call)) orelse return null;
 
     // In `x |> f(a, ..)` the piped `x` is argument 0 but sits left of the `(`, so the comma
     // count is one short. The tree, not the tokens, says whether the call is piped: a token
@@ -364,8 +329,8 @@ pub fn signatureHelpAt(
         },
         .method => |hm| {
             const ms = hm.sig;
-            if (ms.decl != null and callee_sig.spelledFromDecl(&tc, entry, hm.node))
-                try renderDeclLabel(a, &label, &graph.modules[ms.decl.?.module], ms.decl.?.node, ms.name, ms.has_self, &ranges)
+            if (ms.decl != null and an.spelledFromDecl(hm.node))
+                try renderDeclLabel(a, &label, &an.graph.modules[ms.decl.?.module], ms.decl.?.node, ms.name, ms.has_self, &ranges)
             else
                 try renderLabel(a, &label, ms.name, ms.params[@intFromBool(ms.has_self)..], ms.mut_mask >> @intFromBool(ms.has_self), ms.ret, tc.layouts, tc.enum_layouts, ms.var_names, &ranges);
         },
@@ -386,12 +351,38 @@ pub fn signatureHelpAt(
 
     const sigs = try a.alloc(protocol.SignatureInformation, 1);
     sigs[0] = .{ .label = label.items, .parameters = params };
-
-    return .{ .arena = arena, .help = .{ .signatures = sigs, .activeSignature = 0, .activeParameter = active } };
+    return .{ .signatures = sigs, .activeSignature = 0, .activeParameter = active };
 }
 
 const testing = std.testing;
 const test_util = @import("test_util.zig");
+
+/// A test's signature help: its analysis and the answer, torn down together.
+const Result = struct {
+    an: *Analysis,
+    arena: std.heap.ArenaAllocator,
+    help: protocol.SignatureHelp,
+
+    fn deinit(r: *Result) void {
+        r.arena.deinit();
+        r.an.deinit();
+    }
+};
+
+/// The signature help at (`line`, `character`) in `source`, checked as the document
+/// `doc_uri` in `ws`.
+fn signatureHelpAt(gpa: std.mem.Allocator, ws: Workspace, source: []const u8, line: u32, character: u32, doc_uri: []const u8) !?Result {
+    const an = try test_util.analyzeIn(gpa, ws, doc_uri, source);
+    errdefer an.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const h = (try at(arena.allocator(), gpa, ws, an, line, character)) orelse {
+        arena.deinit();
+        an.deinit();
+        return null;
+    };
+    return .{ .an = an, .arena = arena, .help = h };
+}
 
 fn tok(tag: toyc.Tag, start: u32, end: u32) Token {
     return .{ .tag = tag, .start = start, .end = end };

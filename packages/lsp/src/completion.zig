@@ -22,9 +22,9 @@
 //!     (`Counter.`) resolve to no field/method set → a valid empty list. A member context
 //!     needs a struct/enum VALUE receiver.
 //!   * The resolver keeps no positional lexical-scope table, so SCOPE is an approximation:
-//!     the enclosing fn's params + its `:=` locals and local fns (bracketed by source
-//!     position between adjacent top-level fn decls) + all visible top-level decls + the
-//!     language keywords. A cursor inside a fn signature may misattribute the enclosing fn.
+//!     the params of the top-level fn around the cursor + every `:=` local and local fn in
+//!     it (wherever declared) + all visible top-level decls + the language keywords. Outside
+//!     any fn's source, only the top-level decls and keywords.
 //!   * Scalar / `str` / generic-template methods are not surfaced (only concrete
 //!     `methods`-table entries are).
 
@@ -33,32 +33,20 @@ const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
 const position = @import("position.zig");
 const render = @import("render.zig");
+const Analysis = @import("Analysis.zig");
 const Workspace = @import("Workspace.zig");
 
 const Graph = toyc.Graph;
 const ResolveGraph = toyc.ResolveGraph;
-const TypecheckGraph = toyc.TypecheckGraph;
 const Token = toyc.Token;
 const Ast = toyc.Ast;
 const Type = toyc.Typecheck.Type;
-const SourceMap = toyc.term.render.SourceMap;
 
 const kind = protocol.completion_kind;
 
 /// The probe identifier spliced after a trailing `.` so the buffer parses. Long +
 /// underscored so it can never collide with a real toy identifier the user typed.
 const probe = "__toy_completion_probe__";
-
-/// Owns the arena backing `items`. `items` is empty (never null) and stays valid until
-/// `deinit`; the compiler results it was rendered from have already been torn down.
-pub const Completions = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const protocol.CompletionItem,
-
-    pub fn deinit(self: *Completions) void {
-        self.arena.deinit();
-    }
-};
 
 const Context = enum { none, scope, member };
 
@@ -74,69 +62,40 @@ const Detected = struct {
     partial_start: u32 = 0,
 };
 
-/// The completion candidates at (`line`, `character`) in `source`. Never errors on a
-/// compile problem — only a hard I/O / OOM fault propagates. An empty list is valid.
-pub fn completionsAt(
-    gpa: std.mem.Allocator,
-    ws: Workspace,
-    source: []const u8,
-    line: u32,
-    character: u32,
-    doc_uri: []const u8,
-) !Completions {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    errdefer arena.deinit();
-
+/// The completion candidates at (`line`, `character`) in `doc`'s document, allocated in
+/// `a`. A repaired buffer is checked with `gpa` in `ws` and torn down before this returns.
+/// An empty list is valid.
+pub fn at(a: std.mem.Allocator, gpa: std.mem.Allocator, ws: Workspace, doc: *Analysis, line: u32, character: u32) ![]const protocol.CompletionItem {
+    const source = doc.text;
     // Detect the context from a fault-tolerant raw lex — the parse tree may not exist yet.
-    const toks = try toyc.Lexer.tokenize(gpa, source);
-    defer gpa.free(toks);
-
-    var sm = try SourceMap.init(gpa, "c", source);
-    defer sm.deinit(gpa);
-
-    const off = position.positionToOffset(&sm, line, character, ws.encoding) orelse return empty(arena);
+    const toks = try toyc.Lexer.tokenize(a, source);
+    const off = doc.offsetAt(line, character) orelse return &.{};
     const det = classify(toks, off);
-    if (det.context == .none) return empty(arena);
+    if (det.context == .none) return &.{};
 
-    // Repair a trailing `.` so the access parses; otherwise compile the buffer as-is.
-    const repaired = if (det.repair)
-        try std.mem.concat(gpa, u8, &.{ source[0..off], probe, source[off..] })
-    else
-        source;
-    defer if (det.repair) gpa.free(repaired);
-
-    var graph = try ws.discover(gpa, doc_uri, repaired);
-    defer graph.deinit(gpa);
-    // A parse error other than the repaired cursor discards the tree — nothing to offer.
-    if (graph.err != null) return empty(arena);
-
-    // Unlike hover, we do NOT bail on resolve/type errors: an unknown probe member or a
-    // mistyped elsewhere is expected mid-edit. The receiver still resolves and types.
-    var res = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer res.deinit(gpa);
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, ws.io, 0);
-    defer tc.deinit(gpa);
-
-    const m = graph.entry();
-    const entry = graph.entry_index;
-    const a = arena.allocator();
-
-    var col: Collector = .{ .a = a };
-
-    switch (det.context) {
-        .none => {},
-        .scope => try collectScope(&col, m, entry, &res, &tc, off),
-        .member => {
-            const recv = locateReceiver(m, det) orelse return empty(arena);
-            try collectMember(&col, graph.modules, entry, &res, &tc, recv);
-        },
-    }
-
-    return .{ .arena = arena, .items = try col.items.toOwnedSlice(a) };
+    // Repair a trailing `.` so the access parses; otherwise read the document as it is.
+    if (!det.repair) return collect(a, doc, det, toks, off);
+    const repaired = try std.mem.concat(a, u8, &.{ source[0..off], probe, source[off..] });
+    const an = try Analysis.init(gpa, ws, doc.uri, repaired, doc.version);
+    defer an.deinit();
+    return collect(a, an, det, toks, off);
 }
 
-fn empty(arena: std.heap.ArenaAllocator) Completions {
-    return .{ .arena = arena, .items = &.{} };
+fn collect(a: std.mem.Allocator, an: *Analysis, det: Detected, toks: []const Token, off: u32) ![]const protocol.CompletionItem {
+    // A parse error other than the repaired cursor discards the tree — nothing to offer.
+    // Unlike hover, resolve and type errors do not bail: an unknown probe member or a
+    // mistyped line elsewhere is expected mid-edit, and the receiver still resolves and types.
+    if (an.checked == null) return &.{};
+    var col: Collector = .{ .a = a };
+    switch (det.context) {
+        .none => {},
+        .scope => try collectScope(&col, an, toks, off),
+        .member => {
+            const recv = locateReceiver(an.module(), det) orelse return &.{};
+            try collectMember(&col, an, recv);
+        },
+    }
+    return col.items.toOwnedSlice(a);
 }
 
 /// Accumulates candidates into the result arena, de-duping by `(label, kind)`. Every
@@ -223,21 +182,16 @@ fn locateReceiver(m: *const Graph.Module, det: Detected) ?u32 {
 /// Member/module enumeration. Decides module vs value by the receiver's RESOLUTION FIRST
 /// (a `.module` receiver must not be misread as a value), then hard-returns without a
 /// scope fallback so unrelated globals never leak into a `recv.` completion.
-fn collectMember(
-    col: *Collector,
-    mods: []const Graph.Module,
-    entry: u32,
-    res: *const ResolveGraph.GraphResult,
-    tc: *const TypecheckGraph.GraphResult,
-    recv: u32,
-) !void {
-    const resolutions = res.resolutions[entry];
+fn collectMember(col: *Collector, an: *const Analysis, recv: u32) !void {
+    const res = an.res();
+    const tc = an.tc();
+    const resolutions = an.resolutions();
     if (recv < resolutions.len and resolutions[recv] == .module) {
-        try collectModule(col, mods, res, resolutions[recv].module);
+        try collectModule(col, an.graph.modules, res, resolutions[recv].module);
         return;
     }
 
-    const node_types = tc.node_types[entry];
+    const node_types = an.nodeTypes();
     if (recv >= node_types.len) return;
     const rt = node_types[recv];
     if (rt.kind != .@"struct" and rt.kind != .@"enum") return;
@@ -291,21 +245,17 @@ fn collectModule(col: *Collector, mods: []const Graph.Module, res: *const Resolv
 
 /// Scope enumeration (documented approximation): keywords, visible top-level fns/types,
 /// and the enclosing fn's params + `:=` locals.
-fn collectScope(
-    col: *Collector,
-    m: *const Graph.Module,
-    entry: u32,
-    res: *const ResolveGraph.GraphResult,
-    tc: *const TypecheckGraph.GraphResult,
-    off: u32,
-) !void {
+fn collectScope(col: *Collector, an: *const Analysis, toks: []const Token, off: u32) !void {
+    const m = an.module();
+    const res = an.res();
+    const tc = an.tc();
     for (toyc.token.keywords.keys()) |kw| try col.add(kw, kind.keyword, null);
 
     // Top-level user fns of the entry module. `recv_type == none` EXCLUDES inherent
     // methods (which also live in `res.fns`, module == entry) so a method never leaks
     // into plain scope as a free function.
     for (res.fns, 0..) |gf, i| {
-        if (gf.kind != .user_fn or gf.module != entry or gf.recv_type != Ast.none) continue;
+        if (gf.kind != .user_fn or gf.module != an.entry() or gf.recv_type != Ast.none) continue;
         var detail: ?[]const u8 = null;
         var buf: std.ArrayList(u8) = .empty;
         if (i < tc.sigs.len) {
@@ -332,53 +282,23 @@ fn collectScope(
         }
     }
 
-    try collectEnclosing(col, m, entry, res, tc, off);
+    // The name being typed is the token before the cursor; the raw lex and the checked
+    // buffer agree on it, since a scope context is never repaired.
+    const typed = lastBefore(toks, off) orelse return;
+    try collectEnclosing(col, an, @intCast(typed));
 }
 
-/// Add the enclosing fn's params + `:=` locals + local fns. The resolver keeps no positional scope,
-/// so the enclosing fn is the last `fn_decl` starting at/before the cursor and its locals
-/// are bracketed to `[fn.start, next_fn.start)`. Impl methods are interleaved `fn_decl`s,
-/// handled by the next-fn bound.
-fn collectEnclosing(
-    col: *Collector,
-    m: *const Graph.Module,
-    entry: u32,
-    res: *const ResolveGraph.GraphResult,
-    tc: *const TypecheckGraph.GraphResult,
-    off: u32,
-) !void {
-    var encl: ?u32 = null;
-    var encl_start: u32 = 0;
-    var next_start: u32 = std.math.maxInt(u32);
-    for (m.nodes, 0..) |n, i| {
-        if (n.tag != .fn_decl) continue;
-        const start = m.tokens[n.main_token].start;
-        if (start <= off and (encl == null or start >= encl_start)) {
-            encl = @intCast(i);
-            encl_start = start;
-        }
-    }
-    if (encl == null) return;
-    for (m.nodes) |n| {
-        if (n.tag != .fn_decl) continue;
-        const start = m.tokens[n.main_token].start;
-        if (start > encl_start and start < next_start) next_start = start;
-    }
-
-    const fn_node = encl.?;
+/// Add the enclosing fn's params + `:=` locals + local fns. The resolver keeps no
+/// positional scope, so every local of the fn is offered, wherever it is declared.
+fn collectEnclosing(col: *Collector, an: *const Analysis, typed: u32) !void {
+    const m = an.module();
+    const tc = an.tc();
+    const fn_node = an.fnOf(typed) orelse return;
     const decl = m.nodes[fn_node];
     const proto = Ast.protoAt(m.tree(), decl.lhs.int());
 
-    // Map the enclosing fn decl node → its global fn id, to read param types from the sig
-    // (a param's own `node_types` slot is `.invalid`).
-    var fid: ?u32 = null;
-    for (res.fns, 0..) |gf, i| {
-        if (gf.module == entry and gf.decl_node == Ast.Index.from(fn_node)) {
-            fid = @intCast(i);
-            break;
-        }
-    }
-
+    // Param types come from the sig: a param's own `node_types` slot is `.invalid`.
+    const fid = an.gidOf(fn_node);
     for (proto.params, 0..) |param_idx, k| {
         const param = m.nodes[param_idx.int()];
         const name = m.tokens[param.main_token].text(m.source);
@@ -391,31 +311,48 @@ fn collectEnclosing(
         try col.add(name, kind.variable, detail);
     }
 
-    const node_types = tc.node_types[entry];
     for (m.nodes, 0..) |n, i| {
         const k = switch (n.tag) {
             .var_decl => kind.variable,
             .local_fn => kind.function,
             else => continue,
         };
-        const start = m.tokens[n.main_token].start;
-        if (start < encl_start or start >= next_start) continue;
+        if (an.fnOf(n.main_token) != fn_node) continue;
         const name = m.tokens[n.main_token].text(m.source);
         var detail: ?[]const u8 = null;
         var buf: std.ArrayList(u8) = .empty;
-        if (i < node_types.len and isRenderable(node_types[i])) {
-            try render.renderType(col.a, &buf, node_types[i], tc.layouts, tc.enum_layouts);
+        if (an.typeAt(@intCast(i))) |t| {
+            try render.renderType(col.a, &buf, t, tc.layouts, tc.enum_layouts);
             detail = buf.items;
         }
         try col.add(name, k, detail);
     }
 }
 
-fn isRenderable(t: Type) bool {
-    return t.kind != .invalid and t.kind != .type_var and t.kind != .app and t.kind != .func;
-}
-
 const testing = std.testing;
+
+/// A test's candidates: their analysis and the answer, torn down together.
+const Completions = struct {
+    an: *Analysis,
+    arena: std.heap.ArenaAllocator,
+    items: []const protocol.CompletionItem,
+
+    fn deinit(c: *Completions) void {
+        c.arena.deinit();
+        c.an.deinit();
+    }
+};
+
+/// The candidates at (`line`, `character`) in `source`, checked as the document `doc_uri`
+/// in `ws`.
+fn completionsAt(gpa: std.mem.Allocator, ws: Workspace, source: []const u8, line: u32, character: u32, doc_uri: []const u8) !Completions {
+    const an = try @import("test_util.zig").analyzeIn(gpa, ws, doc_uri, source);
+    errdefer an.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const items = try at(arena.allocator(), gpa, ws, an, line, character);
+    return .{ .an = an, .arena = arena, .items = items };
+}
 
 fn tok(tag: toyc.Tag, start: u32, end: u32) Token {
     return .{ .tag = tag, .start = start, .end = end };

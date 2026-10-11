@@ -9,66 +9,25 @@
 //!   marker (closures.md, `mut` parameters); the tooltip names the callee. A `mut self`
 //!   receiver gets none: as in Rust and Swift, a receiver is unmarked and its method names
 //!   what happens to it. Hover says "mutated by f" on both.
-//!
-//! Checks through the same `Workspace` as hover, and like hover renders into its own arena
-//! before the compiler results are torn down.
 
 const std = @import("std");
-const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
-const position = @import("position.zig");
 const places = @import("places.zig");
-const Workspace = @import("Workspace.zig");
+const Analysis = @import("Analysis.zig");
 
-const ResolveGraph = toyc.ResolveGraph;
-const TypecheckGraph = toyc.TypecheckGraph;
-const SourceMap = toyc.term.render.SourceMap;
+/// The hints whose position falls in `range` (both ends included), in source order,
+/// allocated in `a`. A document that does not parse has none; resolve and type errors
+/// elsewhere do not suppress them.
+pub fn in(a: std.mem.Allocator, an: *Analysis, range: protocol.Range) ![]const protocol.InlayHint {
+    if (an.checked == null) return &.{};
+    const m = an.module();
+    const lo = an.offsetAt(range.start.line, range.start.character) orelse return &.{};
+    const hi = an.offsetAt(range.end.line, range.end.character) orelse @as(u32, @intCast(m.source.len));
 
-/// Owns the arena backing `hints`. The compiler results they were rendered from have
-/// already been torn down.
-pub const Result = struct {
-    arena: std.heap.ArenaAllocator,
-    hints: []const protocol.InlayHint,
-
-    pub fn deinit(self: *Result) void {
-        self.arena.deinit();
-    }
-};
-
-/// The hints whose position falls in `range` (both ends included), in source order. A
-/// document that does not parse has none; resolve and type errors elsewhere do not
-/// suppress them. Only a hard I/O / OOM fault errors.
-pub fn hintsIn(
-    gpa: std.mem.Allocator,
-    ws: Workspace,
-    source: []const u8,
-    range: protocol.Range,
-    doc_uri: []const u8,
-) !Result {
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    errdefer arena.deinit();
-    const a = arena.allocator();
-
-    var graph = try ws.discover(gpa, doc_uri, source);
-    defer graph.deinit(gpa);
-    if (graph.err != null) return .{ .arena = arena, .hints = &.{} };
-
-    var res = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer res.deinit(gpa);
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, ws.io, 0);
-    defer tc.deinit(gpa);
-
-    const m = graph.entry();
-    var sm = try SourceMap.init(gpa, m.file, m.source);
-    defer sm.deinit(gpa);
-    const lo = position.positionToOffset(&sm, range.start.line, range.start.character, ws.encoding) orelse return .{ .arena = arena, .hints = &.{} };
-    const hi = position.positionToOffset(&sm, range.end.line, range.end.character, ws.encoding) orelse @as(u32, @intCast(m.source.len));
-
-    const f: places.Facts = .{ .graph = &graph, .res = &res, .tc = &tc };
     const At = struct { off: u32, hint: protocol.InlayHint };
     var found: std.ArrayList(At) = .empty;
 
-    for (try f.capturing(a)) |cl| {
+    for (try places.capturing(an, a)) |cl| {
         const off = m.tokens[cl.body].start;
         if (off < lo or off > hi) continue;
         var label: std.ArrayList(u8) = .empty;
@@ -88,19 +47,19 @@ pub fn hintsIn(
             }
         }
         try found.append(a, .{ .off = off, .hint = .{
-            .position = position.offsetToPosition(&sm, off, ws.encoding),
+            .position = an.positionOf(off),
             .label = label.items,
             .tooltip = tip.items,
             .paddingRight = true,
         } });
     }
 
-    for (try f.mutArgs(a)) |ma| {
+    for (try an.mutArgs()) |ma| {
         if (ma.receiver) continue;
-        const off = toyc.Walk.nodeSpan(.{ .tree = m.tree(), .tokens = m.tokens, .source = m.source }, toyc.Ast.Index.from(ma.node)).start;
+        const off = an.span(ma.node).start;
         if (off < lo or off > hi) continue;
         try found.append(a, .{ .off = off, .hint = .{
-            .position = position.offsetToPosition(&sm, off, ws.encoding),
+            .position = an.positionOf(off),
             .label = "mut",
             .kind = protocol.inlay_kind.parameter,
             .tooltip = try std.fmt.allocPrint(a, "mutated by {s}", .{ma.callee}),
@@ -114,13 +73,37 @@ pub fn hintsIn(
         }
     }.lt);
     const hints = try a.alloc(protocol.InlayHint, found.items.len);
-    for (found.items, hints) |at, *h| h.* = at.hint;
-    return .{ .arena = arena, .hints = hints };
+    for (found.items, hints) |f, *h| h.* = f.hint;
+    return hints;
 }
 
 const testing = std.testing;
 const Documents = @import("Documents.zig");
+const Workspace = @import("Workspace.zig");
+const position = @import("position.zig");
 const test_util = @import("test_util.zig");
+
+/// A test's hints: their analysis and the answer, torn down together.
+const Result = struct {
+    an: *Analysis,
+    arena: std.heap.ArenaAllocator,
+    hints: []const protocol.InlayHint,
+
+    fn deinit(r: *Result) void {
+        r.arena.deinit();
+        r.an.deinit();
+    }
+};
+
+/// The hints in `range` of `source`, checked as the document `doc_uri` in `ws`.
+fn hintsIn(gpa: std.mem.Allocator, ws: Workspace, source: []const u8, range: protocol.Range, doc_uri: []const u8) !Result {
+    const an = try test_util.analyzeIn(gpa, ws, doc_uri, source);
+    errdefer an.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const hints = try in(arena.allocator(), an, range);
+    return .{ .an = an, .arena = arena, .hints = hints };
+}
 
 fn whole(src: []const u8) protocol.Range {
     return .{ .start = .{ .line = 0, .character = 0 }, .end = test_util.posAfterLast(src, "}") };

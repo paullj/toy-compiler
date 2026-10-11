@@ -29,8 +29,10 @@ const completion = @import("completion.zig");
 const definition = @import("definition.zig");
 const signature = @import("signature.zig");
 const inlay = @import("inlay.zig");
+const Analysis = @import("Analysis.zig");
 const Documents = @import("Documents.zig");
 const Workspace = @import("Workspace.zig");
+const Graph = @import("toy_compiler").Graph;
 
 pub const ExitCode = enum(u8) { ok = 0, no_shutdown = 1 };
 
@@ -51,11 +53,20 @@ pub const Server = struct {
     /// Owns its own compute io (discover / checkGraph). This is separate from the transport
     /// reader/writer, whose io was already consumed by the caller.
     threaded: std.Io.Threaded,
-    /// Backs everything one message allocates (its JSON, the check, the response) and is
-    /// reset after it, keeping its capacity: the heap then plateaus at the largest
-    /// message instead of fragmenting (a wasm heap never shrinks). Documents use `gpa`.
+    /// Backs everything one message allocates (its JSON, a scratch check of a repaired
+    /// buffer's answer, the response) and is reset after it, keeping its capacity: the heap
+    /// then plateaus at the largest message instead of fragmenting (a wasm heap never
+    /// shrinks). Documents and analyses outlive a message, so they use `gpa`.
     arena: std.heap.ArenaAllocator,
     docs: Documents,
+    /// The latest analysis of each open document, by uri (the key is the analysis' own
+    /// copy). Every feature request on an unchanged document reads it, so an edit costs one
+    /// check however many requests follow; a change drops what it makes stale.
+    analyses: std.StringHashMapUnmanaged(*Analysis) = .empty,
+    /// The bundled std, parsed once for the session: it never changes.
+    std_cache: Graph.BundledCache = .{},
+    /// How many analyses the session has built.
+    checks: u64 = 0,
     /// How the client counts `character`; utf-16 unless it offers utf-8 at `initialize`.
     encoding: position.Encoding = .utf16,
     got_initialize: bool = false,
@@ -66,6 +77,10 @@ pub const Server = struct {
     }
 
     pub fn deinit(self: *Server) void {
+        var it = self.analyses.valueIterator();
+        while (it.next()) |an| an.*.deinit();
+        self.analyses.deinit(self.gpa);
+        self.std_cache.deinit(self.gpa);
         self.docs.deinit(self.gpa);
         self.arena.deinit();
         self.threaded.deinit();
@@ -75,37 +90,71 @@ pub const Server = struct {
     /// Recomputed from the PINNED server each call: `Threaded.io()` captures
     /// `&self.threaded`, so it must never be cached across the by-value move out of `init`.
     fn workspace(self: *Server) Workspace {
-        return .{ .io = self.threaded.io(), .docs = &self.docs, .disk = host_has_disk, .encoding = self.encoding };
+        return .{ .io = self.threaded.io(), .docs = &self.docs, .disk = host_has_disk, .encoding = self.encoding, .std_cache = &self.std_cache };
     }
 
-    /// The open document and position a `textDocument/<feature>` request names, or null for
-    /// a malformed request or one about a document that is not open. The whole u32 range is
+    /// The analysis of `uri`'s current text, checked now unless an earlier request on this
+    /// version already did; null for a document that is not open.
+    fn analysisFor(self: *Server, uri: []const u8) !?*Analysis {
+        const doc = self.docs.get(uri) orelse return null;
+        if (self.analyses.get(uri)) |an| {
+            if (an.version == doc.version) return an;
+            self.drop(uri);
+        }
+        const an = try Analysis.init(self.gpa, self.workspace(), uri, doc.text, doc.version);
+        errdefer an.deinit();
+        try self.analyses.put(self.gpa, an.uri, an);
+        self.checks += 1;
+        return an;
+    }
+
+    fn drop(self: *Server, uri: []const u8) void {
+        const kv = self.analyses.fetchRemove(uri) orelse return;
+        kv.value.deinit();
+    }
+
+    /// Drop every analysis a change to `uri`'s document makes stale: its own, and each one
+    /// that read it (see `Analysis.reads`). Called before the change's publish, so even a
+    /// client that does not bump the version never reads a stale analysis.
+    fn invalidate(self: *Server, uri: []const u8) !void {
+        self.drop(uri);
+        const path = try Workspace.pathOf(self.gpa, uri);
+        defer self.gpa.free(path);
+        var stale: std.ArrayList([]const u8) = .empty;
+        defer stale.deinit(self.gpa);
+        var it = self.analyses.iterator();
+        while (it.next()) |e| if (e.value_ptr.*.reads(path)) try stale.append(self.gpa, e.key_ptr.*);
+        for (stale.items) |k| self.drop(k);
+    }
+
+    /// The analysis and position a `textDocument/<feature>` request names, or null for a
+    /// malformed request or one about a document that is not open. The whole u32 range is
     /// guarded, not just `>= 0`: a valid i64 past u32 max would otherwise panic `@intCast`.
-    fn positionAt(self: *Server, root: std.json.Value) ?Position {
+    fn positionAt(self: *Server, root: std.json.Value) !?Position {
         const params = objGet(root, "params") orelse return null;
         const uri = getStr(objGet(params, "textDocument") orelse return null, "uri") orelse return null;
         const pos = objGet(params, "position") orelse return null;
         const line = coordU32(getInt(pos, "line")) orelse return null;
         const character = coordU32(getInt(pos, "character")) orelse return null;
-        const doc = self.docs.get(uri) orelse return null;
-        return .{ .uri = uri, .text = doc.text, .line = line, .character = character };
+        const an = (try self.analysisFor(uri)) orelse return null;
+        return .{ .an = an, .line = line, .character = character };
     }
 
-    const Position = struct { uri: []const u8, text: []const u8, line: u32, character: u32 };
+    const Position = struct { an: *Analysis, line: u32, character: u32 };
 
-    /// The open document and range a `textDocument/inlayHint` request names, or null as
-    /// for `positionAt`.
-    fn rangeAt(self: *Server, root: std.json.Value) ?DocRange {
+    /// The analysis and range a `textDocument/inlayHint` request names, or null as for
+    /// `positionAt`.
+    fn rangeAt(self: *Server, root: std.json.Value) !?DocRange {
         const params = objGet(root, "params") orelse return null;
         const uri = getStr(objGet(params, "textDocument") orelse return null, "uri") orelse return null;
         const range = objGet(params, "range") orelse return null;
         const start = jsonPosition(objGet(range, "start") orelse return null) orelse return null;
         const end = jsonPosition(objGet(range, "end") orelse return null) orelse return null;
-        const doc = self.docs.get(uri) orelse return null;
-        return .{ .uri = uri, .text = doc.text, .range = .{ .start = start, .end = end } };
+        const an = (try self.analysisFor(uri)) orelse return null;
+        return .{ .an = an, .range = .{ .start = start, .end = end } };
     }
 
-    const DocRange = struct { uri: []const u8, text: []const u8, range: protocol.Range };
+    const DocRange = struct { an: *Analysis, range: protocol.Range };
 
     /// Serve every framed message in `input`, then return — for a host that pushes messages
     /// in (a browser worker) rather than the server pulling from a pipe. False once `exit`
@@ -238,6 +287,7 @@ pub const Server = struct {
             const text = getStr(td, "text") orelse return true;
             const version = getInt(td, "version") orelse 0;
             try self.docs.put(self.gpa, uri, text, version);
+            try self.invalidate(uri);
             try self.publish(a, writer, uri);
             return true;
         }
@@ -275,6 +325,7 @@ pub const Server = struct {
                 try self.docs.spliceRange(self.gpa, uri, start_off, end_off, text);
             }
             self.docs.setVersion(uri, version);
+            try self.invalidate(uri);
             try self.publish(a, writer, uri);
             return true;
         }
@@ -284,6 +335,7 @@ pub const Server = struct {
             const uri = getStr(td, "uri") orelse return true;
             const version = if (self.docs.get(uri)) |d| d.version else 0;
             self.docs.remove(self.gpa, uri);
+            try self.invalidate(uri);
             // Clear any diagnostics the client is still showing for the closed doc.
             try sendDiagnostics(a, writer, uri, version, &.{});
             return true;
@@ -291,57 +343,53 @@ pub const Server = struct {
 
         // The position and range requests below allocate their answers from the per-message
         // arena, so nothing needs freeing: the arena reset after dispatch returns does it.
-        if (eql(method, "textDocument/hover")) {
+        if (eql(method, protocol.provider_requests.hoverProvider)) {
             const iv = id orelse return true; // a request must carry an id
             const result: ?protocol.Hover = blk: {
-                const at = self.positionAt(root) orelse break :blk null;
-                const h = (hover.hoverAt(a, self.workspace(), at.text, at.line, at.character, at.uri) catch break :blk null) orelse break :blk null;
-                break :blk .{ .contents = .{ .kind = h.kind, .value = h.value } };
+                const at = (self.positionAt(root) catch break :blk null) orelse break :blk null;
+                const value = (hover.at(a, at.an, at.line, at.character) catch break :blk null) orelse break :blk null;
+                break :blk .{ .contents = .{ .kind = "markdown", .value = value } };
             };
             try respond(a, writer, iv, result);
             return true;
         }
 
-        if (eql(method, "textDocument/completion")) {
+        if (eql(method, protocol.provider_requests.completionProvider)) {
             const iv = id orelse return true;
             const items: []const protocol.CompletionItem = blk: {
-                const at = self.positionAt(root) orelse break :blk &.{};
-                const c = completion.completionsAt(a, self.workspace(), at.text, at.line, at.character, at.uri) catch break :blk &.{};
-                break :blk c.items;
+                const at = (self.positionAt(root) catch break :blk &.{}) orelse break :blk &.{};
+                break :blk completion.at(a, self.gpa, self.workspace(), at.an, at.line, at.character) catch &.{};
             };
             // Always an array: an empty list is a valid "no candidates".
             try protocol.writeResponse(a, writer, iv, items);
             return true;
         }
 
-        if (eql(method, "textDocument/definition")) {
+        if (eql(method, protocol.provider_requests.definitionProvider)) {
             const iv = id orelse return true;
             const result: ?protocol.Location = blk: {
-                const at = self.positionAt(root) orelse break :blk null;
-                const d = (definition.definitionAt(a, self.workspace(), at.text, at.line, at.character, at.uri) catch break :blk null) orelse break :blk null;
-                break :blk .{ .uri = d.uri, .range = d.range };
+                const at = (self.positionAt(root) catch break :blk null) orelse break :blk null;
+                break :blk definition.at(a, at.an, at.line, at.character) catch null;
             };
             try respond(a, writer, iv, result);
             return true;
         }
 
-        if (eql(method, "textDocument/signatureHelp")) {
+        if (eql(method, protocol.provider_requests.signatureHelpProvider)) {
             const iv = id orelse return true;
             const result: ?protocol.SignatureHelp = blk: {
-                const at = self.positionAt(root) orelse break :blk null;
-                const sh = (signature.signatureHelpAt(a, self.workspace(), at.text, at.line, at.character, at.uri) catch break :blk null) orelse break :blk null;
-                break :blk sh.help;
+                const at = (self.positionAt(root) catch break :blk null) orelse break :blk null;
+                break :blk signature.at(a, self.gpa, self.workspace(), at.an, at.line, at.character) catch null;
             };
             try respond(a, writer, iv, result);
             return true;
         }
 
-        if (eql(method, "textDocument/inlayHint")) {
+        if (eql(method, protocol.provider_requests.inlayHintProvider)) {
             const iv = id orelse return true;
             const hints: []const protocol.InlayHint = blk: {
-                const at = self.rangeAt(root) orelse break :blk &.{};
-                const r = inlay.hintsIn(a, self.workspace(), at.text, at.range, at.uri) catch break :blk &.{};
-                break :blk r.hints;
+                const at = (self.rangeAt(root) catch break :blk &.{}) orelse break :blk &.{};
+                break :blk inlay.in(a, at.an, at.range) catch &.{};
             };
             // Always an array: an empty list is a valid "no hints".
             try protocol.writeResponse(a, writer, iv, hints);
@@ -365,13 +413,11 @@ pub const Server = struct {
     fn publish(self: *Server, a: std.mem.Allocator, writer: *Writer, uri: []const u8) !void {
         const doc = self.docs.get(uri) orelse return;
         const version = doc.version;
-        const text = doc.text;
-        var mapped = diagnostics.checkBuffer(a, self.workspace(), uri, text) catch {
+        const an = (self.analysisFor(uri) catch null) orelse {
             try sendDiagnostics(a, writer, uri, version, &.{});
             return;
         };
-        defer mapped.deinit();
-        try sendDiagnostics(a, writer, uri, version, mapped.items);
+        try sendDiagnostics(a, writer, uri, version, an.diagnostics);
     }
 };
 
@@ -522,6 +568,119 @@ fn splitFrames(gpa: std.mem.Allocator, raw: []const u8) !std.ArrayList([]u8) {
     return list;
 }
 
+/// One whole client session for an end-to-end test: frame the client's messages, serve
+/// them in one run through `serve`, then read the server's replies.
+const TestSession = struct {
+    gpa: std.mem.Allocator,
+    in: Writer.Allocating,
+    out: Writer.Allocating,
+    /// Backs the parsed replies; kept until every assertion is done.
+    arena: std.heap.ArenaAllocator,
+    frames: std.ArrayList([]u8) = .empty,
+    /// Every reply, parsed, in the order the server wrote it.
+    replies: std.ArrayList(std.json.Value) = .empty,
+
+    /// The id `finish` gives `shutdown`.
+    const shutdown_id: i64 = 9999;
+
+    fn init(gpa: std.mem.Allocator) TestSession {
+        return .{ .gpa = gpa, .in = .init(gpa), .out = .init(gpa), .arena = .init(gpa) };
+    }
+
+    fn deinit(ts: *TestSession) void {
+        for (ts.frames.items) |f| ts.gpa.free(f);
+        ts.frames.deinit(ts.gpa);
+        ts.arena.deinit();
+        ts.in.deinit();
+        ts.out.deinit();
+    }
+
+    fn send(ts: *TestSession, payload: anytype) !void {
+        try frameInto(ts.gpa, &ts.in, payload);
+    }
+
+    /// `initialize` (id 1) with `params`, then `initialized`.
+    fn initialize(ts: *TestSession, params: anytype) !void {
+        try ts.send(.{ .jsonrpc = "2.0", .id = @as(i64, 1), .method = "initialize", .params = params });
+        try ts.send(.{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
+    }
+
+    fn open(ts: *TestSession, uri: []const u8, text: []const u8) !void {
+        try ts.send(.{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didOpen",
+            .params = .{ .textDocument = .{ .uri = uri, .languageId = "toy", .version = @as(i64, 1), .text = text } },
+        });
+    }
+
+    /// A whole-document `didChange` to `version`.
+    fn change(ts: *TestSession, uri: []const u8, version: i64, text: []const u8) !void {
+        const Change = struct { text: []const u8 };
+        try ts.send(.{
+            .jsonrpc = "2.0",
+            .method = "textDocument/didChange",
+            .params = .{ .textDocument = .{ .uri = uri, .version = version }, .contentChanges = &[_]Change{.{ .text = text }} },
+        });
+    }
+
+    fn request(ts: *TestSession, id: anytype, method: []const u8, params: anytype) !void {
+        try ts.send(.{ .jsonrpc = "2.0", .id = id, .method = method, .params = params });
+    }
+
+    /// The params of a position request.
+    fn at(uri: []const u8, line: i64, character: i64) struct {
+        textDocument: struct { uri: []const u8 },
+        position: struct { line: i64, character: i64 },
+    } {
+        return .{ .textDocument = .{ .uri = uri }, .position = .{ .line = line, .character = character } };
+    }
+
+    /// `shutdown` then `exit`, served: every request was answered (exit code ok) and
+    /// `shutdown`'s result is null.
+    fn finish(ts: *TestSession) !void {
+        try ts.request(shutdown_id, "shutdown", .{});
+        try ts.send(.{ .jsonrpc = "2.0", .method = "exit" });
+        var reader = Reader.fixed(ts.in.written());
+        try testing.expectEqual(ExitCode.ok, try serve(ts.gpa, &reader, &ts.out.writer));
+        ts.frames = try splitFrames(ts.gpa, ts.out.written());
+        for (ts.frames.items) |f| try ts.replies.append(ts.arena.allocator(), try std.json.parseFromSliceLeaky(std.json.Value, ts.arena.allocator(), f, .{}));
+        try testing.expect(objGet(ts.response(shutdown_id).?, "result").? == .null);
+    }
+
+    fn index(ts: *const TestSession, id: i64) ?usize {
+        for (ts.replies.items, 0..) |v, i| {
+            if (objGet(v, "method") != null) continue; // a notification
+            const idv = objGet(v, "id") orelse continue;
+            if (idv == .integer and idv.integer == id) return i;
+        }
+        return null;
+    }
+
+    /// The response to request `id`.
+    fn response(ts: *const TestSession, id: i64) ?std.json.Value {
+        return ts.replies.items[ts.index(id) orelse return null];
+    }
+
+    /// The response to request `id`, as the server wrote it.
+    fn raw(ts: *const TestSession, id: i64) ?[]const u8 {
+        return ts.frames.items[ts.index(id) orelse return null];
+    }
+
+    fn capabilities(ts: *const TestSession) std.json.Value {
+        return field(ts.response(1).?, "result", "capabilities").?;
+    }
+
+    /// The params of every `publishDiagnostics`, in order.
+    fn publishes(ts: *TestSession) ![]const std.json.Value {
+        var out: std.ArrayList(std.json.Value) = .empty;
+        for (ts.replies.items) |v| {
+            const m = getStr(v, "method") orelse continue;
+            if (eql(m, "textDocument/publishDiagnostics")) try out.append(ts.arena.allocator(), objGet(v, "params").?);
+        }
+        return out.items;
+    }
+};
+
 /// The 0-based index of the line carrying the `#~ ERROR` annotation — computed from the
 /// fixture itself, never from server output, so the range assertion is independent.
 fn annotatedLine(src: []const u8) u32 {
@@ -567,89 +726,27 @@ test "lsp e2e: initialize -> didOpen(diag) -> didChange(clean clears) -> broken(
     const arity_line = annotatedLine(arity);
     const clean = "fn main() -> int { return 0 }";
     const uri = "file:///d.toy";
-    const Change = struct { text: []const u8 };
 
-    // Build the whole session as one byte stream.
-    var session: Writer.Allocating = .init(gpa);
-    defer session.deinit();
-    try frameInto(gpa, &session, .{
-        .jsonrpc = "2.0",
-        .id = @as(i64, 1),
-        .method = "initialize",
-        .params = .{ .capabilities = .{ .general = .{ .positionEncodings = &[_][]const u8{"utf-8"} } } },
-    });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
-    try frameInto(gpa, &session, .{
-        .jsonrpc = "2.0",
-        .method = "textDocument/didOpen",
-        .params = .{ .textDocument = .{ .uri = uri, .languageId = "toy", .version = @as(i64, 1), .text = arity } },
-    });
-    try frameInto(gpa, &session, .{
-        .jsonrpc = "2.0",
-        .method = "textDocument/didChange",
-        .params = .{ .textDocument = .{ .uri = uri, .version = @as(i64, 2) }, .contentChanges = &[_]Change{.{ .text = clean }} },
-    });
-    try frameInto(gpa, &session, .{
-        .jsonrpc = "2.0",
-        .method = "textDocument/didChange",
-        .params = .{ .textDocument = .{ .uri = uri, .version = @as(i64, 3) }, .contentChanges = &[_]Change{.{ .text = broken }} },
-    });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 2), .method = "shutdown" });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "exit" });
+    var ts = TestSession.init(gpa);
+    defer ts.deinit();
+    try ts.initialize(.{ .capabilities = .{ .general = .{ .positionEncodings = &[_][]const u8{"utf-8"} } } });
+    try ts.open(uri, arity);
+    try ts.change(uri, 2, clean);
+    try ts.change(uri, 3, broken);
+    try ts.finish();
 
-    // Drive the server end to end over in-memory buffers.
-    var out: Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var reader = Reader.fixed(session.written());
-    const code = try serve(gpa, &reader, &out.writer);
-    try testing.expectEqual(ExitCode.ok, code); // shutdown preceded exit
+    const caps = ts.capabilities();
+    try testing.expectEqualStrings("utf-8", getStr(caps, "positionEncoding").?);
+    const sync = objGet(caps, "textDocumentSync").?;
+    try testing.expectEqual(@as(i64, 2), getInt(sync, "change").?);
+    // The advertised capability set is exactly `ServerCapabilities`: a provider appears
+    // there only with its handler (see `protocol.provider_requests`).
+    const declared = @typeInfo(protocol.ServerCapabilities).@"struct".fields;
+    try testing.expectEqual(declared.len, caps.object.count());
+    inline for (declared) |f| try testing.expect(caps.object.get(f.name) != null);
 
-    var frames = try splitFrames(gpa, out.written());
-    defer {
-        for (frames.items) |b| gpa.free(b);
-        frames.deinit(gpa);
-    }
-
-    var saw_init = false;
-    var saw_shutdown = false;
-    var publishes: [8]std.json.Value = undefined;
-    var publish_count: usize = 0;
-    // One arena for every parsed frame; kept alive until all assertions are done.
-    var parse_arena = std.heap.ArenaAllocator.init(gpa);
-    defer parse_arena.deinit();
-    const pa = parse_arena.allocator();
-
-    for (frames.items) |body| {
-        const v = (try std.json.parseFromSliceLeaky(std.json.Value, pa, body, .{}));
-        if (objGet(v, "method")) |m| {
-            if (m == .string and eql(m.string, "textDocument/publishDiagnostics")) {
-                publishes[publish_count] = objGet(v, "params").?;
-                publish_count += 1;
-            }
-            continue;
-        }
-        // A response: correlate by id.
-        const idv = objGet(v, "id") orelse continue;
-        if (idv == .integer and idv.integer == 1) {
-            saw_init = true;
-            const caps = field(v, "result", "capabilities").?;
-            try testing.expectEqualStrings("utf-8", getStr(caps, "positionEncoding").?);
-            const sync = objGet(caps, "textDocumentSync").?;
-            try testing.expectEqual(@as(i64, 2), getInt(sync, "change").?);
-            // The advertised capability set must be a SUBSET of what we implement — no
-            // hover/completion/definition/etc. leaking in.
-            var it = caps.object.iterator();
-            while (it.next()) |e| {
-                const k = e.key_ptr.*;
-                try testing.expect(eql(k, "positionEncoding") or eql(k, "textDocumentSync") or eql(k, "hoverProvider") or eql(k, "completionProvider") or eql(k, "definitionProvider") or eql(k, "signatureHelpProvider") or eql(k, "inlayHintProvider"));
-            }
-        } else if (idv == .integer and idv.integer == 2) {
-            saw_shutdown = true;
-            try testing.expect(objGet(v, "result").? == .null);
-        }
-    }
-
-    try testing.expectEqual(@as(usize, 3), publish_count); // three publishes, none dropped
+    const publishes = try ts.publishes();
+    try testing.expectEqual(@as(usize, 3), publishes.len); // three publishes, none dropped
 
     // v1: the arity error surfaces as T0039 on the annotated line, over one line.
     const d1 = objGet(publishes[0], "diagnostics").?;
@@ -671,8 +768,29 @@ test "lsp e2e: initialize -> didOpen(diag) -> didChange(clean clears) -> broken(
     // v3: a syntactically broken document still yields diagnostics (fault-tolerant).
     const d3 = objGet(publishes[2], "diagnostics").?;
     try testing.expect(hasCode(d3, "P0002"));
+}
 
-    try testing.expect(saw_init and saw_shutdown);
+test "lsp: every advertised provider's request is answered" {
+    const gpa = testing.allocator;
+    const uri = "file:///p.toy";
+    var ts = TestSession.init(gpa);
+    defer ts.deinit();
+    try ts.initialize(.{});
+    try ts.open(uri, "fn add(a: int, b: int) -> int { a + b }\nfn main() -> int { return add(1, 2) }\n");
+    const fields = @typeInfo(@TypeOf(protocol.provider_requests)).@"struct".fields;
+    inline for (fields, 0..) |f, k| {
+        const params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = @as(i64, 1), .character = @as(i64, 30) }, .range = .{ .start = .{ .line = @as(i64, 0), .character = @as(i64, 0) }, .end = .{ .line = @as(i64, 2), .character = @as(i64, 0) } } };
+        try ts.request(@as(i64, 10 + k), @field(protocol.provider_requests, f.name), params);
+    }
+    try ts.request(@as(i64, 50), "textDocument/references", TestSession.at(uri, 1, 30));
+    try ts.finish();
+    inline for (fields, 0..) |_, k| {
+        const r = ts.response(10 + k).?;
+        try testing.expect(objGet(r, "error") == null);
+        try testing.expect(objGet(r, "result") != null);
+    }
+    // A request no provider advertises is rejected.
+    try testing.expectEqual(@as(i64, protocol.err_code.method_not_found), getInt(objGet(ts.response(50).?, "error").?, "code").?);
 }
 
 test "lsp hover: type at a binding/param/expr, signature at a callee, null over a gap and OOB" {
@@ -681,92 +799,45 @@ test "lsp hover: type at a binding/param/expr, signature at a callee, null over 
     // The leading indent on line 2 is the deliberate whitespace gap (id 6).
     const src = "fn add(a: int, b: int) -> int { return a + b }\nfn main() -> int {\n    x := add(1, 2)\n    return x\n}";
     const uri = "file:///h.toy";
+    const hov = "textDocument/hover";
+    const at = TestSession.at;
 
-    const Pos = struct { line: i64, character: i64 };
-    const hoverReq = struct {
-        fn make(id: i64, line: u32, character: u32) struct {
-            jsonrpc: []const u8 = "2.0",
-            id: i64,
-            method: []const u8 = "textDocument/hover",
-            params: struct { textDocument: struct { uri: []const u8 }, position: Pos },
-        } {
-            return .{ .id = id, .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = line, .character = character } } };
-        }
-    };
-
-    var session: Writer.Allocating = .init(gpa);
-    defer session.deinit();
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 1), .method = "initialize", .params = .{} });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
+    var ts = TestSession.init(gpa);
+    defer ts.deinit();
+    try ts.initialize(.{});
     // A hover BEFORE the document is opened -> null, no crash.
-    try frameInto(gpa, &session, hoverReq.make(10, 0, 0));
-    try frameInto(gpa, &session, .{
-        .jsonrpc = "2.0",
-        .method = "textDocument/didOpen",
-        .params = .{ .textDocument = .{ .uri = uri, .languageId = "toy", .version = @as(i64, 1), .text = src } },
-    });
-    try frameInto(gpa, &session, hoverReq.make(2, 2, colOf(src, 2, "x :="))); // binding x
-    try frameInto(gpa, &session, hoverReq.make(3, 0, colOf(src, 0, "a + b"))); // param-use a
-    try frameInto(gpa, &session, hoverReq.make(4, 2, colOf(src, 2, "add("))); // callee add
-    try frameInto(gpa, &session, hoverReq.make(5, 0, colOf(src, 0, "+ b"))); // expr +
-    try frameInto(gpa, &session, hoverReq.make(6, 2, colOf(src, 2, "  "))); // leading-indent gap
+    try ts.request(@as(i64, 10), hov, at(uri, 0, 0));
+    try ts.open(uri, src);
+    try ts.request(@as(i64, 2), hov, at(uri, 2, colOf(src, 2, "x :="))); // binding x
+    try ts.request(@as(i64, 3), hov, at(uri, 0, colOf(src, 0, "a + b"))); // param-use a
+    try ts.request(@as(i64, 4), hov, at(uri, 2, colOf(src, 2, "add("))); // callee add
+    try ts.request(@as(i64, 5), hov, at(uri, 0, colOf(src, 0, "+ b"))); // expr +
+    try ts.request(@as(i64, 6), hov, at(uri, 2, colOf(src, 2, "  "))); // leading-indent gap
     // Out-of-range line, and a character past u32 max (must NOT panic the @intCast).
-    try frameInto(gpa, &session, hoverReq.make(7, 100000, 0));
-    try frameInto(gpa, &session, .{
-        .jsonrpc = "2.0",
-        .id = @as(i64, 11),
-        .method = "textDocument/hover",
-        .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = @as(i64, 0), .character = @as(i64, 3000000000) } },
-    });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 8), .method = "shutdown" });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "exit" });
+    try ts.request(@as(i64, 7), hov, at(uri, 100000, 0));
+    try ts.request(@as(i64, 11), hov, at(uri, 0, 3000000000));
+    try ts.finish();
 
-    var out: Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var reader = Reader.fixed(session.written());
-    const code = try serve(gpa, &reader, &out.writer);
-    try testing.expectEqual(ExitCode.ok, code); // every request answered; no hang
-
-    var frames = try splitFrames(gpa, out.written());
-    defer {
-        for (frames.items) |b| gpa.free(b);
-        frames.deinit(gpa);
-    }
-
-    var parse_arena = std.heap.ArenaAllocator.init(gpa);
-    defer parse_arena.deinit();
-    const pa = parse_arena.allocator();
-
-    // Collect every response by id (ids run 1..11).
-    var by_id: [12]?std.json.Value = @splat(null);
-    for (frames.items) |body| {
-        const v = try std.json.parseFromSliceLeaky(std.json.Value, pa, body, .{});
-        if (objGet(v, "method") != null) continue; // a notification (publishDiagnostics)
-        const idv = objGet(v, "id") orelse continue;
-        if (idv == .integer and idv.integer >= 0 and idv.integer < 12) by_id[@intCast(idv.integer)] = v;
-    }
-
-    // id 1: hoverProvider is advertised as a boolean.
-    const caps = field(by_id[1].?, "result", "capabilities").?;
-    const hp = objGet(caps, "hoverProvider").?;
+    // hoverProvider is advertised as a boolean.
+    const hp = objGet(ts.capabilities(), "hoverProvider").?;
     try testing.expect(hp == .bool and hp.bool);
 
     // The positive cases FAIL on a null/absent value (non-vacuous).
-    try testing.expectEqualStrings("x: int", hoverValue(by_id[2].?).?); // binding x
-    try testing.expectEqualStrings("a: int", hoverValue(by_id[3].?).?); // param a
-    try testing.expectEqualStrings("int", hoverValue(by_id[5].?).?); // expr +
+    try testing.expectEqualStrings("x: int", hoverValue(ts.response(2).?).?); // binding x
+    try testing.expectEqualStrings("a: int", hoverValue(ts.response(3).?).?); // param a
+    try testing.expectEqualStrings("int", hoverValue(ts.response(5).?).?); // expr +
 
     // id 4: callee signature.
-    const callee = hoverValue(by_id[4].?).?;
+    const callee = hoverValue(ts.response(4).?).?;
     try testing.expectEqualStrings("fn add(a: int, b: int) -> int", callee);
     // The entry module qualifier must never leak into hover output.
     try testing.expect(std.mem.indexOf(u8, callee, "doc.") == null);
 
     // Every non-hit path answers with an explicit null result.
-    try testing.expect(objGet(by_id[6].?, "result").? == .null); // whitespace gap
-    try testing.expect(objGet(by_id[10].?, "result").? == .null); // before didOpen
-    try testing.expect(objGet(by_id[7].?, "result").? == .null); // OOB line
-    try testing.expect(objGet(by_id[11].?, "result").? == .null); // char > u32 max
+    try testing.expect(objGet(ts.response(6).?, "result").? == .null); // whitespace gap
+    try testing.expect(objGet(ts.response(10).?, "result").? == .null); // before didOpen
+    try testing.expect(objGet(ts.response(7).?, "result").? == .null); // OOB line
+    try testing.expect(objGet(ts.response(11).?, "result").? == .null); // char > u32 max
 }
 
 /// The hover `result.contents.value`, or null if the response's result was JSON null.
@@ -783,6 +854,11 @@ fn hoverValue(resp: std.json.Value) ?[]const u8 {
 }
 
 const posAfterLast = @import("test_util.zig").posAfterLast;
+
+/// The params of a position request at `p`.
+fn atPos(uri: []const u8, p: protocol.Position) @TypeOf(TestSession.at("", 0, 0)) {
+    return TestSession.at(uri, p.line, p.character);
+}
 
 /// The response's `result` array (the completion items), or null.
 fn resultArr(resp: std.json.Value) ?[]std.json.Value {
@@ -845,76 +921,29 @@ test "lsp completion: scope, member (fields+methods), module members, and a brok
     const u_member = "file:///member.toy";
     const u_module = "file:///module.toy";
     const u_broken = "file:///broken.toy";
+    const compl = "textDocument/completion";
 
-    const Pos = struct { line: u32, character: u32 };
-    const complReq = struct {
-        fn make(id: i64, uri: []const u8, p: protocol.Position) struct {
-            jsonrpc: []const u8 = "2.0",
-            id: i64,
-            method: []const u8 = "textDocument/completion",
-            params: struct { textDocument: struct { uri: []const u8 }, position: Pos },
-        } {
-            return .{ .id = id, .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = p.line, .character = p.character } } };
-        }
-    };
-    const openDoc = struct {
-        fn make(uri: []const u8, text: []const u8) struct {
-            jsonrpc: []const u8 = "2.0",
-            method: []const u8 = "textDocument/didOpen",
-            params: struct { textDocument: struct { uri: []const u8, languageId: []const u8 = "toy", version: i64 = 1, text: []const u8 } },
-        } {
-            return .{ .params = .{ .textDocument = .{ .uri = uri, .text = text } } };
-        }
-    };
-
-    var session: Writer.Allocating = .init(gpa);
-    defer session.deinit();
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 1), .method = "initialize", .params = .{} });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
-    try frameInto(gpa, &session, openDoc.make(u_scope, scope_src));
-    try frameInto(gpa, &session, openDoc.make(u_member, member_src));
-    try frameInto(gpa, &session, openDoc.make(u_module, module_src));
-    try frameInto(gpa, &session, openDoc.make(u_broken, broken_src));
-    try frameInto(gpa, &session, complReq.make(20, u_scope, posAfterLast(scope_src, "count")));
-    try frameInto(gpa, &session, complReq.make(21, u_member, posAfterLast(member_src, "p.")));
-    try frameInto(gpa, &session, complReq.make(22, u_module, posAfterLast(module_src, "io.")));
-    try frameInto(gpa, &session, complReq.make(23, u_broken, posAfterLast(broken_src, "s.")));
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 99), .method = "shutdown" });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "exit" });
-
-    var out: Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var reader = Reader.fixed(session.written());
-    const code = try serve(gpa, &reader, &out.writer);
-    try testing.expectEqual(ExitCode.ok, code); // every request answered; no hang/crash
-
-    var frames = try splitFrames(gpa, out.written());
-    defer {
-        for (frames.items) |b| gpa.free(b);
-        frames.deinit(gpa);
-    }
-
-    var parse_arena = std.heap.ArenaAllocator.init(gpa);
-    defer parse_arena.deinit();
-    const pa = parse_arena.allocator();
-
-    var by_id: [100]?std.json.Value = @splat(null);
-    for (frames.items) |body| {
-        const v = try std.json.parseFromSliceLeaky(std.json.Value, pa, body, .{});
-        if (objGet(v, "method") != null) continue;
-        const idv = objGet(v, "id") orelse continue;
-        if (idv == .integer and idv.integer >= 0 and idv.integer < 100) by_id[@intCast(idv.integer)] = v;
-    }
+    var ts = TestSession.init(gpa);
+    defer ts.deinit();
+    try ts.initialize(.{});
+    try ts.open(u_scope, scope_src);
+    try ts.open(u_member, member_src);
+    try ts.open(u_module, module_src);
+    try ts.open(u_broken, broken_src);
+    try ts.request(@as(i64, 20), compl, atPos(u_scope, posAfterLast(scope_src, "count")));
+    try ts.request(@as(i64, 21), compl, atPos(u_member, posAfterLast(member_src, "p.")));
+    try ts.request(@as(i64, 22), compl, atPos(u_module, posAfterLast(module_src, "io.")));
+    try ts.request(@as(i64, 23), compl, atPos(u_broken, posAfterLast(broken_src, "s.")));
+    try ts.finish();
 
     // Capability: the `.` trigger is advertised.
-    const caps = field(by_id[1].?, "result", "capabilities").?;
-    const cp = objGet(caps, "completionProvider").?;
+    const cp = objGet(ts.capabilities(), "completionProvider").?;
     const trigs = objGet(cp, "triggerCharacters").?;
     try testing.expect(trigs == .array and trigs.array.items.len == 1);
     try testing.expectEqualStrings(".", trigs.array.items[0].string);
 
     // (1) SCOPE: enclosing-fn local + param + a visible top-level fn + a type + a keyword.
-    const scope = resultArr(by_id[20].?).?;
+    const scope = resultArr(ts.response(20).?).?;
     try testing.expectEqual(@as(?i64, 6), labelKind(scope, "count")); // local
     try testing.expectEqual(@as(?i64, 6), labelKind(scope, "arg")); // enclosing param
     try testing.expectEqual(@as(?i64, 3), labelKind(scope, "helper")); // top-level fn
@@ -927,7 +956,7 @@ test "lsp completion: scope, member (fields+methods), module members, and a brok
     try testing.expect(!hasLabel(scope, "n"));
 
     // (2) MEMBER: the receiver struct's fields + method, and NOT unrelated globals.
-    const member = resultArr(by_id[21].?).?;
+    const member = resultArr(ts.response(21).?).?;
     try testing.expectEqual(@as(?i64, 5), labelKind(member, "x")); // field
     try testing.expectEqual(@as(?i64, 5), labelKind(member, "y")); // field
     try testing.expectEqual(@as(?i64, 2), labelKind(member, "mag")); // method
@@ -936,7 +965,7 @@ test "lsp completion: scope, member (fields+methods), module members, and a brok
     try testing.expect(!hasLabel(member, "if"));
 
     // (3) MODULE: the imported module's pub fns, and no scratch-file qualifier leak.
-    const module = resultArr(by_id[22].?).?;
+    const module = resultArr(ts.response(22).?).?;
     try testing.expectEqual(@as(?i64, 3), labelKind(module, "print"));
     try testing.expectEqual(@as(?i64, 3), labelKind(module, "println"));
     try testing.expect(!hasLabel(module, "main"));
@@ -946,7 +975,7 @@ test "lsp completion: scope, member (fields+methods), module members, and a brok
     }
 
     // (4) INCOMPLETE (fault-tolerant): a trailing `.` still yields the receiver's fields.
-    const broken = resultArr(by_id[23].?).?;
+    const broken = resultArr(ts.response(23).?).?;
     try testing.expectEqual(@as(?i64, 5), labelKind(broken, "a"));
     try testing.expectEqual(@as(?i64, 5), labelKind(broken, "b"));
 }
@@ -984,82 +1013,30 @@ test "lsp definition: local, param, top-level fn, type; null over a gap/OOB/pre-
         \\}
     ;
     const uri = "file:///def.toy";
+    const def = "textDocument/definition";
+    const at = TestSession.at;
 
-    const Pos = struct { line: i64, character: i64 };
-    const defReq = struct {
-        fn make(id: i64, line: u32, character: u32) struct {
-            jsonrpc: []const u8 = "2.0",
-            id: i64,
-            method: []const u8 = "textDocument/definition",
-            params: struct { textDocument: struct { uri: []const u8 }, position: Pos },
-        } {
-            return .{ .id = id, .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = line, .character = character } } };
-        }
-    };
-
-    var session: Writer.Allocating = .init(gpa);
-    defer session.deinit();
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 1), .method = "initialize", .params = .{} });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
+    var ts = TestSession.init(gpa);
+    defer ts.deinit();
+    try ts.initialize(.{});
     // A definition BEFORE the document is opened -> null, no crash.
-    try frameInto(gpa, &session, defReq.make(10, 0, 0));
-    try frameInto(gpa, &session, .{
-        .jsonrpc = "2.0",
-        .method = "textDocument/didOpen",
-        .params = .{ .textDocument = .{ .uri = uri, .languageId = "toy", .version = @as(i64, 1), .text = src } },
-    });
-    try frameInto(gpa, &session, defReq.make(2, 5, colOf(src, 5, "s"))); // use of local `s`
-    try frameInto(gpa, &session, defReq.make(3, 0, colOf(src, 0, "a + b"))); // use of param `a`
-    try frameInto(gpa, &session, defReq.make(4, 4, colOf(src, 4, "add("))); // use of fn `add`
-    try frameInto(gpa, &session, defReq.make(5, 3, colOf(src, 3, "Point"))); // use of type `Point`
-    try frameInto(gpa, &session, defReq.make(6, 3, 0)); // leading-indent gap -> null
-    try frameInto(gpa, &session, defReq.make(7, 100000, 0)); // OOB line -> null
-    try frameInto(gpa, &session, .{
-        .jsonrpc = "2.0",
-        .id = @as(i64, 11),
-        .method = "textDocument/definition",
-        .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = @as(i64, 0), .character = @as(i64, 3000000000) } },
-    });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 8), .method = "shutdown" });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "exit" });
+    try ts.request(@as(i64, 10), def, at(uri, 0, 0));
+    try ts.open(uri, src);
+    try ts.request(@as(i64, 2), def, at(uri, 5, colOf(src, 5, "s"))); // use of local `s`
+    try ts.request(@as(i64, 3), def, at(uri, 0, colOf(src, 0, "a + b"))); // use of param `a`
+    try ts.request(@as(i64, 4), def, at(uri, 4, colOf(src, 4, "add("))); // use of fn `add`
+    try ts.request(@as(i64, 5), def, at(uri, 3, colOf(src, 3, "Point"))); // use of type `Point`
+    try ts.request(@as(i64, 6), def, at(uri, 3, 0)); // leading-indent gap -> null
+    try ts.request(@as(i64, 7), def, at(uri, 100000, 0)); // OOB line -> null
+    try ts.request(@as(i64, 11), def, at(uri, 0, 3000000000));
+    try ts.finish();
 
-    var out: Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var reader = Reader.fixed(session.written());
-    const code = try serve(gpa, &reader, &out.writer);
-    try testing.expectEqual(ExitCode.ok, code); // every request answered; no hang
-
-    var frames = try splitFrames(gpa, out.written());
-    defer {
-        for (frames.items) |b| gpa.free(b);
-        frames.deinit(gpa);
-    }
-
-    var parse_arena = std.heap.ArenaAllocator.init(gpa);
-    defer parse_arena.deinit();
-    const pa = parse_arena.allocator();
-
-    // Both the parsed value AND the raw frame bytes, by id (ids run 1..11): the leak check
-    // asserts over the RAW response bytes, not the re-serialized parse.
-    var by_id: [12]?std.json.Value = @splat(null);
-    var raw_by_id: [12]?[]const u8 = @splat(null);
-    for (frames.items) |body| {
-        const v = try std.json.parseFromSliceLeaky(std.json.Value, pa, body, .{});
-        if (objGet(v, "method") != null) continue; // a notification
-        const idv = objGet(v, "id") orelse continue;
-        if (idv == .integer and idv.integer >= 0 and idv.integer < 12) {
-            by_id[@intCast(idv.integer)] = v;
-            raw_by_id[@intCast(idv.integer)] = body;
-        }
-    }
-
-    // id 1: definitionProvider is advertised as a boolean.
-    const caps = field(by_id[1].?, "result", "capabilities").?;
-    const dp = objGet(caps, "definitionProvider").?;
+    // definitionProvider is advertised as a boolean.
+    const dp = objGet(ts.capabilities(), "definitionProvider").?;
     try testing.expect(dp == .bool and dp.bool);
 
     // The expected DECL ranges — every column derived from the fixture via `colOf`.
-    const Case = struct { id: usize, line: i64, start: u32, len: u32 };
+    const Case = struct { id: i64, line: i64, start: u32, len: u32 };
     const cases = [_]Case{
         .{ .id = 2, .line = 4, .start = colOf(src, 4, "s :="), .len = 1 }, // local `s`
         .{ .id = 3, .line = 0, .start = colOf(src, 0, "a: int"), .len = 1 }, // param `a`
@@ -1067,22 +1044,22 @@ test "lsp definition: local, param, top-level fn, type; null over a gap/OOB/pre-
         .{ .id = 5, .line = 1, .start = colOf(src, 1, "Point"), .len = 5 }, // type `Point`
     };
     for (cases) |c| {
-        const r = defRange(by_id[c.id].?).?; // fails on a null result (non-vacuous)
-        try testing.expectEqualStrings(uri, getStr(objGet(by_id[c.id].?, "result").?, "uri").?);
+        const r = defRange(ts.response(c.id).?).?; // fails on a null result (non-vacuous)
+        try testing.expectEqualStrings(uri, getStr(objGet(ts.response(c.id).?, "result").?, "uri").?);
         try testing.expectEqual(c.line, r.start_line);
         try testing.expectEqual(@as(i64, c.start), r.start_char);
         try testing.expectEqual(c.line, r.end_line);
         try testing.expectEqual(@as(i64, c.start + c.len), r.end_char); // start != end -> non-vacuous
         // The internal scratch path must never surface in the response bytes.
-        try testing.expect(std.mem.indexOf(u8, raw_by_id[c.id].?, ".toy-lsp") == null);
-        try testing.expect(std.mem.indexOf(u8, raw_by_id[c.id].?, "doc.toy") == null);
+        try testing.expect(std.mem.indexOf(u8, ts.raw(c.id).?, ".toy-lsp") == null);
+        try testing.expect(std.mem.indexOf(u8, ts.raw(c.id).?, "doc.toy") == null);
     }
 
     // Every non-hit path answers with an explicit null result.
-    try testing.expect(objGet(by_id[6].?, "result").? == .null); // whitespace gap
-    try testing.expect(objGet(by_id[7].?, "result").? == .null); // OOB line
-    try testing.expect(objGet(by_id[10].?, "result").? == .null); // before didOpen
-    try testing.expect(objGet(by_id[11].?, "result").? == .null); // char > u32 max
+    try testing.expect(objGet(ts.response(6).?, "result").? == .null); // whitespace gap
+    try testing.expect(objGet(ts.response(7).?, "result").? == .null); // OOB line
+    try testing.expect(objGet(ts.response(10).?, "result").? == .null); // before didOpen
+    try testing.expect(objGet(ts.response(11).?, "result").? == .null); // char > u32 max
 }
 
 /// The `result.signatures[0].label` of a signatureHelp response, or null if the result was
@@ -1141,27 +1118,7 @@ test "lsp signatureHelp: active param, innermost nested callee, incomplete call,
     const u_src = "file:///sig.toy";
     const u_nested = "file:///nested.toy";
     const u_inc = "file:///inc.toy";
-
-    const Pos = struct { line: u32, character: u32 };
-    const sigReq = struct {
-        fn make(id: i64, uri: []const u8, p: protocol.Position) struct {
-            jsonrpc: []const u8 = "2.0",
-            id: i64,
-            method: []const u8 = "textDocument/signatureHelp",
-            params: struct { textDocument: struct { uri: []const u8 }, position: Pos },
-        } {
-            return .{ .id = id, .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = p.line, .character = p.character } } };
-        }
-    };
-    const openDoc = struct {
-        fn make(uri: []const u8, text: []const u8) struct {
-            jsonrpc: []const u8 = "2.0",
-            method: []const u8 = "textDocument/didOpen",
-            params: struct { textDocument: struct { uri: []const u8, languageId: []const u8 = "toy", version: i64 = 1, text: []const u8 } },
-        } {
-            return .{ .params = .{ .textDocument = .{ .uri = uri, .text = text } } };
-        }
-    };
+    const sig = "textDocument/signatureHelp";
 
     const before_comma = posAfterLast(src, "add(1");
     const after_comma = posAfterLast(src, "add(1, ");
@@ -1169,92 +1126,56 @@ test "lsp signatureHelp: active param, innermost nested callee, incomplete call,
     const inc_pos = posAfterLast(incomplete, "add(1, ");
     const outside: protocol.Position = .{ .line = 4, .character = colOf(src, 4, "return") };
 
-    var session: Writer.Allocating = .init(gpa);
-    defer session.deinit();
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 1), .method = "initialize", .params = .{} });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
+    var ts = TestSession.init(gpa);
+    defer ts.deinit();
+    try ts.initialize(.{});
     // A signatureHelp BEFORE the document is opened -> null, no crash.
-    try frameInto(gpa, &session, sigReq.make(25, u_src, .{ .line = 0, .character = 0 }));
-    try frameInto(gpa, &session, openDoc.make(u_src, src));
-    try frameInto(gpa, &session, openDoc.make(u_nested, nested));
-    try frameInto(gpa, &session, openDoc.make(u_inc, incomplete));
-    try frameInto(gpa, &session, sigReq.make(20, u_src, before_comma));
-    try frameInto(gpa, &session, sigReq.make(21, u_src, after_comma));
-    try frameInto(gpa, &session, sigReq.make(22, u_nested, inner));
-    try frameInto(gpa, &session, sigReq.make(23, u_inc, inc_pos));
-    try frameInto(gpa, &session, sigReq.make(24, u_src, outside));
+    try ts.request(@as(i64, 25), sig, TestSession.at(u_src, 0, 0));
+    try ts.open(u_src, src);
+    try ts.open(u_nested, nested);
+    try ts.open(u_inc, incomplete);
+    try ts.request(@as(i64, 20), sig, atPos(u_src, before_comma));
+    try ts.request(@as(i64, 21), sig, atPos(u_src, after_comma));
+    try ts.request(@as(i64, 22), sig, atPos(u_nested, inner));
+    try ts.request(@as(i64, 23), sig, atPos(u_inc, inc_pos));
+    try ts.request(@as(i64, 24), sig, atPos(u_src, outside));
     // A character past u32 max must NOT panic the @intCast.
-    try frameInto(gpa, &session, .{
-        .jsonrpc = "2.0",
-        .id = @as(i64, 26),
-        .method = "textDocument/signatureHelp",
-        .params = .{ .textDocument = .{ .uri = u_src }, .position = .{ .line = @as(i64, 0), .character = @as(i64, 3000000000) } },
-    });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 99), .method = "shutdown" });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "exit" });
-
-    var out: Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var reader = Reader.fixed(session.written());
-    const code = try serve(gpa, &reader, &out.writer);
-    try testing.expectEqual(ExitCode.ok, code); // every request answered; no hang/crash
-
-    var frames = try splitFrames(gpa, out.written());
-    defer {
-        for (frames.items) |b| gpa.free(b);
-        frames.deinit(gpa);
-    }
-
-    var parse_arena = std.heap.ArenaAllocator.init(gpa);
-    defer parse_arena.deinit();
-    const pa = parse_arena.allocator();
-
-    var by_id: [100]?std.json.Value = @splat(null);
-    var raw_by_id: [100]?[]const u8 = @splat(null);
-    for (frames.items) |body| {
-        const v = try std.json.parseFromSliceLeaky(std.json.Value, pa, body, .{});
-        if (objGet(v, "method") != null) continue; // a notification
-        const idv = objGet(v, "id") orelse continue;
-        if (idv == .integer and idv.integer >= 0 and idv.integer < 100) {
-            by_id[@intCast(idv.integer)] = v;
-            raw_by_id[@intCast(idv.integer)] = body;
-        }
-    }
+    try ts.request(@as(i64, 26), sig, TestSession.at(u_src, 0, 3000000000));
+    try ts.finish();
 
     // Capability: the `(`/`,` triggers are advertised.
-    const caps = field(by_id[1].?, "result", "capabilities").?;
-    const shp = objGet(caps, "signatureHelpProvider").?;
+    const shp = objGet(ts.capabilities(), "signatureHelpProvider").?;
     const trigs = objGet(shp, "triggerCharacters").?;
     try testing.expect(trigs == .array and trigs.array.items.len == 2);
     try testing.expectEqualStrings("(", trigs.array.items[0].string);
     try testing.expectEqualStrings(",", trigs.array.items[1].string);
 
     // Before the first comma -> active param 0; the label is the exact rendered signature.
-    try testing.expectEqualStrings("fn add(int, int) -> int", sigLabel(by_id[20].?).?);
-    try testing.expectEqual(@as(?i64, 0), sigActive(by_id[20].?));
+    try testing.expectEqualStrings("fn add(int, int) -> int", sigLabel(ts.response(20).?).?);
+    try testing.expectEqual(@as(?i64, 0), sigActive(ts.response(20).?));
     // The SECOND param's label span is the second `int` occurrence (proves the offset label).
-    try testing.expectEqual([2]i64{ 12, 15 }, sigParam(by_id[20].?, 1).?);
+    try testing.expectEqual([2]i64{ 12, 15 }, sigParam(ts.response(20).?, 1).?);
 
     // After the first comma -> active param 1, same signature.
-    try testing.expectEqualStrings("fn add(int, int) -> int", sigLabel(by_id[21].?).?);
-    try testing.expectEqual(@as(?i64, 1), sigActive(by_id[21].?));
+    try testing.expectEqualStrings("fn add(int, int) -> int", sigLabel(ts.response(21).?).?);
+    try testing.expectEqual(@as(?i64, 1), sigActive(ts.response(21).?));
 
     // Nested: the cursor in the inner call resolves to the INNERMOST callee `id`.
-    try testing.expectEqualStrings("fn id(int) -> int", sigLabel(by_id[22].?).?);
-    try testing.expectEqual(@as(?i64, 0), sigActive(by_id[22].?));
+    try testing.expectEqualStrings("fn id(int) -> int", sigLabel(ts.response(22).?).?);
+    try testing.expectEqual(@as(?i64, 0), sigActive(ts.response(22).?));
 
     // Incomplete `add(1, ` at EOF: does NOT bail, returns the signature with active param 1.
-    try testing.expectEqualStrings("fn add(int, int) -> int", sigLabel(by_id[23].?).?);
-    try testing.expectEqual(@as(?i64, 1), sigActive(by_id[23].?));
+    try testing.expectEqualStrings("fn add(int, int) -> int", sigLabel(ts.response(23).?).?);
+    try testing.expectEqual(@as(?i64, 1), sigActive(ts.response(23).?));
 
     // Outside any call, before didOpen, and a char past u32 max all answer explicit null.
-    try testing.expect(objGet(by_id[24].?, "result").? == .null); // on the `return` line
-    try testing.expect(objGet(by_id[25].?, "result").? == .null); // before didOpen
-    try testing.expect(objGet(by_id[26].?, "result").? == .null); // char > u32 max
+    try testing.expect(objGet(ts.response(24).?, "result").? == .null); // on the `return` line
+    try testing.expect(objGet(ts.response(25).?, "result").? == .null); // before didOpen
+    try testing.expect(objGet(ts.response(26).?, "result").? == .null); // char > u32 max
 
     // The internal scratch path/module qualifier must never surface in the response bytes.
-    try testing.expect(std.mem.indexOf(u8, raw_by_id[20].?, ".toy-lsp") == null);
-    try testing.expect(std.mem.indexOf(u8, raw_by_id[20].?, "doc.") == null);
+    try testing.expect(std.mem.indexOf(u8, ts.raw(20).?, ".toy-lsp") == null);
+    try testing.expect(std.mem.indexOf(u8, ts.raw(20).?, "doc.") == null);
 }
 
 test "lsp incremental didChange: in-order ranged deltas + no-range full replace reflected by hover/diagnostics" {
@@ -1273,102 +1194,48 @@ test "lsp incremental didChange: in-order ranged deltas + no-range full replace 
     const Pos = struct { line: u32, character: u32 };
     const Rng = struct { start: Pos, end: Pos };
     const Ranged = struct { range: Rng, text: []const u8 };
-    const FullReplace = struct { text: []const u8 };
 
-    const hoverReq = struct {
-        fn make(id: i64, line: u32, character: u32) struct {
-            jsonrpc: []const u8 = "2.0",
-            id: i64,
-            method: []const u8 = "textDocument/hover",
-            params: struct { textDocument: struct { uri: []const u8 }, position: struct { line: u32, character: u32 } },
-        } {
-            return .{ .id = id, .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = line, .character = character } } };
-        }
-    };
-
-    var session: Writer.Allocating = .init(gpa);
-    defer session.deinit();
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 1), .method = "initialize", .params = .{} });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
-    try frameInto(gpa, &session, .{
-        .jsonrpc = "2.0",
-        .method = "textDocument/didOpen",
-        .params = .{ .textDocument = .{ .uri = uri, .languageId = "toy", .version = @as(i64, 1), .text = T0 } },
-    });
+    var ts = TestSession.init(gpa);
+    defer ts.deinit();
+    try ts.initialize(.{});
+    try ts.open(uri, T0);
     // v2: TWO in-order ranged deltas. c1 inserts a new fn at (0,0); c2 then renames the call
     // `add` -> `id` on line 7 — a coordinate that only exists AFTER c1 was applied.
     const add_col = colOf(afterC1, 7, "add");
     const c1: Ranged = .{ .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 0, .character = 0 } }, .text = c1_ins };
     const c2: Ranged = .{ .range = .{ .start = .{ .line = 7, .character = add_col }, .end = .{ .line = 7, .character = add_col + 3 } }, .text = "id" };
-    try frameInto(gpa, &session, .{
+    try ts.send(.{
         .jsonrpc = "2.0",
         .method = "textDocument/didChange",
         .params = .{ .textDocument = .{ .uri = uri, .version = @as(i64, 2) }, .contentChanges = &[_]Ranged{ c1, c2 } },
     });
-    try frameInto(gpa, &session, hoverReq.make(30, 7, colOf(v2doc, 7, "id(")));
+    try ts.request(@as(i64, 30), "textDocument/hover", TestSession.at(uri, 7, colOf(v2doc, 7, "id(")));
     // v3: ONE ranged delta, `0` -> `zzz`, coordinates against the post-v2 text.
     const zero_col = colOf(v2doc, 7, "0");
     const c3: Ranged = .{ .range = .{ .start = .{ .line = 7, .character = zero_col }, .end = .{ .line = 7, .character = zero_col + 1 } }, .text = "zzz" };
-    try frameInto(gpa, &session, .{
+    try ts.send(.{
         .jsonrpc = "2.0",
         .method = "textDocument/didChange",
         .params = .{ .textDocument = .{ .uri = uri, .version = @as(i64, 3) }, .contentChanges = &[_]Ranged{c3} },
     });
     // v4: a no-range change is a whole-document replace.
-    try frameInto(gpa, &session, .{
-        .jsonrpc = "2.0",
-        .method = "textDocument/didChange",
-        .params = .{ .textDocument = .{ .uri = uri, .version = @as(i64, 4) }, .contentChanges = &[_]FullReplace{.{ .text = T2 }} },
-    });
-    try frameInto(gpa, &session, hoverReq.make(31, 4, colOf(T2, 4, "f(")));
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 99), .method = "shutdown" });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "exit" });
-
-    var out: Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var reader = Reader.fixed(session.written());
-    const code = try serve(gpa, &reader, &out.writer);
-    try testing.expectEqual(ExitCode.ok, code);
-
-    var frames = try splitFrames(gpa, out.written());
-    defer {
-        for (frames.items) |b| gpa.free(b);
-        frames.deinit(gpa);
-    }
-
-    var parse_arena = std.heap.ArenaAllocator.init(gpa);
-    defer parse_arena.deinit();
-    const pa = parse_arena.allocator();
-
-    var by_id: [40]?std.json.Value = @splat(null);
-    var publishes: [8]std.json.Value = undefined;
-    var publish_count: usize = 0;
-    for (frames.items) |body| {
-        const v = try std.json.parseFromSliceLeaky(std.json.Value, pa, body, .{});
-        if (objGet(v, "method")) |m| {
-            if (m == .string and eql(m.string, "textDocument/publishDiagnostics")) {
-                publishes[publish_count] = objGet(v, "params").?;
-                publish_count += 1;
-            }
-            continue;
-        }
-        const idv = objGet(v, "id") orelse continue;
-        if (idv == .integer and idv.integer >= 0 and idv.integer < 40) by_id[@intCast(idv.integer)] = v;
-    }
+    try ts.change(uri, 4, T2);
+    try ts.request(@as(i64, 31), "textDocument/hover", TestSession.at(uri, 4, colOf(T2, 4, "f(")));
+    try ts.finish();
 
     // Capability: incremental sync advertised.
-    const caps = field(by_id[1].?, "result", "capabilities").?;
-    const sync = objGet(caps, "textDocumentSync").?;
+    const sync = objGet(ts.capabilities(), "textDocumentSync").?;
     try testing.expectEqual(@as(i64, 2), getInt(sync, "change").?);
 
     // didOpen + three didChange = four publishes, none dropped/added.
-    try testing.expectEqual(@as(usize, 4), publish_count);
+    const publishes = try ts.publishes();
+    try testing.expectEqual(@as(usize, 4), publishes.len);
     // T0 is clean.
     try testing.expectEqual(@as(usize, 0), objGet(publishes[0], "diagnostics").?.array.items.len);
 
     // In-order multi-edit: a hover on the renamed callee resolves to `id`. Fails under
     // last-wins (whole doc would become `"id"`) or if c2's line-7 coord hit pre-c1 text.
-    try testing.expectEqualStrings("fn id(x: int) -> int", hoverValue(by_id[30].?).?);
+    try testing.expectEqualStrings("fn id(x: int) -> int", hoverValue(ts.response(30).?).?);
 
     // Ranged single delta, offset-exact: the `zzz` edit yields a diagnostic pinned to BOTH the
     // line AND the exact column of `zzz` (a no-op/wrong-line/off-by-N splice all fail this).
@@ -1384,12 +1251,8 @@ test "lsp incremental didChange: in-order ranged deltas + no-range full replace 
     // Full replace (not append): T2 is clean AND a hover on `f` resolves. Under append, the
     // (4, colOf(T2,4,"f(")) coordinate would land in the retained old prefix, not `f`.
     try testing.expectEqual(@as(usize, 0), objGet(publishes[3], "diagnostics").?.array.items.len);
-    try testing.expectEqualStrings("fn f() -> int", hoverValue(by_id[31].?).?);
+    try testing.expectEqualStrings("fn f() -> int", hoverValue(ts.response(31).?).?);
 }
-
-/// The response frame (parsed) whose top-level `id` is the string `want`, plus a count of
-/// how many response frames carried it — for the double-response guard in the cancel test.
-const StrIdHit = struct { resp: ?std.json.Value = null, count: usize = 0 };
 
 test "lsp cancelRequest: a cancelled request answers -32800 with no result; a normal one still works" {
     const gpa = testing.allocator;
@@ -1399,83 +1262,44 @@ test "lsp cancelRequest: a cancelled request answers -32800 with no result; a no
 
     const x_col = colOf(src, 1, "x");
 
-    var session: Writer.Allocating = .init(gpa);
-    defer session.deinit();
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 1), .method = "initialize", .params = .{} });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
-    try frameInto(gpa, &session, .{
-        .jsonrpc = "2.0",
-        .method = "textDocument/didOpen",
-        .params = .{ .textDocument = .{ .uri = uri, .languageId = "toy", .version = @as(i64, 1), .text = src } },
-    });
+    var ts = TestSession.init(gpa);
+    defer ts.deinit();
+    try ts.initialize(.{});
+    try ts.open(uri, src);
     // The request to cancel (a STRING id, exercising CancelId.str) ...
-    try frameInto(gpa, &session, .{
-        .jsonrpc = "2.0",
-        .id = "cancelme",
-        .method = "textDocument/hover",
-        .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = @as(i64, 1), .character = @as(i64, x_col) } },
-    });
+    try ts.request("cancelme", "textDocument/hover", TestSession.at(uri, 1, x_col));
     // ... its cancellation (a notification: target id in params, no top-level id) ...
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "$/cancelRequest", .params = .{ .id = "cancelme" } });
+    try ts.send(.{ .jsonrpc = "2.0", .method = "$/cancelRequest", .params = .{ .id = "cancelme" } });
     // ... and a NON-cancelled control request (int id).
-    try frameInto(gpa, &session, .{
-        .jsonrpc = "2.0",
-        .id = @as(i64, 6),
-        .method = "textDocument/hover",
-        .params = .{ .textDocument = .{ .uri = uri }, .position = .{ .line = @as(i64, 1), .character = @as(i64, x_col) } },
-    });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 7), .method = "shutdown" });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "exit" });
+    try ts.request(@as(i64, 6), "textDocument/hover", TestSession.at(uri, 1, x_col));
+    try ts.finish();
 
-    var out: Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var reader = Reader.fixed(session.written());
-    const code = try serve(gpa, &reader, &out.writer);
-    try testing.expectEqual(ExitCode.ok, code); // the loop did not hang
-
-    var frames = try splitFrames(gpa, out.written());
-    defer {
-        for (frames.items) |b| gpa.free(b);
-        frames.deinit(gpa);
-    }
-
-    var parse_arena = std.heap.ArenaAllocator.init(gpa);
-    defer parse_arena.deinit();
-    const pa = parse_arena.allocator();
-
-    var by_id: [16]?std.json.Value = @splat(null);
-    var cancel_hit: StrIdHit = .{};
-    var publish_count: usize = 0;
-    for (frames.items) |body| {
-        const v = try std.json.parseFromSliceLeaky(std.json.Value, pa, body, .{});
-        if (objGet(v, "method")) |m| {
-            if (m == .string and eql(m.string, "textDocument/publishDiagnostics")) publish_count += 1;
-            continue; // a notification is never a response
-        }
+    var cancel_hits: usize = 0;
+    var cancel_resp: ?std.json.Value = null;
+    for (ts.replies.items) |v| {
+        if (objGet(v, "method") != null) continue; // a notification is never a response
         const idv = objGet(v, "id") orelse continue;
         if (idv == .string and eql(idv.string, "cancelme")) {
-            cancel_hit.count += 1;
-            cancel_hit.resp = v;
-        } else if (idv == .integer and idv.integer >= 0 and idv.integer < 16) {
-            by_id[@intCast(idv.integer)] = v;
+            cancel_hits += 1;
+            cancel_resp = v;
         }
     }
 
     // Exactly ONE response carries the cancelled id (no double-response) ...
-    try testing.expectEqual(@as(usize, 1), cancel_hit.count);
+    try testing.expectEqual(@as(usize, 1), cancel_hits);
     // ... it is RequestCancelled and produced NO normal work-product (no `result` key). This
     // response-level pair is the genuine skipped-work proof: the gate returns before any
     // check / feature call, so hover did zero work.
-    const err_obj = objGet(cancel_hit.resp.?, "error").?;
+    const err_obj = objGet(cancel_resp.?, "error").?;
     try testing.expectEqual(@as(i64, -32800), getInt(err_obj, "code").?);
-    try testing.expect(objGet(cancel_hit.resp.?, "result") == null);
+    try testing.expect(objGet(cancel_resp.?, "result") == null);
 
     // The non-cancelled control request is answered normally in the same session.
-    try testing.expectEqualStrings("x: int", hoverValue(by_id[6].?).?);
+    try testing.expectEqualStrings("x: int", hoverValue(ts.response(6).?).?);
 
     // Sanity (explicitly NOT the skip-work proof — hover never publishes): only the didOpen
     // publish was emitted; no stray notification leaked from the cancelled request.
-    try testing.expectEqual(@as(usize, 1), publish_count);
+    try testing.expectEqual(@as(usize, 1), (try ts.publishes()).len);
 }
 
 test "lsp feed: each push is served to completion; the server reports exit" {
@@ -1567,71 +1391,42 @@ test "lsp inlayHint: advertised, answered in range over stdio and through feed a
         \\
     ;
     const uri = "file:///inlay.toy";
-    const Rng = struct { start: struct { line: i64, character: i64 }, end: struct { line: i64, character: i64 } };
-    const req = struct {
-        fn make(id: i64, u: []const u8, first: i64, last: i64) struct {
-            jsonrpc: []const u8 = "2.0",
-            id: i64,
-            method: []const u8 = "textDocument/inlayHint",
-            params: struct { textDocument: struct { uri: []const u8 }, range: Rng },
+    const range = struct {
+        fn of(u: []const u8, first: i64, last: i64) struct {
+            textDocument: struct { uri: []const u8 },
+            range: struct { start: struct { line: i64, character: i64 }, end: struct { line: i64, character: i64 } },
         } {
-            return .{ .id = id, .params = .{ .textDocument = .{ .uri = u }, .range = .{ .start = .{ .line = first, .character = 0 }, .end = .{ .line = last, .character = 0 } } } };
+            return .{ .textDocument = .{ .uri = u }, .range = .{ .start = .{ .line = first, .character = 0 }, .end = .{ .line = last, .character = 0 } } };
         }
-    };
+    }.of;
+    const ih = "textDocument/inlayHint";
 
-    var session: Writer.Allocating = .init(gpa);
-    defer session.deinit();
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 1), .method = "initialize", .params = .{} });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "initialized", .params = .{} });
-    try frameInto(gpa, &session, req.make(2, uri, 0, 9));
-    try frameInto(gpa, &session, .{
-        .jsonrpc = "2.0",
-        .method = "textDocument/didOpen",
-        .params = .{ .textDocument = .{ .uri = uri, .languageId = "toy", .version = @as(i64, 1), .text = src } },
-    });
-    try frameInto(gpa, &session, req.make(3, uri, 0, 9));
-    try frameInto(gpa, &session, req.make(4, uri, 5, 6));
+    var ts = TestSession.init(gpa);
+    defer ts.deinit();
+    try ts.initialize(.{});
+    try ts.request(@as(i64, 2), ih, range(uri, 0, 9));
+    try ts.open(uri, src);
+    try ts.request(@as(i64, 3), ih, range(uri, 0, 9));
+    try ts.request(@as(i64, 4), ih, range(uri, 5, 6));
     // A negative coordinate is malformed: no hints, no crash.
-    try frameInto(gpa, &session, req.make(5, uri, -1, 9));
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .id = @as(i64, 6), .method = "shutdown" });
-    try frameInto(gpa, &session, .{ .jsonrpc = "2.0", .method = "exit" });
-
-    var out: Writer.Allocating = .init(gpa);
-    defer out.deinit();
-    var reader = Reader.fixed(session.written());
-    try testing.expectEqual(ExitCode.ok, try serve(gpa, &reader, &out.writer));
+    try ts.request(@as(i64, 5), ih, range(uri, -1, 9));
+    try ts.finish();
 
     // The wasm build drives the same core through `feed`: the same bytes in, the same out.
     var fed: Writer.Allocating = .init(gpa);
     defer fed.deinit();
     var s = Server.init(gpa);
     defer s.deinit();
-    try testing.expect(!try s.feed(session.written(), &fed.writer));
-    try testing.expectEqualStrings(out.written(), fed.written());
+    try testing.expect(!try s.feed(ts.in.written(), &fed.writer));
+    try testing.expectEqualStrings(ts.out.written(), fed.written());
 
-    var frames = try splitFrames(gpa, out.written());
-    defer {
-        for (frames.items) |b| gpa.free(b);
-        frames.deinit(gpa);
-    }
-    var parse_arena = std.heap.ArenaAllocator.init(gpa);
-    defer parse_arena.deinit();
-    const pa = parse_arena.allocator();
-    var by_id: [8]?std.json.Value = @splat(null);
-    for (frames.items) |body| {
-        const v = try std.json.parseFromSliceLeaky(std.json.Value, pa, body, .{});
-        if (objGet(v, "method") != null) continue;
-        const idv = objGet(v, "id") orelse continue;
-        if (idv == .integer and idv.integer >= 0 and idv.integer < 8) by_id[@intCast(idv.integer)] = v;
-    }
-
-    const ihp = objGet(field(by_id[1].?, "result", "capabilities").?, "inlayHintProvider").?;
+    const ihp = objGet(ts.capabilities(), "inlayHintProvider").?;
     try testing.expect(ihp == .bool and ihp.bool);
 
-    try testing.expectEqual(@as(usize, 0), resultArr(by_id[2].?).?.len); // before didOpen
-    try testing.expectEqual(@as(usize, 0), resultArr(by_id[5].?).?.len); // malformed range
+    try testing.expectEqual(@as(usize, 0), resultArr(ts.response(2).?).?.len); // before didOpen
+    try testing.expectEqual(@as(usize, 0), resultArr(ts.response(5).?).?.len); // malformed range
 
-    const all = resultArr(by_id[3].?).?;
+    const all = resultArr(ts.response(3).?).?;
     try testing.expectEqual(@as(usize, 3), all.len);
     const Want = struct { line: i64, character: i64, label: []const u8, tooltip: []const u8 };
     const want = [_]Want{
@@ -1649,7 +1444,64 @@ test "lsp inlayHint: advertised, answered in range over stdio and through feed a
     try testing.expect(objGet(all[0], "kind") == null);
 
     // Lines 5..6 hold only the second `mut` argument.
-    const ranged = resultArr(by_id[4].?).?;
+    const ranged = resultArr(ts.response(4).?).?;
     try testing.expectEqual(@as(usize, 1), ranged.len);
     try testing.expectEqual(@as(i64, 5), getInt(objGet(ranged[0], "position").?, "line").?);
+}
+
+test "lsp: one check per document version, however many requests read it; a change to an import re-checks" {
+    const gpa = testing.allocator;
+    var s = Server.init(gpa);
+    defer s.deinit();
+    var in: Writer.Allocating = .init(gpa);
+    defer in.deinit();
+    var out: Writer.Allocating = .init(gpa);
+    defer out.deinit();
+
+    const main_uri = "file:///w/main.toy";
+    const helper_uri = "file:///w/helper.toy";
+    try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .id = 1, .method = "initialize", .params = .{} });
+    try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .method = "textDocument/didOpen", .params = .{
+        .textDocument = .{ .uri = helper_uri, .version = 1, .text = "pub fn seven() -> int { return 7 }\n" },
+    } });
+    try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .method = "textDocument/didOpen", .params = .{
+        .textDocument = .{ .uri = main_uri, .version = 1, .text = "import helper\nfn main() -> int { return helper.seven() }\n" },
+    } });
+    _ = try s.feed(in.written(), &out.writer);
+    try testing.expectEqual(@as(u64, 2), s.checks);
+
+    // Requests on the same version read the analysis the publish built.
+    in.clearRetainingCapacity();
+    try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .id = 2, .method = "textDocument/hover", .params = TestSession.at(main_uri, 1, 34) });
+    try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .id = 3, .method = "textDocument/inlayHint", .params = .{
+        .textDocument = .{ .uri = main_uri },
+        .range = .{ .start = .{ .line = 0, .character = 0 }, .end = .{ .line = 2, .character = 0 } },
+    } });
+    try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .id = 4, .method = "textDocument/definition", .params = TestSession.at(main_uri, 1, 34) });
+    _ = try s.feed(in.written(), &out.writer);
+    try testing.expectEqual(@as(u64, 2), s.checks);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "fn seven() -> int") != null);
+
+    // An edit to the import drops the importer's analysis; its next request re-checks.
+    in.clearRetainingCapacity();
+    out.clearRetainingCapacity();
+    try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .method = "textDocument/didChange", .params = .{
+        .textDocument = .{ .uri = helper_uri, .version = 2 },
+        .contentChanges = &[_]struct { text: []const u8 }{.{ .text = "pub fn seven() -> str { return \"7\" }\n" }},
+    } });
+    _ = try s.feed(in.written(), &out.writer);
+    try testing.expectEqual(@as(u64, 3), s.checks);
+    try testing.expect(s.analyses.get(main_uri) == null);
+    in.clearRetainingCapacity();
+    out.clearRetainingCapacity();
+    try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .id = 5, .method = "textDocument/hover", .params = TestSession.at(main_uri, 1, 34) });
+    _ = try s.feed(in.written(), &out.writer);
+    try testing.expectEqual(@as(u64, 4), s.checks);
+    try testing.expect(std.mem.indexOf(u8, out.written(), "fn seven() -> str") != null);
+
+    // Closing a document drops its analysis.
+    in.clearRetainingCapacity();
+    try frameInto(gpa, &in, .{ .jsonrpc = "2.0", .method = "textDocument/didClose", .params = .{ .textDocument = .{ .uri = main_uri } } });
+    _ = try s.feed(in.written(), &out.writer);
+    try testing.expect(s.analyses.get(main_uri) == null);
 }

@@ -103,8 +103,9 @@ pub const LspDiagnostic = struct {
 
 /// The subset of `ServerCapabilities` we actually implement — advertised as-is. Only
 /// providers we back with a handler appear here: advertising one we do not implement
-/// would make the client send requests we can only reject.
-const ServerCapabilities = struct {
+/// would make the client send requests we can only reject. Each provider's request is
+/// named in `provider_requests`, which the server dispatches on.
+pub const ServerCapabilities = struct {
     /// Negotiated at `initialize` (`position.Encoding`): utf-8 when the client offers it,
     /// else the protocol's utf-16 default.
     positionEncoding: []const u8 = "utf-16",
@@ -129,6 +130,26 @@ const ServerCapabilities = struct {
     /// `textDocument/inlayHint` is implemented: closure capture lists and `mut` arguments.
     inlayHintProvider: bool = true,
 };
+
+/// The request each provider of `ServerCapabilities` promises an answer to. The server
+/// dispatches on these names, so a provider cannot be advertised without its handler.
+pub const provider_requests = .{
+    .hoverProvider = "textDocument/hover",
+    .completionProvider = "textDocument/completion",
+    .definitionProvider = "textDocument/definition",
+    .signatureHelpProvider = "textDocument/signatureHelp",
+    .inlayHintProvider = "textDocument/inlayHint",
+};
+
+comptime {
+    for (@typeInfo(ServerCapabilities).@"struct".fields) |f| {
+        if (std.mem.endsWith(u8, f.name, "Provider") and !@hasField(@TypeOf(provider_requests), f.name))
+            @compileError("no request named for " ++ f.name);
+    }
+    for (@typeInfo(@TypeOf(provider_requests)).@"struct".fields) |f| {
+        if (!@hasField(ServerCapabilities, f.name)) @compileError(f.name ++ " is not advertised");
+    }
+}
 
 const ServerInfo = struct { name: []const u8, version: []const u8 };
 

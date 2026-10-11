@@ -1,20 +1,17 @@
-//! Bridge from the compiler's check front-end to LSP diagnostics. The graph sequence
-//! mirrors `toy check`: discover -> resolveGraph -> (if resolve is clean) checkGraph, then
-//! stop before lower/codegen. Diagnostics belonging to an IMPORTED module are dropped from
-//! this publish — they carry byte offsets into their own source and belong to their own URIs.
+//! Bridge from the compiler's check front-end to LSP diagnostics. Reads an `Analysis`,
+//! mirroring `toy check`: a discovery error alone, else resolve's diagnostics and, when
+//! resolve is clean, typecheck's. Diagnostics belonging to an IMPORTED module are dropped
+//! from this publish: they carry byte offsets into their own source and belong to their
+//! own URIs.
 
 const std = @import("std");
 const Io = std.Io;
 const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
-const hover = @import("hover.zig");
-const Workspace = @import("Workspace.zig");
 const position = @import("position.zig");
-const Documents = @import("Documents.zig");
+const Analysis = @import("Analysis.zig");
 
 const Graph = toyc.Graph;
-const ResolveGraph = toyc.ResolveGraph;
-const TypecheckGraph = toyc.TypecheckGraph;
 const Decide = toyc.Decide;
 const Sink = toyc.DiagnosticSink;
 const Diagnostic = Sink.Diagnostic;
@@ -22,49 +19,24 @@ const codes = toyc.diagnostics.codes;
 const model = toyc.diagnostics.model;
 const SourceMap = toyc.term.render.SourceMap;
 
-/// Owns the arena backing `items` (their message/related strings). `items` stays valid
-/// until `deinit`; the compiler graph it was mapped from has already been torn down.
-pub const Mapped = struct {
-    arena: std.heap.ArenaAllocator,
-    items: []const protocol.LspDiagnostic,
-
-    pub fn deinit(self: *Mapped) void {
-        self.arena.deinit();
-    }
-};
-
-/// Check `source` (an open document's buffer) and return the mapped LSP diagnostics. `uri` is only used as the URI of any related-location. A
-/// hard I/O / OOM failure propagates; a compile problem is reported as diagnostics, never
-/// an error.
-pub fn checkBuffer(
-    gpa: std.mem.Allocator,
-    ws: Workspace,
-    uri: []const u8,
-    source: []const u8,
-) !Mapped {
-    var graph = try ws.discover(gpa, uri, source);
-    defer graph.deinit(gpa);
-
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    errdefer arena.deinit();
-    const a = arena.allocator();
-
-    var sm = try SourceMap.init(gpa, graph.entry().file, graph.entry().source);
-    defer sm.deinit(gpa);
-
+/// The LSP diagnostics of `an`'s document, allocated in `a` (strings included). A compile
+/// problem is reported as diagnostics, never an error.
+pub fn collect(a: std.mem.Allocator, an: *const Analysis) ![]const protocol.LspDiagnostic {
+    const graph = &an.graph;
+    const sm = &an.sm;
     var out: std.ArrayList(protocol.LspDiagnostic) = .empty;
 
     if (graph.err) |ge| {
         // A tainted parse in the ENTRY carries its full coded diagnostic list; map it.
         const in_entry = ge.module == null or ge.module == graph.entry_index;
         if (ge.kind == .parse and in_entry) {
-            try mapInto(a, &sm, ws.encoding, &graph, uri, &out, ge.parse_diags);
+            try mapInto(a, sm, an.encoding, graph, an.uri, &out, ge.parse_diags);
         } else if (in_entry) {
             // Any other structural error that belongs to the entry and carries an offset
             // (an unresolvable/mis-cased import token) becomes one diagnostic there.
             if (ge.span) |span| {
                 try out.append(a, .{
-                    .range = position.rangeOf(&sm, span.start, span.end, ws.encoding),
+                    .range = position.rangeOf(sm, span.start, span.end, an.encoding),
                     .severity = protocol.severity.err,
                     .code = codes.str(ge.code()),
                     .message = try a.dupe(u8, ge.message),
@@ -72,29 +44,21 @@ pub fn checkBuffer(
             }
         }
         // A structural error owned by an imported module belongs to its own URI: dropped.
-        return .{ .arena = arena, .items = out.items };
+        return out.items;
     }
 
-    var res = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer res.deinit(gpa);
-
-    var tc: ?TypecheckGraph.GraphResult = null;
-    defer if (tc) |*t| t.deinit(gpa);
-    if (!Decide.resolveHasError(res.diags)) {
-        tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, ws.io, 0);
-    }
-    const type_diags: []const Diagnostic = if (tc) |t| t.diags else &.{};
+    const res = an.res();
+    const type_diags: []const Diagnostic = if (Decide.resolveHasError(res.diags)) &.{} else an.tc().diags;
 
     // Merge resolve + type diagnostics and re-sort on the canonical key so they surface in
     // source order across stages (a resolve warning and a type error interleave by line).
-    const combined = try gpa.alloc(Diagnostic, res.diags.len + type_diags.len);
-    defer gpa.free(combined);
+    const combined = try a.alloc(Diagnostic, res.diags.len + type_diags.len);
     @memcpy(combined[0..res.diags.len], res.diags);
     @memcpy(combined[res.diags.len..], type_diags);
     Sink.sortSlice(combined);
 
-    try mapInto(a, &sm, ws.encoding, &graph, uri, &out, combined);
-    return .{ .arena = arena, .items = out.items };
+    try mapInto(a, sm, an.encoding, graph, an.uri, &out, combined);
+    return out.items;
 }
 
 /// Append every diagnostic that belongs to the ENTRY module (unscoped, or the entry's
@@ -144,6 +108,25 @@ fn lspSeverity(s: model.Severity) u8 {
 }
 
 const testing = std.testing;
+const Documents = @import("Documents.zig");
+const Workspace = @import("Workspace.zig");
+
+/// The diagnostics a publish of `src` (as `file:///doc.toy`) sends.
+const Checked = struct {
+    an: *Analysis,
+    items: []const protocol.LspDiagnostic,
+
+    fn deinit(c: *Checked) void {
+        c.an.deinit();
+    }
+};
+
+fn checkBuffer(gpa: std.mem.Allocator, src: []const u8) !Checked {
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const an = try @import("test_util.zig").analyzeIn(gpa, .{ .io = Io.failing, .docs = &docs, .disk = false }, "file:///doc.toy", src);
+    return .{ .an = an, .items = an.diagnostics };
+}
 
 test "checkBuffer maps an arity mismatch to a T0039 on the erroring line" {
     const gpa = testing.allocator;
@@ -154,10 +137,7 @@ test "checkBuffer maps an arity mismatch to a T0039 on the erroring line" {
     const src = try Io.Dir.cwd().readFileAlloc(io, "tests/corpora/diagnostics/arity_mismatch.toy", gpa, .unlimited);
     defer gpa.free(src);
 
-    var docs: Documents = .{};
-    defer docs.deinit(gpa);
-    const ws: Workspace = .{ .io = io, .docs = &docs, .disk = false };
-    var mapped = try checkBuffer(gpa, ws, "file:///doc.toy", src);
+    var mapped = try checkBuffer(gpa, src);
     defer mapped.deinit();
 
     var found = false;
@@ -180,13 +160,9 @@ test "checkBuffer maps a piped T0039 to the |> step and each P0014 to its annota
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    var docs: Documents = .{};
-    defer docs.deinit(gpa);
-    const ws: Workspace = .{ .io = io, .docs = &docs, .disk = false };
-
     {
         const src = "fn add(a: int, b: int) -> int { return a + b }\nfn main() -> int {\n    x := 1 |> add\n    return x\n}\n";
-        var mapped = try checkBuffer(gpa, ws, "file:///doc.toy", src);
+        var mapped = try checkBuffer(gpa, src);
         defer mapped.deinit();
         try testing.expectEqual(@as(usize, 1), mapped.items.len);
         const d = mapped.items[0];
@@ -199,7 +175,7 @@ test "checkBuffer maps a piped T0039 to the |> step and each P0014 to its annota
     {
         const src = try Io.Dir.cwd().readFileAlloc(io, "tests/corpora/diagnostics/pipe_target.toy", gpa, .unlimited);
         defer gpa.free(src);
-        var mapped = try checkBuffer(gpa, ws, "file:///doc.toy", src);
+        var mapped = try checkBuffer(gpa, src);
         defer mapped.deinit();
         // Every P0014 lands on a line the fixture annotates with it, and each annotation
         // gets one, so a range that drifts to another line fails.
@@ -220,18 +196,12 @@ test "checkBuffer maps a piped T0039 to the |> step and each P0014 to its annota
 
 test "checkBuffer codes a missing import and a call of a non-function" {
     const gpa = testing.allocator;
-    var threaded: std.Io.Threaded = .init(gpa, .{});
-    defer threaded.deinit();
-    const io = threaded.io();
-    var docs: Documents = .{};
-    defer docs.deinit(gpa);
-    const ws: Workspace = .{ .io = io, .docs = &docs, .disk = false };
     const cases = [_]struct { src: []const u8, code: []const u8, line: u32 }{
         .{ .src = "import no_such_module\nfn main() -> int { return 0 }\n", .code = "R0003", .line = 0 },
         .{ .src = "fn main() -> int {\n    x := 1\n    return x(2)\n}\n", .code = "T0055", .line = 2 },
     };
     for (cases) |cs| {
-        var mapped = try checkBuffer(gpa, ws, "file:///doc.toy", cs.src);
+        var mapped = try checkBuffer(gpa, cs.src);
         defer mapped.deinit();
         try testing.expectEqual(@as(usize, 1), mapped.items.len);
         try testing.expectEqualStrings(cs.code, mapped.items[0].code.?);
@@ -262,10 +232,7 @@ fn expectWarningsOnAnnotatedLines(path: []const u8, code: []const u8) !void {
     const src = try Io.Dir.cwd().readFileAlloc(io, path, gpa, .unlimited);
     defer gpa.free(src);
 
-    var docs: Documents = .{};
-    defer docs.deinit(gpa);
-    const ws: Workspace = .{ .io = io, .docs = &docs, .disk = false };
-    var mapped = try checkBuffer(gpa, ws, "file:///doc.toy", src);
+    var mapped = try checkBuffer(gpa, src);
     defer mapped.deinit();
 
     var buf: [32]u8 = undefined;
