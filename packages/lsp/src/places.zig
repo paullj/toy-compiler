@@ -273,14 +273,8 @@ fn ownerHold(an: *const Analysis, owner: Closure.Owner, slot: u32, copy_size: ?u
 }
 
 fn isBoundReceiver(an: *const Analysis, recv: u32) bool {
-    const e = an.entry();
-    const t = an.tc();
     for (an.module().nodes, 0..) |n, fa| {
-        if (n.tag != .field_access or n.lhs.int() != recv) continue;
-        if (fa < t.callees[e].len and t.callees[e][fa].view() == .bound_method) return true;
-        for (t.instances) |inst| {
-            if (inst.mod == e and fa < inst.callees.len and inst.callees[fa].view() == .bound_method) return true;
-        }
+        if (n.tag == .field_access and n.lhs.int() == recv and an.bindsMethod(@intCast(fa))) return true;
     }
     return false;
 }

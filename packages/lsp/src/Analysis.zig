@@ -62,12 +62,18 @@ pub const Checked = struct {
     scope_of: []const u32,
     /// The top-level fn or method whose body holds token `t`, else `no_node`.
     fn_of: []const u32,
+    /// Each local fn's and lambda's innermost enclosing scope.
+    scope_parent: std.AutoHashMapUnmanaged(u32, u32),
     /// Each fn, local fn and lambda node's span.
     spans: std.AutoHashMapUnmanaged(u32, Span),
     /// The entry module's fn decl nodes, by global fn id.
     gid_of: std.AutoHashMapUnmanaged(u32, u32),
     /// Each member node that heads a call (`recv.m(..)`, `recv.m[T](..)`), by its call.
     call_of: std.AutoHashMapUnmanaged(u32, u32),
+    /// Each node that explicit type args apply to (`id` in `id[int]`), by the `type_app`.
+    type_app_of: std.AutoHashMapUnmanaged(u32, u32),
+    /// The entry's generic fns and generic types' methods (see `isTemplate`).
+    templates: std.AutoHashMapUnmanaged(u32, void),
 };
 
 const no_node = std.math.maxInt(u32);
@@ -154,6 +160,8 @@ fn index(a: std.mem.Allocator, graph: *const Graph.Graph, resolved: ResolveGraph
             else => continue,
         };
         if (n.rhs == Ast.none) continue; // a protocol's or an extern's signature: no body
+        // A `_` capture's body is the call it is written in: it holds no scope of its own.
+        if (Ast.isCaptureLambda(tree, m.tokens, Ast.Index.from(@intCast(i)))) continue;
         const sp = toyc.Walk.nodeSpan(.{ .tree = tree, .tokens = m.tokens, .source = m.source }, Ast.Index.from(@intCast(i)));
         try spans.put(a, @intCast(i), sp);
         try scopes.append(a, .{ .node = @intCast(i), .span = sp, .top = top });
@@ -168,8 +176,11 @@ fn index(a: std.mem.Allocator, graph: *const Graph.Graph, resolved: ResolveGraph
     const fn_of = try a.alloc(u32, ntok);
     @memset(scope_of, no_node);
     @memset(fn_of, no_node);
+    var scope_parent: std.AutoHashMapUnmanaged(u32, u32) = .empty;
     for (scopes.items) |s| {
         var t = firstTokenAt(m.tokens, s.span.start);
+        // The scope painted here before this one is the one around it.
+        if (!s.top and t < ntok and scope_of[t] != no_node) try scope_parent.put(a, s.node, scope_of[t]);
         while (t < ntok and m.tokens[t].start < s.span.end) : (t += 1) {
             scope_of[t] = s.node;
             if (s.top) fn_of[t] = s.node;
@@ -182,9 +193,19 @@ fn index(a: std.mem.Allocator, graph: *const Graph.Graph, resolved: ResolveGraph
         try gid_of.put(a, gf.decl_node.int(), @intCast(g));
     }
     var call_of: std.AutoHashMapUnmanaged(u32, u32) = .empty;
+    var type_app_of: std.AutoHashMapUnmanaged(u32, u32) = .empty;
     for (m.nodes, 0..) |n, c| {
+        if (n.tag == .type_app and n.lhs != Ast.none) try type_app_of.put(a, n.lhs.int(), @intCast(c));
         const member = Callee.memberNode(tree, n) orelse continue;
         try call_of.put(a, member.int(), @intCast(c));
+    }
+    var templates: std.AutoHashMapUnmanaged(u32, void) = .empty;
+    for (m.nodes, 0..) |n, i| {
+        if (n.tag == .fn_decl and Ast.protoAt(tree, n.lhs.int()).generic_params.len > 0) try templates.put(a, @intCast(i), {});
+    }
+    for (typed.templates) |t| {
+        const gf = resolved.fns[t.fn_id];
+        if (gf.module == graph.entry_index and gf.decl_node != Ast.none) try templates.put(a, gf.decl_node.int(), {});
     }
 
     return .{
@@ -194,9 +215,12 @@ fn index(a: std.mem.Allocator, graph: *const Graph.Graph, resolved: ResolveGraph
         .tok_nodes = tok_nodes,
         .scope_of = scope_of,
         .fn_of = fn_of,
+        .scope_parent = scope_parent,
         .spans = spans,
         .gid_of = gid_of,
         .call_of = call_of,
+        .type_app_of = type_app_of,
+        .templates = templates,
     };
 }
 
@@ -284,6 +308,11 @@ pub fn scopeOf(an: *const Analysis, tok: u32) ?u32 {
     return c.scope_of[tok];
 }
 
+/// The scope around the local fn or lambda `scope`.
+pub fn scopeParent(an: *const Analysis, scope: u32) ?u32 {
+    return an.checked.?.scope_parent.get(scope);
+}
+
 /// The top-level fn or method whose source holds token `tok`.
 pub fn fnOf(an: *const Analysis, tok: u32) ?u32 {
     const c = &an.checked.?;
@@ -294,6 +323,48 @@ pub fn fnOf(an: *const Analysis, tok: u32) ?u32 {
 /// The global fn id of the entry module's fn decl `decl`.
 pub fn gidOf(an: *const Analysis, decl: u32) ?u32 {
     return an.checked.?.gid_of.get(decl);
+}
+
+/// Whether `fn_node`, a top-level fn or method, is a generic template: a generic fn or a
+/// generic type's method. Its body is checked only per instance (a bounded one also over
+/// scratch types), so what its own table selects is no concrete selection.
+pub fn isTemplate(an: *const Analysis, fn_node: u32) bool {
+    return an.checked.?.templates.contains(fn_node);
+}
+
+/// Whether node `node` sits in a generic template's body.
+pub fn inTemplate(an: *const Analysis, node: u32) bool {
+    const f = an.fnOf(an.module().nodes[node].main_token) orelse return false;
+    return an.isTemplate(f);
+}
+
+/// The slot the checker records the call of `callee` on: the `type_app` it heads when
+/// given explicit type args (`id[int](..)`), else its own node.
+pub fn callSlotOf(an: *const Analysis, callee: u32) u32 {
+    return an.checked.?.type_app_of.get(callee) orelse callee;
+}
+
+/// What a free fn's call at `slot` runs.
+pub const FreeCallee = union(enum) {
+    /// A non-generic fn: its global id.
+    direct: u32,
+    /// A generic fn's instance.
+    instance: u32,
+    /// A generic fn whose instance is not known here: shown as declared.
+    generic: u32,
+};
+
+/// The free fn the call whose slot is `slot` runs, from its Callee; null for any other
+/// call. In a generic template's own body an instance pick is no instance's (the body was
+/// checked over no concrete types), so the fn shows as declared there.
+pub fn freeCallee(an: *const Analysis, slot: u32) ?FreeCallee {
+    const t = an.tc();
+    return switch (an.callees()[slot].view()) {
+        .direct => |g| .{ .direct = g },
+        .generic => |g| .{ .generic = g },
+        .instance => |ii| if (ii >= t.instances.len) null else if (an.inTemplate(slot)) .{ .generic = t.instances[ii].template_gid } else .{ .instance = ii },
+        else => null,
+    };
 }
 
 /// Node `node`'s source extent (see `Walk.nodeSpan`).
@@ -341,9 +412,9 @@ pub fn callOfMember(an: *const Analysis, fa: u32) ?u32 {
 pub const Site = struct { module: u32, tok: u32 };
 
 /// The declaration the symbol at `tok` names: a fn's (in whichever module declares it),
-/// a local's binding, the method a call selects, or the entry's type of that name. Null
-/// for a builtin, a derive, a bundled declaration (no file a client can open) and a
-/// token that names nothing.
+/// a local's binding, the method a call or a bound method value selects, or the type of
+/// that name. Null for a builtin, a derive, a bundled declaration (no file a client can
+/// open) and a token that names nothing.
 pub fn declOf(an: *const Analysis, a: std.mem.Allocator, tok: u32) !?Site {
     if (an.symbolAt(tok)) |sym| switch (sym) {
         .func => |f| {
@@ -355,17 +426,42 @@ pub fn declOf(an: *const Analysis, a: std.mem.Allocator, tok: u32) !?Site {
             const t = an.localDeclToken(tok, l.slot) orelse return null;
             return .{ .module = an.entry(), .tok = t };
         },
-        .member => |fa| if (an.callOfMember(fa) != null) {
-            // A derive, a builtin or a prelude protocol method has no source to jump to.
-            if (try an.calleeAt(a, fa)) |sig| {
-                const decl = sig.decl orelse return null;
-                return an.sourceSite(decl.module, Ast.Index.from(decl.node));
-            }
+        // A derive, a builtin or a prelude protocol method has no source to jump to.
+        .member => |fa| if (try an.calleeAt(a, fa)) |sig| {
+            const decl = sig.decl orelse return null;
+            return an.sourceSite(decl.module, Ast.Index.from(decl.node));
         },
     };
     // A type name is left unresolved by the resolver.
-    const t = an.typeDeclToken(tok) orelse return null;
-    return .{ .module = an.entry(), .tok = t };
+    const m = an.module();
+    if (m.tokens[tok].tag != .identifier) return null;
+    const td = an.typeDecl(m.tokens[tok].text(m.source)) orelse return null;
+    return an.sourceSite(td.module, Ast.Index.from(td.node));
+}
+
+/// A type's declaration: its module and its decl node.
+pub const TypeDecl = struct { module: u32, node: u32 };
+
+/// The declaration of the type named `name` (a struct, tuple struct, enum or protocol), in
+/// whichever module declares it; the entry module wins a name clash. The resolver leaves a
+/// type name unresolved, so the name is all there is to go on.
+pub fn typeDecl(an: *const Analysis, name: []const u8) ?TypeDecl {
+    var found: ?TypeDecl = null;
+    for (an.graph.modules, 0..) |*tm, mi| {
+        if (tm.nodes.len == 0) continue;
+        const prog = tm.nodes[Ast.root(tm.nodes).int()];
+        if (prog.tag != .program) continue;
+        for (Ast.rangeSlice(tm.tree(), prog.lhs.int())) |d| {
+            const decl = tm.nodes[d.int()];
+            switch (decl.tag) {
+                .struct_decl, .tuple_struct_decl, .enum_decl, .protocol_decl => {},
+                else => continue,
+            }
+            if (!std.mem.eql(u8, tm.tokens[decl.main_token].text(tm.source), name)) continue;
+            if (found == null or mi == an.entry()) found = .{ .module = @intCast(mi), .node = d.int() };
+        }
+    }
+    return found;
 }
 
 /// The name token of `decl` in `mod`, or null when there is no openable source: a seeded
@@ -395,23 +491,6 @@ fn localDeclToken(an: *const Analysis, use_tok: u32, slot: u32) ?u32 {
         }
         if (i >= rs.len or an.fnOf(n.main_token) != fn_node) continue;
         if (rs[i] == .local and rs[i].local == slot) return n.main_token;
-    }
-    return null;
-}
-
-/// The name token of the entry module's top-level type named like `use_tok`.
-fn typeDeclToken(an: *const Analysis, use_tok: u32) ?u32 {
-    const m = an.module();
-    if (m.tokens[use_tok].tag != .identifier or m.nodes.len == 0) return null;
-    const name = m.tokens[use_tok].text(m.source);
-    const prog = m.nodes[Ast.root(m.nodes).int()];
-    if (prog.tag != .program) return null;
-    for (Ast.rangeSlice(m.tree(), prog.lhs.int())) |decl_idx| {
-        const decl = m.nodes[decl_idx.int()];
-        switch (decl.tag) {
-            .struct_decl, .tuple_struct_decl, .enum_decl => if (std.mem.eql(u8, m.tokens[decl.main_token].text(m.source), name)) return decl.main_token,
-            else => {},
-        }
     }
     return null;
 }
@@ -574,6 +653,56 @@ pub fn declParamNames(an: *const Analysis, a: std.mem.Allocator, mod: u32, decl:
     const out = try a.alloc([]const u8, proto.params.len);
     for (proto.params, out) |p, *pname| pname.* = tm.tokens[tm.nodes[p.int()].main_token].text(tm.source);
     return out;
+}
+
+/// The instances of the generic fn `fn_node` (none for a fn that is no template): each
+/// rechecked its body, so its tables cover the nodes the template's own table leaves
+/// empty.
+pub fn instancesOf(an: *const Analysis, fn_node: ?u32) InstanceIterator {
+    return .{ .an = an, .fn_node = fn_node orelse no_node };
+}
+
+pub const InstanceIterator = struct {
+    an: *const Analysis,
+    fn_node: u32,
+    i: usize = 0,
+
+    pub fn next(it: *InstanceIterator) ?*const toyc.Mono.Instance {
+        const insts = it.an.tc().instances;
+        while (it.i < insts.len) {
+            const inst = &insts[it.i];
+            it.i += 1;
+            if (inst.mod == it.an.entry() and inst.decl_node.int() == it.fn_node) return inst;
+        }
+        return null;
+    }
+};
+
+/// Whether member node `fa` binds a method as a value (`g := acc.plus`): in its body as
+/// checked, or in an instance of the generic fn around it.
+pub fn bindsMethod(an: *const Analysis, fa: u32) bool {
+    if (an.callees()[fa].view() == .bound_method) return true;
+    var it = an.instancesOf(an.fnOf(an.module().nodes[fa].main_token));
+    while (it.next()) |inst| if (fa < inst.callees.len and inst.callees[fa].view() == .bound_method) return true;
+    return false;
+}
+
+/// The receiver type of the bound method value `fa`, when every check of it agrees on
+/// one: its body's, or each instance's of the generic fn around it.
+pub fn boundReceiver(an: *const Analysis, fa: u32) ?Type {
+    const recv = an.module().nodes[fa].lhs;
+    if (recv == Ast.none) return null;
+    if (an.callees()[fa].view() == .bound_method) return an.typeAt(recv.int());
+    var agreed: ?Type = null;
+    var it = an.instancesOf(an.fnOf(an.module().nodes[fa].main_token));
+    while (it.next()) |inst| {
+        if (fa >= inst.callees.len or inst.callees[fa].view() != .bound_method) continue;
+        const t = inst.node_types[recv.int()];
+        if (!render.isRenderable(t)) return null;
+        if (agreed) |prev| if (!Type.eql(prev, t)) return null;
+        agreed = t;
+    }
+    return agreed;
 }
 
 /// Every argument a `mut` param takes and every `mut self` receiver (see `places`).
@@ -797,4 +926,44 @@ test "hover, definition and signature help agree on what each token of the metho
     }
     // plus (twice), make, get, concat, eq, unwrap, unwrap_or, hash, len, dbl (twice), twice.
     try testing.expectEqual(@as(usize, 13), calls);
+}
+
+test "a bound method value in a generic fn: its instances say it binds, and agree or not on its receiver" {
+    const gpa = testing.allocator;
+    const src =
+        \\struct Acc { n: int }
+        \\impl Acc { fn plus(self, k: int) -> int { self.n + k } }
+        \\struct Box[T] { v: T }
+        \\impl Box[T] { fn get(self) -> T { self.v } }
+        \\fn f[T](x: T) -> int {
+        \\    acc := Acc { n: 1 }
+        \\    g := acc.plus
+        \\    b := Box { v: x }
+        \\    h := b.get
+        \\    return g(1)
+        \\}
+        \\fn main() -> int { return f(1) + f("s") }
+        \\
+    ;
+    const an = try test_util.analyze(gpa, src);
+    defer an.deinit();
+    const m = an.module();
+    const memberAt = struct {
+        fn f(x: *const Analysis, needle: []const u8) u32 {
+            const off: u32 = @intCast(std.mem.indexOf(u8, x.module().source, needle).?);
+            const tok = position.tokenAt(x.module().tokens, off).?;
+            return x.symbolAt(tok).?.member;
+        }
+    }.f;
+    const plus = memberAt(an, "plus\n");
+    const get = memberAt(an, "get\n");
+    // The template's own table records neither: only its instances check its body.
+    try testing.expect(an.callees()[plus].view() != .bound_method);
+    try testing.expect(an.bindsMethod(plus) and an.bindsMethod(get));
+    const recv = an.boundReceiver(plus).?;
+    try testing.expectEqualStrings("Acc", @import("render.zig").bareName(an.tc().layouts[recv.struct_id].name));
+    // `Box[int]` in one instance, `Box[str]` in the other.
+    try testing.expect(an.boundReceiver(get) == null);
+    try testing.expect(!an.bindsMethod(memberAt(an, "n + k")));
+    _ = m;
 }
