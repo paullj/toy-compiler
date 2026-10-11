@@ -1,17 +1,12 @@
-//! textDocument/definition: from a USE of a symbol, the source range of its DECLARATION.
+//! textDocument/definition: from a USE of a symbol, the source range of its DECLARATION
+//! (`Analysis.declOf`). UNRELATED resolve and type errors are tolerated (a valid symbol
+//! still navigates in a partially-broken buffer); only a missing tree (`graph.err`) leaves
+//! nothing to navigate.
 //!
-//! Checks through the same `Workspace` as hover, but a free fn, a local or a type needs only
-//! discover→resolve: its declaration is found from `resolutions` + the merged fn table + the
-//! AST. Only a method call's member token also runs typecheck, because the method a call
-//! selects is the checker's Callee record, so every other request keeps the resolve-only
-//! cost. UNRELATED resolve and type errors are tolerated (a valid symbol still navigates in
-//! a partially-broken buffer). Only a missing tree (`graph.err`) aborts — there is then
-//! nothing to resolve against.
-//!
-//! Returns a `Def { uri, range }`. The uri is EITHER the open-doc uri (`doc_uri`, for a
-//! within-file target) OR an imported module's `file://` path (cross-file target, an open
-//! document or a file on disk). The check roots sibling imports at the open doc's directory,
-//! so `import a/b` resolves to the real project files.
+//! The target uri is EITHER the open document's (a within-file target) OR an imported
+//! module's `file://` path (a cross-file target, an open document or a file on disk). The
+//! check roots sibling imports at the open document's directory, so `import a/b` resolves
+//! to the real project files.
 //!
 //! CROSS-FILE go-to-definition is supported for imported PUB fns: a `mod.fn` field-access
 //! resolves to a global `.func` carrying its owning module + decl node, which maps to that
@@ -20,218 +15,38 @@
 //! follow — a type use navigates only within the entry module.
 //!
 //! A broken import (`graph.err != null`, e.g. a typo'd import path) disables go-to-def for the
-//! WHOLE buffer — there is then no sound tree to resolve against. Pre-existing behavior; once
-//! real imports resolve, a genuinely-broken import still zeroes out def.
+//! WHOLE buffer — there is then no sound tree to resolve against.
 
 const std = @import("std");
-const Io = std.Io;
 const toyc = @import("toy_compiler");
 const protocol = @import("protocol.zig");
 const position = @import("position.zig");
 const lsp_uri = @import("uri.zig");
-const Workspace = @import("Workspace.zig");
-const Documents = @import("Documents.zig");
-const callee_sig = @import("callee_sig.zig");
+const Analysis = @import("Analysis.zig");
 
-const Graph = toyc.Graph;
-const ResolveGraph = toyc.ResolveGraph;
-const TypecheckGraph = toyc.TypecheckGraph;
-const Callee = toyc.Callee;
-const Ast = toyc.Ast;
 const Token = toyc.Token;
 const SourceMap = toyc.term.render.SourceMap;
 
-/// A resolved definition: the target's `file://` uri (always owned) plus the decl range in
-/// that file's coordinates.
-pub const Def = struct {
-    uri: []u8,
-    range: protocol.Range,
-};
+/// The declaration of the symbol used at (`line`, `character`), allocated in `a`, or null
+/// when there is nothing to navigate to (a gap, an out-of-range or unresolved position, a
+/// bundled or builtin target with no openable file, or a buffer that does not parse).
+pub fn at(a: std.mem.Allocator, an: *Analysis, line: u32, character: u32) !?protocol.Location {
+    if (an.checked == null) return null;
+    const use_tok = an.tokenAt(line, character) orelse return null;
+    const site = (try an.declOf(a, use_tok)) orelse return null;
 
-/// The definition for the symbol used at (`line`, `character`) in `source`, or null when
-/// there is nothing to navigate to (a gap, an out-of-range or unresolved position, a bundled
-/// or builtin target with no openable file, or a buffer that does not parse). `doc_uri` is the
-/// open document's real uri: it both roots sibling-import resolution at the real project dir
-/// and is returned verbatim for a within-file target. Never errors on a compile problem —
-/// only a hard I/O / OOM fault propagates.
-pub fn definitionAt(
-    gpa: std.mem.Allocator,
-    ws: Workspace,
-    source: []const u8,
-    line: u32,
-    character: u32,
-    doc_uri: []const u8,
-) !?Def {
-    var graph = try ws.discover(gpa, doc_uri, source);
-    defer graph.deinit(gpa);
-    if (graph.err != null) return null; // broken import -> no sound tree to resolve
-
-    var res = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer res.deinit(gpa);
-
-    const entry = graph.entry_index;
-    const m = graph.entry();
-
-    var sm = try SourceMap.init(gpa, m.file, m.source);
-    defer sm.deinit(gpa);
-
-    const off = position.positionToOffset(&sm, line, character, ws.encoding) orelse return null;
-    const use_tok = position.tokenAt(m.tokens, off) orelse return null;
-    const site = (try declSiteFor(gpa, ws.io, &graph, entry, &res, use_tok)) orelse return null;
-
-    if (site.module == entry) {
-        // Within-file: the request's uri verbatim (m.file is its decoded path).
-        return .{ .uri = try gpa.dupe(u8, doc_uri), .range = rangeOfToken(&sm, m.tokens, site.tok, ws.encoding) };
+    if (site.module == an.entry()) {
+        const t = an.module().tokens[site.tok];
+        return .{ .uri = try a.dupe(u8, an.uri), .range = an.rangeOf(t.start, t.end) };
     }
 
-    const tm = &graph.modules[site.module];
+    const tm = &an.graph.modules[site.module];
     // A bundled module's `file` is the relative `<bundled>/…` marker, which no client can
     // open; every real module file is absolute.
     if (!std.fs.path.isAbsolute(tm.file)) return null;
-    var tsm = try SourceMap.init(gpa, tm.file, tm.source);
-    defer tsm.deinit(gpa);
-    return .{ .uri = try lsp_uri.pathToUri(gpa, tm.file), .range = rangeOfToken(&tsm, tm.tokens, site.tok, ws.encoding) };
-}
-
-/// A decl site: the module it lives in and its name token within that module.
-const Site = struct { module: u32, tok: u32 };
-
-/// The decl site for the symbol whose use is `use_tok`, tried func → local → method → type.
-/// Func-first mirrors hover: a `mod.fn` field-access and its callee identifier share a token,
-/// and the callable's decl is the intended target. A local shadowing a type name also wins by
-/// this order. A `.func` may live in ANOTHER module (an imported pub fn) — its owning module +
-/// decl node come from the global fn table. A method's decl is where the checker's selection
-/// points: the impl's fn, or a bounded receiver's protocol signature.
-fn declSiteFor(gpa: std.mem.Allocator, io: Io, graph: *const Graph.Graph, entry: u32, res: *const ResolveGraph.GraphResult, use_tok: u32) !?Site {
-    const m = &graph.modules[entry];
-    const resolutions = res.resolutions[entry];
-    var func_id: ?u32 = null;
-    var local_slot: ?u32 = null;
-    for (m.nodes, 0..) |n, i| {
-        if (n.main_token != use_tok or i >= resolutions.len) continue;
-        switch (resolutions[i]) {
-            .func => |f| if (func_id == null) {
-                func_id = f;
-            },
-            .local => |s| if (local_slot == null) {
-                local_slot = s;
-            },
-            else => {},
-        }
-    }
-    if (func_id) |f| {
-        if (f >= res.fns.len) return null;
-        const gf = res.fns[f];
-        return sourceSite(graph, gf.module, gf.decl_node);
-    }
-    if (local_slot) |s| {
-        const t = localDeclToken(m, entry, res, use_tok, s) orelse return null;
-        return .{ .module = entry, .tok = t };
-    }
-    if (methodMember(m, resolutions, use_tok)) |fa| {
-        var tc = try TypecheckGraph.checkGraph(gpa, graph, res, io, 0);
-        defer tc.deinit(gpa);
-        var arena = std.heap.ArenaAllocator.init(gpa);
-        defer arena.deinit();
-        // A derive, a builtin or a prelude protocol method has no source to jump to.
-        if (try callee_sig.of(arena.allocator(), graph, res, &tc, entry, fa)) |sig| {
-            const decl = sig.decl orelse return null;
-            return sourceSite(graph, decl.module, Ast.Index.from(decl.node));
-        }
-    }
-    const t = typeDeclToken(m, use_tok) orelse return null; // a type name is left .unresolved
-    return .{ .module = entry, .tok = t };
-}
-
-/// The name token of the `decl` node in `module`, or null when there is no openable source: a
-/// seeded builtin has no decl, and the embedded stdlib has no file a client can open.
-fn sourceSite(graph: *const Graph.Graph, module: u32, decl: Ast.Index) ?Site {
-    if (decl == Ast.none) return null;
-    const tm = &graph.modules[module];
-    if (tm.bundled) return null;
-    return .{ .module = module, .tok = tm.nodes[decl.int()].main_token };
-}
-
-/// The member node of a method call whose member token is `use_tok`: a `recv.m` field access
-/// heading some call. A `mod.f` access resolves to `.func` and is handled before this.
-fn methodMember(m: *const Graph.Module, resolutions: []const ResolveGraph.Resolution, use_tok: u32) ?u32 {
-    for (m.nodes, 0..) |n, i| {
-        if (n.main_token != use_tok or n.tag != .field_access or i >= resolutions.len or resolutions[i] == .func) continue;
-        for (m.nodes) |call| {
-            const member = Callee.memberNode(m.tree(), call) orelse continue;
-            if (member.int() == i) return @intCast(i);
-        }
-    }
-    return null;
-}
-
-/// The binding token for the local in `slot`, within the fn enclosing `use_tok`. The
-/// resolver keeps no positional scope table, so the enclosing fn is the last `fn_decl`
-/// starting at/before the use, bracketed to `[fn.start, next_fn.start)` (ported from
-/// completion's `collectEnclosing`). A param is located POSITIONALLY (params are declared in
-/// order and never carry a resolution); a `:=` / for-key binding is found by scanning the
-/// binder-tagged nodes that carry this slot.
-fn localDeclToken(m: *const Graph.Module, entry: u32, res: *const ResolveGraph.GraphResult, use_tok: u32, slot: u32) ?u32 {
-    const resolutions = res.resolutions[entry];
-    const use_off = m.tokens[use_tok].start;
-
-    var encl: ?u32 = null;
-    var encl_start: u32 = 0;
-    var next_start: u32 = std.math.maxInt(u32);
-    for (m.nodes, 0..) |n, i| {
-        if (n.tag != .fn_decl) continue;
-        const s = m.tokens[n.main_token].start;
-        if (s <= use_off and (encl == null or s >= encl_start)) {
-            encl = @intCast(i);
-            encl_start = s;
-        }
-    }
-    if (encl == null) return null;
-    for (m.nodes) |n| {
-        if (n.tag != .fn_decl) continue;
-        const s = m.tokens[n.main_token].start;
-        if (s > encl_start and s < next_start) next_start = s;
-    }
-
-    const decl = m.nodes[encl.?];
-    const proto = Ast.protoAt(m.tree(), decl.lhs.int());
-    if (slot < proto.params.len) return m.nodes[proto.params[slot].int()].main_token;
-
-    // A `:=` / for-KEY / local-fn / lambda-param binder carrying this slot (a top-level
-    // fn's params carry no resolution). The binder-tag filter is load-bearing: identifier
-    // USE nodes also carry `.local` with the same slot, so an unfiltered scan would match
-    // a use, not the binding. (Accepted gap: a `for k, v in` VALUE var binds on an
-    // `.identifier` val_leaf, not a binder-tagged node, so a use of `v` finds nothing.)
-    for (m.nodes, 0..) |n, i| {
-        switch (n.tag) {
-            .var_decl, .for_stmt, .for_in_stmt, .for_in2_stmt, .local_fn, .param => {},
-            else => continue,
-        }
-        if (i >= resolutions.len) continue;
-        const s = m.tokens[n.main_token].start;
-        if (s < encl_start or s >= next_start) continue;
-        if (resolutions[i] == .local and resolutions[i].local == slot) return n.main_token;
-    }
-    return null;
-}
-
-/// The name token of the entry module's top-level type decl named like `use_tok`. A struct-
-/// literal head / bare type name is left `.unresolved` by the resolver, so func/local miss
-/// and this name fallback fires. `main_token` on a `*_decl` IS its name token.
-fn typeDeclToken(m: *const Graph.Module, use_tok: u32) ?u32 {
-    if (m.tokens[use_tok].tag != .identifier) return null;
-    if (m.nodes.len == 0) return null;
-    const name = m.tokens[use_tok].text(m.source);
-    const prog = m.nodes[Ast.root(m.nodes).int()];
-    if (prog.tag != .program) return null;
-    for (Ast.rangeSlice(m.tree(), prog.lhs.int())) |decl_idx| {
-        const decl = m.nodes[decl_idx.int()];
-        switch (decl.tag) {
-            .struct_decl, .tuple_struct_decl, .enum_decl => if (std.mem.eql(u8, m.tokens[decl.main_token].text(m.source), name)) return decl.main_token,
-            else => {},
-        }
-    }
-    return null;
+    var tsm = try SourceMap.init(a, tm.file, tm.source);
+    defer tsm.deinit(a);
+    return .{ .uri = try lsp_uri.pathToUri(a, tm.file), .range = rangeOfToken(&tsm, tm.tokens, site.tok, an.encoding) };
 }
 
 fn rangeOfToken(sm: *const SourceMap, tokens: []const Token, t: u32, enc: position.Encoding) protocol.Range {
@@ -239,6 +54,23 @@ fn rangeOfToken(sm: *const SourceMap, tokens: []const Token, t: u32, enc: positi
 }
 
 const testing = std.testing;
+const Io = std.Io;
+const Workspace = @import("Workspace.zig");
+const Documents = @import("Documents.zig");
+
+/// A test's definition: the target uri (owned by `gpa`) and range.
+const Def = struct { uri: []u8, range: protocol.Range };
+
+/// The definition at (`line`, `character`) in `source`, checked as the document `doc_uri`
+/// in `ws`.
+fn definitionAt(gpa: std.mem.Allocator, ws: Workspace, source: []const u8, line: u32, character: u32, doc_uri: []const u8) !?Def {
+    const an = try @import("test_util.zig").analyzeIn(gpa, ws, doc_uri, source);
+    defer an.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const loc = (try at(arena.allocator(), an, line, character)) orelse return null;
+    return .{ .uri = try gpa.dupe(u8, loc.uri), .range = loc.range };
+}
 
 test "rangeOfToken maps a token's [start,end) to a 0-based exclusive range" {
     const gpa = testing.allocator;

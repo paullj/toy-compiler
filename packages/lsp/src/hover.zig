@@ -2,105 +2,53 @@
 //! a ```toy block the client highlights. A bound method value, a `_` capture, a captured
 //! name and a `mut` argument also get a prose note after the block (see `places.zig`).
 //!
-//! Checks through the same `Workspace` as `diagnostics.checkBuffer`, but instead of mapping
-//! diagnostics it RETAINS the graph/resolve/typecheck results to describe the token, renders
-//! the answer into an owned arena, THEN tears the compiler results down. The render must
-//! precede those deinits: a `Sig.name` and a `Layout.name` are BORROWED from the
-//! resolve/graph tables, so the arena copy is what outlives them.
-//!
-//! Selection is token-keyed because the AST stores only a `main_token` per node — no span,
-//! no subtree-exit marker. The innermost node covering an offset is therefore "the node
-//! whose `main_token` is the token under the cursor". A `{` / `(` / keyword token thus
-//! hovers its enclosing node's type by design (a `block` -> `()`, a `call`'s `(` -> the
-//! call's result); a whitespace/comment GAP carries no token and yields null.
+//! A `{` / `(` / keyword token hovers its enclosing node's type by design (a `block` ->
+//! `()`, a `call`'s `(` -> the call's result); a whitespace/comment GAP carries no token and
+//! yields null (see `Analysis` on token-keyed selection).
 
 const std = @import("std");
 const toyc = @import("toy_compiler");
-const Workspace = @import("Workspace.zig");
-const position = @import("position.zig");
+const Analysis = @import("Analysis.zig");
 const describe = @import("describe.zig");
 const places = @import("places.zig");
 const render = @import("render.zig");
 
-const ResolveGraph = toyc.ResolveGraph;
-const TypecheckGraph = toyc.TypecheckGraph;
 const Type = toyc.Typecheck.Type;
-const SourceMap = toyc.term.render.SourceMap;
 
-/// Owns the arena backing `value`. `kind` is a static string. `value` stays valid until
-/// `deinit`; the compiler results it was rendered from have already been torn down.
-pub const Hover = struct {
-    arena: std.heap.ArenaAllocator,
-    value: []const u8,
-    kind: []const u8,
-
-    pub fn deinit(self: *Hover) void {
-        self.arena.deinit();
-    }
-};
-
-/// The type/signature at (`line`, `character`) in `source`, or null when there is nothing
-/// meaningful under the cursor (a gap, an out-of-range or poisoned position, or a document
-/// that does not parse). Resolve and type errors elsewhere do not suppress it: mid-edit, the
-/// rest of the buffer still types. Never errors on a compile problem — only a hard I/O / OOM
-/// fault propagates.
-pub fn hoverAt(
-    gpa: std.mem.Allocator,
-    ws: Workspace,
-    source: []const u8,
-    line: u32,
-    character: u32,
-    doc_uri: []const u8,
-) !?Hover {
-    var graph = try ws.discover(gpa, doc_uri, source);
-    defer graph.deinit(gpa);
-    if (graph.err != null) return null;
-
-    var res = try ResolveGraph.resolveGraph(gpa, &graph);
-    defer res.deinit(gpa);
-
-    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, ws.io, 0);
-    defer tc.deinit(gpa);
-
-    const m = graph.entry();
-
-    var sm = try SourceMap.init(gpa, m.file, m.source);
-    defer sm.deinit(gpa);
-
-    const off = position.positionToOffset(&sm, line, character, ws.encoding) orelse return null;
-    const tok = position.tokenAt(m.tokens, off) orelse return null;
-
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    errdefer arena.deinit();
-    var d: describe.Describer = .{ .a = arena.allocator(), .graph = &graph, .res = &res, .tc = &tc };
-    if (!try d.describe(tok)) {
-        arena.deinit();
-        return null;
-    }
+/// The hover's markdown at (`line`, `character`), allocated in `a`, or null when there is
+/// nothing meaningful under the cursor (a gap, an out-of-range or poisoned position, or a
+/// document that does not parse). Resolve and type errors elsewhere do not suppress it:
+/// mid-edit, the rest of the buffer still types.
+pub fn at(a: std.mem.Allocator, an: *Analysis, line: u32, character: u32) !?[]const u8 {
+    if (an.checked == null) return null;
+    const tok = an.tokenAt(line, character) orelse return null;
+    var d: describe.Describer = .{ .a = a, .an = an };
+    if (!try d.describe(tok)) return null;
     var value: std.ArrayList(u8) = .empty;
     // Fenced so the client highlights it as toy source.
-    try value.print(d.a, "```toy\n{s}\n```", .{d.buf.items});
-    try appendValueNotes(d.a, &value, &graph, &tc, tok);
-    try appendPlaceNotes(d.a, &value, .{ .graph = &graph, .res = &res, .tc = &tc }, tok);
-    return .{ .arena = arena, .value = value.items, .kind = "markdown" };
+    try value.print(a, "```toy\n{s}\n```", .{d.buf.items});
+    try appendValueNotes(a, &value, an, tok);
+    try appendPlaceNotes(a, &value, an, tok);
+    return value.items;
 }
 
 /// Which function value `tok` makes, as prose after the fence: the member of a bound method
 /// value names its receiver's type (the fence shows the method), and the `_` of a capture
 /// gives the capture's fn type (the fence shows the `_` itself).
-fn appendValueNotes(a: std.mem.Allocator, buf: *std.ArrayList(u8), graph: *const toyc.Graph.Graph, tc: *const TypecheckGraph.GraphResult, tok: u32) !void {
-    const m = graph.entry();
-    const e = graph.entry_index;
-    const nts = tc.node_types[e];
-    const callees = tc.callees[e];
-    for (m.nodes, 0..) |n, i| {
-        if (n.main_token != tok or i >= nts.len) continue;
+fn appendValueNotes(a: std.mem.Allocator, buf: *std.ArrayList(u8), an: *const Analysis, tok: u32) !void {
+    const m = an.module();
+    const nts = an.nodeTypes();
+    const callees = an.callees();
+    const tc = an.tc();
+    for (an.nodesAt(tok)) |i| {
+        if (i >= nts.len) continue;
+        const n = m.nodes[i];
         const ty: Type, const what: []const u8 = switch (n.tag) {
             .field_access => if (i < callees.len and callees[i].view() == .bound_method and n.lhs.int() < nts.len)
                 .{ nts[n.lhs.int()], "bound method of " }
             else
                 continue,
-            .lambda => if (toyc.Ast.isCaptureLambda(m.tree(), m.tokens, toyc.Ast.Index.from(@intCast(i))))
+            .lambda => if (toyc.Ast.isCaptureLambda(m.tree(), m.tokens, toyc.Ast.Index.from(i)))
                 .{ nts[i], "capture: " }
             else
                 continue,
@@ -115,18 +63,45 @@ fn appendValueNotes(a: std.mem.Allocator, buf: *std.ArrayList(u8), graph: *const
 
 /// What the source never spells about the place `tok` names, as prose after the fence:
 /// how a closure holds it, and which call writes it through a `mut` param.
-fn appendPlaceNotes(a: std.mem.Allocator, buf: *std.ArrayList(u8), f: places.Facts, tok: u32) !void {
-    if (f.captureAt(tok)) |h| {
+fn appendPlaceNotes(a: std.mem.Allocator, buf: *std.ArrayList(u8), an: *Analysis, tok: u32) !void {
+    if (places.captureAt(an, tok)) |h| {
         try buf.appendSlice(a, "\n\ncaptured");
         if (h != .unknown) {
             try buf.appendSlice(a, ": ");
             try h.append(a, buf);
         }
     }
-    if (try f.mutatedBy(a, tok)) |callee| try buf.print(a, "\n\nmutated by {s}", .{callee});
+    if (try places.mutatedBy(an, tok)) |callee| try buf.print(a, "\n\nmutated by {s}", .{callee});
 }
 
 const testing = std.testing;
+const Workspace = @import("Workspace.zig");
+
+/// A test's hover: its analysis and its answer, torn down together.
+const TestHover = struct {
+    an: *Analysis,
+    arena: std.heap.ArenaAllocator,
+    value: []const u8,
+
+    fn deinit(h: *TestHover) void {
+        h.arena.deinit();
+        h.an.deinit();
+    }
+};
+
+/// The hover at (`line`, `character`) in `src`, checked as the document `uri` in `ws`.
+fn hoverAt(gpa: std.mem.Allocator, ws: Workspace, src: []const u8, line: u32, character: u32, uri: []const u8) !?TestHover {
+    const an = try @import("test_util.zig").analyzeIn(gpa, ws, uri, src);
+    errdefer an.deinit();
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const value = (try at(arena.allocator(), an, line, character)) orelse {
+        arena.deinit();
+        an.deinit();
+        return null;
+    };
+    return .{ .an = an, .arena = arena, .value = value };
+}
 
 test "hover still types a binding when another line has a resolve error" {
     const gpa = testing.allocator;

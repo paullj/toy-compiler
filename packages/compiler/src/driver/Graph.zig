@@ -197,6 +197,58 @@ pub const DiscoverOptions = struct {
     /// skip the warm manifest and the source cache: their bytes are not a file with a
     /// stable stat.
     overlay: ?Overlay = null,
+    /// Bundled modules already lexed and parsed by an earlier discover (see
+    /// `BundledCache`). BORROWED; null => every bundled module is lexed and parsed.
+    bundled_cache: ?*BundledCache = null,
+};
+
+/// The bundled modules a long-lived caller (an editor session) keeps parsed between
+/// discovers. The embedded std never changes, so each module lexes and parses once per
+/// cache, and every later graph takes a copy of its arrays (the graph owns what it holds).
+/// The caller owns the cache and passes the same allocator to every discover that uses it.
+pub const BundledCache = struct {
+    /// Keyed by the address of the module's embedded source, which is static.
+    map: std.AutoHashMapUnmanaged(usize, Parsed) = .empty,
+
+    const Parsed = struct { tokens: []Token, nodes: []Ast.Node, extra: []u32, pub_bits: []const u32 };
+
+    pub fn deinit(c: *BundledCache, gpa: std.mem.Allocator) void {
+        var it = c.map.valueIterator();
+        while (it.next()) |p| {
+            gpa.free(p.tokens);
+            gpa.free(p.nodes);
+            gpa.free(p.extra);
+            if (p.pub_bits.len != 0) gpa.free(@constCast(p.pub_bits));
+        }
+        c.map.deinit(gpa);
+        c.* = undefined;
+    }
+
+    fn get(c: *const BundledCache, gpa: std.mem.Allocator, src: []const u8) !?Parsed {
+        const p = c.map.get(@intFromPtr(src.ptr)) orelse return null;
+        const tokens = try gpa.dupe(Token, p.tokens);
+        errdefer gpa.free(tokens);
+        const nodes = try gpa.dupe(Ast.Node, p.nodes);
+        errdefer gpa.free(nodes);
+        const extra = try gpa.dupe(u32, p.extra);
+        errdefer gpa.free(extra);
+        const pub_bits: []const u32 = if (p.pub_bits.len != 0) try gpa.dupe(u32, p.pub_bits) else &.{};
+        return .{ .tokens = tokens, .nodes = nodes, .extra = extra, .pub_bits = pub_bits };
+    }
+
+    fn put(c: *BundledCache, gpa: std.mem.Allocator, src: []const u8, p: Parsed) !void {
+        const gop = try c.map.getOrPut(gpa, @intFromPtr(src.ptr));
+        if (gop.found_existing) return;
+        errdefer c.map.removeByPtr(gop.key_ptr);
+        const tokens = try gpa.dupe(Token, p.tokens);
+        errdefer gpa.free(tokens);
+        const nodes = try gpa.dupe(Ast.Node, p.nodes);
+        errdefer gpa.free(nodes);
+        const extra = try gpa.dupe(u32, p.extra);
+        errdefer gpa.free(extra);
+        const pub_bits: []const u32 = if (p.pub_bits.len != 0) try gpa.dupe(u32, p.pub_bits) else &.{};
+        gop.value_ptr.* = .{ .tokens = tokens, .nodes = nodes, .extra = extra, .pub_bits = pub_bits };
+    }
 };
 
 /// An in-memory source layer consulted BEFORE disk, keyed by resolved file path (the
@@ -234,6 +286,7 @@ pub fn discover(
         .probe = opts.probe,
         .root = opts.root orelse dirname(entry_path),
         .overlay = opts.overlay,
+        .bundled_cache = opts.bundled_cache,
     };
     defer d.deinit();
 
@@ -399,6 +452,7 @@ const Discoverer = struct {
     /// fresh dupe so the existing intern/free ownership is unchanged.
     realpath_cache: std.StringHashMapUnmanaged([]const u8) = .empty,
     overlay: ?Overlay = null,
+    bundled_cache: ?*BundledCache = null,
     err: ?Error = null,
 
     fn deinit(d: *Discoverer) void {
@@ -541,6 +595,23 @@ const Discoverer = struct {
             if (d.overlay) |o| o.get(d.slots.items[id].file) else null;
         if (mem_src) |static_src| {
             const source = try d.gpa.dupe(u8, static_src);
+            const bundled = d.slots.items[id].bundled_src != null;
+            if (bundled) if (d.bundled_cache) |bc| {
+                const hit = bc.get(d.gpa, static_src) catch |e| {
+                    d.gpa.free(source);
+                    return e;
+                };
+                if (hit) |p| {
+                    const s = &d.slots.items[id];
+                    s.source = source;
+                    s.tokens = p.tokens;
+                    s.nodes = p.nodes;
+                    s.extra = p.extra;
+                    s.pub_bits = p.pub_bits;
+                    s.loaded = true;
+                    return;
+                }
+            };
             const engine = Engine.initProbe(d.cache, .normal, d.probe);
             const lexed = engine.lex(d.gpa, d.io, d.target, source, id, true) catch |e| {
                 d.gpa.free(source);
@@ -579,6 +650,7 @@ const Discoverer = struct {
             s.extra = parsed.tree.extra;
             s.pub_bits = parsed.tree.pub_bits;
             s.loaded = true;
+            if (bundled) if (d.bundled_cache) |bc| try bc.put(d.gpa, static_src, .{ .tokens = tokens, .nodes = parsed.tree.nodes, .extra = parsed.tree.extra, .pub_bits = parsed.tree.pub_bits });
             return;
         }
 
@@ -1233,6 +1305,49 @@ test "discover: single entry with no imports" {
         }
     };
     try withFixture(".toy-test-graph-solo", files, "solo.toy", Check.run);
+}
+
+test "discover: a bundled cache parses each std module once and later graphs match a fresh parse" {
+    const gpa = testing.allocator;
+    const entry_src: []const u8 = "import std/vec\nfn main() -> int { return 0 }\n";
+    const Lookup = struct {
+        fn get(ctx: *const anyopaque, path: []const u8) ?[]const u8 {
+            const src: *const []const u8 = @ptrCast(@alignCast(ctx));
+            return if (std.mem.eql(u8, path, "/ws/main.toy")) src.* else null;
+        }
+    };
+    const overlay: Overlay = .{ .ctx = @ptrCast(&entry_src), .getFn = Lookup.get, .disk = false };
+    var cache: BundledCache = .{};
+    defer cache.deinit(gpa);
+
+    var fresh = try discover(gpa, Io.failing, Cache.disabled, "native", "/ws/main.toy", .{ .root = "/ws", .overlay = overlay });
+    defer fresh.deinit(gpa);
+    try testing.expect(fresh.err == null);
+    var cold = try discover(gpa, Io.failing, Cache.disabled, "native", "/ws/main.toy", .{ .root = "/ws", .overlay = overlay, .bundled_cache = &cache });
+    defer cold.deinit(gpa);
+    var bundled: usize = 0;
+    for (fresh.modules) |m| bundled += @intFromBool(m.bundled);
+    try testing.expect(bundled > 0);
+    try testing.expectEqual(bundled, cache.map.count());
+    var warm = try discover(gpa, Io.failing, Cache.disabled, "native", "/ws/main.toy", .{ .root = "/ws", .overlay = overlay, .bundled_cache = &cache });
+    defer warm.deinit(gpa);
+    try testing.expectEqual(bundled, cache.map.count());
+
+    for ([_]*const Graph{ &cold, &warm }) |g| {
+        try testing.expectEqual(fresh.modules.len, g.modules.len);
+        for (fresh.modules, g.modules) |f, m| {
+            try testing.expectEqualStrings(f.source, m.source);
+            try testing.expectEqualSlices(Token, f.tokens, m.tokens);
+            try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(f.nodes), std.mem.sliceAsBytes(m.nodes));
+            try testing.expectEqualSlices(u32, f.extra, m.extra);
+            try testing.expectEqualSlices(u32, f.pub_bits, m.pub_bits);
+        }
+    }
+    // Each graph owns its copy: the cache's arrays are not the graph's.
+    for (warm.modules) |m| if (m.bundled) {
+        var it = cache.map.valueIterator();
+        while (it.next()) |p| try testing.expect(p.tokens.ptr != m.tokens.ptr);
+    };
 }
 
 test "single: trivial one-module graph from a parsed source" {

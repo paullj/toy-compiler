@@ -63,3 +63,20 @@ pub const method_fixture =
     \\}
     \\
 ;
+
+const Analysis = @import("Analysis.zig");
+const Documents = @import("Documents.zig");
+const Workspace = @import("Workspace.zig");
+
+/// The analysis of `src` as the unsaved document `file:///p/main.toy`, with no other
+/// document open and no disk; free with `deinit`.
+pub fn analyze(gpa: std.mem.Allocator, src: []const u8) !*Analysis {
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    return analyzeIn(gpa, .{ .io = std.Io.failing, .docs = &docs, .disk = false }, "file:///p/main.toy", src);
+}
+
+/// The analysis of `src` as the unsaved document `uri` in `ws`; free with `deinit`.
+pub fn analyzeIn(gpa: std.mem.Allocator, ws: Workspace, uri: []const u8, src: []const u8) !*Analysis {
+    return Analysis.init(gpa, ws, uri, src, 1);
+}

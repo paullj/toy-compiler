@@ -2,7 +2,8 @@
 //! the disk. An open buffer is usually UNSAVED, so the front-end reads it — and every other
 //! open document an import names — from memory through a `Graph.Overlay`; only a module no
 //! editor has open falls through to disk. Nothing is written, and the query cache is
-//! disabled: per-keystroke content would grow a persistent cache without bound.
+//! disabled: per-keystroke content would grow a persistent cache without bound. The
+//! bundled std, which never changes, is parsed once per session instead (`std_cache`).
 
 const std = @import("std");
 const Io = std.Io;
@@ -23,12 +24,14 @@ docs: *const Documents,
 disk: bool = true,
 /// How the client counts `character` in the positions it sends and reads back.
 encoding: position.Encoding = .utf16,
+/// The session's parsed bundled modules, or null to parse them on every discover.
+std_cache: ?*Graph.BundledCache = null,
 
 /// Discover the module graph rooted at `uri`, whose current text is `text` (which may differ
 /// from the stored document: completion and signature help check a repaired copy). A
 /// non-`file://` uri has no directory, so it can import only bundled modules.
 pub fn discover(ws: Workspace, gpa: std.mem.Allocator, uri: []const u8, text: []const u8) !Graph.Graph {
-    const path = (try lsp_uri.uriToPath(gpa, uri)) orelse try gpa.dupe(u8, untitled_path);
+    const path = try pathOf(gpa, uri);
     defer gpa.free(path);
     const root = std.fs.path.dirname(path) orelse "";
 
@@ -53,10 +56,16 @@ pub fn discover(ws: Workspace, gpa: std.mem.Allocator, uri: []const u8, text: []
     entry.value_ptr.* = text;
 
     const overlay: Graph.Overlay = .{ .ctx = &by_path, .getFn = lookup, .disk = ws.disk };
-    return Graph.discover(gpa, ws.io, Cache.disabled, toyc.Driver.default_target, path, .{ .root = root, .overlay = overlay });
+    return Graph.discover(gpa, ws.io, Cache.disabled, toyc.Driver.default_target, path, .{ .root = root, .overlay = overlay, .bundled_cache = ws.std_cache });
 }
 
 const untitled_path = "untitled.toy";
+
+/// The path the front-end reads document `uri` at (caller frees): its decoded file path,
+/// or a stand-in for a uri with none.
+pub fn pathOf(gpa: std.mem.Allocator, uri: []const u8) ![]u8 {
+    return (try lsp_uri.uriToPath(gpa, uri)) orelse try gpa.dupe(u8, untitled_path);
+}
 
 fn lookup(ctx: *const anyopaque, path: []const u8) ?[]const u8 {
     const by_path: *const std.StringHashMapUnmanaged([]const u8) = @ptrCast(@alignCast(ctx));
