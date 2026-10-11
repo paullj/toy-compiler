@@ -80,3 +80,28 @@ pub fn analyze(gpa: std.mem.Allocator, src: []const u8) !*Analysis {
 pub fn analyzeIn(gpa: std.mem.Allocator, ws: Workspace, uri: []const u8, src: []const u8) !*Analysis {
     return Analysis.init(gpa, ws, uri, src, 1);
 }
+
+/// Method calls inside generic bodies (issue #33): a generic impl's method calling another,
+/// a generic fn calling a generic type's method, and a concrete type's method called and
+/// bound inside a generic fn with two instances.
+pub const generic_body_fixture =
+    \\struct Acc { n: int }
+    \\impl Acc { fn plus(self, k: int) -> int { self.n + k } }
+    \\struct Box[T] { v: T }
+    \\impl Box[T] {
+    \\    fn get(self) -> T { self.v }
+    \\    fn twice(self) -> T { self.get() }
+    \\}
+    \\fn use_box[T](b: Box[T]) -> T { b.get() }
+    \\fn with_acc[T](x: T) -> int {
+    \\    acc := Acc { n: 1 }
+    \\    g := acc.plus
+    \\    return acc.plus(2) + g(3)
+    \\}
+    \\fn main() -> int {
+    \\    b := Box[int]{ v: 3 }
+    \\    x := b.get()
+    \\    return x + b.twice() + use_box(b) + with_acc(1) + with_acc("s")
+    \\}
+    \\
+;

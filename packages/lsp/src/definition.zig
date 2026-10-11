@@ -316,3 +316,28 @@ test "definition: a bound method value jumps to its method; a protocol name to i
         try testing.expectEqual(want.character, d.range.start.character);
     }
 }
+
+test "definition on method calls inside generic bodies (#33)" {
+    const gpa = testing.allocator;
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src = @import("test_util.zig").generic_body_fixture;
+    const cases = [_]struct { use: []const u8, skip: u32, decl: []const u8 }{
+        .{ .use = "self.get()", .skip = 5, .decl = "get(self)" },
+        .{ .use = "b.get() }", .skip = 2, .decl = "get(self)" },
+        .{ .use = "plus(2)", .skip = 0, .decl = "plus(self" },
+        .{ .use = "plus\n", .skip = 0, .decl = "plus(self" },
+    };
+    for (cases) |c| {
+        const use = posOf(src, c.use);
+        const d = (try definitionAt(gpa, ws, src, use.line, use.character + c.skip, "file:///p/main.toy")) orelse {
+            std.debug.print("no definition for '{s}'\n", .{c.use});
+            return error.NoDefinition;
+        };
+        defer gpa.free(d.uri);
+        const want = posOf(src, c.decl);
+        try testing.expectEqual(want.line, d.range.start.line);
+        try testing.expectEqual(want.character, d.range.start.character);
+    }
+}
