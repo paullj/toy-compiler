@@ -209,3 +209,25 @@ pub fn live_paced_collections() -> int {
     if s2 == s1 { return 2 }
     return 1
 }
+
+# A large object whose only root points into its third 16 KiB page must survive. The
+# collector resolves a word's span by the word's page, so every page of a large object has
+# to resolve to it. A swept object is munmapped and the read faults. Reads 9.
+fn large_interior() -> rawptr {
+    big := gc_alloc(65536)
+    mid := offset(big, 40000)
+    unsafe { store(mid, 9) }
+    return mid
+}
+
+pub fn large_interior_survivor() -> int {
+    mid := large_interior()
+    i := 0
+    loop {
+        if i >= 20000 { break }
+        junk := gc_alloc(64)
+        unsafe { store(junk, i) }
+        i = i + 1
+    }
+    return unsafe { load(mid) }
+}

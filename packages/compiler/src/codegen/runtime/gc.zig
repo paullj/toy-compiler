@@ -40,15 +40,16 @@ const patchBTo = em.patchBTo;
 // span when the freelist is empty, and runs a synchronous stop-the-world collection once
 // the bytes allocated since the last one reach the live bytes it kept (Go's GOGC=100
 // pacing, floored at 256 KiB). A fixed budget makes a growing live set pay a whole-heap
-// trace every 256 KiB: O(live) collections of O(live) work each. The collector walks the FP chain enumerating each
-// frame's roots by PRECISE stack-map lookup (a per-fn table names the managed cells;
-// frames with no entry fall back to a conservative whole-frame word scan — sound because
-// the spill-everything frame puts every live reference in a frame cell), traces marked
-// objects to a fixpoint over a malloc-backed mark stack, and linear-sweeps every span
-// (dead cells → freelists, mark bits cleared). All emitted bodies are PURE fixed AArch64
-// (only the constant CB address / mmap+malloc flags / lengths are baked), so the bytes
-// are byte-identical at any -jN; the runtime span/mark-stack addresses never touch the
-// image.
+// trace every 256 KiB: O(live) collections of O(live) work each. The collector walks the
+// FP chain enumerating each frame's roots by PRECISE stack-map lookup (a per-fn table
+// names the managed cells; frames with no entry fall back to a conservative whole-frame
+// word scan — sound because the spill-everything frame puts every live reference in a
+// frame cell), traces marked objects to a fixpoint over a malloc-backed mark stack
+// (resolving each candidate word's span through a hash table of span pages built per
+// collection), and linear-sweeps every span (dead cells → freelists, mark bits cleared).
+// All emitted bodies are PURE fixed AArch64 (only the constant CB address / mmap+malloc
+// flags / lengths are baked), so the bytes are byte-identical at any -jN; the runtime
+// span/mark-stack addresses never touch the image.
 
 const cb_addr_hw: u16 = 0x3000; // CB_ADDR = 0x3000 << 32 (48 TiB, image-far, empty mid-VA)
 const cb_addr_lsl: u2 = 2; // lsl #32
@@ -67,6 +68,10 @@ const off_freelist: u32 = 64; // freelist_heads[0..12] → +64..+160
 const off_scratch_a: u32 = 168;
 const off_scratch_b: u32 = 176;
 const off_live: u32 = 184;
+// The collection-scoped span table: {page, base} slots, its mask, and the hash's shift.
+const off_ht_ptr: u32 = 192;
+const off_ht_mask: u32 = 200;
+const off_ht_shift: u32 = 208;
 
 // Class-span prologue field offsets (size_class != 0 marks a class span).
 const sp_next: u32 = 0;
@@ -340,41 +345,202 @@ pub fn lowerGcAlloc(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     return finishBuiltin(&code, &relocs, gpa, "gc_alloc");
 }
 
+/// Emit `x0 = ((page >> 14) * 2^64/phi) >> shift`, the unmasked span-table slot of the
+/// 16 KiB page in `page` (CB in x19). Fibonacci hashing, because kernel-chosen span
+/// addresses arrive in runs that an identity hash would pile into one probe chain.
+/// Clobbers x0-x2.
+fn emitPageHash(code: *std.ArrayList(u8), gpa: std.mem.Allocator, page: u32) error{OutOfMemory}!void {
+    const A = Aarch64;
+    const emit = emitWord;
+    try emit(code, gpa, A.movz(1, 14, 0));
+    try emit(code, gpa, A.lsrv(0, page, 1));
+    try emit(code, gpa, A.movz(1, 0x7C15, 0));
+    try emit(code, gpa, A.movk(1, 0x7F4A, 1));
+    try emit(code, gpa, A.movk(1, 0x79B9, 2));
+    try emit(code, gpa, A.movk(1, 0x9E37, 3));
+    try emit(code, gpa, A.mul(0, 0, 1));
+    try emit(code, gpa, A.ldrRegUoff(2, 19, off_ht_shift));
+    try emit(code, gpa, A.lsrv(0, 0, 2));
+}
+
+/// Emit, inline, the span lookup of the word in `word` (CB in x19): probe the collection's
+/// span table for the word's 16 KiB page. A hit leaves the page's class-span or
+/// large-object base in x14 and falls through; a miss takes the returned `cbz` site, which
+/// the caller patches. Walking the span list instead made every marked word cost O(spans),
+/// so one collection cost O(live words x spans). Clobbers x0-x6, x11-x14.
+fn emitSpanLookup(code: *std.ArrayList(u8), gpa: std.mem.Allocator, word: u32) error{OutOfMemory}!u32 {
+    const A = Aarch64;
+    const emit = emitWord;
+    try emit(code, gpa, A.movz(11, 0x3FFF, 0));
+    try emit(code, gpa, A.mvn(12, 11));
+    try emit(code, gpa, A.andReg(13, word, 12)); // page = word & ~0x3FFF
+    try emitPageHash(code, gpa, 13);
+    try emit(code, gpa, A.ldrRegUoff(3, 19, off_ht_ptr));
+    try emit(code, gpa, A.ldrRegUoff(4, 19, off_ht_mask));
+    const probe: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.andReg(0, 0, 4));
+    try emit(code, gpa, A.movz(6, 4, 0));
+    try emit(code, gpa, A.lslv(5, 0, 6));
+    try emit(code, gpa, A.addReg(5, 3, 5)); // &slot = table + idx*16
+    try emit(code, gpa, A.ldrRegUoff(6, 5, 0)); // slot.page
+    const miss: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.cbz(6, 0)); // empty slot → not a heap page
+    try emit(code, gpa, A.cmpReg(6, 13));
+    const beq_hit: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.bCond(.eq, 0));
+    try emit(code, gpa, A.addImm(0, 0, 1));
+    const b_probe: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.b(0));
+    patchBTo(code.items, b_probe, probe);
+    const hit: u32 = @intCast(code.items.len);
+    patchBCondTo(code.items, beq_hit, hit);
+    try emit(code, gpa, A.ldrRegUoff(14, 5, 8)); // slot.base
+    return miss;
+}
+
+/// Emit, inline, the insert of page x10 → base x11 into the span table (CB in x19). The
+/// table is sized to at most half full and every page is distinct, so the probe always
+/// ends at an empty slot. Clobbers x0-x6.
+fn emitSpanInsert(code: *std.ArrayList(u8), gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    const A = Aarch64;
+    const emit = emitWord;
+    try emitPageHash(code, gpa, 10);
+    try emit(code, gpa, A.ldrRegUoff(3, 19, off_ht_ptr));
+    try emit(code, gpa, A.ldrRegUoff(4, 19, off_ht_mask));
+    const probe: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.andReg(0, 0, 4));
+    try emit(code, gpa, A.movz(6, 4, 0));
+    try emit(code, gpa, A.lslv(5, 0, 6));
+    try emit(code, gpa, A.addReg(5, 3, 5));
+    try emit(code, gpa, A.ldrRegUoff(6, 5, 0));
+    const cbz_empty: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.cbz(6, 0));
+    try emit(code, gpa, A.addImm(0, 0, 1));
+    const b_probe: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.b(0));
+    patchBTo(code.items, b_probe, probe);
+    const empty: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbz_empty, empty);
+    try emit(code, gpa, A.strRegUoff(10, 5, 0));
+    try emit(code, gpa, A.strRegUoff(11, 5, 8));
+}
+
+/// Emit the span-table build that opens a collection (CB in x19): one slot per class
+/// span and one per page of every large object (so an interior pointer anywhere in it
+/// resolves), in a zeroed table of power-of-two capacity at least twice the page count.
+/// The table lives only for the collection, so no allocation or munmap path has to keep
+/// it current. Clobbers x0-x18 and x20-x22 (callee-saved, the collector saved them).
+fn emitSpanTableBuild(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    const A = Aarch64;
+    const emit = emitWord;
+
+    try emit(code, gpa, A.movz(20, 0, 0)); // pages
+    try emit(code, gpa, A.ldrRegUoff(0, 19, off_span_head));
+    const cnt_cls: u32 = @intCast(code.items.len);
+    const cbz_cnt_cls: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.cbz(0, 0));
+    try emit(code, gpa, A.addImm(20, 20, 1));
+    try emit(code, gpa, A.ldrRegUoff(0, 0, sp_next));
+    const b_cnt_cls: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.b(0));
+    patchBTo(code.items, b_cnt_cls, cnt_cls);
+    patchCbzTo(code.items, cbz_cnt_cls, @intCast(code.items.len));
+    try emit(code, gpa, A.ldrRegUoff(0, 19, off_large_head));
+    try emit(code, gpa, A.movz(2, 14, 0));
+    const cnt_lg: u32 = @intCast(code.items.len);
+    const cbz_cnt_lg: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.cbz(0, 0));
+    try emit(code, gpa, A.ldrRegUoff(1, 0, lg_maplen));
+    try emit(code, gpa, A.lsrv(1, 1, 2));
+    try emit(code, gpa, A.addReg(20, 20, 1)); // pages += maplen / 16 KiB
+    try emit(code, gpa, A.ldrRegUoff(0, 0, lg_next));
+    const b_cnt_lg: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.b(0));
+    patchBTo(code.items, b_cnt_lg, cnt_lg);
+    patchCbzTo(code.items, cbz_cnt_lg, @intCast(code.items.len));
+
+    // cap = 16 << k ≥ 2*pages; shift = 64 - log2(cap) so the hash's top bits index it.
+    try emit(code, gpa, A.addReg(1, 20, 20));
+    try emit(code, gpa, A.movz(21, 16, 0));
+    try emit(code, gpa, A.movz(22, 60, 0));
+    const cap_top: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.cmpReg(21, 1));
+    const bhs_cap: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.bCond(.hs, 0));
+    try emit(code, gpa, A.addReg(21, 21, 21));
+    try emit(code, gpa, A.subImm(22, 22, 1));
+    const b_cap: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.b(0));
+    patchBTo(code.items, b_cap, cap_top);
+    patchBCondTo(code.items, bhs_cap, @intCast(code.items.len));
+    try emit(code, gpa, A.subImm(0, 21, 1));
+    try emit(code, gpa, A.strRegUoff(0, 19, off_ht_mask));
+    try emit(code, gpa, A.strRegUoff(22, 19, off_ht_shift));
+    try emit(code, gpa, A.movReg(0, 21));
+    try emit(code, gpa, A.movz(1, 16, 0));
+    try emitImportPreamble(code, relocs, gpa, "calloc", 16);
+    try emit(code, gpa, A.blr(16)); // x0 = zeroed cap x 16-byte {page, base} slots
+    try emit(code, gpa, A.strRegUoff(0, 19, off_ht_ptr));
+
+    try emit(code, gpa, A.ldrRegUoff(20, 19, off_span_head));
+    const ins_cls: u32 = @intCast(code.items.len);
+    const cbz_ins_cls: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.cbz(20, 0));
+    try emit(code, gpa, A.movReg(10, 20));
+    try emit(code, gpa, A.movReg(11, 20));
+    try emitSpanInsert(code, gpa);
+    try emit(code, gpa, A.ldrRegUoff(20, 20, sp_next));
+    const b_ins_cls: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.b(0));
+    patchBTo(code.items, b_ins_cls, ins_cls);
+    patchCbzTo(code.items, cbz_ins_cls, @intCast(code.items.len));
+
+    try emit(code, gpa, A.ldrRegUoff(20, 19, off_large_head));
+    const ins_lg: u32 = @intCast(code.items.len);
+    const cbz_ins_lg: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.cbz(20, 0));
+    try emit(code, gpa, A.ldrRegUoff(21, 20, lg_maplen)); // bytes left to insert
+    try emit(code, gpa, A.movReg(22, 20)); // page
+    const ins_pg: u32 = @intCast(code.items.len);
+    const cbz_ins_pg: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.cbz(21, 0));
+    try emit(code, gpa, A.movReg(10, 22));
+    try emit(code, gpa, A.movReg(11, 20));
+    try emitSpanInsert(code, gpa);
+    try emit(code, gpa, A.addImmLsl12(22, 22, 4)); // page += 16 KiB
+    try emit(code, gpa, A.subImmLsl12(21, 21, 4));
+    const b_ins_pg: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.b(0));
+    patchBTo(code.items, b_ins_pg, ins_pg);
+    patchCbzTo(code.items, cbz_ins_pg, @intCast(code.items.len));
+    try emit(code, gpa, A.ldrRegUoff(20, 20, lg_next));
+    const b_ins_lg: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.b(0));
+    patchBTo(code.items, b_ins_lg, ins_lg);
+    patchCbzTo(code.items, cbz_ins_lg, @intCast(code.items.len));
+}
+
 /// Emit, inline, the conservative "mark one candidate word" step: given the candidate
-/// pointer in x10 and CB in x19, round it down to a 16 KiB span base and look that base
-/// up in the class-span list (then the large-object list). On a hit, normalize to the
-/// enclosing cell/payload, set its mark bit, and — if newly set AND `push` — push it
-/// (carrying x24 as its descriptor). A leaf mark (`push == false`) sets only the mark
-/// bit: the cell survives the sweep but is never traced, so a backing array's scattered
-/// interior pointers are reached only through an explicit container walk, not a rescan.
-/// Clobbers x0-x16; preserves x17-x28. Every branch is a local backpatched jump.
+/// pointer in x10 and CB in x19, look its 16 KiB page up in the span table. On a hit,
+/// normalize to the enclosing cell/payload, set its mark bit, and — if newly set AND
+/// `push` — push it (carrying x24 as its descriptor). A leaf mark (`push == false`) sets
+/// only the mark bit: the cell survives the sweep but is never traced, so a backing array's
+/// scattered interior pointers are reached only through an explicit container walk, not a
+/// rescan. Clobbers x0-x16; preserves x17-x28. Every branch is a local backpatched jump.
 fn emitConservativeMark(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), gpa: std.mem.Allocator, push: bool) error{OutOfMemory}!void {
     const A = Aarch64;
     const emit = emitWord;
 
-    try emit(code, gpa, A.movz(11, 0x3FFF, 0));
-    try emit(code, gpa, A.mvn(12, 11));
-    try emit(code, gpa, A.andReg(13, 10, 12)); // cand_base = word & ~0x3FFF
-
-    try emit(code, gpa, A.ldrRegUoff(14, 19, off_span_head)); // node
-    const span_top: u32 = @intCast(code.items.len);
+    const cbz_miss = try emitSpanLookup(code, gpa, 10); // x14 = span / large base
+    try emit(code, gpa, A.ldrRegUoff(1, 14, sp_class));
     const cbz_large: u32 = @intCast(code.items.len);
-    try emit(code, gpa, A.cbz(14, 0)); // end of class spans → try large
-    try emit(code, gpa, A.cmpReg(14, 13));
-    const beq_found: u32 = @intCast(code.items.len);
-    try emit(code, gpa, A.bCond(.eq, 0)); // node == cand_base → span_found
-    try emit(code, gpa, A.ldrRegUoff(14, 14, sp_next));
-    const b_span_top: u32 = @intCast(code.items.len);
-    try emit(code, gpa, A.b(0));
+    try emit(code, gpa, A.cbz(1, 0)); // size_class == 0 → large object
 
-    const span_found: u32 = @intCast(code.items.len);
-    patchBCondTo(code.items, beq_found, span_found);
     try emit(code, gpa, A.ldrRegUoff(15, 14, sp_cellsbase)); // cells_base
     try emit(code, gpa, A.cmpReg(10, 15));
     const blo_done_a: u32 = @intCast(code.items.len);
     try emit(code, gpa, A.bCond(.lo, 0)); // word < cells_base (prologue) → done
     try emit(code, gpa, A.subReg(0, 10, 15)); // off
-    try emit(code, gpa, A.ldrRegUoff(1, 14, sp_class));
     try emit(code, gpa, A.udiv(2, 0, 1)); // idx = off / class
     try emit(code, gpa, A.ldrRegUoff(3, 14, sp_cellcount));
     try emit(code, gpa, A.cmpReg(2, 3));
@@ -402,21 +568,17 @@ fn emitConservativeMark(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Re
     const b_done_a: u32 = @intCast(code.items.len);
     try emit(code, gpa, A.b(0)); // → done
 
-    const try_large: u32 = @intCast(code.items.len);
-    patchCbzTo(code.items, cbz_large, try_large);
-    try emit(code, gpa, A.ldrRegUoff(14, 19, off_large_head));
-    const large_top: u32 = @intCast(code.items.len);
-    const cbz_done_b: u32 = @intCast(code.items.len);
-    try emit(code, gpa, A.cbz(14, 0)); // end of large list → done
+    const large: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbz_large, large);
     try emit(code, gpa, A.ldrRegUoff(0, 14, lg_objbase));
     try emit(code, gpa, A.cmpReg(10, 0));
-    const blo_next: u32 = @intCast(code.items.len);
-    try emit(code, gpa, A.bCond(.lo, 0)); // word < objbase → next
+    const blo_done_b: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.bCond(.lo, 0)); // word < objbase (prologue) → done
     try emit(code, gpa, A.ldrRegUoff(1, 14, lg_reqsize));
     try emit(code, gpa, A.addReg(2, 0, 1)); // end
     try emit(code, gpa, A.cmpReg(10, 2));
-    const bhs_next: u32 = @intCast(code.items.len);
-    try emit(code, gpa, A.bCond(.hs, 0)); // word >= end → next
+    const bhs_done_b: u32 = @intCast(code.items.len);
+    try emit(code, gpa, A.bCond(.hs, 0)); // word >= end → done
     try emit(code, gpa, A.ldrRegUoff(3, 14, lg_mark));
     const cbnz_done_c: u32 = @intCast(code.items.len);
     try emit(code, gpa, A.cbnz(3, 0)); // already marked → done
@@ -426,25 +588,16 @@ fn emitConservativeMark(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Re
         try emit(code, gpa, A.movReg(10, 0)); // push objbase
         try emitPush(code, relocs, gpa);
     }
-    const b_done_c: u32 = @intCast(code.items.len);
-    try emit(code, gpa, A.b(0)); // → done
-    const large_next: u32 = @intCast(code.items.len);
-    patchBCondTo(code.items, blo_next, large_next);
-    patchBCondTo(code.items, bhs_next, large_next);
-    try emit(code, gpa, A.ldrRegUoff(14, 14, lg_next));
-    const b_large_top: u32 = @intCast(code.items.len);
-    try emit(code, gpa, A.b(0)); // → large_top
 
     const done: u32 = @intCast(code.items.len);
-    patchBTo(code.items, b_span_top, span_top);
+    patchCbzTo(code.items, cbz_miss, done);
     patchBCondTo(code.items, blo_done_a, done);
     patchBCondTo(code.items, bhs_done_a, done);
     patchCbzTo(code.items, cbnz_done_a, done);
     patchBTo(code.items, b_done_a, done);
-    patchCbzTo(code.items, cbz_done_b, done);
+    patchBCondTo(code.items, blo_done_b, done);
+    patchBCondTo(code.items, bhs_done_b, done);
     patchCbzTo(code.items, cbnz_done_c, done);
-    patchBTo(code.items, b_done_c, done);
-    patchBTo(code.items, b_large_top, large_top);
 }
 
 /// Emit, inline, a push of the pointer in x10 onto the malloc-backed mark stack (16-byte
@@ -572,7 +725,7 @@ pub fn lowerGcMarkLeaf(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
 /// through their stashed element/K/V descriptors); everything else (descriptor 0) is
 /// word-scanned conservatively. Marked objects are traced to a fixpoint over the mark stack,
 /// then every class span is linear-swept (dead cells → per-class freelists, mark bits
-/// cleared). Large objects leak (their mark is just reset). Caller owns the result.
+/// cleared); dead large objects are munmapped. Caller owns the result.
 ///
 /// Register contract: x19=CB, x24=pending descriptor for the next push (the live-byte sum
 /// during the sweep), x25=text_base, x26=&stackmap, x27=cur fp, x28=parent fp,
@@ -639,6 +792,8 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     const cbnz_reset: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbnz(1, 0));
     patchCbzTo(code.items, cbnz_reset, reset_top);
+
+    try emitSpanTableBuild(&code, &relocs, gpa);
 
     // Hybrid root scan: walk the x29 chain from gc_collect's own frame outward. For each
     // parent frame, identify its fn by the return address the child saved (`*(cur+8)`, less
@@ -793,45 +948,15 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     patchBTo(code.items, b_after_mp, trace_pop);
     const cons_scan: u32 = @intCast(code.items.len);
     patchCbzTo(code.items, cbnz_not_container, cons_scan);
-    try emit(&code, gpa, A.movz(4, 0x3FFF, 0));
-    try emit(&code, gpa, A.mvn(5, 4));
-    try emit(&code, gpa, A.andReg(6, 22, 5)); // cand_base
-    try emit(&code, gpa, A.ldrRegUoff(7, 19, off_span_head));
-    const tp_span_top: u32 = @intCast(code.items.len);
-    const cbz_tp_large: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.cbz(7, 0));
-    try emit(&code, gpa, A.cmpReg(7, 6));
-    const beq_tp_span: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.bCond(.eq, 0));
-    try emit(&code, gpa, A.ldrRegUoff(7, 7, sp_next));
-    const b_tp_span: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.b(0));
-    patchBTo(code.items, b_tp_span, tp_span_top);
-    const tp_span_found: u32 = @intCast(code.items.len);
-    patchBCondTo(code.items, beq_tp_span, tp_span_found);
-    try emit(&code, gpa, A.ldrRegUoff(8, 7, sp_class));
-    try emit(&code, gpa, A.addReg(23, 22, 8)); // end = ptr + size_class
-    const b_tp_scan: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.b(0)); // → tp_scan
-    const tp_try_large: u32 = @intCast(code.items.len);
-    patchCbzTo(code.items, cbz_tp_large, tp_try_large);
-    try emit(&code, gpa, A.ldrRegUoff(7, 19, off_large_head));
-    const tp_large_top: u32 = @intCast(code.items.len);
-    const cbz_tp_pop: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.cbz(7, 0)); // not found → pop next
-    try emit(&code, gpa, A.cmpReg(7, 6));
-    const beq_tp_large: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.bCond(.eq, 0));
-    try emit(&code, gpa, A.ldrRegUoff(7, 7, lg_next));
-    const b_tp_large: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.b(0));
-    patchBTo(code.items, b_tp_large, tp_large_top);
-    const tp_large_found: u32 = @intCast(code.items.len);
-    patchBCondTo(code.items, beq_tp_large, tp_large_found);
-    try emit(&code, gpa, A.ldrRegUoff(8, 7, lg_reqsize));
-    try emit(&code, gpa, A.addReg(23, 22, 8)); // end = ptr + req_size
+    const cbz_tp_pop = try emitSpanLookup(&code, gpa, 22); // x14 = span / large base
+    try emit(&code, gpa, A.ldrRegUoff(8, 14, sp_class));
+    const cbnz_tp_class: u32 = @intCast(code.items.len);
+    try emit(&code, gpa, A.cbnz(8, 0)); // class span → size = size_class
+    try emit(&code, gpa, A.ldrRegUoff(8, 14, lg_reqsize)); // large → size = req_size
+    const tp_sized: u32 = @intCast(code.items.len);
+    patchCbzTo(code.items, cbnz_tp_class, tp_sized);
+    try emit(&code, gpa, A.addReg(23, 22, 8)); // end = ptr + size
     const tp_scan: u32 = @intCast(code.items.len);
-    patchBTo(code.items, b_tp_scan, tp_scan);
     try emit(&code, gpa, A.cmpReg(22, 23));
     const bhs_tp_pop: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.bCond(.hs, 0)); // scanned whole object → pop next
@@ -851,6 +976,10 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     // trace_done target:
     const trace_done: u32 = @intCast(code.items.len);
     patchCbzTo(code.items, cbz_trace_done, trace_done);
+    try emit(&code, gpa, A.ldrRegUoff(0, 19, off_ht_ptr));
+    try emitImportPreamble(&code, &relocs, gpa, "free", 16);
+    try emit(&code, gpa, A.blr(16));
+    try emit(&code, gpa, A.strRegUoff(A.XZR, 19, off_ht_ptr));
 
     // Sweep class spans: dead cells → freelists (zeroed first), marked cells → bit cleared
     // and their class bytes summed into x24, the live total that paces the next collection.
@@ -1102,7 +1231,7 @@ test "gc_alloc: names the builtin, opens a frame, and carries a bl gc_collect ca
     try testing.expect(saw_mmap);
 }
 
-test "gc_collect: names the builtin, opens a frame, ends in ret, and pulls malloc + realloc" {
+test "gc_collect: names the builtin, opens a frame, ends in ret, and pulls malloc + realloc + calloc + free" {
     const gpa = testing.allocator;
     var fc = try lowerGcCollect(gpa);
     defer fc.deinit(gpa);
@@ -1118,6 +1247,8 @@ test "gc_collect: names the builtin, opens a frame, ends in ret, and pulls mallo
     // the only `.call26` edges out of the collector.
     var saw_malloc = false;
     var saw_realloc = false;
+    var saw_calloc = false;
+    var saw_free = false;
     var saw_ga_trace = false;
     var saw_mp_trace = false;
     // The hybrid root scan self-locates text_base (a movw_g0/movw_g1 self-relative pair)
@@ -1132,6 +1263,8 @@ test "gc_collect: names the builtin, opens a frame, ends in ret, and pulls mallo
         if (r.target == .func and r.kind == .call26 and std.mem.eql(u8, r.target.func.name, "mp_trace")) saw_mp_trace = true;
         if (r.target == .import and std.mem.eql(u8, r.target.import.name, "malloc")) saw_malloc = true;
         if (r.target == .import and std.mem.eql(u8, r.target.import.name, "realloc")) saw_realloc = true;
+        if (r.target == .import and std.mem.eql(u8, r.target.import.name, "calloc")) saw_calloc = true;
+        if (r.target == .import and std.mem.eql(u8, r.target.import.name, "free")) saw_free = true;
         if (r.kind == .movw_g0) saw_movw_g0 = true;
         if (r.kind == .movw_g1) saw_movw_g1 = true;
         if (r.target == .cstr and r.target.cstr == Link.gc_stackmap_base_hash and r.kind == .adrp_page) saw_sm_adrp = true;
@@ -1139,6 +1272,8 @@ test "gc_collect: names the builtin, opens a frame, ends in ret, and pulls mallo
     }
     try testing.expect(saw_malloc);
     try testing.expect(saw_realloc);
+    // The span table is allocated and freed per collection.
+    try testing.expect(saw_calloc and saw_free);
     try testing.expect(saw_ga_trace and saw_mp_trace);
     try testing.expect(saw_movw_g0 and saw_movw_g1);
     try testing.expect(saw_sm_adrp and saw_sm_add);

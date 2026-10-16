@@ -1,0 +1,16 @@
+# expect: exit 16
+# The live heap grows with the loop: every 20th 3-element Vec is kept. Each collection
+# must cost O(live), and the budget between collections must grow with the live heap, or
+# GC time grows quadratically (#87: 1.5 s here, 13 s at 400000). Now about 0.15 s.
+# 200000 / 20 = 10000 kept; 10000 % 256 = 16.
+import std/vec
+fn main() -> int {
+    keep: Vec[Vec[int]] = []
+    i := 0
+    while i < 200000 {
+        v: Vec[int] = [i, i + 1, i + 2]
+        if i % 20 == 0 { keep.push(v) }
+        i = i + 1
+    }
+    return keep.len() % 256
+}
