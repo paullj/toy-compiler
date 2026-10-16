@@ -38,8 +38,8 @@ pub fn argMask(body: Body.BodyView, prog: Body.ProgramView, call: Ast.Index) u64
     const tree = body.tree;
     const n = tree.nodes[call.int()];
     const slot = Callee.callSlot(tree, n) orelse return 0;
-    if (slot.int() >= body.callees.len) return 0;
-    return switch (body.callees[slot.int()].view()) {
+    if (!body.nodes.has(slot)) return 0;
+    return switch (body.nodes.callee(slot).view()) {
         .method => |mi| {
             if (mi >= prog.methods.len) return 0;
             const m = prog.methods[mi];
@@ -62,8 +62,8 @@ pub fn argMask(body: Body.BodyView, prog: Body.ProgramView, call: Ast.Index) u64
 pub fn receiverMut(body: Body.BodyView, prog: Body.ProgramView, call: Ast.Index) bool {
     const n = body.tree.nodes[call.int()];
     const slot = Callee.callSlot(body.tree, n) orelse return false;
-    if (slot.int() >= body.callees.len) return false;
-    return switch (body.callees[slot.int()].view()) {
+    if (!body.nodes.has(slot)) return false;
+    return switch (body.nodes.callee(slot).view()) {
         .method => |mi| mi < prog.methods.len and !prog.methods[mi].is_static and prog.methods[mi].mut_self,
         else => false,
     };

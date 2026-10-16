@@ -524,6 +524,9 @@ pub const GraphResult = struct {
     bodies: Body.List = .{},
     /// Each fn's boxed locals by global id, which its body borrows. Owned.
     fn_boxed: []const []const u32 = &.{},
+    /// The nodes the monomorphization tail's call scans visited: a work count that must
+    /// grow linearly with the program, which a test can pin where a timing would flake.
+    mono_scanned_nodes: usize = 0,
 
     pub fn deinit(self: *GraphResult, gpa: std.mem.Allocator) void {
         for (self.node_types) |nt| gpa.free(nt);
@@ -618,8 +621,7 @@ fn buildBodies(
             .mod = f.module,
             .decl = f.decl_node,
             .sig = sigs[gid],
-            .node_types = node_types[f.module],
-            .callees = callees[f.module],
+            .nodes = .{ .types = node_types[f.module], .callees = callees[f.module] },
             .boxed = if (gid < fn_boxed.len) fn_boxed[gid] else &.{},
         });
     }
@@ -629,8 +631,7 @@ fn buildBodies(
         .mod = inst.mod,
         .decl = inst.decl_node,
         .sig = .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret, .mut_mask = sigs[inst.template_gid].mut_mask },
-        .node_types = inst.node_types,
-        .callees = inst.callees,
+        .nodes = inst.nodes(),
         .boxed = inst.boxed,
     });
     return .{ .items = try list.toOwnedSlice(gpa), .n_base = n_base };
@@ -1600,6 +1601,9 @@ reified_names: std.ArrayList([]u8) = .empty,
 /// so an unbounded `f[T] -> f[Box[T]]` yields exactly one diagnostic at `-j1`/`-jN`.
 mono_depth_capped: bool = false,
 
+/// The nodes `scanCalls` has visited (see `GraphResult.mono_scanned_nodes`).
+mono_scanned_nodes: usize = 0,
+
 /// Per-global-fn-id poison flags: true for a BOUNDED generic template whose
 /// bound-as-axiom body check (`bodyUnit`) emitted at least one diagnostic. The mono
 /// tail (`enqueueInstance`) skips instantiating a poisoned template so a definition
@@ -2197,6 +2201,7 @@ pub fn checkGraph(
         .adapters = adapters,
         .lambda_units = lambda_units,
         .owner_closures = owner_closures,
+        .mono_scanned_nodes = t.mono_scanned_nodes,
         .bodies = bodies,
         .fn_boxed = fn_boxed,
     };
@@ -2220,8 +2225,9 @@ fn sealCalls(
     const V = struct {
         gpa: std.mem.Allocator,
         view: Mono.CallView,
+        /// The view's callees, writable.
         callees: []Callee,
-        instances: []const Mono.Instance,
+        instances: *const Mono.Lookup,
         sigs: []const Sig,
 
         fn seal(self: *const @This(), call: Ast.Index) !void {
@@ -2229,7 +2235,9 @@ fn sealCalls(
             const n = tree.nodes[call.int()];
             if (n.tag != .call or n.lhs == Ast.none) return;
             const slot = Callee.callSlot(tree, n).?;
-            if (slot.int() >= self.callees.len or self.callees[slot.int()].tag != .none) return;
+            if (!self.view.nodes.has(slot)) return;
+            const out = &self.callees[slot.int() - self.view.nodes.base];
+            if (out.tag != .none) return;
             const cn = tree.nodes[n.lhs.int()];
             switch (cn.tag) {
                 .type_app, .identifier, .field_access => {},
@@ -2246,8 +2254,8 @@ fn sealCalls(
                 const targ_nodes = Ast.rangeSlice(tree, cn.rhs.int());
                 const targs = try self.gpa.alloc(Type, targ_nodes.len);
                 defer self.gpa.free(targs);
-                for (targ_nodes, targs) |tn, *ta| ta.* = self.view.node_types[tn.int()];
-                if (Mono.find(self.instances, gid, targs)) |ii| break :blk Callee.instanceCall(@intCast(ii));
+                for (targ_nodes, targs) |tn, *ta| ta.* = self.view.nodes.typeOf(tn);
+                if (self.instances.find(gid, targs)) |ii| break :blk Callee.instanceCall(@intCast(ii));
                 break :blk if (generic) Callee.genericCall(gid) else .{};
             } else if (!generic)
                 Callee.direct(gid)
@@ -2255,7 +2263,7 @@ fn sealCalls(
                 Callee.instanceCall(@intCast(ii))
             else
                 Callee.genericCall(gid);
-            self.callees[slot.int()] = c;
+            out.* = c;
         }
 
         pub fn on(self: *@This(), ev: Walk.Event) !void {
@@ -2265,14 +2273,15 @@ fn sealCalls(
             }
         }
     };
+    var lookup = try Mono.Lookup.init(gpa, instances);
+    defer lookup.deinit(gpa);
     for (graph.mods, node_types, callees) |*mc, nts, cs| {
-        const v: V = .{ .gpa = gpa, .view = .{ .tree = mc.tree, .resolutions = mc.resolutions, .node_types = nts, .templates = .{ .sigs = sigs } }, .callees = cs, .instances = instances, .sigs = sigs };
+        const v: V = .{ .gpa = gpa, .view = .{ .tree = mc.tree, .resolutions = mc.resolutions, .nodes = .{ .types = nts, .callees = cs }, .templates = .{ .sigs = sigs } }, .callees = cs, .instances = &lookup, .sigs = sigs };
         for (0..mc.tree.nodes.len) |i| try v.seal(Ast.Index.from(@intCast(i)));
     }
-    // An instance's slice spans its template's whole module; only its own body is typed.
     for (instances) |inst| {
         const mc = &graph.mods[inst.mod];
-        var v: V = .{ .gpa = gpa, .view = .{ .tree = mc.tree, .resolutions = mc.resolutions, .node_types = inst.node_types, .templates = .{ .sigs = sigs } }, .callees = inst.callees, .instances = instances, .sigs = sigs };
+        var v: V = .{ .gpa = gpa, .view = .{ .tree = mc.tree, .resolutions = mc.resolutions, .nodes = inst.nodes(), .templates = .{ .sigs = sigs } }, .callees = inst.callees, .instances = &lookup, .sigs = sigs };
         try Walk.walk(.{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, inst.decl_node, &v);
     }
 }
@@ -2529,8 +2538,11 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
         seen.deinit(t.gpa);
     }
 
-    // Seed: scan every non-generic user fn's body (in fn-id order) for call-position
-    // generic calls, reading the Pass-C-populated per-module node_types.
+    // Seed: scan each module that holds a non-generic user fn for call-position generic
+    // calls, reading the Pass-C-populated per-module node_types, in the order of each
+    // module's first such fn. A scan per fn would see its whole module each time (only
+    // template bodies stay untyped in it), and `seen` would drop every repeat: O(fns x
+    // calls) for the same worklist.
     const nts = t.gph_node_types orelse return; // graph mode always sets it
     const cs = t.gph_callees.?;
     // Each template's facts as the checker holds them: `generic_params.len` is the count.
@@ -2538,10 +2550,30 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     defer t.gpa.free(template_refs);
     for (model.fns, template_refs) |f, *r| r.* = if (f.isGeneric()) .{ .params = f.params, .count = @intCast(f.generic_params.len) } else null;
     const templates: Mono.Templates = .{ .refs = .{ .of = template_refs, .decomposer = t.composite.decomposer() } };
+    const seeded = try t.gpa.alloc(bool, nts.len);
+    defer t.gpa.free(seeded);
+    @memset(seeded, false);
     for (model.fns) |f| {
         if (f.kind != .user_fn or f.isGeneric()) continue; // bodyless builtins/externs have no calls
-        try t.scanCalls(model, templates, f.mod, nts[f.mod], cs[f.mod], &worklist, &seen);
+        if (seeded[f.mod]) continue;
+        seeded[f.mod] = true;
+        try t.scanCalls(model, templates, f.mod, nts[f.mod], cs[f.mod], .{ .start = 0, .end = @intCast(nts[f.mod].len) }, &worklist, &seen);
     }
+    // Each template's decl subtree range, computed once and shared by its instances.
+    const spans = try t.gpa.alloc(?NodeRange, model.fns.len);
+    defer t.gpa.free(spans);
+    @memset(spans, null);
+    // One module-sized pair of tables per module, which every instance re-check in it
+    // writes and resets: the instance keeps only its template's decl range (`Body.Nodes`).
+    const scratch = try t.gpa.alloc(?NodeSlots, nts.len);
+    defer {
+        for (scratch) |sc| if (sc) |x| {
+            t.gpa.free(x.node_types);
+            t.gpa.free(x.callees);
+        };
+        t.gpa.free(scratch);
+    }
+    @memset(scratch, null);
 
     var capped = false;
     var idx: usize = 0;
@@ -2557,10 +2589,28 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
             break;
         }
         const p = worklist.items[idx];
-        const inst = try t.recheck(model, p.gid, p.args);
+        const f = model.fns[p.gid];
+        const span = spans[p.gid] orelse blk: {
+            const r = try t.declRange(f.mod, f.decl_node);
+            spans[p.gid] = r;
+            break :blk r;
+        };
+        const sc = scratch[f.mod] orelse blk: {
+            const n = t.graph.mods[f.mod].tree.nodes.len;
+            const sc_nt = try t.gpa.alloc(Type, n);
+            errdefer t.gpa.free(sc_nt);
+            const x: NodeSlots = .{ .node_types = sc_nt, .callees = try t.gpa.alloc(Callee, n) };
+            @memset(x.node_types, .invalid);
+            @memset(x.callees, .{});
+            scratch[f.mod] = x;
+            break :blk x;
+        };
+        const inst = try t.recheck(model, p.gid, p.args, span, sc);
         try t.mono.append(t.gpa, inst);
-        // Discover nested generic calls in the instance body (its own node_types).
-        try t.scanCalls(model, templates, inst.mod, inst.node_types, inst.callees, &worklist, &seen);
+        // Discover nested generic calls in the instance body, on the tables it was checked into.
+        try t.scanCalls(model, templates, inst.mod, sc.node_types, sc.callees, span, &worklist, &seen);
+        @memset(sc.node_types[span.start..span.end], .invalid);
+        @memset(sc.callees[span.start..span.end], .{});
     }
 
     // Reification: mint a fresh concrete `struct_id` for every reachable ground
@@ -2581,9 +2631,9 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     // A mangled name is a pure function of (template name, arg tuple); two distinct
     // instances therefore never collide (Debug/ReleaseSafe guard).
     if (std.debug.runtime_safety) {
-        for (t.mono.items, 0..) |a, i| {
-            for (t.mono.items[i + 1 ..]) |b| std.debug.assert(!std.mem.eql(u8, a.name.?, b.name.?));
-        }
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        defer names.deinit(t.gpa);
+        for (t.mono.items) |inst| std.debug.assert(!(try names.getOrPut(t.gpa, inst.name.?)).found_existing);
     }
 
     // Append a REIFIED-DISPATCH `Method` entry for each reachable
@@ -2650,8 +2700,8 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
 
 /// Resolve every pending slot: only now are receiver types reified and every method row appended.
 fn sealCallees(t: *Typecheck) void {
-    for (t.gph_node_types.?, t.gph_callees.?, 0..) |nts, cs, m| t.sealSlice(@intCast(m), nts, cs);
-    for (t.mono.items) |inst| t.sealSlice(inst.mod, inst.node_types, inst.callees);
+    for (t.gph_node_types.?, t.gph_callees.?, 0..) |nts, cs, m| t.sealSlice(@intCast(m), .{ .types = nts, .callees = cs }, cs);
+    for (t.mono.items) |inst| t.sealSlice(inst.mod, inst.nodes(), inst.callees);
     if (builtin.mode == .Debug) t.sealed_methods_len = t.methods.items.len;
 }
 
@@ -2660,19 +2710,19 @@ fn sealCallees(t: *Typecheck) void {
 /// arg types), so the order slots are sealed in cannot matter. An unresolvable slot
 /// becomes `.none` rather than a panic: `toy check` accepts such a program and only
 /// codegen rejects it.
-fn sealSlice(t: *const Typecheck, mod: u32, nts: []const Type, cs: []Callee) void {
+fn sealSlice(t: *const Typecheck, mod: u32, nodes: Body.Nodes, cs: []Callee) void {
     const mc = &t.graph.mods[mod];
     const site = Site.of(mc.bundled);
-    for (cs, 0..) |*c, i| {
+    for (cs, nodes.base..) |*c, i| {
         if (!c.isPending() or c.tag == .pending_template) continue;
         const fa = mc.tree.nodes[i];
         const member = mc.tokens[fa.main_token].text(mc.source);
         if (c.tag == .pending_call) {
-            const crumb = cs[c.id];
-            c.* = t.pickInstanceRow(mc, nts, fa, member, c.id, if (crumb.tag == .pending_template) crumb else null);
+            const crumb = nodes.callee(Ast.Index.from(c.id));
+            c.* = t.pickInstanceRow(mc, nodes, fa, member, c.id, if (crumb.tag == .pending_template) crumb else null);
             continue;
         }
-        c.* = switch (pickMethodIndex(t.methods.items, nts[fa.lhs.int()], member, null, null, site)) {
+        c.* = switch (pickMethodIndex(t.methods.items, nodes.typeOf(fa.lhs), member, null, null, site)) {
             .one => |mi| if (c.tag == .pending_bound) Callee.boundMethod(mi) else Callee.method(mi),
             .none, .ambiguous => .{},
         };
@@ -2693,12 +2743,12 @@ fn sealSlice(t: *const Typecheck, mod: u32, nts: []const Type, cs: []Callee) voi
 /// template. A call with explicit type args (`crumb`) takes only its template's rows, and
 /// when the args are the method's own, the row whose instance has them: a type param
 /// that no value param names (`fn none[U](self) -> Option[U]`) leaves the arg types alike.
-fn pickInstanceRow(t: *const Typecheck, mc: *const GraphCtx.ModuleCtx, nts: []const Type, fa: Ast.Node, member: []const u8, call: u32, crumb: ?Callee) Callee {
-    const recv = nts[fa.lhs.int()];
+fn pickInstanceRow(t: *const Typecheck, mc: *const GraphCtx.ModuleCtx, nodes: Body.Nodes, fa: Ast.Node, member: []const u8, call: u32, crumb: ?Callee) Callee {
+    const recv = nodes.typeOf(fa.lhs);
     const site = Site.of(mc.bundled);
     const call_node = mc.tree.nodes[call];
     const args = Ast.rangeSlice(mc.tree, call_node.rhs.int());
-    for (args) |a| if (nts[a.int()].kind == .invalid) return t.templateCallee(recv, member, site);
+    for (args) |a| if (nodes.typeOf(a).kind == .invalid) return t.templateCallee(recv, member, site);
     const explicit: []const Ast.Index = if (crumb != null and crumb.?.aux == 1) Ast.rangeSlice(mc.tree, mc.tree.nodes[call_node.lhs.int()].rhs.int()) else &.{};
     for ([_]u1{ 0, 1 }) |pass| {
         rows: for (t.methods.items, 0..) |m, mi| {
@@ -2708,12 +2758,12 @@ fn pickInstanceRow(t: *const Typecheck, mc: *const GraphCtx.ModuleCtx, nts: []co
             if (crumb) |cr| {
                 const inst = t.mono.items[ii];
                 if (inst.template_gid != cr.id or inst.args.len < explicit.len) continue;
-                for (inst.args[inst.args.len - explicit.len ..], explicit) |ia, e| if (!Type.eql(ia, nts[e.int()])) continue :rows;
+                for (inst.args[inst.args.len - explicit.len ..], explicit) |ia, e| if (!Type.eql(ia, nodes.typeOf(e))) continue :rows;
             }
             const ps = t.mono.items[ii].params;
             const off: usize = if (m.is_static) 0 else 1;
             if (ps.len != args.len + off) continue;
-            for (ps[off..], args) |p, a| if (!Type.assignable(p, nts[a.int()])) continue :rows;
+            for (ps[off..], args) |p, a| if (!Type.assignable(p, nodes.typeOf(a))) continue :rows;
             return Callee.method(@intCast(mi));
         }
     }
@@ -2881,18 +2931,46 @@ fn ownGenericArgs(gpa: std.mem.Allocator, composite: *Composite, mf: FnSym, has_
     return Infer.infer(gpa, @intCast(mf.generic_params.len), params, arg_types, composite.decomposer());
 }
 
-/// Scan module `mod`'s nodes for call-position generic calls (and generic-type methods
-/// bound as values, from `callees`), reading `node_types` for the concrete type-args,
-/// and enqueue each new `(gid, args)`. Uniform for the
-/// base seed (module node_types) and an instance re-check (the instance's own
-/// node_types — other fns' nodes stay `.invalid` there, so only THIS body's calls
-/// are seen).
-fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod: u32, node_types: []const Type, callees: []const Callee, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void)) !void {
+/// A half-open run `[start, end)` of one module's node indices.
+const NodeRange = struct { start: u32, end: u32 };
+
+/// The node range of the decl subtree at `decl` in module `mod`: every node an instance
+/// re-check of that fn can type. The parser builds children before their parent, so the
+/// decl is the subtree's last node; the walk finds its first (an impl method's receiver
+/// type is the impl's, built before the method).
+fn declRange(t: *const Typecheck, mod: u32, decl: Ast.Index) !NodeRange {
+    const mc = &t.graph.mods[mod];
+    var v: struct {
+        lo: u32 = std.math.maxInt(u32),
+        hi: u32 = 0,
+        pub fn on(self: *@This(), ev: Walk.Event) void {
+            switch (ev) {
+                .enter => |e| {
+                    self.lo = @min(self.lo, e.idx.int());
+                    self.hi = @max(self.hi, e.idx.int());
+                },
+                else => {},
+            }
+        }
+    } = .{};
+    try Walk.walk(.{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, decl, &v);
+    return .{ .start = v.lo, .end = v.hi + 1 };
+}
+
+/// Scan module `mod`'s nodes in `range` for call-position generic calls (and generic-type
+/// methods bound as values, from `callees`), reading `node_types` for the concrete
+/// type-args, and enqueue each new `(gid, args)`. Uniform for the base seed (a whole
+/// module's node_types) and an instance re-check (the instance's own node_types over its
+/// template's decl range — nodes outside the body stay `.invalid` there, so only THIS
+/// body's calls are seen).
+fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod: u32, node_types: []const Type, callees: []const Callee, range: NodeRange, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void)) !void {
     const mc = &t.graph.mods[mod];
     const tree = mc.tree;
     const resolutions = mc.resolutions;
-    const view: Mono.CallView = .{ .tree = tree, .resolutions = resolutions, .node_types = node_types, .templates = templates };
-    for (tree.nodes, 0..) |n, ci| {
+    const view: Mono.CallView = .{ .tree = tree, .resolutions = resolutions, .nodes = .{ .types = node_types, .callees = callees }, .templates = templates };
+    const nodes = tree.nodes[range.start..range.end];
+    t.mono_scanned_nodes += nodes.len;
+    for (nodes, range.start..) |n, ci| {
         if (n.tag != .call or n.lhs == Ast.none) continue;
         const call_at: Anchor = .{ .node = Ast.Index.from(@intCast(ci)) };
         // The explicit-turbofish `id[int](..)` and bare-inferred `id(7)` shapes route
@@ -2970,7 +3048,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
     // An annotated empty-list literal `xs: Vec[int] = []` desugars to the type's
     // associated `new()`: discover that instance from the literal's typed `Vec[int]`
     // receiver, mirroring the `Type[int].new()` field_access branch above.
-    for (tree.nodes, 0..) |n, i| {
+    for (nodes, range.start..) |n, i| {
         if (n.tag != .empty_list) continue;
         for (StdNames.desugarMethods(.empty_list)) |dm| {
             const recv = desugarRecvType(node_types, n, i, dm.recv);
@@ -2984,7 +3062,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
     // The method set + receiver source come from the shared `desugarMethods` table so
     // discovery enqueues exactly what lower emits. Lower resolves a desugar at the
     // program's site wherever it is written, so discovery does too.
-    for (tree.nodes, 0..) |n, i| {
+    for (nodes, range.start..) |n, i| {
         switch (n.tag) {
             .list_literal, .for_in_stmt, .for_in2_stmt => {
                 for (StdNames.desugarMethods(n.tag)) |dm| {
@@ -3171,24 +3249,18 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
 }
 
 /// Re-check one generic instance: substitute the template's params/ret to concrete
-/// types, allocate a FRESH per-instance `node_types`, and walk the template body
-/// with a substitution-seeded `BodyChecker` so every node types concretely. Returns
-/// an owning `Instance` (name filled after the canonical sort).
-fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mono.Instance {
+/// types and walk the template body with a substitution-seeded `BodyChecker` so every
+/// node types concretely. Returns an owning `Instance` (name filled after the canonical
+/// sort). The body is checked into `sc`, its module's unchecked scratch tables, and the
+/// instance keeps its own copy of `span`, the template's decl range; the caller resets
+/// that range.
+fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type, span: NodeRange, sc: NodeSlots) !Mono.Instance {
     const f = model.fns[gid];
 
     const params = try t.gpa.alloc(Type, f.params.len);
     errdefer t.gpa.free(params);
     for (f.params, 0..) |p, i| params[i] = t.substType(p, args);
     const ret = t.substType(f.ret, args);
-
-    const node_count = t.graph.mods[f.mod].tree.nodes.len;
-    const inst_nt = try t.gpa.alloc(Type, node_count);
-    errdefer t.gpa.free(inst_nt);
-    @memset(inst_nt, .invalid);
-    const inst_callees = try t.gpa.alloc(Callee, node_count);
-    errdefer t.gpa.free(inst_callees);
-    @memset(inst_callees, .{});
 
     const args_owned = try t.gpa.dupe(Type, args);
     errdefer t.gpa.free(args_owned);
@@ -3201,10 +3273,21 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mo
     fsub.params = params;
     fsub.ret = ret;
 
-    var bc = t.bodyCheckerFor(model, fsub, .{ .node_types = inst_nt, .callees = inst_callees });
+    var bc = t.bodyCheckerFor(model, fsub, sc);
     defer bc.deinit();
     bc.subst = .{ .names = f.generic_params, .types = args };
     try bc.checkBody(gid, fsub);
+    // The instance keeps only `span`, so a write outside it would be lost.
+    if (builtin.is_test) {
+        for (sc.node_types[0..span.start]) |ty| std.debug.assert(ty.kind == .invalid);
+        for (sc.node_types[span.end..]) |ty| std.debug.assert(ty.kind == .invalid);
+        for (sc.callees[0..span.start]) |c| std.debug.assert(c.tag == .none);
+        for (sc.callees[span.end..]) |c| std.debug.assert(c.tag == .none);
+    }
+    const inst_nt = try t.gpa.dupe(Type, sc.node_types[span.start..span.end]);
+    errdefer t.gpa.free(inst_nt);
+    const inst_callees = try t.gpa.dupe(Callee, sc.callees[span.start..span.end]);
+    errdefer t.gpa.free(inst_callees);
     // Merge the instance's diagnostics into the shared stream (sorted at the end).
     try t.sink.merge(&bc.sink);
     // A derivable-struct `==` reached ONLY from an unbounded generic body is seen for the
@@ -3233,6 +3316,7 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type) !Mo
         .args = args_owned,
         .node_types = inst_nt,
         .callees = inst_callees,
+        .node_base = span.start,
         .params = params,
         .ret = ret,
         .name = null, // minted in canonical order after the sort
@@ -4306,6 +4390,61 @@ test "repeated call sites of one (template,args) monomorphize to ONE instance (d
     try testing.expectEqualStrings("main.id$int", c.result.instances[0].name.?);
 }
 
+const MonoShape = enum { generic_fn, own_generic, instances, late_template };
+
+/// A program of `n` fns or instances in one module: `n` fns calling a generic fn, `n` fns
+/// calling an own-generic method at three types, or one fn making `n` distinct instances of
+/// a generic fn declared first or last.
+fn monoShapeSource(gpa: std.mem.Allocator, shape: MonoShape, n: usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    switch (shape) {
+        .generic_fn => {
+            try out.appendSlice(gpa, "fn id[T](x: T) -> T { x }\n");
+            for (0..n) |k| try out.print(gpa, "fn _pad{d}(a: int) -> int {{ id(a) + id({d}) }}\n", .{ k, k });
+            try out.appendSlice(gpa, "fn main() -> int { return 0 }\n");
+        },
+        .own_generic => {
+            try out.appendSlice(gpa, "struct Box[T] { v: T }\nimpl Box[T] {\n    fn pick[U](self, a: U, _b: U) -> U { a }\n}\n");
+            for (0..n) |k| try out.print(gpa, "fn _pad{d}(b: Box[int]) -> int {{ b.pick({d}, 1) + (if b.pick(true, false) {{ 1 }} else {{ 0 }}) + b.pick(\"s\", \"t\").len() }}\n", .{ k, k });
+            try out.appendSlice(gpa, "fn main() -> int { return 0 }\n");
+        },
+        .instances, .late_template => {
+            if (shape == .instances) try out.appendSlice(gpa, "fn id[T](x: T) -> T { x }\n");
+            for (0..n) |k| try out.print(gpa, "struct S{d} {{ v: int }}\n", .{k});
+            try out.appendSlice(gpa, "fn main() -> int {\n    t := 0\n");
+            for (0..n) |k| try out.print(gpa, "    t = t + id(S{d} {{ v: {d} }}).v\n", .{ k, k });
+            try out.appendSlice(gpa, "    return t\n}\n");
+            if (shape == .late_template) try out.appendSlice(gpa, "fn id[T](x: T) -> T { x }\n");
+        },
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "the monomorphization scans and instance tables at most double when the program doubles" {
+    // A scan or a table the size of the module per fn or per instance doubles both their
+    // count and their size, so 2N costs 4x (#41). Counting nodes pins it where a timing flakes.
+    const gpa = testing.allocator;
+    for ([_]MonoShape{ .generic_fn, .own_generic, .instances, .late_template }) |shape| {
+        var scanned: [2]usize = undefined;
+        var slots: [2]usize = undefined;
+        for ([_]usize{ 40, 80 }, &scanned, &slots) |n, *out, *slot_out| {
+            const src = try monoShapeSource(gpa, shape, n);
+            defer gpa.free(src);
+            var c = try checkSource(src);
+            defer c.deinit(gpa);
+            try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+            if (shape == .instances or shape == .late_template) try testing.expectEqual(n, c.result.instances.len);
+            out.* = c.result.mono_scanned_nodes;
+            slot_out.* = 0;
+            for (c.result.instances) |inst| slot_out.* += inst.node_types.len + inst.callees.len;
+        }
+        errdefer std.debug.print("{s}: {d}/{d} nodes scanned, {d}/{d} table slots at N=40/80\n", .{ @tagName(shape), scanned[0], scanned[1], slots[0], slots[1] });
+        try testing.expect(scanned[1] <= 2 * scanned[0]);
+        try testing.expect(slots[1] <= 2 * slots[0]);
+    }
+}
+
 test "an uninstantiated generic enum (and struct) is clean and reifies NOTHING" {
     const gpa = testing.allocator;
     // A generic enum decl is NO LONGER gated; UNinstantiated it is
@@ -4730,7 +4869,7 @@ test "Modes.argMask agrees with every call shape" {
     );
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
-    const body: Body.BodyView = .{ .tree = c.tree, .resolutions = c.resolve.resolutions[0], .node_types = c.result.node_types[0], .callees = c.result.callees[0] };
+    const body: Body.BodyView = .{ .tree = c.tree, .resolutions = c.resolve.resolutions[0], .nodes = .{ .types = c.result.node_types[0], .callees = c.result.callees[0] } };
     const prog: Body.ProgramView = .{ .sigs = c.result.sigs, .methods = c.result.methods, .instances = c.result.instances };
     const cases = [_]struct { name: []const u8, nth: usize, mask: u64 }{
         .{ .name = "bump", .nth = 0, .mask = 0b1 }, // direct
@@ -9673,7 +9812,7 @@ test "template spans: the module slice holds the abstract pick, each instance sl
     for (c.result.instances) |inst| {
         const name = c.resolve.fns[inst.template_gid].name;
         if (std.mem.endsWith(u8, name, "hashit")) {
-            const v = inst.callees[hash_fa].view();
+            const v = inst.nodes().callee(Ast.Index.from(hash_fa)).view();
             if (inst.args[0].kind == .int) {
                 try testing.expectEqual(Callee.View{ .builtin = .scalar_hash }, v);
                 saw_int = true;
@@ -9682,7 +9821,7 @@ test "template spans: the module slice holds the abstract pick, each instance sl
                 saw_pt = true;
             }
         } else if (std.mem.endsWith(u8, name, "twice")) {
-            const mi = inst.callees[dbl_fa].view().method;
+            const mi = inst.nodes().callee(Ast.Index.from(dbl_fa)).view().method;
             try testing.expectEqual(@as(?u32, abstract.protocol), c.result.methods[mi].protocol_id);
             saw_acc = true;
         }

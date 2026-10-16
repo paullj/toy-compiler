@@ -56,12 +56,12 @@ pub fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Va
     switch (n.tag) {
         .identifier => {
             if (b.in.resolutions[(node_idx).int()] != .local) return Ir.none_value;
-            return try homeAddr(b, try bindingHome(b, node_idx, b.in.node_types[(node_idx).int()]));
+            return try homeAddr(b, try bindingHome(b, node_idx, b.in.nodes.typeOf(node_idx)));
         },
         .field_access, .tuple_field => {
             const base_addr = try lowerPlaceAddr(b, n.lhs);
             if (base_addr == Ir.none_value) return Ir.none_value;
-            const base_ty = b.in.node_types[(n.lhs).int()];
+            const base_ty = b.in.nodes.typeOf(n.lhs);
             if (base_ty.kind != .@"struct") return Ir.none_value;
             const layout = b.in.layouts[base_ty.struct_id];
             const fname = b.in.tokens[n.main_token].text(b.in.source);
@@ -96,7 +96,7 @@ pub fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Va
         // silently reads a stale register, or crashes when used in arithmetic. The
         // checker rejects a store through such a base (T0075), so this read-only
         // materialization can never alias a real place.
-        else => switch (L.passKind(b, b.in.node_types[(node_idx).int()])) {
+        else => switch (L.passKind(b, b.in.nodes.typeOf(node_idx))) {
             .str, .@"struct", .@"enum" => {
                 const op = try L.lowerExpr(b, node_idx);
                 return try L.operandPtr(b, op);
@@ -195,7 +195,7 @@ fn readsOf(b: *const Builder, expr: Ast.Index, li: u32) Reads {
                     else => {},
                 },
                 .call, .index, .type_app, .for_in_stmt, .for_in2_stmt => v.r.runs_code = true,
-                .binary => switch (in.node_types[in.tree.nodes[e.idx.int()].lhs.int()].kind) {
+                .binary => switch (in.nodes.typeOf(in.tree.nodes[e.idx.int()].lhs).kind) {
                     .@"struct", .@"enum" => v.r.runs_code = true,
                     else => {},
                 },

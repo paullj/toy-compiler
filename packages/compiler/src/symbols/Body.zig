@@ -24,10 +24,38 @@ decl: Ast.Index,
 /// under its mangled name, with its template's modes, since modes are syntactic. So
 /// `sig.mut_mask` is the body's `mut` params, `mut self` first.
 sig: Sig,
-node_types: []const Type,
-callees: []const Callee,
+nodes: Nodes,
 /// Its boxed locals: resolver slots, ascending.
 boxed: []const u32,
+
+/// A body's types and call selections for a run of its module's nodes, indexed by module
+/// node index. A fn's run is its whole module; an instance's is its template's decl range,
+/// since a module-sized pair per instance made N instances of a template declared late in
+/// a large module cost O(N x module) (#41). A node before `base` reads as unchecked, as it
+/// would in a module-sized table; one past the end has no slot.
+pub const Nodes = struct {
+    base: u32 = 0,
+    types: []const Type = &.{},
+    /// Parallel to `types`.
+    callees: []const Callee = &.{},
+
+    pub fn typeOf(n: Nodes, idx: Ast.Index) Type {
+        const i = idx.int();
+        return if (i < n.base) .invalid else n.types[i - n.base];
+    }
+
+    /// Whether node `idx` has a slot.
+    pub fn has(n: Nodes, idx: Ast.Index) bool {
+        const i = idx.int();
+        return i >= n.base and i - n.base < n.types.len;
+    }
+
+    /// Node `idx`'s call selection, `.none` when it has no slot.
+    pub fn callee(n: Nodes, idx: Ast.Index) Callee {
+        const i = idx.int();
+        return if (i < n.base or i - n.base >= n.callees.len) .{} else n.callees[i - n.base];
+    }
+};
 
 /// What a body lowers: a fn by global id, or an instance by its index in the instance
 /// table.
@@ -37,7 +65,7 @@ pub const Of = union(enum) { base: u32, instance: u32 };
 pub const Index = u32;
 
 pub fn view(b: Body, tree: Ast.Tree, resolutions: []const Resolution) BodyView {
-    return .{ .tree = tree, .resolutions = resolutions, .node_types = b.node_types, .callees = b.callees };
+    return .{ .tree = tree, .resolutions = resolutions, .nodes = b.nodes };
 }
 
 /// The program's bodies, the base fns first.
@@ -67,8 +95,7 @@ pub const List = struct {
 pub const BodyView = struct {
     tree: Ast.Tree,
     resolutions: []const Resolution,
-    node_types: []const Type,
-    callees: []const Callee,
+    nodes: Nodes,
 };
 
 /// The program-wide tables a body's calls and values are read against.
@@ -84,13 +111,26 @@ pub const ProgramView = struct {
 test "a fn's body is found by its global id, an instance's by its index" {
     const sig: Sig = .{ .kind = .user_fn, .name = "f", .params = &.{}, .ret = Type.unit };
     const b = [_]Body{
-        .{ .of = .{ .base = 2 }, .mod = 0, .decl = Ast.none, .sig = sig, .node_types = &.{}, .callees = &.{}, .boxed = &.{} },
-        .{ .of = .{ .base = 5 }, .mod = 0, .decl = Ast.none, .sig = sig, .node_types = &.{}, .callees = &.{}, .boxed = &.{} },
-        .{ .of = .{ .instance = 0 }, .mod = 0, .decl = Ast.none, .sig = sig, .node_types = &.{}, .callees = &.{}, .boxed = &.{} },
+        .{ .of = .{ .base = 2 }, .mod = 0, .decl = Ast.none, .sig = sig, .nodes = .{}, .boxed = &.{} },
+        .{ .of = .{ .base = 5 }, .mod = 0, .decl = Ast.none, .sig = sig, .nodes = .{}, .boxed = &.{} },
+        .{ .of = .{ .instance = 0 }, .mod = 0, .decl = Ast.none, .sig = sig, .nodes = .{}, .boxed = &.{} },
     };
     const l: List = .{ .items = &b, .n_base = 2 };
     try std.testing.expectEqual(@as(?Index, 0), l.ofFn(2));
     try std.testing.expectEqual(@as(?Index, 1), l.ofFn(5));
     try std.testing.expectEqual(@as(?Index, null), l.ofFn(3));
     try std.testing.expectEqual(@as(Index, 2), l.ofInstance(0));
+}
+
+test "a body's nodes read unchecked before their base and by offset after it" {
+    const types = [_]Type{ Type.int, Type.bool };
+    const callees = [_]Callee{ .{}, Callee.direct(4) };
+    const n: Nodes = .{ .base = 3, .types = &types, .callees = &callees };
+    try std.testing.expect(!n.has(Ast.Index.from(2)));
+    try std.testing.expect(n.has(Ast.Index.from(3)) and n.has(Ast.Index.from(4)));
+    try std.testing.expect(!n.has(Ast.Index.from(5)));
+    try std.testing.expect(n.typeOf(Ast.Index.from(2)).kind == .invalid);
+    try std.testing.expect(Type.eql(Type.bool, n.typeOf(Ast.Index.from(4))));
+    try std.testing.expectEqual(Callee.direct(4), n.callee(Ast.Index.from(4)));
+    try std.testing.expectEqual(@as(Callee, .{}), n.callee(Ast.Index.from(5)));
 }

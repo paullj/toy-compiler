@@ -58,9 +58,8 @@ pub const Inputs = struct {
     tokens: []const Token,
     source: []const u8,
     resolutions: []const Resolve.Resolution,
-    node_types: []const Typecheck.Type,
-    /// The checker's per-call method selection (symbols/Callee.zig), parallel to `node_types`.
-    callees: []const Callee,
+    /// This body's node types and per-call method selections (symbols/Callee.zig).
+    nodes: Body.Nodes,
     layouts: []const Typecheck.Layout,
     enum_layouts: []const Typecheck.EnumLayout,
     names: []const Link.SymName,
@@ -112,7 +111,7 @@ pub const Inputs = struct {
     closure: ClosureInputs,
 
     pub fn bodyView(in: *const Inputs) Body.BodyView {
-        return .{ .tree = in.tree, .resolutions = in.resolutions, .node_types = in.node_types, .callees = in.callees };
+        return .{ .tree = in.tree, .resolutions = in.resolutions, .nodes = in.nodes };
     }
 
     pub fn programView(in: *const Inputs) Body.ProgramView {
@@ -358,7 +357,7 @@ pub fn lowerFn(
     is_entry: bool,
     out_diags: *std.ArrayList(Diagnostic),
 ) error{OutOfMemory}!Ir.Function {
-    std.debug.assert(in.callees.len == in.node_types.len);
+    std.debug.assert(in.nodes.callees.len == in.nodes.types.len);
     _ = is_entry; // the is_entry unit-main x0=0 contract is a codegen concern.
 
     const decl = in.tree.nodes[(fn_decl).int()];
@@ -530,13 +529,13 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
     const stmt = b.in.tree.nodes[(stmt_idx).int()];
     switch (stmt.tag) {
         .var_decl => {
-            const ty = b.in.node_types[(stmt_idx).int()];
+            const ty = b.in.nodes.typeOf(stmt_idx);
             const home = if (places.boxedBinding(b, stmt_idx)) |li| try places.bindBox(b, li, ty) else try places.localHome(b, stmt_idx, ty);
             try storeInto(b, home, stmt.lhs, ty);
         },
         .assign => {
             const target = b.in.tree.nodes[(stmt.lhs).int()];
-            const place_ty = b.in.node_types[(stmt.lhs).int()];
+            const place_ty = b.in.nodes.typeOf(stmt.lhs);
             if (target.tag == .field_access or target.tag == .tuple_field) {
                 try lowerFieldStore(b, stmt.lhs, stmt.rhs, place_ty);
                 return;
@@ -610,7 +609,7 @@ fn storeInto(b: *Builder, home: places.LocalHome, expr: Ast.Index, ty: Typecheck
 pub fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
     if (node_idx == Ast.none) return .none;
     const n = b.in.tree.nodes[(node_idx).int()];
-    const ty = b.in.node_types[(node_idx).int()];
+    const ty = b.in.nodes.typeOf(node_idx);
     // A check-time `type_var` / composite `App` / fn type is substituted/reified to a
     // concrete kind BEFORE lowering; if one reaches here, the mono tail missed a
     // node_types slot — trip loudly in Debug/ReleaseSafe rather than miscompile.
@@ -754,7 +753,7 @@ fn lowerIdentifier(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{O
 /// `Ref.new(v)`: box `v` into a fresh `gc_alloc`'d cell; the `Ref[T]` value IS the 8-byte
 /// cell pointer.
 fn lowerRefNew(b: *Builder, operand: Ast.Index, tok: u32) error{OutOfMemory}!Ir.Operand {
-    const t = b.in.node_types[(operand).int()];
+    const t = b.in.nodes.typeOf(operand);
     const cellptr = try emitGcAlloc(b, Abi.typeSize(t, b.in.layouts, b.in.enum_layouts));
     switch (passKind(b, t)) {
         .box => {
@@ -798,7 +797,7 @@ fn lowerUnary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!
             const v = try lowerExpr(b, n.lhs);
             // The checked type of the negation node carries its integer width, so
             // codegen re-canonicalizes a narrow `neg` (sxtb/and) at the right size.
-            return .{ .value = try b.emit(.{ .neg = operandValue(v) }, b.in.node_types[(node_idx).int()]) };
+            return .{ .value = try b.emit(.{ .neg = operandValue(v) }, b.in.nodes.typeOf(node_idx)) };
         },
         .bang => {
             const v = try lowerExpr(b, n.lhs);
@@ -806,7 +805,7 @@ fn lowerUnary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!
         },
         .tilde => {
             const v = try lowerExpr(b, n.lhs);
-            return .{ .value = try b.emit(.{ .bcompl = operandValue(v) }, b.in.node_types[(node_idx).int()]) };
+            return .{ .value = try b.emit(.{ .bcompl = operandValue(v) }, b.in.nodes.typeOf(node_idx)) };
         },
         else => {
             try b.note(n.main_token, "unary operator unsupported in lower");
@@ -840,7 +839,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
             // int stays an inline machine add/sub/mul/sdiv (bytes unchanged); a struct/enum
             // operand desugars to the resolved Add/Sub/Mul/Div witness via `lowerArithValue`
             //. The checker (T0028) has already proven a same-type conforming operand.
-            const lt = b.in.node_types[(n.lhs).int()];
+            const lt = b.in.nodes.typeOf(n.lhs);
             if (isInlineArith(lt.kind)) {
                 const lhs = operandValue(try lowerExpr(b, n.lhs));
                 const rhs = operandValue(try lowerExpr(b, n.rhs));
@@ -866,7 +865,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
         .lt, .lt_eq, .gt, .gt_eq => {
             // int/bool stay an inline `icmp` (bytes unchanged); str/struct/enum desugar to a
             // discriminant test on `Ord::cmp` via `lowerOrdValue`.
-            const lt = b.in.node_types[(n.lhs).int()];
+            const lt = b.in.nodes.typeOf(n.lhs);
             if (isInlineOrd(lt.kind)) {
                 const lhs = operandValue(try lowerExpr(b, n.lhs));
                 const rhs = operandValue(try lowerExpr(b, n.rhs));
@@ -878,7 +877,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
         .eq_eq, .bang_eq => {
             // int/bool stay an inline `icmp` (bytes unchanged); str/unit/struct/enum
             // desugar to `Eq::eq` via `lowerEqValue`.
-            const lt = b.in.node_types[(n.lhs).int()];
+            const lt = b.in.nodes.typeOf(n.lhs);
             if (isInlineEq(lt.kind)) {
                 const lhs = operandValue(try lowerExpr(b, n.lhs));
                 const rhs = operandValue(try lowerExpr(b, n.rhs));
@@ -889,7 +888,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
         },
         .amp_amp, .pipe_pipe => return try lowerAndOrValue(b, n, op),
         .amp, .pipe, .caret, .lt_lt, .gt_gt => {
-            const lt = b.in.node_types[(n.lhs).int()];
+            const lt = b.in.nodes.typeOf(n.lhs);
             const lhs = operandValue(try lowerExpr(b, n.lhs));
             const rhs = operandValue(try lowerExpr(b, n.rhs));
             const bin: Ir.Bin = .{ .lhs = lhs, .rhs = rhs };
@@ -907,7 +906,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
             // Integer-only builtin like the bitwise arm above (no Div-style witness path),
             // so it trusts the checker (T "operands of '%' must be int") rather than
             // re-guarding the operand kind.
-            const lt = b.in.node_types[(n.lhs).int()];
+            const lt = b.in.nodes.typeOf(n.lhs);
             const lhs = operandValue(try lowerExpr(b, n.lhs));
             const rhs = operandValue(try lowerExpr(b, n.rhs));
             try emitZeroGuard(b, rhs, lt, .rem_by_zero);
@@ -1574,7 +1573,7 @@ fn strBase(b: *Builder, node: Ast.Index) error{OutOfMemory}!Ir.ValueId {
 /// `FrameTooLarge`.
 fn lowerStrConcat(b: *Builder, node_idx: Ast.Index, lhs: Ast.Index, rhs: Ast.Index) error{OutOfMemory}!Ir.Operand {
     const int_ty = Typecheck.Type.int;
-    const res_ty = b.in.node_types[(node_idx).int()];
+    const res_ty = b.in.nodes.typeOf(node_idx);
 
     const lb = try strBase(b, lhs);
     const rb = try strBase(b, rhs);
@@ -2054,7 +2053,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         },
         .none => return lowerTypeIntrinsicCall(b, n),
     }
-    const result_ty = b.in.node_types[(node_idx).int()];
+    const result_ty = b.in.nodes.typeOf(node_idx);
 
     // Evaluate every arg left-to-right into an Operand (scalar→value, str→slot; a `mut`
     // param's arg is its place address). For a method call the receiver is the FIRST arg
@@ -2110,7 +2109,7 @@ fn lowerTypeIntrinsicCall(b: *Builder, n: Ast.Node) error{OutOfMemory}!Ir.Operan
         // `size_of[T]()` / `align_of[T]()`: a compile-time ABI constant (no call, no reloc).
         .size_of, .align_of => {
             const tnodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
-            const t = b.in.node_types[(tnodes[0]).int()];
+            const t = b.in.nodes.typeOf(tnodes[0]);
             const c: u32 = if (bik == .size_of)
                 Abi.typeSize(t, b.in.layouts, b.in.enum_layouts)
             else
@@ -2128,7 +2127,7 @@ fn lowerTypeIntrinsicCall(b: *Builder, n: Ast.Node) error{OutOfMemory}!Ir.Operan
         // link-time-resolved reloc, exactly like a string literal ptr).
         .descriptor_of => {
             const tnodes = Ast.rangeSlice(b.in.tree, (callee_node.rhs).int());
-            const t = b.in.node_types[(tnodes[0]).int()];
+            const t = b.in.nodes.typeOf(tnodes[0]);
             return .{ .value = try b.emit(.{ .cstr_ptr = try Link.descHash(b.gpa, t) }, Typecheck.Type.rawptr) };
         },
         else => {},
@@ -2143,7 +2142,7 @@ fn lowerIntrinsicCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node, ik: Intrins
     switch (ik) {
         .store => {
             const sargs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
-            const vty = b.in.node_types[(sargs[1]).int()];
+            const vty = b.in.nodes.typeOf(sargs[1]);
             const addr = operandValue(try lowerExpr(b, sargs[0]));
             // A zero-sized value (`()`) occupies no bytes: evaluate the value
             // expr for its effects, emit no store (the erased Map's value column
@@ -2165,7 +2164,7 @@ fn lowerIntrinsicCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node, ik: Intrins
         .load => {
             const largs = Ast.rangeSlice(b.in.tree, (n.rhs).int());
             const addr = operandValue(try lowerExpr(b, largs[0]));
-            const lty = b.in.node_types[(node_idx).int()];
+            const lty = b.in.nodes.typeOf(node_idx);
             // A load typed `()` yields the zero-sized unit value (`.none`): the
             // address was already evaluated for effect; read nothing (mp_val_at /
             // mp_grow when V = ()).
@@ -2220,13 +2219,13 @@ fn lowerIntrinsicCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node, ik: Intrins
         .ref_get => {
             const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
             const addr = operandValue(try lowerExpr(b, a[0]));
-            return try lowerRefLoad(b, addr, b.in.node_types[(node_idx).int()], n.main_token);
+            return try lowerRefLoad(b, addr, b.in.nodes.typeOf(node_idx), n.main_token);
         },
         .ref_set => {
             const a = Ast.rangeSlice(b.in.tree, (n.rhs).int());
             // The cell is evaluated before the value, as every place store is.
             const addr = operandValue(try lowerExpr(b, a[0]));
-            const vty = b.in.node_types[(a[1]).int()];
+            const vty = b.in.nodes.typeOf(a[1]);
             if (vty.kind == .never) {
                 _ = try lowerExpr(b, a[1]);
             } else try storeThrough(b, addr, a[1], vty, n.main_token);
@@ -2316,7 +2315,7 @@ fn isTupleStructCtorCall(b: *Builder, n: Ast.Node, ty: Typecheck.Type) bool {
 /// arg at `layout.offsets[i]` (declaration order). Positional twin of `lowerStructInitInto`.
 fn lowerTupleStructInitInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId) error{OutOfMemory}!void {
     const n = b.in.tree.nodes[(node_idx).int()];
-    const layout = b.in.layouts[b.in.node_types[(node_idx).int()].struct_id];
+    const layout = b.in.layouts[b.in.nodes.typeOf(node_idx).struct_id];
     const args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
     std.debug.assert(args.len == layout.field_types.len); // guaranteed by the check-error gate
     for (args, 0..) |arg, i| {
@@ -2343,7 +2342,7 @@ noinline fn lowerBuiltinMethod(b: *Builder, node_idx: Ast.Index, n: Ast.Node, k:
             // `lowerEqValue` the `==` operator uses (heap-free byte-compare / trivially
             // -true bconst), so `a.eq(b)` and `a == b` emit identical IR.
             std.debug.assert(args.len == 1);
-            const recv_ty = b.in.node_types[(recv).int()];
+            const recv_ty = b.in.nodes.typeOf(recv);
             if (isInlineEq(recv_ty.kind)) {
                 const lhs = operandValue(try lowerExpr(b, recv));
                 const rhs = operandValue(try lowerExpr(b, args[0]));
@@ -2356,7 +2355,7 @@ noinline fn lowerBuiltinMethod(b: *Builder, node_idx: Ast.Index, n: Ast.Node, k:
             // to their own VALUE (an int is its own hash, a bool is 0/1); str folds its
             // bytes via the SAME heap-free polynomial the derive uses (`hashStrAtPtr`);
             // unit hashes to the fixed seed (the sole `()` value).
-            const recv_ty = b.in.node_types[(recv).int()];
+            const recv_ty = b.in.nodes.typeOf(recv);
             switch (recv_ty.kind) {
                 .int, .bool => return .{ .value = operandValue(try lowerExpr(b, recv)) },
                 .str => {
@@ -2407,7 +2406,7 @@ noinline fn lowerBuiltinMethod(b: *Builder, node_idx: Ast.Index, n: Ast.Node, k:
             // The `displayToSlot` renderer. `str` is identity (share the immutable receiver,
             // no alloc); int/bool/unit build a fresh str (via `__int_to_str` / the literal
             // cond / the const-data `"()"`).
-            const recv_ty = b.in.node_types[(recv).int()];
+            const recv_ty = b.in.nodes.typeOf(recv);
             if (recv_ty.kind == .str) return try lowerExpr(b, recv);
             const op = try lowerExpr(b, recv);
             return .{ .slot = try displayToSlot(b, recv_ty, op) };
@@ -2416,7 +2415,7 @@ noinline fn lowerBuiltinMethod(b: *Builder, node_idx: Ast.Index, n: Ast.Node, k:
             // A struct/enum (incl `char`) `.to_string()`: render through the `displayToSlot`
             // authority. A custom `impl Display` and a structural derive land in the same
             // witness call, which is what makes `to_string` universal.
-            const recv_ty = b.in.node_types[(recv).int()];
+            const recv_ty = b.in.nodes.typeOf(recv);
             const op = try lowerExpr(b, recv);
             return .{ .slot = try displayToSlot(b, recv_ty, op) };
         },
@@ -2440,8 +2439,7 @@ const OptResultCall = struct { recv: Ast.Index, op: Typecheck.OptResultMethod };
 /// The checker's selection for call `n`, read from its slot.
 fn calleeOf(b: *const Builder, n: Ast.Node) Callee.View {
     const slot = Callee.callSlot(b.in.tree, n) orelse return .none;
-    if (slot.int() >= b.in.callees.len) return .none;
-    return b.in.callees[slot.int()].view();
+    return b.in.nodes.callee(slot).view();
 }
 
 /// Inline a native `Option`/`Result` method. The receiver is materialized into a
@@ -2456,7 +2454,7 @@ fn calleeOf(b: *const Builder, n: Ast.Node) Callee.View {
 fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{OutOfMemory}!Ir.Operand {
     const int_ty = Typecheck.Type.int;
     const bool_ty = Typecheck.Type.bool;
-    const recv_ty = b.in.node_types[(om.recv).int()];
+    const recv_ty = b.in.nodes.typeOf(om.recv);
     const e = b.in.enum_layouts[recv_ty.enum_id];
 
     // The native path ships scalar-payload `unwrap`/`unwrap_or` only: a non-scalar payload would
@@ -2606,7 +2604,7 @@ pub fn validScalarValue(b: *Builder, v: Ir.ValueId) error{OutOfMemory}!Ir.ValueI
 fn lowerConvMethod(b: *Builder, node_idx: Ast.Index, cv: ConvCall) error{OutOfMemory}!Ir.Operand {
     const int_ty = Typecheck.Type.int;
     const bool_ty = Typecheck.Type.bool;
-    const recv_ty = b.in.node_types[(cv.recv).int()];
+    const recv_ty = b.in.nodes.typeOf(cv.recv);
     const recv_is_char = isCharTy(b, recv_ty);
 
     if (cv.into) {
@@ -2615,7 +2613,7 @@ fn lowerConvMethod(b: *Builder, node_idx: Ast.Index, cv: ConvCall) error{OutOfMe
             const v = try loadCharCodepoint(b, cv.recv);
             return .{ .value = try recanonToWidth(b, v, Typecheck.Type.uint32) };
         }
-        const into_ty = b.in.node_types[(node_idx).int()];
+        const into_ty = b.in.nodes.typeOf(node_idx);
         if (into_ty.kind == .float) {
             // int -> float: lossless single scvtf. No Result, no witness, no slot.
             const v = operandValue(try lowerExpr(b, cv.recv));
@@ -2636,7 +2634,7 @@ fn lowerConvMethod(b: *Builder, node_idx: Ast.Index, cv: ConvCall) error{OutOfMe
 
     // try_into: build a `Result[T, ConvErr]` into a fresh slot.
     const v = if (recv_is_char) try loadCharCodepoint(b, cv.recv) else operandValue(try lowerExpr(b, cv.recv));
-    const call_ty = b.in.node_types[(node_idx).int()];
+    const call_ty = b.in.nodes.typeOf(node_idx);
     const e = b.in.enum_layouts[call_ty.enum_id];
     const dst_T = Typecheck.somePayload(e);
 
@@ -2868,7 +2866,7 @@ pub fn producesInPlace(b: *Builder, expr: Ast.Index) bool {
         .struct_init, .enum_init_tuple, .enum_init_struct => true,
         .if_stmt, .block, .unsafe_block, .loop_expr, .labeled, .match_expr => true,
         .call => blk: {
-            const ty = b.in.node_types[expr.int()];
+            const ty = b.in.nodes.typeOf(expr);
             break :blk isTupleStructCtorCall(b, n, ty) or isQualifiedVariantCtorCall(b, n, ty);
         },
         else => false,
@@ -3147,7 +3145,7 @@ fn storeThrough(b: *Builder, addr: Ir.ValueId, value: Ast.Index, ty: Typecheck.T
 /// through `lowerExprInto` at a field_addr.
 fn lowerStructInitInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId) error{OutOfMemory}!void {
     const n = b.in.tree.nodes[(node_idx).int()];
-    const id = b.in.node_types[(node_idx).int()].struct_id;
+    const id = b.in.nodes.typeOf(node_idx).struct_id;
     const layout = b.in.layouts[id];
     for (Ast.rangeSlice(b.in.tree, (n.rhs).int())) |fi_idx| {
         const fi = b.in.tree.nodes[(fi_idx).int()];
@@ -3274,7 +3272,7 @@ fn lowerMatchValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{O
 /// switch terminator (preserves overlapping-pattern order).
 fn lowerMatchInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
     const n = b.in.tree.nodes[(node_idx).int()];
-    const scrut_ty = b.in.node_types[(n.lhs).int()];
+    const scrut_ty = b.in.nodes.typeOf(n.lhs);
 
     // Spill the scrutinee into a slot (every match reads it by address).
     const scrut_op = try lowerExpr(b, n.lhs);
@@ -3362,7 +3360,7 @@ fn lowerTryValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{Out
 fn lowerTryInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
     const int_ty = Typecheck.Type.int;
     const n = b.in.tree.nodes[(node_idx).int()];
-    const op_ty = b.in.node_types[(n.lhs).int()];
+    const op_ty = b.in.nodes.typeOf(n.lhs);
     if (op_ty.kind != .@"enum") {
         try b.note(n.main_token, "'?' operand did not reify to an Option/Result enum");
         return;
@@ -3905,7 +3903,7 @@ fn lowerForIn(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfM
     const stmt = b.in.tree.nodes[(stmt_idx).int()];
     const int_ty = Typecheck.Type.int;
 
-    const calls = forInCalls(&b.in, b.in.node_types[(stmt.rhs).int()]) catch |e| return b.note(stmt.main_token, forInFailure(e, "for-in"));
+    const calls = forInCalls(&b.in, b.in.nodes.typeOf(stmt.rhs)) catch |e| return b.note(stmt.main_token, forInFailure(e, "for-in"));
     const next_m = calls.next;
     const it_slot = try b.addSlot(calls.iter_ty);
     if (!try emitForIter(b, stmt.rhs, calls.iter, it_slot)) return;
@@ -3963,7 +3961,7 @@ fn lowerForIn2(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOf
     const h = Ast.forIn2HeaderAt(b.in.tree, stmt.lhs.int());
     const int_ty = Typecheck.Type.int;
 
-    const calls = forInCalls(&b.in, b.in.node_types[(stmt.rhs).int()]) catch |e| return b.note(stmt.main_token, forInFailure(e, "for-in2"));
+    const calls = forInCalls(&b.in, b.in.nodes.typeOf(stmt.rhs)) catch |e| return b.note(stmt.main_token, forInFailure(e, "for-in2"));
     const next_m = calls.next;
     const it_slot = try b.addSlot(calls.iter_ty);
     if (!try emitForIter(b, stmt.rhs, calls.iter, it_slot)) return;
@@ -4057,8 +4055,8 @@ fn lowerLabeledStmt(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!void {
         .for_stmt => try lowerFor(b, n.lhs, label),
         .for_in_stmt => try lowerForIn(b, n.lhs, label),
         .for_in2_stmt => try lowerForIn2(b, n.lhs, label),
-        .loop_expr => _ = try lowerLoopValue(b, n.lhs, b.in.node_types[(n.lhs).int()], label),
-        .block => _ = try lowerLabeledBlock(b, n.lhs, b.in.node_types[(node_idx).int()], label),
+        .loop_expr => _ = try lowerLoopValue(b, n.lhs, b.in.nodes.typeOf(n.lhs), label),
+        .block => _ = try lowerLabeledBlock(b, n.lhs, b.in.nodes.typeOf(node_idx), label),
         else => try b.note(n.main_token, "labeled construct unsupported in lower"),
     }
 }
@@ -4263,7 +4261,7 @@ fn genCond(b: *Builder, node_idx: Ast.Index, true_bb: Ir.BlockId, false_bb: Ir.B
                     // int/bool stay an inline `icmp` then cond_br (bytes unchanged);
                     // str/struct/enum desugar via `lowerOrdValue`, then cond_br on the
                     // produced bool (its current block is the desugar's tail).
-                    const lt = b.in.node_types[(n.lhs).int()];
+                    const lt = b.in.nodes.typeOf(n.lhs);
                     if (isInlineOrd(lt.kind)) {
                         const lhs = operandValue(try lowerExpr(b, n.lhs));
                         const rhs = operandValue(try lowerExpr(b, n.rhs));
@@ -4279,7 +4277,7 @@ fn genCond(b: *Builder, node_idx: Ast.Index, true_bb: Ir.BlockId, false_bb: Ir.B
                     // int/bool stay an inline `icmp` then cond_br (bytes unchanged);
                     // str/unit/struct/enum desugar via `lowerEqValue`, then cond_br on
                     // the produced bool (its current block is the eq computation's tail).
-                    const lt = b.in.node_types[(n.lhs).int()];
+                    const lt = b.in.nodes.typeOf(n.lhs);
                     if (isInlineEq(lt.kind)) {
                         const lhs = operandValue(try lowerExpr(b, n.lhs));
                         const rhs = operandValue(try lowerExpr(b, n.rhs));
@@ -4392,8 +4390,8 @@ fn paramType(in: Inputs, proto: Ast.FnProto, slot: u32) Typecheck.Type {
         std.debug.assert(!s.params[slot].isTypeVar() and !s.params[slot].isApp() and !s.params[slot].isFunc()); // reified-away before lower
         return s.params[slot];
     };
-    if (param_node.int() < in.node_types.len) {
-        const t = in.node_types[(param_node).int()];
+    if (in.nodes.has(param_node)) {
+        const t = in.nodes.typeOf(param_node);
         if (t.kind != .invalid) return t;
     }
     const pn = in.tree.nodes[(param_node).int()];
@@ -4537,8 +4535,7 @@ fn expectLowered(src: []const u8, fn_name: []const u8, want: []const u8) !void {
         .tokens = tokens,
         .source = src,
         .resolutions = rr.resolutions[0],
-        .node_types = tc.node_types[0],
-        .callees = tc.callees[0],
+        .nodes = .{ .types = tc.node_types[0], .callees = tc.callees[0] },
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = names,
@@ -5569,8 +5566,7 @@ test "lower-core: while loop with break/continue is well-formed" {
         .tokens = tokens,
         .source = src,
         .resolutions = rr.resolutions[0],
-        .node_types = tc.node_types[0],
-        .callees = tc.callees[0],
+        .nodes = .{ .types = tc.node_types[0], .callees = tc.callees[0] },
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = &names,
@@ -5642,8 +5638,7 @@ test "lower-aggregates: enum match dispatch is well-formed + leak-clean" {
         .tokens = tokens,
         .source = src,
         .resolutions = rr.resolutions[0],
-        .node_types = tc.node_types[0],
-        .callees = tc.callees[0],
+        .nodes = .{ .types = tc.node_types[0], .callees = tc.callees[0] },
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = &names,
@@ -5703,8 +5698,7 @@ fn expectLowerDiag(src: []const u8, fn_name: []const u8) !void {
         .tokens = tokens,
         .source = src,
         .resolutions = rr.resolutions[0],
-        .node_types = tc.node_types[0],
-        .callees = tc.callees[0],
+        .nodes = .{ .types = tc.node_types[0], .callees = tc.callees[0] },
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = &names,
@@ -6498,8 +6492,7 @@ fn lowerMainWithCallee(gpa: std.mem.Allocator, src: []const u8, member: []const 
         .tokens = tokens,
         .source = src,
         .resolutions = rr.resolutions[0],
-        .node_types = tc.node_types[0],
-        .callees = cs,
+        .nodes = .{ .types = tc.node_types[0], .callees = cs },
         .layouts = tc.layouts,
         .enum_layouts = tc.enum_layouts,
         .names = names,
@@ -7033,7 +7026,7 @@ test "Escape.callTarget names the unit lowerCall calls" {
     defer fe.deinit(gpa);
     const rr = fe.resolve;
     const tc = fe.typecheck;
-    const body: Body.BodyView = .{ .tree = t, .resolutions = rr.resolutions[0], .node_types = tc.node_types[0], .callees = tc.callees[0] };
+    const body: Body.BodyView = .{ .tree = t, .resolutions = rr.resolutions[0], .nodes = .{ .types = tc.node_types[0], .callees = tc.callees[0] } };
     const prog: Body.ProgramView = .{ .sigs = tc.sigs, .methods = tc.methods, .instances = tc.instances, .layouts = tc.layouts };
 
     var got: std.ArrayList(u8) = .empty;

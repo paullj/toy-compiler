@@ -38,8 +38,8 @@ pub const Target = struct { unit: u32, self_n: u32 };
 pub fn callTarget(body: Body.BodyView, prog: Body.ProgramView, bodies: Body.List, call: Ast.Index) ?Target {
     const tree = body.tree;
     const slot = Callee.callSlot(tree, tree.nodes[call.int()]) orelse return null;
-    if (slot.int() >= body.callees.len) return null;
-    return switch (body.callees[slot.int()].view()) {
+    if (!body.nodes.has(slot)) return null;
+    return switch (body.nodes.callee(slot).view()) {
         .method => |mi| {
             if (mi >= prog.methods.len) return null;
             const m = prog.methods[mi];
@@ -203,12 +203,12 @@ pub fn factsOf(
             switch (e.tag) {
                 .call => {
                     if (n.lhs == Ast.none) return;
-                    if (Callee.callSlot(tree, n)) |slot| if (slot.int() < self.body.callees.len and self.body.callees[slot.int()].view() == .value)
+                    if (Callee.callSlot(tree, n)) |slot| if (self.body.nodes.has(slot) and self.body.nodes.callee(slot).view() == .value)
                         try self.roles.put(self.gpa, n.lhs.int(), .value_callee);
                     const args = Ast.rangeSlice(tree, n.rhs.int());
                     if (self.mode == .template) return self.templateCall(e.idx, n, args);
                     const passes_fn = for (args) |a| {
-                        if (a.int() < self.body.node_types.len and LayoutEngine.isFnStruct(self.body.node_types[a.int()], self.prog.layouts)) break true;
+                        if (self.body.nodes.has(a) and LayoutEngine.isFnStruct(self.body.nodes.typeOf(a), self.prog.layouts)) break true;
                     } else false;
                     if (!passes_fn) return;
                     const target = callTarget(self.body, self.prog, self.bodies, e.idx);
@@ -234,7 +234,7 @@ pub fn factsOf(
                 },
                 .lambda => try self.sites.append(self.gpa, .{ .node = e.idx, .use = self.roleUse(e.idx), .kind = .lambda }),
                 .local_fn => try self.sites.append(self.gpa, .{ .node = e.idx, .use = if (self.local(e.idx)) |s| .{ .local = s } else .escapes, .kind = .local_fn }),
-                .field_access => if (e.idx.int() < self.body.callees.len and self.body.callees[e.idx.int()].view() == .bound_method) {
+                .field_access => if (self.body.nodes.has(e.idx) and self.body.nodes.callee(e.idx).view() == .bound_method) {
                     const recv = Closure.boundRecvLocal(tree, self.body.resolutions, e.idx);
                     if (recv) |s| try self.bound_recv.append(self.gpa, s);
                     try self.sites.append(self.gpa, .{ .node = e.idx, .use = self.roleUse(e.idx), .kind = .bound, .recv = recv });
@@ -519,7 +519,7 @@ test "a bound method site takes its use from its position, like a lambda in that
         if (std.mem.eql(u8, f.name, "main")) main_gid = @intCast(i);
         if (std.mem.eql(u8, f.name, "main.run")) run_gid = @intCast(i);
     }
-    const body: Body.BodyView = .{ .tree = tree, .resolutions = res.resolutions[0], .node_types = tc.node_types[0], .callees = tc.callees[0] };
+    const body: Body.BodyView = .{ .tree = tree, .resolutions = res.resolutions[0], .nodes = .{ .types = tc.node_types[0], .callees = tc.callees[0] } };
     const prog: Body.ProgramView = .{ .sigs = tc.sigs, .methods = tc.methods, .instances = tc.instances, .layouts = tc.layouts };
     const decl = res.fns[main_gid.?].decl_node;
     var f = try factsOf(gpa, .{ .tree = tree, .tokens = tokens, .source = src }, body, prog, tc.bodies, decl, 0, Closure.findFn(res.closures[0], decl), .lowered);

@@ -373,8 +373,7 @@ const Plan = struct {
                 .tokens = src.tokens,
                 .source = src.source,
                 .resolutions = p.res.resolutions[mod],
-                .node_types = if (ob) |b| b.node_types else &.{},
-                .callees = if (ob) |b| b.callees else &.{},
+                .nodes = if (ob) |b| b.nodes else .{},
                 .layouts = tc.layouts,
                 .enum_layouts = tc.enum_layouts,
                 .names = p.names,
@@ -811,29 +810,29 @@ test "each unit reads its owner's tables: an instance its own, a lambda its owne
                 try testing.expect(fr.body.source.cached);
                 switch (tc.bodies.items[bi].of) {
                     .base => |gid| {
-                        try testing.expectEqual(tc.node_types[0].ptr, fr.in.node_types.ptr);
+                        try testing.expectEqual(tc.node_types[0].ptr, fr.in.nodes.types.ptr);
                         try testing.expectEqual(tc.sigs[gid].mut_mask, fr.in.sig.?.mut_mask);
                     },
                     .instance => |k| {
-                        try testing.expectEqual(tc.instances[k].node_types.ptr, fr.in.node_types.ptr);
+                        try testing.expectEqual(tc.instances[k].node_types.ptr, fr.in.nodes.types.ptr);
                         try testing.expectEqual(tc.instances[k].args.ptr, fr.type_args.ptr);
                     },
                 }
             },
             .lambda => |k| {
-                try testing.expectEqual(tc.node_types[0].ptr, fr.in.node_types.ptr);
+                try testing.expectEqual(tc.node_types[0].ptr, fr.in.nodes.types.ptr);
                 try testing.expectEqual(tc.lambda_units[k].owner, fr.in.closure.owner.?);
                 try testing.expect(fr.in.closure.frame_envs);
             },
             .spec => |k| {
                 const inst = &tc.instances[plan.specs.units[k].inst];
-                try testing.expectEqual(inst.node_types.ptr, fr.in.node_types.ptr);
+                try testing.expectEqual(inst.node_types.ptr, fr.in.nodes.types.ptr);
                 try testing.expectEqual(@as(usize, 1), fr.in.closure.spec_targets.len);
                 try testing.expect(!fr.body.source.cached);
                 try testing.expectEqualStrings(fr.sym.name, fr.in.sig.?.name);
             },
             .derive, .erased, .adapter => {
-                try testing.expectEqual(@as(usize, 0), fr.in.node_types.len);
+                try testing.expectEqual(@as(usize, 0), fr.in.nodes.types.len);
                 try testing.expectEqual(@as(?Closure.Owner, null), fr.in.closure.owner);
                 try testing.expectEqual(@as(?Fingerprint.Sig, null), fr.in.sig);
             },

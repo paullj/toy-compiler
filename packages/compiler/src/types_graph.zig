@@ -708,6 +708,7 @@ fn calleeTables(gpa: std.mem.Allocator, tr: *const GraphResult, out: *std.ArrayL
         try out.appendSlice(gpa, std.mem.asBytes(&inst.template_gid));
         if (inst.name) |name| try out.appendSlice(gpa, name);
         try out.append(gpa, 0);
+        try out.appendSlice(gpa, std.mem.asBytes(&inst.node_base));
         try out.appendSlice(gpa, std.mem.sliceAsBytes(inst.callees));
         for (inst.callees) |c| tags.getPtr(c.tag).* += 1;
     }
@@ -782,9 +783,8 @@ fn lambdaTables(gpa: std.mem.Allocator, g: *const Graph.Graph, tr: *const GraphR
         const t = tr.node_types[mi][k];
         if (t.isStruct()) try out.appendSlice(gpa, tr.layouts[t.struct_id].name);
     };
-    for (tr.instances) |inst| for (g.modules[inst.mod].nodes, 0..) |n, k| {
+    for (tr.instances) |inst| for (g.modules[inst.mod].nodes[inst.node_base..][0..inst.node_types.len], inst.node_types) |n, t| {
         if (n.tag != .lambda) continue;
-        const t = inst.node_types[k];
         if (t.isStruct()) try out.appendSlice(gpa, tr.layouts[t.struct_id].name);
     };
     return frame_envs;

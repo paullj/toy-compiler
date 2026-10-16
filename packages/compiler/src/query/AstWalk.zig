@@ -6,9 +6,9 @@
 //!     folded when it owned its own walk.
 //!   * `CallVisitor` records each callee's `Sig` at a `.callee` event (reading
 //!     `frozen.resolutions` at the callee identifier, or the checker's selection in
-//!     `frozen.callees` for a method call), in body-walk order.
+//!     `frozen.nodes` for a method call), in body-walk order.
 //!   * `TouchedVisitor` records each touched type's layout at a `.touch` event
-//!     (reading `frozen.node_types`) plus the owning fn's param/return types at a
+//!     (reading `frozen.nodes`) plus the owning fn's param/return types at a
 //!     `.type_ref` event.
 
 const std = @import("std");
@@ -97,8 +97,8 @@ pub const CallVisitor = struct {
             .enter => |e| {
                 const fr = self.frozen;
                 try self.foldDesugar(e.idx, e.tag);
-                if (e.idx.int() >= fr.callees.len) return;
-                switch (fr.callees[e.idx.int()].view()) {
+                if (!fr.nodes.has(e.idx)) return;
+                switch (fr.nodes.callee(e.idx).view()) {
                     .fn_ref => |gid| if (gid < fr.names.len and gid < fr.sigs.len) {
                         const nm = fr.names[gid];
                         const sig = fr.sigs[gid];
@@ -120,8 +120,8 @@ pub const CallVisitor = struct {
                 // is nothing to fold. A pre-typecheck view (lhs out of range or an invalid
                 // recv) folds nothing.
                 const bn = self.frozen.tree.nodes[e.idx.int()];
-                if (bn.lhs.int() >= self.frozen.node_types.len) return;
-                const recv = self.frozen.node_types[bn.lhs.int()];
+                if (!self.frozen.nodes.has(bn.lhs)) return;
+                const recv = self.frozen.nodes.typeOf(bn.lhs);
                 if (recv.kind != .@"struct" and recv.kind != .@"enum") return;
                 for (Walk.opMethods(self.frozen.tokens[bn.main_token].tag)) |method| {
                     const pid = Typecheck.witnessProtocolId(self.frozen.prelude_ids, method);
@@ -143,8 +143,8 @@ pub const CallVisitor = struct {
                 const fs = self.fn_sig orelse return;
                 if (fs.ret.kind != .@"enum" or fs.ret.enum_id >= self.frozen.enum_layouts.len) return;
                 const tn = self.frozen.tree.nodes[e.idx.int()];
-                if (tn.lhs.int() >= self.frozen.node_types.len) return;
-                const op = self.frozen.node_types[tn.lhs.int()];
+                if (!self.frozen.nodes.has(tn.lhs)) return;
+                const op = self.frozen.nodes.typeOf(tn.lhs);
                 if (op.kind != .@"enum" or op.enum_id >= self.frozen.enum_layouts.len) return;
                 const ol = self.frozen.enum_layouts[op.enum_id];
                 const rl = self.frozen.enum_layouts[fs.ret.enum_id];
@@ -168,16 +168,16 @@ pub const CallVisitor = struct {
     /// through the same helpers, so the fold names what the code relocates to ([C2]).
     fn foldDesugar(self: *Self, idx: Ast.Index, tag: Ast.Node.Tag) error{OutOfMemory}!void {
         const fr = self.frozen;
-        if (idx.int() >= fr.node_types.len) return;
+        if (!fr.nodes.has(idx)) return;
         const n = fr.tree.nodes[idx.int()];
         switch (tag) {
             .for_in_stmt, .for_in2_stmt => {
-                const calls = lower.forInCalls(fr, fr.node_types[n.rhs.int()]) catch return;
+                const calls = lower.forInCalls(fr, fr.nodes.typeOf(n.rhs)) catch return;
                 try self.foldWitness(calls.iter);
                 try self.foldWitness(calls.next);
             },
             .empty_list, .list_literal => for (StdNames.desugarMethods(tag)) |dm| {
-                if (Typecheck.findMethod(fr.methods, fr.node_types[idx.int()], dm.name)) |m| try self.foldWitness(m);
+                if (Typecheck.findMethod(fr.methods, fr.nodes.typeOf(idx), dm.name)) |m| try self.foldWitness(m);
             },
             .index => try self.foldGaAt(idx),
             .type_app => if (fr.resolutions.len == fr.tree.nodes.len and symbols_res.leftmostHeadIsValue(fr.tree, fr.resolutions, n.lhs)) try self.foldGaAt(idx),
@@ -187,7 +187,7 @@ pub const CallVisitor = struct {
 
     fn foldGaAt(self: *Self, idx: Ast.Index) error{OutOfMemory}!void {
         const fr = self.frozen;
-        const ii = lower.gaAtInstance(fr, fr.node_types[idx.int()]) orelse return;
+        const ii = lower.gaAtInstance(fr, fr.nodes.typeOf(idx)) orelse return;
         const inst = fr.instances[ii];
         try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret, .mut_mask = templateMask(fr.sigs, inst) });
     }
@@ -199,8 +199,8 @@ pub const CallVisitor = struct {
     fn foldCallee(self: *Self, call: Ast.Index) error{OutOfMemory}!void {
         const fr = self.frozen;
         const slot = Callee.callSlot(fr.tree, fr.tree.nodes[call.int()]) orelse return;
-        if (slot.int() >= fr.callees.len) return;
-        switch (fr.callees[slot.int()].view()) {
+        if (!fr.nodes.has(slot)) return;
+        switch (fr.nodes.callee(slot).view()) {
             // `gid` indexes BOTH `names` (the SymName{kind,name} the reloc target carries)
             // and `sigs`. Fold the full identity so a builtin<->user_fn shadow switch flips
             // the caller's hash.
@@ -219,10 +219,10 @@ pub const CallVisitor = struct {
     fn foldCalleeTable(self: *Self, call_idx: Ast.Index) error{OutOfMemory}!void {
         const fr = self.frozen;
         const fa = Callee.memberNode(fr.tree, fr.tree.nodes[call_idx.int()]) orelse return;
-        if (fa.int() >= fr.callees.len) return;
+        if (!fr.nodes.has(fa)) return;
         const recv_idx = fr.tree.nodes[fa.int()].lhs;
-        const recv: Typecheck.Type = if (recv_idx.int() < fr.node_types.len) fr.node_types[recv_idx.int()] else .{ .kind = .invalid };
-        switch (fr.callees[fa.int()].view()) {
+        const recv: Typecheck.Type = if (fr.nodes.has(recv_idx)) fr.nodes.typeOf(recv_idx) else .{ .kind = .invalid };
+        switch (fr.nodes.callee(fa).view()) {
             // A value call's code is not known statically; `.fn_ref` and `.bound_method`
             // never sit on a call's slot (they fold at their own node's `.enter`).
             .none, .protocol, .value, .fn_ref, .bound_method, .direct, .instance, .generic => {},
@@ -253,7 +253,7 @@ pub const CallVisitor = struct {
                 },
                 // A `try_into` to or from `char`, or from `float`, calls a shared witness.
                 .conv_try_into => {
-                    const call_ty: Typecheck.Type = if (call_idx.int() < fr.node_types.len) fr.node_types[call_idx.int()] else .{ .kind = .invalid };
+                    const call_ty: Typecheck.Type = if (fr.nodes.has(call_idx)) fr.nodes.typeOf(call_idx) else .{ .kind = .invalid };
                     if (call_ty.kind != .@"enum" or call_ty.enum_id >= fr.enum_layouts.len) return;
                     const kind = lower.convWitnessKind(fr, recv, call_ty) orelse return;
                     const d = fr.derives[lower.convWitness(fr, kind) orelse return];
@@ -292,7 +292,7 @@ fn templateMask(sigs: []const Sig, inst: Mono.Instance) u64 {
 }
 
 /// Records each touched type's layout in body-walk order: at a `.touch` event the
-/// node's `node_types[idx]` (guarded `idx < len`); at a `.type_ref` event the
+/// node's type in `frozen.nodes` (when it has a slot); at a `.type_ref` event the
 /// OWNING fn's sig param/return type (falling back to a bare-name re-scan when no
 /// sig is threaded). Owns the layout slices it appends (free via
 /// `freeTouched`).
@@ -306,7 +306,7 @@ pub const TouchedVisitor = struct {
     pub fn on(self: *Self, ev: Walk.Event) error{OutOfMemory}!void {
         switch (ev) {
             .touch => |t| {
-                if (t.idx.int() < self.frozen.node_types.len) try appendTouched(self.gpa, self.frozen.layouts, self.frozen.enum_layouts, self.frozen.node_types[t.idx.int()], self.out);
+                if (self.frozen.nodes.has(t.idx)) try appendTouched(self.gpa, self.frozen.layouts, self.frozen.enum_layouts, self.frozen.nodes.typeOf(t.idx), self.out);
             },
             .type_ref => |r| {
                 // Prefer the typecheck-resolved sig type (carries the right
@@ -590,8 +590,7 @@ fn fakeInputs(tree: Ast.Tree, tokens: []const Token, source: []const u8, with: F
         .tokens = tokens,
         .source = source,
         .resolutions = with.resolutions,
-        .node_types = with.node_types,
-        .callees = with.callees,
+        .nodes = .{ .types = with.node_types, .callees = with.callees },
         .layouts = with.layouts,
         .enum_layouts = with.enum_layouts,
         .names = with.names,
