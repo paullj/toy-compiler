@@ -630,10 +630,15 @@ disambiguate, the compiler does **not** pick arbitrarily — it is a use-site er
 **T0025** naming the conflicting conformances in source (fn-id) order (deterministic at
 any `-jN`). An explicit `p.into[int]()` (parsed as `call(type_app(field_access, [int]))`)
 selects the matching conformance; on a generic receiver (`impl Box[T] has Into[int]`
-and `has Into[bool]`) `b.into[bool]()` selects it the same way, though an inferred
-`b.into()` there takes the first-declared conformance rather than reporting T0025. A
-type conforming **once** (a non-generic protocol OR a single generic conformance)
-resolves with **no** explicit args — byte-identical dispatch
+and `has Into[bool]`) `b.into[bool]()` selects it the same way, and an inferred
+`b.into()` there is T0025 as well. The generic receiver's lookup, `pickGenericMethod`,
+applies `pickMethodIndex`'s rule to the method templates of the receiver's type
+constructor, and every place the checker selects a generic receiver's method by name
+uses it: a call, a bound method value (`f := b.into`), the `for`-in desugar's `iter`.
+The same holds for two different protocols that share a method name (`Show` and
+`Debug`, both with `render`). The expected type does not choose a conformance:
+`n: int = p.into()` is T0025 too. A type conforming **once** (a non-generic protocol
+OR a single generic conformance) resolves with **no** explicit args — byte-identical dispatch
 to the single-conformance path. The single disambiguator `resolveConformanceMethod` is shared by all three
 consumers (BodyChecker types, `lower` symbols, `AstWalk` fingerprint), so they always
 select the identical witness. A `[T has Convert[U]]` bound resolves at the mono worklist
