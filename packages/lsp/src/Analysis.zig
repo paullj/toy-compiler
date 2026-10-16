@@ -365,9 +365,10 @@ pub fn freeCallee(an: *const Analysis, slot: u32) ?FreeCallee {
         var agreed: ?Callee = null;
         var it = an.instancesOf(an.fnOf(an.module().nodes[slot].main_token));
         const same = while (it.next()) |inst| {
-            if (slot >= inst.callees.len or inst.callees[slot].view() == .none) continue;
-            if (agreed) |p| if (!std.meta.eql(p, inst.callees[slot])) break false;
-            agreed = inst.callees[slot];
+            const ic = inst.nodes().callee(Ast.Index.from(slot));
+            if (ic.view() == .none) continue;
+            if (agreed) |p| if (!std.meta.eql(p, ic)) break false;
+            agreed = ic;
         } else true;
         if (same) if (agreed) |c| if (c.view() == .direct) return .{ .direct = c.view().direct };
         // A fn the resolver names but no instance agrees on: as declared.
@@ -595,7 +596,7 @@ fn selectCallee(an: *const Analysis, a: std.mem.Allocator, fa: u32) !?CalleeSig 
     if (c.view() != .protocol and c.templateFn() == null and an.inTemplate(fa)) {
         if (try an.instanceSelect(a, fa)) |sig| return sig;
     }
-    return an.selectFrom(a, fa, c, an.nodeTypes());
+    return an.selectFrom(a, fa, c, .{ .types = an.nodeTypes(), .callees = an.callees() });
 }
 
 /// The method at member `fa`, in a generic template's body, as the template's instances
@@ -611,20 +612,20 @@ fn instanceSelect(an: *const Analysis, a: std.mem.Allocator, fa: u32) !?CalleeSi
     var reach: ?u32 = null;
     var one_reach = true;
     var it = an.instancesOf(an.fnOf(an.module().nodes[fa].main_token));
+    const fa_i = Ast.Index.from(fa);
     while (it.next()) |inst| {
-        if (fa >= inst.callees.len) continue;
-        const c = inst.callees[fa];
+        const c = inst.nodes().callee(fa_i);
         if (c.view() == .none) continue;
         if (first) |f| {
-            if (!std.meta.eql(f.callees[fa], c)) same = false;
-            if (recv != Ast.none and !Type.eql(f.node_types[recv.int()], inst.node_types[recv.int()])) same = false;
+            if (!std.meta.eql(f.nodes().callee(fa_i), c)) same = false;
+            if (recv != Ast.none and !Type.eql(f.nodes().typeOf(recv), inst.nodes().typeOf(recv))) same = false;
         } else first = inst;
         const g = an.declaredFn(c);
         if (g == null or (reach != null and reach.? != g.?)) one_reach = false;
         if (reach == null) reach = g;
     }
     const f = first orelse return null;
-    if (same and !an.reifiesGeneric(f.callees[fa])) return an.selectFrom(a, fa, f.callees[fa], f.node_types);
+    if (same and !an.reifiesGeneric(f.nodes().callee(fa_i))) return an.selectFrom(a, fa, f.nodes().callee(fa_i), f.nodes());
     if (!one_reach) return null;
     return an.templateSig(a, fa, reach orelse return null);
 }
@@ -678,7 +679,7 @@ fn templateSig(an: *const Analysis, a: std.mem.Allocator, fa: u32, gid: u32) !?C
 
 /// What callee `c` at member `fa` selects, reading node types from `nts` (the module's, or
 /// an instance's).
-fn selectFrom(an: *const Analysis, a: std.mem.Allocator, fa: u32, c: Callee, nts: []const Type) !?CalleeSig {
+fn selectFrom(an: *const Analysis, a: std.mem.Allocator, fa: u32, c: Callee, nodes: toyc.Body.Nodes) !?CalleeSig {
     const t = an.tc();
     const r = an.res();
     const m = an.module();
@@ -735,8 +736,8 @@ fn selectFrom(an: *const Analysis, a: std.mem.Allocator, fa: u32, c: Callee, nts
             return sig;
         },
         .builtin => |k| {
-            const recv: Type = if (fa_node.lhs != Ast.none and fa_node.lhs.int() < nts.len) nts[fa_node.lhs.int()] else .invalid;
-            const call_ty: Type = if (an.callOfMember(fa)) |call| (if (call < nts.len) nts[call] else .invalid) else .invalid;
+            const recv: Type = if (fa_node.lhs != Ast.none and nodes.has(fa_node.lhs)) nodes.typeOf(fa_node.lhs) else .invalid;
+            const call_ty: Type = if (an.callOfMember(fa)) |call| (if (nodes.has(Ast.Index.from(call))) nodes.typeOf(Ast.Index.from(call)) else .invalid) else .invalid;
             // Kept here rather than as a compiler table: a new `Builtin` breaks this switch
             // at compile time, and the compiler grows no LSP-only API.
             const shape: struct { params: []const Type, ret: Type, names: []const []const u8 } = switch (k) {
@@ -801,7 +802,7 @@ pub const InstanceIterator = struct {
 pub fn bindsMethod(an: *const Analysis, fa: u32) bool {
     if (an.callees()[fa].view() == .bound_method) return true;
     var it = an.instancesOf(an.fnOf(an.module().nodes[fa].main_token));
-    while (it.next()) |inst| if (fa < inst.callees.len and inst.callees[fa].view() == .bound_method) return true;
+    while (it.next()) |inst| if (inst.nodes().callee(Ast.Index.from(fa)).view() == .bound_method) return true;
     return false;
 }
 
@@ -814,8 +815,8 @@ pub fn boundReceiver(an: *const Analysis, fa: u32) ?Type {
     var agreed: ?Type = null;
     var it = an.instancesOf(an.fnOf(an.module().nodes[fa].main_token));
     while (it.next()) |inst| {
-        if (fa >= inst.callees.len or inst.callees[fa].view() != .bound_method) continue;
-        const t = inst.node_types[recv.int()];
+        if (inst.nodes().callee(Ast.Index.from(fa)).view() != .bound_method) continue;
+        const t = inst.nodes().typeOf(recv);
         if (!render.isRenderable(t)) return null;
         if (agreed) |prev| if (!Type.eql(prev, t)) return null;
         agreed = t;

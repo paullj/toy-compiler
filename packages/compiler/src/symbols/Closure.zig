@@ -422,7 +422,7 @@ test "ownerStorage keeps every box without frame storage and moves the unboxable
     const mut_sig: Sig = .{ .kind = .user_fn, .name = "g", .params = &.{}, .ret = Type.unit, .mut_mask = 0b1 };
     const body = struct {
         fn f(s: Sig, boxed: []const u32) Body {
-            return .{ .of = .{ .base = 0 }, .mod = 0, .decl = Ast.none, .sig = s, .node_types = &.{}, .callees = &.{}, .boxed = boxed };
+            return .{ .of = .{ .base = 0 }, .mod = 0, .decl = Ast.none, .sig = s, .nodes = .{}, .boxed = boxed };
         }
     }.f;
     const items = [_]Body{ body(sig, &.{ 2, 5 }), body(mut_sig, &.{3}), body(sig, &.{}) };

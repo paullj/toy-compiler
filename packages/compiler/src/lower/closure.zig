@@ -29,7 +29,7 @@ pub fn lowerLambda(
     sym: Link.SymName,
     out_diags: *std.ArrayList(Diagnostic),
 ) error{OutOfMemory}!Ir.Function {
-    std.debug.assert(in.callees.len == in.node_types.len);
+    std.debug.assert(in.nodes.callees.len == in.nodes.types.len);
     const unit = in.closure.lambda_units[unit_i];
     var b: Builder = .{ .gpa = gpa, .in = in, .ret_type = unit.sig.ret, .diags = out_diags };
     errdefer b.deinit();
@@ -111,14 +111,14 @@ fn isSelfParam(b: *const Builder, fn_node: Ast.Index, slot: u32) bool {
 fn bindSelf(b: *Builder, unit: Closure.LambdaUnit, self_slot: u32, env_slot: Ir.SlotId) error{OutOfMemory}!void {
     const env_sa = try b.emit(.{ .slot_addr = env_slot }, Typecheck.Type.int);
     const env = try b.emit(.{ .load = .{ .addr = env_sa, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr);
-    const pair = try emitFnPair(b, unit.name, b.in.node_types[unit.node.int()], env);
+    const pair = try emitFnPair(b, unit.name, b.in.nodes.typeOf(unit.node), env);
     try b.homes.put(b.gpa, self_slot, .{ .slot = pair.slot });
 }
 
 /// `fn name(..) { .. }` in a block: make its closure like a lambda's, and let the pair's
 /// slot be the name's home. Nothing assigns a local fn, so it is never boxed.
 pub fn lowerLocalFn(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
-    const v = try lowerLambdaValue(b, stmt_idx, b.in.node_types[(stmt_idx).int()]);
+    const v = try lowerLambdaValue(b, stmt_idx, b.in.nodes.typeOf(stmt_idx));
     const res = b.in.resolutions[(stmt_idx).int()];
     if (v != .slot or res != .local) return;
     std.debug.assert(!b.isBoxedLocal(res.local));
@@ -143,7 +143,7 @@ pub fn lowerValueCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOf
     errdefer b.gpa.free(args);
     args[0] = .{ .value = env };
     for (arg_nodes, 1..) |arg, i| args[i] = try L.lowerExpr(b, arg);
-    return try L.emitCall(b, .{ .indirect = code }, args, b.in.node_types[(node_idx).int()], n.main_token);
+    return try L.emitCall(b, .{ .indirect = code }, args, b.in.nodes.typeOf(node_idx), n.main_token);
 }
 
 /// The target of a spec unit's param when `callee` names one directly. Resolver slots
@@ -178,7 +178,7 @@ fn lowerSpecTargetCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node, t: Spec.Ta
         args[0] = .{ .value = try b.emit(.{ .load = .{ .addr = env_addr, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr) };
     }
     for (arg_nodes, lead..) |arg, i| args[i] = try L.lowerExpr(b, arg);
-    return try L.emitCall(b, .{ .direct = t.sym }, args, b.in.node_types[(node_idx).int()], n.main_token);
+    return try L.emitCall(b, .{ .direct = t.sym }, args, b.in.nodes.typeOf(node_idx), n.main_token);
 }
 
 /// A named fn in value position: the pair `{its thunk's address, null env}` in a fresh
@@ -283,8 +283,7 @@ fn emitFnPair(b: *Builder, code_sym: []const u8, ty: Typecheck.Type, env: ?Ir.Va
 /// The fn a value-position name refers to, when the checker typed it as a fn value.
 pub fn fnValueRef(b: *const Builder, node_idx: Ast.Index) ?u32 {
     if (b.in.resolutions[(node_idx).int()] != .func) return null;
-    if (node_idx.int() >= b.in.callees.len) return null;
-    return switch (b.in.callees[node_idx.int()].view()) {
+    return switch (b.in.nodes.callee(node_idx).view()) {
         .fn_ref => |gid| gid,
         else => null,
     };
@@ -294,7 +293,7 @@ pub fn fnValueRef(b: *const Builder, node_idx: Ast.Index) ?u32 {
 pub fn namesField(b: *const Builder, node_idx: Ast.Index) bool {
     const n = b.in.tree.nodes[(node_idx).int()];
     if (n.tag != .field_access) return true;
-    const base_ty = b.in.node_types[(n.lhs).int()];
+    const base_ty = b.in.nodes.typeOf(n.lhs);
     if (base_ty.kind != .@"struct" or base_ty.struct_id >= b.in.layouts.len) return false;
     const fname = b.in.tokens[n.main_token].text(b.in.source);
     for (b.in.layouts[base_ty.struct_id].field_names) |dn| if (std.mem.eql(u8, dn, fname)) return true;
@@ -303,8 +302,7 @@ pub fn namesField(b: *const Builder, node_idx: Ast.Index) bool {
 
 /// The method a value-position `recv.m` binds, when the checker typed it as one.
 pub fn boundMethodRef(b: *const Builder, node_idx: Ast.Index) ?u32 {
-    if (node_idx.int() >= b.in.callees.len) return null;
-    return switch (b.in.callees[node_idx.int()].view()) {
+    return switch (b.in.nodes.callee(node_idx).view()) {
         .bound_method => |mi| mi,
         else => null,
     };
@@ -321,7 +319,7 @@ pub fn lowerBoundValue(b: *Builder, node_idx: Ast.Index, mi: u32, ty: Typecheck.
         try b.note(n.main_token, "bound method has no adapter in lower");
         return .none;
     };
-    const recv_ty = b.in.node_types[(n.lhs).int()];
+    const recv_ty = b.in.nodes.typeOf(n.lhs);
     switch (kind) {
         .bound_box => {
             const home = try places.bindingHome(b, n.lhs, recv_ty);

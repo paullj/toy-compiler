@@ -20,6 +20,9 @@ const Callee = @import("Callee.zig").Callee;
 const Infer = @import("Infer.zig");
 const Sig = @import("Sig.zig").Sig;
 const Resolution = @import("Resolution.zig").Resolution;
+const Body = @import("Body.zig");
+
+const Mono = @This();
 
 /// One resolved bound `[T has P]` on a monomorphized instance: the witnessing
 /// `impl <conform_ty> has P` chosen at the mono worklist by conformance lookup. This
@@ -57,13 +60,14 @@ pub const Instance = struct {
     template_gid: u32,
     /// The concrete type-args, in generic-param order.
     args: []const Type,
-    /// A per-instance `node_types` slice sized to the template module's node count
-    /// (written by the per-instance re-check). NEVER the module's shared slice, so
-    /// two instances of one template do not alias each other's node slots.
+    /// The per-instance types of the template's decl range, from module node `node_base`
+    /// (written by the per-instance re-check; read through `nodes`). NEVER the module's
+    /// shared slice, so two instances of one template do not alias each other's node slots.
     node_types: []Type,
-    /// This instance's method-call selections, sized and owned like `node_types` (and
-    /// likewise never the module's shared slice).
+    /// This instance's method-call selections, parallel to `node_types` (and likewise never
+    /// the module's shared slice).
     callees: []Callee,
+    node_base: u32 = 0,
     /// The template's params/ret with every `type_var` substituted to concrete.
     params: []const Type,
     ret: Type,
@@ -83,6 +87,10 @@ pub const Instance = struct {
     /// This instance's boxed locals (see `Closure.OwnerClosure`), ascending; owned. Each
     /// instance computes its own: a `mut self` pick, and so a box, can differ per args.
     boxed: []const u32 = &.{},
+
+    pub fn nodes(inst: Instance) Body.Nodes {
+        return .{ .base = inst.node_base, .types = inst.node_types, .callees = inst.callees };
+    }
 };
 
 /// A generic template's inference facts: `params` is the template's value params; `count`
@@ -127,7 +135,7 @@ pub const Templates = union(enum) {
 pub const CallView = struct {
     tree: Ast.Tree,
     resolutions: []const Resolution,
-    node_types: []const Type,
+    nodes: Body.Nodes,
     templates: Templates,
 };
 
@@ -166,11 +174,11 @@ pub fn callInstanceRef(gpa: std.mem.Allocator, view: CallView, call_node: Ast.No
             const args = try gpa.alloc(Type, targ_nodes.len);
             errdefer gpa.free(args);
             for (targ_nodes, 0..) |tn, k| {
-                if (tn.int() >= view.node_types.len) {
+                if (!view.nodes.has(tn)) {
                     gpa.free(args);
                     return null; // pre-typecheck view
                 }
-                args[k] = view.node_types[tn.int()];
+                args[k] = view.nodes.typeOf(tn);
             }
             return .{ .gid = gid, .args = args };
         },
@@ -183,8 +191,8 @@ pub fn callInstanceRef(gpa: std.mem.Allocator, view: CallView, call_node: Ast.No
             const arg_types = try gpa.alloc(Type, value_args.len);
             defer gpa.free(arg_types);
             for (value_args, 0..) |va, k| {
-                if (va.int() >= view.node_types.len) return null; // pre-typecheck view
-                arg_types[k] = view.node_types[va.int()];
+                if (!view.nodes.has(va)) return null; // pre-typecheck view
+                arg_types[k] = view.nodes.typeOf(va);
             }
             const targs = (try Infer.infer(gpa, tmpl.count, tmpl.params, arg_types, view.templates.decomposer())) orelse return null;
             return .{ .gid = gid, .args = targs };
@@ -197,11 +205,11 @@ pub fn callInstanceRef(gpa: std.mem.Allocator, view: CallView, call_node: Ast.No
 /// type-args `callInstanceRef` recovers, found in `insts`. The composite is gone by then, so
 /// a pure-container call recovers none; it falls to the instance whose reified params
 /// accept the call's reified args (`findByReifiedParams`). Null when there is none.
-pub fn instanceOf(gpa: std.mem.Allocator, view: CallView, insts: []const Instance, call: Ast.Index) error{OutOfMemory}!?usize {
+pub fn instanceOf(gpa: std.mem.Allocator, view: CallView, insts: *const Lookup, call: Ast.Index) error{OutOfMemory}!?usize {
     const call_node = view.tree.nodes[call.int()];
     if (try callInstanceRef(gpa, view, call_node)) |ref| {
         defer gpa.free(ref.args);
-        if (find(insts, ref.gid, ref.args)) |ii| return ii;
+        if (insts.find(ref.gid, ref.args)) |ii| return ii;
     }
     const bres = view.resolutions[call_node.lhs.int()];
     if (bres != .func) return null;
@@ -211,11 +219,79 @@ pub fn instanceOf(gpa: std.mem.Allocator, view: CallView, insts: []const Instanc
     const buf = try gpa.alloc(Type, value_args.len);
     defer gpa.free(buf);
     for (value_args, 0..) |va, k| {
-        if (va.int() >= view.node_types.len) return null;
-        buf[k] = view.node_types[va.int()];
+        if (!view.nodes.has(va)) return null;
+        buf[k] = view.nodes.typeOf(va);
     }
-    return findByReifiedParams(insts, bres.func, buf);
+    return insts.findByReifiedParams(bres.func, buf);
 }
+
+/// `find` and `findByReifiedParams` over one fixed instance table, by hash. The call seal
+/// asks once per generic call, and a scan of the table each time made N calls of N
+/// instances cost O(N^2) (#41). Each answer is the scan's: the first match in table order.
+pub const Lookup = struct {
+    insts: []const Instance,
+    by_args: Map = .empty,
+    by_params: Map = .empty,
+    /// Templates with an instance whose reified params hold an `invalid` slot. `assignable`
+    /// lets any arg into that slot, so only the scan can answer a params lookup for them.
+    loose: std.AutoHashMapUnmanaged(u32, void) = .empty,
+
+    const Key = struct { gid: u32, types: []const Type };
+    const Map = std.HashMapUnmanaged(Key, usize, KeyContext, std.hash_map.default_max_load_percentage);
+    /// Hashes exactly what `Type.eql` compares, so two keys `eql` treats as one collide.
+    const KeyContext = struct {
+        pub fn hash(_: KeyContext, k: Key) u64 {
+            var h = std.hash.Wyhash.init(k.gid);
+            for (k.types) |t| {
+                h.update(&.{@intFromEnum(t.kind)});
+                if (Type.carriesIntDesc(t.kind)) h.update(&.{@as(u8, @bitCast(t.int_desc))});
+                h.update(std.mem.asBytes(&t.nominalId()));
+            }
+            return h.final();
+        }
+        pub fn eql(_: KeyContext, a: Key, b: Key) bool {
+            if (a.gid != b.gid or a.types.len != b.types.len) return false;
+            for (a.types, b.types) |x, y| if (!Type.eql(x, y)) return false;
+            return true;
+        }
+    };
+
+    pub fn init(gpa: std.mem.Allocator, insts: []const Instance) error{OutOfMemory}!Lookup {
+        var l: Lookup = .{ .insts = insts };
+        errdefer l.deinit(gpa);
+        for (insts, 0..) |inst, i| {
+            const a = try l.by_args.getOrPut(gpa, .{ .gid = inst.template_gid, .types = inst.args });
+            if (!a.found_existing) a.value_ptr.* = i;
+            const loose = for (inst.params) |p| {
+                if (p.kind == .invalid) break true;
+            } else false;
+            if (loose) {
+                try l.loose.put(gpa, inst.template_gid, {});
+                continue;
+            }
+            const p = try l.by_params.getOrPut(gpa, .{ .gid = inst.template_gid, .types = inst.params });
+            if (!p.found_existing) p.value_ptr.* = i;
+        }
+        return l;
+    }
+
+    pub fn deinit(l: *Lookup, gpa: std.mem.Allocator) void {
+        l.by_args.deinit(gpa);
+        l.by_params.deinit(gpa);
+        l.loose.deinit(gpa);
+    }
+
+    pub fn find(l: *const Lookup, gid: u32, args: []const Type) ?usize {
+        return l.by_args.get(.{ .gid = gid, .types = args });
+    }
+
+    pub fn findByReifiedParams(l: *const Lookup, gid: u32, arg_types: []const Type) ?usize {
+        // A `never` or `invalid` arg fits any param, which no single hash key can stand for.
+        for (arg_types) |a| if (a.kind == .invalid or a.kind == .never) return Mono.findByReifiedParams(l.insts, gid, arg_types);
+        if (l.loose.contains(gid)) return Mono.findByReifiedParams(l.insts, gid, arg_types);
+        return l.by_params.get(.{ .gid = gid, .types = arg_types });
+    }
+};
 
 /// Find the instance whose reified value-PARAMS accept the call's reified value-ARG
 /// types — the FIND-regime resolver for a bare container call `total(xs)`, where the
@@ -290,7 +366,7 @@ const testing = std.testing;
 fn fakeView(tree: Ast.Tree, resolutions: []const Resolution, node_types: []const Type, refs: *[10]?TemplateRef, gen_gid: u32, gen_params: []const Type, gen_count: u32) CallView {
     refs.* = .{null} ** 10;
     refs[gen_gid] = .{ .params = gen_params, .count = gen_count };
-    return .{ .tree = tree, .resolutions = resolutions, .node_types = node_types, .templates = .{ .refs = .{ .of = refs } } };
+    return .{ .tree = tree, .resolutions = resolutions, .nodes = .{ .types = node_types }, .templates = .{ .refs = .{ .of = refs } } };
 }
 
 test "callInstanceRef recovers (gid, args) from an explicit turbofish callee" {
@@ -479,6 +555,41 @@ test "find matches on gid + args by Type.eql" {
     try testing.expectEqual(@as(?usize, 1), find(&insts, 0, &.{Type.structT(0)}));
     try testing.expectEqual(@as(?usize, null), find(&insts, 0, &.{Type.bool}));
     try testing.expectEqual(@as(?usize, null), find(&insts, 1, &.{Type.int}));
+}
+
+test "Lookup answers every find and findByReifiedParams as the scans do" {
+    const gpa = testing.allocator;
+    const insts = [_]Instance{
+        .{ .template_gid = 0, .args = &.{Type.int}, .node_types = &.{}, .callees = &.{}, .params = &.{Type.int}, .ret = Type.int, .mod = 0, .decl_node = Ast.none },
+        .{ .template_gid = 0, .args = &.{Type.structT(0)}, .node_types = &.{}, .callees = &.{}, .params = &.{Type.structT(0)}, .ret = Type.int, .mod = 0, .decl_node = Ast.none },
+        .{ .template_gid = 1, .args = &.{Type.int}, .node_types = &.{}, .callees = &.{}, .params = &.{ Type.structT(7), Type.int }, .ret = Type.int, .mod = 0, .decl_node = Ast.none },
+        .{ .template_gid = 1, .args = &.{Type.bool}, .node_types = &.{}, .callees = &.{}, .params = &.{ Type.structT(8), Type.int }, .ret = Type.int, .mod = 0, .decl_node = Ast.none },
+        // A poisoned param slot takes any arg, so gid 2 must fall back to the scan.
+        .{ .template_gid = 2, .args = &.{Type.int}, .node_types = &.{}, .callees = &.{}, .params = &.{ Type.invalid, Type.int }, .ret = Type.int, .mod = 0, .decl_node = Ast.none },
+        .{ .template_gid = 2, .args = &.{Type.bool}, .node_types = &.{}, .callees = &.{}, .params = &.{ Type.bool, Type.int }, .ret = Type.int, .mod = 0, .decl_node = Ast.none },
+    };
+    var l = try Lookup.init(gpa, &insts);
+    defer l.deinit(gpa);
+    const queries = [_]struct { gid: u32, types: []const Type }{
+        .{ .gid = 0, .types = &.{Type.int} },
+        .{ .gid = 0, .types = &.{Type.structT(0)} },
+        .{ .gid = 0, .types = &.{Type.bool} },
+        .{ .gid = 0, .types = &.{Type.never} },
+        .{ .gid = 1, .types = &.{Type.int} },
+        .{ .gid = 1, .types = &.{ Type.structT(8), Type.int } },
+        .{ .gid = 1, .types = &.{ Type.structT(8), Type.never } },
+        .{ .gid = 1, .types = &.{ Type.invalid, Type.int } },
+        .{ .gid = 1, .types = &.{Type.structT(7)} },
+        .{ .gid = 2, .types = &.{ Type.bool, Type.int } },
+        .{ .gid = 2, .types = &.{Type.bool} },
+        .{ .gid = 3, .types = &.{Type.int} },
+    };
+    for (queries) |q| {
+        try testing.expectEqual(find(&insts, q.gid, q.types), l.find(q.gid, q.types));
+        try testing.expectEqual(findByReifiedParams(&insts, q.gid, q.types), l.findByReifiedParams(q.gid, q.types));
+    }
+    // The scan picks gid 2's poisoned instance first; so must the lookup.
+    try testing.expectEqual(@as(?usize, 4), l.findByReifiedParams(2, &.{ Type.bool, Type.int }));
 }
 
 test "an instance carries its resolved conformances" {

@@ -143,8 +143,8 @@ pub fn targetsOf(gpa: std.mem.Allocator, body: Body.BodyView, prog: Body.Program
         const an = tree.nodes[arg.int()];
         switch (an.tag) {
             .identifier, .field_access => {
-                if (arg.int() >= body.callees.len) continue;
-                switch (body.callees[arg.int()].view()) {
+                if (!body.nodes.has(arg)) continue;
+                switch (body.nodes.callee(arg).view()) {
                     .fn_ref => |gid| if (gid < prog.names.len) try out.append(gpa, .{ .param = @intCast(p), .kind = .named, .sym = prog.names[gid] }),
                     .none, .method, .protocol, .builtin, .value, .bound_method, .direct, .instance, .generic => {},
                 }
@@ -318,8 +318,8 @@ pub fn build(gpa: std.mem.Allocator, src: Source) error{OutOfMemory}!Table {
 /// call.
 pub fn siteOf(body: Body.BodyView, prog: Body.ProgramView, call: Ast.Index) ?Site {
     const slot = Callee.callSlot(body.tree, body.tree.nodes[call.int()]) orelse return null;
-    if (slot.int() >= body.callees.len) return null;
-    return switch (body.callees[slot.int()].view()) {
+    if (!body.nodes.has(slot)) return null;
+    return switch (body.nodes.callee(slot).view()) {
         .instance => |ii| .{ .ii = ii, .self_n = 0 },
         .method => |mi| {
             if (mi >= prog.methods.len) return null;
@@ -499,7 +499,7 @@ const Checked = struct {
     }
 
     fn body(self: *const Checked) Body.BodyView {
-        return .{ .tree = self.tree, .resolutions = self.res.resolutions[0], .node_types = self.tc.node_types[0], .callees = self.tc.callees[0] };
+        return .{ .tree = self.tree, .resolutions = self.res.resolutions[0], .nodes = .{ .types = self.tc.node_types[0], .callees = self.tc.callees[0] } };
     }
 
     fn prog(self: *const Checked) Body.ProgramView {

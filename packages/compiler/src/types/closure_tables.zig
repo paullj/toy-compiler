@@ -127,8 +127,8 @@ fn collectBound(
                 .enter => |e| e,
                 else => return,
             };
-            if (e.idx.int() >= self.body.callees.len) return;
-            switch (self.body.callees[e.idx.int()].view()) {
+            if (!self.body.nodes.has(e.idx)) return;
+            switch (self.body.nodes.callee(e.idx).view()) {
                 .bound_method => |mi| try self.keys.append(self.gpa, .{
                     .kind = Closure.boundKind(Closure.boundRecvLocal(self.tree, self.resolutions, e.idx), Closure.heapStorage(self.body)),
                     .key = mi,
@@ -209,8 +209,7 @@ const EscapeUnit = struct {
     /// Its `mut` params, `mut self` first.
     modes: u64,
     params: []const Type,
-    node_types: []const Type,
-    callees: []const Callee,
+    nodes: Body.Nodes,
 };
 
 /// The escape pass, serial over the finished tables in body order (so identical at any
@@ -236,10 +235,10 @@ pub fn analyzeEscapes(
     const gpa = t.gpa;
     var units: std.ArrayList(EscapeUnit) = .empty;
     defer units.deinit(gpa);
-    for (bodies.items) |b| try units.append(gpa, .{ .mod = b.mod, .decl = b.decl, .modes = b.sig.mut_mask, .params = b.sig.params, .node_types = b.node_types, .callees = b.callees });
+    for (bodies.items) |b| try units.append(gpa, .{ .mod = b.mod, .decl = b.decl, .modes = b.sig.mut_mask, .params = b.sig.params, .nodes = b.nodes });
     for (fns, t.fns.items, 0..) |f, fs, gid| {
         if (!isTemplateOwner(f, fs)) continue;
-        try units.append(gpa, .{ .mod = f.module, .decl = f.decl_node, .modes = fs.mut_mask, .params = sigs[gid].params, .node_types = node_types[f.module], .callees = callees[f.module] });
+        try units.append(gpa, .{ .mod = f.module, .decl = f.decl_node, .modes = fs.mut_mask, .params = sigs[gid].params, .nodes = .{ .types = node_types[f.module], .callees = callees[f.module] } });
     }
     const n_bodies = bodies.items.len;
     const prog: Body.ProgramView = .{ .sigs = sigs, .methods = methods, .instances = instances, .layouts = layouts };
@@ -264,7 +263,7 @@ pub fn analyzeEscapes(
         } else false;
         if (fc == null and !takes_fn and !has_mut) continue;
         const proto = Ast.protoAt(mc.tree, mc.tree.nodes[eu.decl.int()].lhs.int());
-        const body: Body.BodyView = .{ .tree = mc.tree, .resolutions = mc.resolutions, .node_types = eu.node_types, .callees = eu.callees };
+        const body: Body.BodyView = .{ .tree = mc.tree, .resolutions = mc.resolutions, .nodes = eu.nodes };
         facts[u] = try Escape.factsOf(gpa, .{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, body, prog, bodies, eu.decl, @intCast(proto.params.len), fc, if (template) .template else .lowered);
     }
     var sol = try Escape.solve(gpa, facts);
@@ -413,7 +412,7 @@ fn appendLambdaUnits(
     enum_layouts: []const EnumLayout,
 ) !void {
     for (fc.boundaries) |bd| {
-        const t = b.node_types[bd.node.int()];
+        const t = b.nodes.typeOf(bd.node);
         // Only a program with type errors leaves a lambda untyped, and it is never lowered.
         if (!LayoutEngine.isFnStruct(t, layouts)) continue;
         const fs = layouts[t.struct_id].fn_sig.?;
@@ -430,7 +429,7 @@ fn appendLambdaUnits(
         };
         const env = try gpa.alloc(Closure.EnvSlot, bd.captures.len);
         errdefer gpa.free(env);
-        const env_size = try layoutCaptureEnv(gpa, bd.captures, b.node_types, Closure.heapStorage(b), layouts, enum_layouts, env);
+        const env_size = try layoutCaptureEnv(gpa, bd.captures, b.nodes, Closure.heapStorage(b), layouts, enum_layouts, env);
         try units.append(gpa, .{
             .owner = owner,
             .mod = b.mod,
@@ -455,7 +454,7 @@ fn appendLambdaUnits(
 fn layoutCaptureEnv(
     gpa: std.mem.Allocator,
     captures: []const Closure.Capture,
-    node_types: []const Type,
+    nodes: Body.Nodes,
     st: Closure.Storage,
     layouts: []const Layout,
     enum_layouts: []const EnumLayout,
@@ -473,12 +472,12 @@ fn layoutCaptureEnv(
             al.* = 8;
             continue;
         }
-        const ty = node_types[c.first_use.int()];
+        const ty = nodes.typeOf(c.first_use);
         sz.* = Abi.typeSize(ty, layouts, enum_layouts);
         al.* = Abi.typeAlign(ty, layouts, enum_layouts);
     }
     const size = envLayout(sizes, aligns, offs);
-    for (captures, offs, out) |c, off, *es| es.* = .{ .slot = c.slot, .ty = node_types[c.first_use.int()], .off = off };
+    for (captures, offs, out) |c, off, *es| es.* = .{ .slot = c.slot, .ty = nodes.typeOf(c.first_use), .off = off };
     return size;
 }
 

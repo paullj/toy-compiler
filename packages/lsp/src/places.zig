@@ -150,7 +150,7 @@ pub fn mutArgs(an: *const Analysis, a: std.mem.Allocator) ![]const MutArg {
     const m = an.module();
     const tree = m.tree();
     const t = an.tc();
-    const body: Body.BodyView = .{ .tree = tree, .resolutions = an.resolutions(), .node_types = an.nodeTypes(), .callees = an.callees() };
+    const body: Body.BodyView = .{ .tree = tree, .resolutions = an.resolutions(), .nodes = .{ .types = an.nodeTypes(), .callees = an.callees() } };
     const prog: Body.ProgramView = .{ .sigs = t.sigs, .methods = t.methods, .instances = t.instances };
     var out: std.ArrayList(MutArg) = .empty;
     for (m.nodes, 0..) |n, c| {
@@ -292,7 +292,7 @@ fn boundHold(an: *const Analysis, tok: u32, recv: u32, slot: u32) Hold {
     var hold: ?Hold = null;
     for (t.bodies.items, 0..) |b, i| {
         if (b.mod != an.entry() or b.decl.int() != fn_node) continue;
-        const h = ownerHold(an, @intCast(i), slot, if (recv < b.node_types.len) sizeOf(an, b.node_types[recv]) else null);
+        const h = ownerHold(an, @intCast(i), slot, if (b.nodes.has(Ast.Index.from(recv))) sizeOf(an, b.nodes.typeOf(Ast.Index.from(recv))) else null);
         hold = if (hold) |prev| prev.merge(h) else h;
     }
     return hold orelse .unknown;
