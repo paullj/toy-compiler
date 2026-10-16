@@ -28,8 +28,9 @@ const patchBTo = em.patchBTo;
 // is the fault-free is-it-initialized probe: it returns 0 when the page is mapped and −1
 // (ENOMEM) when it is not. (macOS `mincore` cannot serve here — it returns 0 for an
 // unmapped page too.) The CB page is metadata-only (span_count, collection count, a
-// growth watermark, the span/large lists, the mark-stack fields, and 13 per-class
-// freelist heads); a fresh zeroed page leaves every field 0, so nothing is seeded.
+// growth watermark, the span/large lists, the mark-stack fields, 13 per-class freelist
+// heads, and the bytes the last sweep kept live); a fresh zeroed page leaves every field
+// 0, so nothing is seeded.
 //
 // Each 16 KiB size-class span carries a 256-byte self-describing prologue (its size
 // class, cell count, cells base, class index, and a 1-bit-per-cell mark bitmap); cells
@@ -37,7 +38,9 @@ const patchBTo = em.patchBTo;
 // prologue shape. `gc_alloc` pops a per-class freelist (clearing the reused cell's
 // next-pointer to keep the zero-on-alloc invariant), refills by mmapping+carving a fresh
 // span when the freelist is empty, and runs a synchronous stop-the-world collection once
-// an allocation watermark is crossed. The collector walks the FP chain enumerating each
+// the bytes allocated since the last one reach the live bytes it kept (Go's GOGC=100
+// pacing, floored at 256 KiB). A fixed budget makes a growing live set pay a whole-heap
+// trace every 256 KiB: O(live) collections of O(live) work each. The collector walks the FP chain enumerating each
 // frame's roots by PRECISE stack-map lookup (a per-fn table names the managed cells;
 // frames with no entry fall back to a conservative whole-frame word scan — sound because
 // the spill-everything frame puts every live reference in a frame cell), traces marked
@@ -63,6 +66,7 @@ const off_ms_cap: u32 = 56;
 const off_freelist: u32 = 64; // freelist_heads[0..12] → +64..+160
 const off_scratch_a: u32 = 168;
 const off_scratch_b: u32 = 176;
+const off_live: u32 = 184;
 
 // Class-span prologue field offsets (size_class != 0 marks a class span).
 const sp_next: u32 = 0;
@@ -88,6 +92,7 @@ const map_anon_priv_fixed: u16 = 0x1012; // MAP_ANON | MAP_PRIVATE | MAP_FIXED
 const large_threshold: u16 = 0x2000; // 8 KiB: requests above this bypass the span arena
 const ms_async: u16 = 1; // MS_ASYNC
 const ms_init: u16 = 4096; // initial mark-stack capacity (entries; 16 B each)
+const trigger_floor_hw1: u16 = 4; // movz #4, lsl #16 = 256 KiB minimum collection budget
 
 // Size classes (index 0..12). 48/96/192 are non-pow2 → normalize via real udiv/mul.
 // The taxonomy lives in `Abi` (the descriptor + the allocator share one authority).
@@ -125,10 +130,24 @@ fn emitLocateCb(code: *std.ArrayList(u8), relocs: *std.ArrayList(Link.Reloc), gp
     try emit(code, gpa, A.movz(9, cb_addr_hw, cb_addr_lsl)); // x9 = CB_ADDR (both paths)
 }
 
+/// Emit the collection-trigger compare with CB in x9: flags = watermark (x3) against the
+/// budget max(live, floor) (x8), so a following `b.lo` skips the collection. The floor also
+/// covers the first cycle, when no sweep has measured `live` yet. Clobbers x3, x8, x13.
+fn emitTriggerCompare(code: *std.ArrayList(u8), gpa: std.mem.Allocator) error{OutOfMemory}!void {
+    const A = Aarch64;
+    const emit = emitWord;
+    try emit(code, gpa, A.ldrRegUoff(3, 9, off_watermark));
+    try emit(code, gpa, A.ldrRegUoff(8, 9, off_live));
+    try emit(code, gpa, A.movz(13, trigger_floor_hw1, 1));
+    try emit(code, gpa, A.cmpReg(8, 13));
+    try emit(code, gpa, A.csel(8, 8, 13, .hs));
+    try emit(code, gpa, A.cmpReg(3, 8));
+}
+
 /// Build the `gc_alloc(size)` builtin: returns a fresh zeroed cell for the request.
 /// Small requests round up to a size class and pop that class's freelist (clearing the
-/// reused cell's next-pointer to preserve zero-on-alloc); an empty freelist past the
-/// growth watermark triggers a collection, else mmaps + carves a fresh span. Requests
+/// reused cell's next-pointer to preserve zero-on-alloc); an empty freelist once the
+/// allocation budget is spent triggers a collection, else mmaps + carves a fresh span. Requests
 /// above 8 KiB get a direct span-aligned mmap (large object). Caller owns the result.
 pub fn lowerGcAlloc(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     const A = Aarch64;
@@ -154,13 +173,11 @@ pub fn lowerGcAlloc(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
 
     // Large objects carry no freelist, so — unlike the small path, which collects only
     // when its class freelist is also empty — the sole reclaim trigger for the large arena
-    // is the growth watermark: cross it and collect first (the sweep munmaps every dead
+    // is the allocation budget: spend it and collect first (the sweep munmaps every dead
     // large span), then map the fresh object. Without this, a pure large-object churn never
     // fires a collection and leaks unbounded. The collection precedes the mmap, so the new
     // object is never at risk. The call clobbers x0-x18, so size/CB are reloaded after.
-    try emit(&code, gpa, A.ldrRegUoff(3, 9, off_watermark));
-    try emit(&code, gpa, A.movz(8, 4, 1)); // WATERMARK = 0x40000
-    try emit(&code, gpa, A.cmpReg(3, 8));
+    try emitTriggerCompare(&code, gpa);
     const lg_skip_collect: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.bCond(.lo, 0)); // not crossed → skip
     try emitBuiltinCall(&code, &relocs, gpa, "gc_collect");
@@ -236,12 +253,10 @@ pub fn lowerGcAlloc(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     const cbnz_pop: u32 = @intCast(code.items.len);
     try emit(&code, gpa, A.cbnz(7, 0)); // head != 0 → pop
 
-    // Empty freelist: collect only if the growth watermark is crossed.
-    try emit(&code, gpa, A.ldrRegUoff(3, 9, off_watermark));
-    try emit(&code, gpa, A.movz(8, 4, 1)); // WATERMARK = 0x40000
-    try emit(&code, gpa, A.cmpReg(3, 8));
+    // Empty freelist: collect only if the allocation budget is spent.
+    try emitTriggerCompare(&code, gpa);
     const to_refill_a: u32 = @intCast(code.items.len);
-    try emit(&code, gpa, A.bCond(.lo, 0)); // watermark not crossed → refill
+    try emit(&code, gpa, A.bCond(.lo, 0)); // budget not spent → refill
     try emitBuiltinCall(&code, &relocs, gpa, "gc_collect");
     // Reload CB/idx/slot/head (the call clobbered x0-x18).
     try emit(&code, gpa, A.movz(9, cb_addr_hw, cb_addr_lsl));
@@ -559,10 +574,10 @@ pub fn lowerGcMarkLeaf(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
 /// then every class span is linear-swept (dead cells → per-class freelists, mark bits
 /// cleared). Large objects leak (their mark is just reset). Caller owns the result.
 ///
-/// Register contract: x19=CB, x24=pending descriptor for the next push, x25=text_base,
-/// x26=&stackmap, x27=cur fp, x28=parent fp, x20/x21/x22=scan/enumeration cursors,
-/// x23=corruption cap — all callee-saved, saved/restored so the collector honors the ABI
-/// toward the allocating caller.
+/// Register contract: x19=CB, x24=pending descriptor for the next push (the live-byte sum
+/// during the sweep), x25=text_base, x26=&stackmap, x27=cur fp, x28=parent fp,
+/// x20/x21/x22=scan/enumeration cursors, x23=corruption cap — all callee-saved,
+/// saved/restored so the collector honors the ABI toward the allocating caller.
 pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     const A = Aarch64;
     const emit = emitWord;
@@ -837,7 +852,9 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     const trace_done: u32 = @intCast(code.items.len);
     patchCbzTo(code.items, cbz_trace_done, trace_done);
 
-    // Sweep class spans: dead cells → freelists (zeroed first), marked cells → bit cleared.
+    // Sweep class spans: dead cells → freelists (zeroed first), marked cells → bit cleared
+    // and their class bytes summed into x24, the live total that paces the next collection.
+    try emit(&code, gpa, A.movz(24, 0, 0));
     try emit(&code, gpa, A.ldrRegUoff(0, 19, off_span_head));
     const sw_span_top: u32 = @intCast(code.items.len);
     const cbz_sweep_large: u32 = @intCast(code.items.len);
@@ -892,6 +909,7 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.mvn(10, 15));
     try emit(&code, gpa, A.andReg(13, 13, 10));
     try emit(&code, gpa, A.strb(13, 12, 0)); // clear bit
+    try emit(&code, gpa, A.addReg(24, 24, 1)); // live += class
     const sw_cell_next: u32 = @intCast(code.items.len);
     patchBTo(code.items, b_cell_next, sw_cell_next);
     try emit(&code, gpa, A.addImm(9, 9, 1));
@@ -934,6 +952,8 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     const sw_lg_survive: u32 = @intCast(code.items.len);
     patchCbzTo(code.items, cbnz_lg_survive, sw_lg_survive);
     try emit(&code, gpa, A.strRegUoff(A.XZR, 21, lg_mark)); // clear mark
+    try emit(&code, gpa, A.ldrRegUoff(0, 21, lg_reqsize));
+    try emit(&code, gpa, A.addReg(24, 24, 0)); // live += req_size
     try emit(&code, gpa, A.addImm(20, 21, lg_next)); // pp = &cur.next
     try emit(&code, gpa, A.movReg(21, 23)); // cur = next
     const b_lg_top2: u32 = @intCast(code.items.len);
@@ -947,6 +967,7 @@ pub fn lowerGcCollect(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.addImm(0, 0, 1));
     try emit(&code, gpa, A.strRegUoff(0, 19, off_collections)); // collections++
     try emit(&code, gpa, A.strRegUoff(A.XZR, 19, off_watermark)); // watermark = 0
+    try emit(&code, gpa, A.strRegUoff(24, 19, off_live));
 
     try emit(&code, gpa, A.ldrSp(19, 0));
     try emit(&code, gpa, A.ldrSp(20, 8));

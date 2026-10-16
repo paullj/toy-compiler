@@ -167,3 +167,45 @@ pub fn large_churn_survivor() -> int {
     }
     return unsafe { load(keep) }
 }
+
+# The allocation budget between collections must scale with the live heap (GOGC=100
+# pacing), or a growing live set pays a whole-heap trace every fixed 256 KiB and the total
+# GC time grows quadratically. Root ~2.25 MiB (a 256 KiB large array of 32768 64-byte
+# cells), collect once to measure it, then churn 1 MiB: below the live-sized budget, so no
+# collection may run (a fixed 256 KiB trigger runs 3). Churning 4 MiB more crosses
+# the budget and must collect. Returns 1; 100+k when k collections ran inside the budget,
+# 2 when none ran past it.
+pub fn live_paced_collections() -> int {
+    n := 32768
+    arr := gc_alloc(n * 8)
+    i := 0
+    loop {
+        if i >= n { break }
+        c := gc_alloc(64)
+        unsafe { store(offset(arr, i * 8), c) }
+        i = i + 1
+    }
+    gc_collect()
+    s0 := gc_stats()
+    j := 0
+    loop {
+        if j >= 16384 { break }
+        junk := gc_alloc(64)
+        unsafe { store(junk, j) }
+        j = j + 1
+    }
+    s1 := gc_stats()
+    k := 0
+    loop {
+        if k >= 65536 { break }
+        junk := gc_alloc(64)
+        unsafe { store(junk, k) }
+        k = k + 1
+    }
+    s2 := gc_stats()
+    kept := unsafe { load(offset(arr, 8)) }
+    if kept == 0 { return 3 }
+    if s1 != s0 { return 100 + s1 - s0 }
+    if s2 == s1 { return 2 }
+    return 1
+}

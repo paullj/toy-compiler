@@ -269,6 +269,22 @@ test "gc: churning dropped large objects is bounded — dead spans munmapped, ro
     try std.testing.expectEqual(@as(u8, 9), code);
 }
 
+test "gc: the collection budget scales with the live heap, not a fixed 256 KiB (GOGC=100 pacing)" {
+    // Exit 1 = no collection while churning 1 MiB under a ~2.25 MiB live heap, then one
+    // once the churn passes it. A fixed 256 KiB trigger runs 3 inside the budget (103),
+    // the quadratic total GC time #87 reported.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-live-paced",
+        \\import core/mem_selftest
+        \\fn main() -> int { return mem_selftest.live_paced_collections() }
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 1), code);
+}
+
 test "heap: repeated span exhaustion keeps mmapping fresh spans (arena count >= 3)" {
     // Allocating past two full spans forces two refills. This catches a refill that
     // fails to persist the new span's limit: such a bug bumps unbounded off the second
