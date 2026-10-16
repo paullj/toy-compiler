@@ -1,0 +1,54 @@
+# Feature: a call on a bounded param takes the bound's conformance in every instance. `P`
+# and `int` each have `render` from both `Show` and `Debug`, and `P` has `Into` twice, so a
+# bare `p.render()` or `p.into()` is T0025; through `use_show[T has Show]` the call can only
+# mean `Show.render`, through `[T has Into[int]]` only `Into[int].into`, and a bound's args
+# may come from another type param (`conv[P, bool]`).
+# expect: stdout "1\n2\n42\ntrue\n12\n33\n"
+# expect: exit 0
+import std/io
+
+protocol Show { fn render(self) -> int }
+protocol Debug { fn render(self) -> int }
+
+struct P { x: int }
+
+impl P has Show {
+    fn render(self) -> int { 1 }
+}
+
+impl P has Debug {
+    fn render(self) -> int { 2 }
+}
+
+impl P has Into[int] {
+    fn into(self) -> int { self.x }
+}
+
+impl P has Into[bool] {
+    fn into(self) -> bool { self.x > 0 }
+}
+
+impl int has Show {
+    fn render(self) -> int { self + 10 }
+}
+
+impl int has Debug {
+    fn render(self) -> int { self + 20 }
+}
+
+fn use_show[T has Show](t: T) -> int { t.render() }
+fn use_debug[T has Debug](t: T) -> int { t.render() }
+fn as_int[T has Into[int]](t: T) -> int { t.into() }
+fn conv[T has Into[U], U](t: T) -> U { t.into() }
+fn both[A has Show, B has Debug](a: A, b: B) -> int { a.render() * 10 + b.render() }
+
+fn main() -> int {
+    p := P { x: 42 }
+    io.println(use_show(p).to_string())
+    io.println(use_debug(p).to_string())
+    io.println(as_int(p).to_string())
+    io.println(conv[P, bool](p).to_string())
+    io.println(both(p, p).to_string())
+    io.println((use_show(1) + use_debug(2)).to_string())
+    return 0
+}

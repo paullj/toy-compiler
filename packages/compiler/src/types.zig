@@ -3308,6 +3308,11 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type, spa
     var bc = t.bodyCheckerFor(model, fsub, sc);
     defer bc.deinit();
     bc.subst = .{ .names = f.generic_params, .types = args };
+    // Pass C checked a bounded template once against its bounds, onto the module's slots.
+    for (f.generic_bounds) |b| if (b != null) {
+        if (t.gph_callees) |cs| bc.axiom_callees = cs[f.mod];
+        break;
+    };
     try bc.checkBody(gid, fsub);
     // The instance keeps only `span`, so a write outside it would be lost.
     if (builtin.is_test) {
@@ -7203,6 +7208,213 @@ test "a generic receiver with two conformances is T0025 wherever its method is s
         try testing.expect(bool_at < int_at);
     }
     try testing.expectEqual(@as(usize, 2), n25);
+}
+
+/// The message of `src`'s only T0025, which `c` holds once checked.
+fn onlyT0025(c: *const Checked) ![]const u8 {
+    var msg: ?[]const u8 = null;
+    for (c.result.diags) |d| if (d.severity == .err) {
+        try testing.expectEqual(codes.Code.T0025, d.code);
+        try testing.expect(msg == null);
+        msg = d.message;
+    };
+    return msg orelse error.TestUnexpectedResult;
+}
+
+fn expectNoErrors(src: []const u8) !void {
+    var c = try checkSource(src);
+    defer c.deinit(testing.allocator);
+    for (c.result.diags) |d| if (d.severity == .err) {
+        std.debug.print("following the hint gave: {s}\n{s}\n", .{ d.message, src });
+        return error.TestUnexpectedResult;
+    };
+}
+
+test "every T0025 hint compiles when it is followed literally" {
+    const gpa = testing.allocator;
+    const Case = struct {
+        decls: []const u8,
+        /// The call in `main` that T0025 reports, on the local `p`, and how it reads
+        /// through a bounded fn (`{f}` stands for its name).
+        p: []const u8,
+        call: []const u8,
+        via: []const u8 = "",
+        explicit: usize,
+        bounded: bool,
+    };
+    const cases = [_]Case{
+        .{
+            .decls = "struct P { x: int }\nimpl P has Into[int] { fn into(self) -> int { self.x } }\nimpl P has Into[bool] { fn into(self) -> bool { self.x > 0 } }\n",
+            .p = "P { x: 1 }",
+            .call = "p.into()",
+            .explicit = 2,
+            .bounded = false,
+        },
+        .{
+            .decls = "struct Box[T] { v: T }\nimpl Box[T] has Into[T] { fn into(self) -> T { self.v } }\nimpl Box[T] has Into[bool] { fn into(self) -> bool { true } }\n",
+            .p = "Box { v: Box { v: 1 } }",
+            .call = "p.into()",
+            .explicit = 2,
+            .bounded = false,
+        },
+        .{
+            .decls = "protocol Show { fn render(self) -> int }\nprotocol Debug { fn render(self) -> int }\nstruct P { x: int }\nimpl P has Show { fn render(self) -> int { 1 } }\nimpl P has Debug { fn render(self) -> int { 2 } }\n",
+            .p = "P { x: 1 }",
+            .call = "p.render()",
+            .via = "{f}(p)",
+            .explicit = 0,
+            .bounded = true,
+        },
+        .{
+            .decls = "protocol Show { fn render(self, k: int) -> int }\nprotocol Debug { fn render(self, k: int) -> int }\nimpl int has Show { fn render(self, k: int) -> int { self + k } }\nimpl int has Debug { fn render(self, k: int) -> int { self - k } }\n",
+            .p = "4",
+            .call = "p.render(1)",
+            .via = "{f}(p, 1)",
+            .explicit = 0,
+            .bounded = true,
+        },
+        .{
+            .decls = "protocol Tagged[X] { fn tag(mut self, n: X, s: str) -> X }\nprotocol Named[X] { fn tag(mut self, n: X, s: str) -> X }\nstruct P { x: int }\nimpl P has Tagged[int] { fn tag(mut self, n: int, _s: str) -> int { n } }\nimpl P has Named[int] { fn tag(mut self, _n: int, _s: str) -> int { 0 } }\n",
+            .p = "P { x: 1 }",
+            .call = "p.tag(1, \"s\")",
+            .via = "{f}(p, 1, \"s\")",
+            .explicit = 0,
+            .bounded = true,
+        },
+        .{
+            .decls = "protocol Conv { fn into(self) -> int }\nstruct P { x: int }\nimpl P has Into[int] { fn into(self) -> int { self.x } }\nimpl P has Into[bool] { fn into(self) -> bool { self.x > 0 } }\nimpl P has Conv { fn into(self) -> int { 5 } }\n",
+            .p = "P { x: 1 }",
+            .call = "p.into()",
+            .via = "{f}(p)",
+            .explicit = 2,
+            .bounded = true,
+        },
+    };
+    for (cases) |k| {
+        const src = try std.fmt.allocPrint(gpa, "{s}fn main() -> int {{\n p := {s}\n _r := {s}\n return 0\n}}\n", .{ k.decls, k.p, k.call });
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        const msg = try onlyT0025(&c);
+        const member = k.call[2..std.mem.indexOfScalar(u8, k.call, '(').?];
+        // Each `.m[..]()` the hint offers, in place of the call's own `.m()`.
+        var explicit: usize = 0;
+        var rest = msg;
+        const dot_m = try std.fmt.allocPrint(gpa, ".{s}[", .{member});
+        defer gpa.free(dot_m);
+        while (std.mem.indexOf(u8, rest, dot_m)) |at| {
+            const end = std.mem.indexOfPos(u8, rest, at, "]()").? + 3;
+            const fixed = try std.fmt.allocPrint(gpa, "{s}fn main() -> int {{\n p := {s}\n _r := p{s}\n return 0\n}}\n", .{ k.decls, k.p, rest[at..end] });
+            defer gpa.free(fixed);
+            try expectNoErrors(fixed);
+            explicit += 1;
+            rest = rest[end..];
+        }
+        try testing.expectEqual(k.explicit, explicit);
+        // The bounded fn it offers, declared and called in place of the method.
+        const fn_at = std.mem.indexOf(u8, msg, "e.g. 'fn ");
+        try testing.expectEqual(k.bounded, fn_at != null);
+        if (fn_at) |at| {
+            const text = msg[at + 6 .. msg.len - 1];
+            const name = text[3..std.mem.indexOfScalar(u8, text, '[').?];
+            const call = try std.mem.replaceOwned(u8, gpa, k.via, "{f}", name);
+            defer gpa.free(call);
+            const fixed = try std.fmt.allocPrint(gpa, "{s}{s}\nfn main() -> int {{\n p := {s}\n _r := {s}\n return 0\n}}\n", .{ k.decls, text, k.p, call });
+            defer gpa.free(fixed);
+            try expectNoErrors(fixed);
+        }
+    }
+}
+
+test "every T0025 hint at a method value compiles when it is followed literally" {
+    const gpa = testing.allocator;
+    const Case = struct { decls: []const u8, p: []const u8, value: []const u8, offered: usize };
+    const into = "impl P has Into[int] { fn into(self) -> int { self.x } }\nimpl P has Into[bool] { fn into(self) -> bool { self.x > 0 } }\n";
+    const cases = [_]Case{
+        .{ .decls = "struct P { x: int }\n" ++ into, .p = "P { x: 1 }", .value = "p.into", .offered = 2 },
+        .{ .decls = "struct P { x: int }\n" ++ into, .p = "P { x: 1 }", .value = "p.into[int]", .offered = 2 },
+        .{ .decls = "struct Box[T] { v: T }\nimpl Box[T] has Into[int] { fn into(self) -> int { 7 } }\nimpl Box[T] has Into[bool] { fn into(self) -> bool { true } }\n", .p = "Box { v: 1 }", .value = "p.into", .offered = 2 },
+        .{ .decls = "struct Box[T] { v: T }\nimpl Box[T] has Into[int] { fn into(self) -> int { 7 } }\nimpl Box[T] has Into[bool] { fn into(self) -> bool { true } }\n", .p = "Box { v: 1 }", .value = "p.into[bool]", .offered = 2 },
+        .{ .decls = "protocol Tagged[X] { fn tag(self, n: X, s: str) -> X }\nstruct P { x: int }\nimpl P has Tagged[int] { fn tag(self, n: int, _s: str) -> int { n } }\nimpl P has Tagged[bool] { fn tag(self, n: bool, _s: str) -> bool { n } }\n", .p = "P { x: 1 }", .value = "p.tag", .offered = 2 },
+    };
+    for (cases) |k| {
+        const src = try std.fmt.allocPrint(gpa, "{s}fn main() -> int {{\n p := {s}\n _f := {s}\n return 0\n}}\n", .{ k.decls, k.p, k.value });
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        const msg = try onlyT0025(&c);
+        var offered: usize = 0;
+        var rest = msg;
+        while (std.mem.indexOf(u8, rest, "'fn(")) |at| {
+            const end = std.mem.indexOfPos(u8, rest, at, "}'").? + 1;
+            const fixed = try std.fmt.allocPrint(gpa, "{s}fn main() -> int {{\n p := {s}\n _f := {s}\n return 0\n}}\n", .{ k.decls, k.p, rest[at + 1 .. end] });
+            defer gpa.free(fixed);
+            try expectNoErrors(fixed);
+            offered += 1;
+            rest = rest[end..];
+        }
+        errdefer std.debug.print("{s}\n", .{msg});
+        try testing.expectEqual(k.offered, offered);
+    }
+}
+
+test "T0025 on a generic type names the conformances no call can choose" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\protocol Show { fn render(self) -> int }
+        \\protocol Debug { fn render(self) -> int }
+        \\struct Box[T] { v: T }
+        \\impl Box[T] has Show { fn render(self) -> int { 1 } }
+        \\impl Box[T] has Debug { fn render(self) -> int { 2 } }
+        \\fn main() -> int { return Box { v: 1 }.render() }
+        \\
+    );
+    defer c.deinit(gpa);
+    const msg = try onlyT0025(&c);
+    try testing.expect(std.mem.endsWith(u8, msg, "(Show and Debug); no call can choose 'Show' or 'Debug' on a generic type yet"));
+}
+
+test "a call on a bounded param takes the bound's conformance in each instance" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\protocol Show { fn render(self) -> int }
+        \\protocol Debug { fn render(self) -> int }
+        \\struct P { x: int }
+        \\impl P has Show { fn render(self) -> int { 1 } }
+        \\impl P has Debug { fn render(self) -> int { 2 } }
+        \\impl P has Into[int] { fn into(self) -> int { self.x } }
+        \\impl P has Into[bool] { fn into(self) -> bool { self.x > 0 } }
+        \\fn use_show[T has Show](t: T) -> int { t.render() }
+        \\fn use_debug[T has Debug](t: T) -> int { t.render() }
+        \\fn as_int[T has Into[int]](t: T) -> int { t.into() }
+        \\fn conv[T has Into[U], U](t: T) -> U { t.into() }
+        \\fn main() -> int {
+        \\ p := P { x: 3 }
+        \\ return use_show(p) + use_debug(p) + as_int(p) + (if conv[P, bool](p) { 1 } else { 0 })
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // Each instance's call selects the witness of its own bound's conformance.
+    var seen: usize = 0;
+    for (c.result.instances) |inst| {
+        const full = c.result.sigs[inst.template_gid].name;
+        const tname = full[(std.mem.lastIndexOfScalar(u8, full, '.') orelse return error.TestUnexpectedResult) + 1 ..];
+        for (inst.callees) |cl| switch (cl.view()) {
+            .method => |mi| {
+                const m = c.result.methods[mi];
+                const proto = c.result.protocols[m.protocol_id.?];
+                const want: []const u8 = if (std.mem.eql(u8, tname, "use_show")) "Show" else if (std.mem.eql(u8, tname, "use_debug")) "Debug" else "Into";
+                try testing.expectEqualStrings(want, proto.name);
+                if (std.mem.eql(u8, tname, "as_int")) try testing.expectEqual(Type.int.kind, m.protocol_args[0].kind);
+                if (std.mem.eql(u8, tname, "conv")) try testing.expectEqual(Type.bool.kind, m.protocol_args[0].kind);
+                seen += 1;
+            },
+            else => {},
+        };
+    }
+    try testing.expectEqual(@as(usize, 4), seen);
 }
 
 test "pickGenericMethod is ambiguous only between conformances" {

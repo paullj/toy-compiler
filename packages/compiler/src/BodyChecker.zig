@@ -363,6 +363,11 @@ pub const BodyChecker = struct {
     /// non-generic/unbounded fn. Set by `bodyCheckerFor` from `FnSym.generic_bound_args`.
     bound_protocol_args: []const []const Type = &.{},
 
+    /// A bounded template's instance re-check only: the callees its bound-as-axiom check
+    /// recorded on the module's nodes (borrowed), where a call on a bounded param holds
+    /// the bound's protocol it resolved through (see `boundConformance`). Empty elsewhere.
+    axiom_callees: []const Callee = &.{},
+
     /// The ordered generic-param NAMES, set by `bodyCheckerFor` from
     /// `FnSym.generic_params`; empty for a non-generic fn. Read ONLY by the innermost-
     /// failure diagnostic so an abstract `App`'s `type_var` culprit renders as its param
@@ -873,7 +878,7 @@ pub const BodyChecker = struct {
         const m = switch (Typecheck.pickGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, StdNames.method_iter, .program)) {
             .one => |m| m,
             .ambiguous => {
-                try bc.emitAmbiguousConformance(bc.spanOf(iterable), recv, StdNames.method_iter);
+                try bc.emitAmbiguousConformance(bc.spanOf(iterable), recv, StdNames.method_iter, null);
                 return Type.invalid;
             },
             .none => return null,
@@ -1715,7 +1720,7 @@ pub const BodyChecker = struct {
                     return ty;
                 },
                 .ambiguous => {
-                    try bc.emitAmbiguousConformance(bc.tokSpan(fa.main_token), recv_ty, member);
+                    try bc.emitAmbiguousConformance(bc.tokSpan(fa.main_token), recv_ty, member, fa.lhs);
                     return bc.poison();
                 },
                 .none => {},
@@ -1728,7 +1733,7 @@ pub const BodyChecker = struct {
             const picked: ?Typecheck.TemplateMethod = switch (Typecheck.pickGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite())) {
                 .one => |m| m,
                 .ambiguous => {
-                    try bc.emitAmbiguousConformance(bc.tokSpan(fa.main_token), recv_ty, member);
+                    try bc.emitAmbiguousConformance(bc.tokSpan(fa.main_token), recv_ty, member, fa.lhs);
                     return bc.poison();
                 },
                 .none => null,
@@ -2757,12 +2762,43 @@ pub const BodyChecker = struct {
         return mf.ret;
     }
 
+    const BoundConformance = struct { pid: u32, args: ?[]const Type };
+
+    /// The conformance a call takes in a bounded template's instance re-check when the
+    /// bound-as-axiom check resolved it through a param's bound (`[T has Show]`,
+    /// `t.render()`): that bound's protocol, and its args grounded through the instance
+    /// (null when two bounds of the protocol on this type disagree). The receiver's own
+    /// methods would offer every conformance of the instance type, which is ambiguous
+    /// once it has a second `render`. Null for any other call. `buf` holds the args.
+    fn boundConformance(bc: *BodyChecker, call: Ast.Node, recv: Type, buf: *std.ArrayList(Type)) error{OutOfMemory}!?BoundConformance {
+        const fa = Callee.memberNode(bc.tree, call) orelse return null;
+        if (fa.int() >= bc.axiom_callees.len) return null;
+        const pid = switch (bc.axiom_callees[fa.int()].view()) {
+            .protocol => |p| p.protocol,
+            else => return null,
+        };
+        const s = bc.subst orelse return .{ .pid = pid, .args = null };
+        var found = false;
+        for (bc.bound_protocols, 0..) |bp, ord| {
+            if ((bp orelse continue) != pid or ord >= s.types.len or !Type.eql(s.types[ord], recv)) continue;
+            const pargs: []const Type = if (ord < bc.bound_protocol_args.len) bc.bound_protocol_args[ord] else &.{};
+            if (!found) {
+                for (pargs) |pa| try buf.append(bc.gpa, substTy(bc, pa, s.types));
+                found = true;
+                continue;
+            }
+            if (pargs.len != buf.items.len) return .{ .pid = pid, .args = null };
+            for (pargs, buf.items) |pa, have| if (!Type.eql(substTy(bc, pa, s.types), have)) return .{ .pid = pid, .args = null };
+        }
+        return .{ .pid = pid, .args = if (found) buf.items else null };
+    }
+
     /// Emit the T0025 ambiguity diagnostic: the receiver conforms more than once with a
     /// method `member` and the use site gave no disambiguating type-args. Names the
     /// conflicting conformances in table (source fn-id) order — deterministic at any `-jN`.
     /// A generic receiver's are its ctor's templates, their arg patterns grounded through
     /// the receiver's args.
-    fn emitAmbiguousConformance(bc: *BodyChecker, at: Span, recv: Type, member: []const u8) error{OutOfMemory}!void {
+    fn emitAmbiguousConformance(bc: *BodyChecker, at: Span, recv: Type, member: []const u8, value_recv: ?Ast.Index) error{OutOfMemory}!void {
         var confs: std.ArrayList(AmbiguousConformance) = .empty;
         defer confs.deinit(bc.gpa);
         var arg_buf: std.ArrayList(Type) = .empty;
@@ -2792,21 +2828,187 @@ pub const BodyChecker = struct {
         defer names.deinit(bc.gpa);
         for (confs.items, 0..) |c, i| {
             if (i != 0) try names.appendSlice(bc.gpa, " and ");
-            try names.appendSlice(bc.gpa, bc.model.protocols[c.pid].name);
-            try bc.appendTypeArgs(&names, arg_buf.items[c.args_start..][0..c.args_len]);
+            try bc.writeConformance(&names, c, arg_buf.items);
         }
-        try bc.sink.report(.{ .span = at, .code = .T0025 }, "ambiguous conformance: '{s}' on '{s}' matches multiple conformances ({s}); add explicit protocol type arguments, e.g. .{s}[int]()", .{ member, bc.typeName(recv), names.items, member });
+        var hint: std.ArrayList(u8) = .empty;
+        defer hint.deinit(bc.gpa);
+        try bc.writeAmbiguityHint(&hint, recv, member, confs.items, arg_buf.items, value_recv);
+        try bc.sink.report(.{ .span = at, .code = .T0025 }, "ambiguous conformance: '{s}' on '{s}' matches multiple conformances ({s}); {s}", .{ member, bc.typeName(recv), names.items, hint.items });
     }
 
-    const AmbiguousConformance = struct { pid: u32, args_start: usize, args_len: usize };
+    const AmbiguousConformance = struct {
+        pid: u32,
+        args_start: usize,
+        args_len: usize,
+
+        fn args(c: AmbiguousConformance, buf: []const Type) []const Type {
+            return buf[c.args_start..][0..c.args_len];
+        }
+    };
+
+    /// `Into[int]`, or `Show` for a protocol without args.
+    fn writeConformance(bc: *BodyChecker, out: *std.ArrayList(u8), c: AmbiguousConformance, buf: []const Type) error{OutOfMemory}!void {
+        try out.appendSlice(bc.gpa, bc.model.protocols[c.pid].name);
+        try bc.writeTypeArgsSource(out, c.args(buf), &.{});
+    }
+
+    /// How to choose among `confs`, in text that compiles where it is written. Explicit
+    /// args name a conformance whose args no other one shares; a method value takes none,
+    /// so at `value_recv.m` they go in a lambda's call. Any other is reached through a fn
+    /// bounded by its protocol, since no call syntax names a protocol; a generic type
+    /// cannot meet a bound yet, so on one it cannot be chosen at all.
+    fn writeAmbiguityHint(bc: *BodyChecker, out: *std.ArrayList(u8), recv: Type, member: []const u8, confs: []const AmbiguousConformance, buf: []const Type, value_recv: ?Ast.Index) error{OutOfMemory}!void {
+        var named: usize = 0;
+        var unnamed: ?AmbiguousConformance = null;
+        for (confs, 0..) |c, i| {
+            if (namedByArgs(confs, buf, i)) named += 1 else if (unnamed == null) unnamed = c;
+        }
+        if (named > 0) {
+            const recv_text: ?[]const u8 = if (value_recv) |vr| bc.oneLineText(vr) else null;
+            if (value_recv != null) {
+                try out.appendSlice(bc.gpa, "a method value takes no protocol type arguments, so call the method in a lambda");
+                if (recv_text != null) try out.appendSlice(bc.gpa, ", e.g. ");
+            } else try out.appendSlice(bc.gpa, "add explicit protocol type arguments, e.g. ");
+            var k: usize = 0;
+            if (value_recv == null or recv_text != null) for (confs, 0..) |c, i| {
+                if (!namedByArgs(confs, buf, i)) continue;
+                if (k != 0) try out.appendSlice(bc.gpa, if (k + 1 == named) " or " else ", ");
+                k += 1;
+                if (recv_text) |rt| {
+                    try out.append(bc.gpa, '\'');
+                    try bc.writeLambdaCall(out, rt, recv, member, c, buf);
+                    try out.append(bc.gpa, '\'');
+                    continue;
+                }
+                try out.append(bc.gpa, '.');
+                try out.appendSlice(bc.gpa, member);
+                try bc.writeTypeArgsSource(out, c.args(buf), &.{});
+                try out.appendSlice(bc.gpa, "()");
+            };
+        }
+        const c = unnamed orelse return;
+        if (named > 0) try out.appendSlice(bc.gpa, ", or ");
+        if (recv.isApp()) {
+            try out.appendSlice(bc.gpa, "no call can choose ");
+            var k: usize = 0;
+            for (confs, 0..) |d, i| {
+                if (namedByArgs(confs, buf, i)) continue;
+                if (k != 0) try out.appendSlice(bc.gpa, " or ");
+                k += 1;
+                try out.append(bc.gpa, '\'');
+                try bc.writeConformance(out, d, buf);
+                try out.append(bc.gpa, '\'');
+            }
+            try out.appendSlice(bc.gpa, " on a generic type yet");
+            return;
+        }
+        try out.appendSlice(bc.gpa, "call it through a fn bounded by '");
+        try bc.writeConformance(out, c, buf);
+        try out.appendSlice(bc.gpa, "', e.g. '");
+        try bc.writeBoundedFn(out, member, c, buf);
+        try out.append(bc.gpa, '\'');
+    }
+
+    fn namedByArgs(confs: []const AmbiguousConformance, buf: []const Type, i: usize) bool {
+        const a = confs[i].args(buf);
+        if (a.len == 0) return false;
+        for (confs, 0..) |d, j| if (j != i and Typecheck.eqlTypeVec(a, d.args(buf))) return false;
+        return true;
+    }
+
+    /// `fn render_via[T has Show](x: T, a0: int) -> int { x.render(a0) }`: a fn whose bound
+    /// makes `x.render(..)` take that conformance's witness.
+    fn writeBoundedFn(bc: *BodyChecker, out: *std.ArrayList(u8), member: []const u8, c: AmbiguousConformance, buf: []const Type) error{OutOfMemory}!void {
+        const p = bc.model.protocols[c.pid];
+        const k = for (p.methods, 0..) |mn, i| {
+            if (std.mem.eql(u8, mn, member)) break i;
+        } else return;
+        // Self is type var 0 and stays one, spelled `T`; the protocol's own params ground.
+        const ground = try bc.gpa.alloc(Type, c.args_len + 1);
+        defer bc.gpa.free(ground);
+        ground[0] = Type.typeVar(0);
+        @memcpy(ground[1..], c.args(buf));
+        const self_name = [_][]const u8{"T"};
+        try out.print(bc.gpa, "fn {s}_via[T has ", .{member});
+        try bc.writeConformance(out, c, buf);
+        try out.appendSlice(bc.gpa, "](");
+        if (p.requiresMutSelf(k)) try out.appendSlice(bc.gpa, "mut ");
+        try out.appendSlice(bc.gpa, "x: T");
+        const params = p.method_params[k];
+        for (params[@min(params.len, 1)..], 0..) |pt, i| {
+            try out.print(bc.gpa, ", a{d}: ", .{i});
+            try bc.writeTypeSource(out, substTy(bc, pt, ground), &self_name);
+        }
+        try out.append(bc.gpa, ')');
+        const ret = substTy(bc, p.method_rets[k], ground);
+        if (ret.kind != .unit) {
+            try out.appendSlice(bc.gpa, " -> ");
+            try bc.writeTypeSource(out, ret, &self_name);
+        }
+        try out.print(bc.gpa, " {{ x.{s}(", .{member});
+        for (0..params.len -| 1) |i| try out.print(bc.gpa, "{s}a{d}", .{ if (i == 0) "" else ", ", i });
+        try out.appendSlice(bc.gpa, ") }");
+    }
+
+    /// `fn(a0: int) { p.tag[int](a0) }`: a lambda that calls `member` on `recv_text` through
+    /// conformance `c`, taking the method's other params.
+    fn writeLambdaCall(bc: *BodyChecker, out: *std.ArrayList(u8), recv_text: []const u8, recv: Type, member: []const u8, c: AmbiguousConformance, buf: []const Type) error{OutOfMemory}!void {
+        const p = bc.model.protocols[c.pid];
+        const k = for (p.methods, 0..) |mn, i| {
+            if (std.mem.eql(u8, mn, member)) break i;
+        } else return;
+        const ground = try bc.gpa.alloc(Type, c.args_len + 1);
+        defer bc.gpa.free(ground);
+        ground[0] = recv;
+        @memcpy(ground[1..], c.args(buf));
+        const params = p.method_params[k];
+        try out.appendSlice(bc.gpa, "fn(");
+        for (params[@min(params.len, 1)..], 0..) |pt, i| {
+            try out.print(bc.gpa, "{s}a{d}: ", .{ if (i == 0) "" else ", ", i });
+            try bc.writeTypeSource(out, substTy(bc, pt, ground), &.{});
+        }
+        try out.print(bc.gpa, ") {{ {s}.{s}", .{ recv_text, member });
+        try bc.writeTypeArgsSource(out, c.args(buf), &.{});
+        try out.append(bc.gpa, '(');
+        for (0..params.len -| 1) |i| try out.print(bc.gpa, "{s}a{d}", .{ if (i == 0) "" else ", ", i });
+        try out.appendSlice(bc.gpa, ") }");
+    }
+
+    /// Node `idx` as written, or null when it spans lines.
+    fn oneLineText(bc: *const BodyChecker, idx: Ast.Index) ?[]const u8 {
+        const sp = bc.spanOf(idx);
+        const text = bc.source[sp.start..sp.end];
+        return if (std.mem.indexOfScalar(u8, text, '\n') == null) text else null;
+    }
+
+    /// `t` as source spells it, generic args included, so a hint that names it compiles
+    /// where it is pasted. A type var `ord` with a name in `names` prints as that name.
+    pub fn writeTypeSource(bc: *BodyChecker, out: *std.ArrayList(u8), t: Type, names: []const []const u8) error{OutOfMemory}!void {
+        if (t.kind == .unit) return out.appendSlice(bc.gpa, "()");
+        if (t.isApp()) {
+            try out.appendSlice(bc.gpa, bc.typeName(t));
+            return bc.writeTypeArgsSource(out, bc.composite.at(t.appIdx()).args, names);
+        }
+        if (!t.isFunc()) return bc.writeTypeNamed(out, t, names, null, 0);
+        const parts = Composite.fnParts(bc.composite.at(t.funcIdx()));
+        try out.appendSlice(bc.gpa, "fn(");
+        for (parts.params, 0..) |fp, i| {
+            if (i != 0) try out.appendSlice(bc.gpa, ", ");
+            try bc.writeTypeSource(out, fp, names);
+        }
+        try out.append(bc.gpa, ')');
+        if (parts.ret.kind == .unit) return;
+        try out.appendSlice(bc.gpa, " -> ");
+        try bc.writeTypeSource(out, parts.ret, names);
+    }
 
     /// `[A, B]` after a name, or nothing for no args.
-    fn appendTypeArgs(bc: *BodyChecker, out: *std.ArrayList(u8), args: []const Type) error{OutOfMemory}!void {
+    fn writeTypeArgsSource(bc: *BodyChecker, out: *std.ArrayList(u8), args: []const Type, names: []const []const u8) error{OutOfMemory}!void {
         if (args.len == 0) return;
         try out.append(bc.gpa, '[');
         for (args, 0..) |a, j| {
             if (j != 0) try out.appendSlice(bc.gpa, ", ");
-            try out.appendSlice(bc.gpa, bc.typeName(a));
+            try bc.writeTypeSource(out, a, names);
         }
         try out.append(bc.gpa, ']');
     }
@@ -2833,7 +3035,10 @@ pub const BodyChecker = struct {
         const recv_ty = try bc.typeOfReceiver(fa.lhs); // also populates node_types[recv] for lower
         if (recv_ty.kind == .invalid) return .invalid;
         if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar()) {
-            switch (Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, explicit, bc.methodSite())) {
+            var bound_args: std.ArrayList(Type) = .empty;
+            defer bound_args.deinit(bc.gpa);
+            const bound = try bc.boundConformance(n, recv_ty, &bound_args);
+            switch (Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, if (bound) |b| b.pid else null, explicit, bc.methodSite())) {
                 .one => |mi| return try bc.dispatchMethod(node_idx, n, fa, recv_ty, member, mi),
                 else => return bc.reportNoExplicitMethod(n, recv_ty),
             }
@@ -3123,7 +3328,7 @@ pub const BodyChecker = struct {
             },
             .ambiguous => {
                 try bc.drainArgs(args);
-                try bc.emitAmbiguousConformance(bc.tokSpan(callee.main_token), ty, member);
+                try bc.emitAmbiguousConformance(bc.tokSpan(callee.main_token), ty, member, null);
             },
             .none => {
                 try bc.drainArgs(args);
@@ -3707,10 +3912,13 @@ pub const BodyChecker = struct {
     fn dispatchConcreteMethod(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node, recv_ty: Type) error{OutOfMemory}!Type {
         const member = bc.nameText(callee.main_token);
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+        var bound_args: std.ArrayList(Type) = .empty;
+        defer bound_args.deinit(bc.gpa);
+        const bound = try bc.boundConformance(n, recv_ty, &bound_args);
         // `.one` is byte-identical to `findMethod` for every existing program (inherent /
         // single conformance / prelude); `.ambiguous` (a doubly-conforming generic
         // protocol used with no type-args) is T0025 — never an arbitrary pick.
-        switch (Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, null, bc.methodSite())) {
+        switch (Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, if (bound) |b| b.pid else null, if (bound) |b| b.args else null, bc.methodSite())) {
             .one => |mi| {
                 // An associated (self-less) function must be reached via `Type[..].fn()`,
                 // never on a value receiver.
@@ -3724,7 +3932,7 @@ pub const BodyChecker = struct {
             },
             .ambiguous => {
                 try bc.drainArgs(args);
-                try bc.emitAmbiguousConformance(bc.tokSpan(callee.main_token), recv_ty, member);
+                try bc.emitAmbiguousConformance(bc.tokSpan(callee.main_token), recv_ty, member, null);
                 return .invalid;
             },
             .none => {},
@@ -3876,7 +4084,7 @@ pub const BodyChecker = struct {
             .one => |m| m,
             .ambiguous => {
                 try bc.drainArgs(args);
-                try bc.emitAmbiguousConformance(bc.tokSpan(callee.main_token), recv_ty, member);
+                try bc.emitAmbiguousConformance(bc.tokSpan(callee.main_token), recv_ty, member, null);
                 return .invalid;
             },
             .none => null,
