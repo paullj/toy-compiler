@@ -11641,6 +11641,15 @@ fn expectOneDiag(src: []const u8, code: codes.Code, message: []const u8) !void {
     return error.TestExpectedDiagnostic;
 }
 
+test "in a bounded template a generic call's diagnostics name the template's own vars apart from the call's" {
+    // `ap`'s `B` binds to the template's `K` and `A` stays open; both are type var 0 unless
+    // the open one sits past the template's vars.
+    const pre = "protocol Add { fn add(self, o: Self) -> Self }\nfn ap[A, B](f: fn(B) -> A, b: B) -> A { f(b) }\n";
+    try expectOneDiag(pre ++ "fn _go[K has Add, V](k: K, _v: V) -> K { ap(fn(_o, _p) { k }, k) }\n", .T0039, "lambda takes 2 parameter(s), but the expected type fn(K) -> A takes 1");
+    try expectOneDiag(pre ++ "fn _go[K has Add, V](k: K, _v: V) -> K { ap(5, k) }\n", .T0040, "argument 1: expected fn(K) -> A, got int; 'ap' takes (fn(K) -> A, K)");
+    try expectOneDiag(pre ++ "fn _go[K has Add, V](k: K, _v: V) -> K { ap(fn(_o: str) { k }, k) }\n", .T0015, "conflicting types for type parameter 'B': str vs K");
+}
+
 test "acc.plus as a value types fn(int) -> int and records bound_method" {
     const gpa = testing.allocator;
     var c = try checkSource(

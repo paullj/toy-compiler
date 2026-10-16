@@ -106,7 +106,8 @@ pub fn noteMutatedRoot(bc: *BodyChecker, place: Ast.Index) error{OutOfMemory}!vo
 /// annotation, else the expected fn type's; the return type is the annotation, else the
 /// expected fn type's, else the join of the body's value and its `return`s. `return`
 /// and `?` exit the lambda, and no jump leaves it. A part of the expected type that
-/// still holds a type variable (a generic callee) provides nothing. A `_` capture's
+/// still holds a generic callee's open type variable provides nothing; a bounded
+/// template's own type vars provide themselves (`givesType`). A `_` capture's
 /// param with no expected type stays open until its hole's call position types it
 /// (`adoptHole`), and is T0050 only when the body reported no error.
 pub fn typeOfLambda(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
@@ -122,11 +123,11 @@ pub fn typeOfLambda(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Ou
         if (parts.params.len == proto.params.len) {
             exp_fn = e;
             exp_params = parts.params;
-            if (bc.isGround(parts.ret)) exp_ret = parts.ret;
+            if (bc.givesType(parts.ret)) exp_ret = parts.ret;
         } else {
             var shown: std.ArrayList(u8) = .empty;
             defer shown.deinit(bc.gpa);
-            try bc.writeTypeNamed(&shown, e, bc.body.open_names, bc.body.open_vars);
+            try bc.writeTypeNamed(&shown, e, bc.body.open_names, bc.body.open_vars, bc.openOrdBase());
             if (capture)
                 try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0039 }, "a '_' capture takes 1 parameter, but the expected type {s} takes {d}", .{ shown.items, parts.params.len })
             else
@@ -141,7 +142,7 @@ pub fn typeOfLambda(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Ou
         const pn = bc.tree.nodes[p.int()];
         const ty: Type = if (pn.lhs != Ast.none)
             bc.typeFromNode(pn.lhs)
-        else if (i < exp_params.len and bc.isGround(exp_params[i]))
+        else if (i < exp_params.len and bc.givesType(exp_params[i]))
             exp_params[i]
         else if (capture and !arity_err) blk: {
             open = true;
@@ -163,7 +164,7 @@ pub fn typeOfLambda(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Ou
         // An annotated param the expected type does not have means the lambda does not
         // fit that type at all, so its return type comes from its own body: the
         // mismatch then names the type the lambda really has.
-        if (pn.lhs != Ast.none and i < exp_params.len and bc.isGround(exp_params[i]) and
+        if (pn.lhs != Ast.none and i < exp_params.len and bc.givesType(exp_params[i]) and
             ty.kind != .invalid and !Type.eql(ty, exp_params[i])) exp_ret = null;
     }
 
@@ -273,7 +274,7 @@ pub fn adoptHole(bc: *BodyChecker, want: Type) error{OutOfMemory}!void {
     const r = bc.resolutions[bc.body.hole.int()];
     if (r != .local) return;
     if (bc.slotType(r.local).kind != .invalid) return;
-    if (want.kind == .invalid or !bc.isGround(want)) return;
+    if (want.kind == .invalid or !bc.givesType(want)) return;
     try bc.setSlot(r.local, want);
 }
 
@@ -323,4 +324,21 @@ pub fn jumpLeavesLambda(bc: *const BodyChecker, stmt_idx: Ast.Index) bool {
     }
     for (outer) |c| if (c.kind != .labeled_block) return true;
     return false;
+}
+
+test "in a bounded template a '_' or an untyped lambda param takes the template's own type var" {
+    const add = "protocol Add {\n fn add(self, o: Self) -> Self\n}\nfn twice[T](f: fn(T) -> T, x: T) -> T { f(f(x)) }\n";
+    const clean = [_][]const u8{
+        add ++ "fn go[T has Add](t: T) -> T { twice(t.add(_), t) }\n",
+        add ++ "fn go[T has Add](t: T) -> T { twice(fn(o) { t.add(o) }, t) }\n",
+        add ++ "fn go[T has Add](t: T) -> T {\n f := t.add(_)\n f(t)\n}\n",
+        add ++ "fn go[T has Add](t: T) -> T {\n f: fn(T) -> T = fn(o) { t.add(o) }\n f(t)\n}\n",
+        // `A` is still open, at the ordinal of the template's `K` that `B` is bound to.
+        add ++ "fn ap[A, B](f: fn(B) -> A, b: B) -> A { f(b) }\nfn go[K has Add, V](k: K, v: V) -> K { ap(fn(o) { k.add(o) }, k) }\n",
+        add ++ "fn ap[A, B](f: fn(B) -> A, b: B) -> A { f(b) }\nfn go[K has Add, V](k: K, v: V) -> K { ap(k.add(_), k) }\n",
+    };
+    for (clean) |src| try Typecheck.expectDiagCodes(src, &.{});
+    try Typecheck.expectDiagCodes(add ++ "fn go[T has Add](t: T) -> T {\n f := fn(o) { t.add(o) }\n f(t)\n}\n", &.{.T0050});
+    // `A` is open at the ordinal of the template's `K`, which `B` is bound to: `o` gets neither.
+    try Typecheck.expectDiagCodes(add ++ "fn ap[A, B](f: fn(A) -> B, b: B) -> B { b }\nfn go[K has Add, V](k: K, v: V) -> K { ap(fn(o) { k }, k) }\n", &.{.T0050});
 }
