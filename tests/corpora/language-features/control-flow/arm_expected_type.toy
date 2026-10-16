@@ -1,0 +1,76 @@
+# Feature: every arm of a value `if` / `else if`, `match`, `loop` and labeled block takes
+# the type expected of the whole, whichever arm comes first: a bare `Option.none`, an
+# inferred `.square(2)` and a literal of a narrow int type all get it from the expected type.
+# expect: stdout "big none mid none none 7 6 x none 3 2 x none x\n"
+# expect: exit 40
+import std/io
+import std/option
+import std/str
+import std/vec
+
+enum Shape { circle(int), square(int) }
+
+fn size(v: int) -> Option[str] {
+    if v > 3 { Option.some("big") } else { Option.none }
+}
+
+fn size_rev(v: int) -> Option[str] {
+    if v <= 3 { Option.none } else { Option.some("big") }
+}
+
+fn ladder(v: int) -> Option[str] {
+    if v > 3 { Option.none } else if v > 1 { Option.some("mid") } else { Option.none }
+}
+
+fn shape(v: int) -> Shape {
+    if v > 3 { .circle(v) } else { .square(v * 2) }
+}
+
+fn narrow(v: int) -> int8 {
+    if v > 3 { 1 } else if v > 1 { 2 } else { 3 }
+}
+
+fn found(v: int) -> Option[str] {
+    loop {
+        if v > 3 { break Option.none }
+        break Option.some("x")
+    }
+}
+
+fn early(v: int) -> Option[str] {
+    @b {
+        if v > 3 { break @b Option.none }
+        Option.some("x")
+    }
+}
+
+fn armed(v: int) -> Option[str] {
+    match v {
+        0 -> Option.some("zero"),
+        _ -> if v > 3 { Option.some("x") } else { Option.none },
+    }
+}
+
+fn show(o: Option[str]) -> str {
+    o.or_else(fn() { "none" })
+}
+
+fn area(s: Shape) -> int {
+    match s {
+        .circle(r) -> r,
+        .square(w) -> w,
+    }
+}
+
+fn main() -> int {
+    bound: Option[str] = if narrow(9) < 2 { Option.some("x") } else { Option.none }
+    picked: int8 = @l loop { break @l if narrow(0) > 2 { narrow(0) } else { 0 } }
+    io.println(" ".join([
+        show(size(5)), show(size(1)), show(ladder(2)), show(ladder(5)), show(size_rev(2)),
+        area(shape(7)).to_string(), (area(shape(4)) + 2).to_string(), show(bound),
+        show(found(5)), picked.to_string(), narrow(2).to_string(), show(armed(9)), show(early(5)), show(early(1)),
+    ]))
+    n: int = narrow(1).into()
+    m: int = narrow(2).into()
+    return area(shape(7)) + area(shape(2)) + n + m + if found(1).is_some() { 24 } else { 0 }
+}

@@ -1,0 +1,32 @@
+# Each arm of a value `if`, `else if` or `loop` is checked against the one expected type,
+# so a wrong arm reports its own mismatch whichever arm comes first.
+enum Shape { circle(int), square(int) }
+
+fn narrow(v: int) -> int8 {
+    if v > 3 { 1 } else { 300 }  #~ ERROR [T0034] literal out of range for type 'int8'
+}
+
+fn ladder(v: int) -> Option[str] {
+    if v > 3 { Option.none } else if v > 1 { Option.none } else { Option.some(5) }  #~ ERROR [T0015] conflicting types for type parameter 'T': int inferred from the value, str from the expected type
+}
+
+fn shape(v: int) -> Shape {
+    if v > 3 { .circle(1) } else { .cube(2) }  #~ ERROR [T0061] enum 'Shape' has no variant 'cube'
+}
+
+fn found(v: int) -> int8 {
+    loop { if v > 3 { break 1 } else { break 300 } }  #~ ERROR [T0034] literal out of range for type 'int8'
+}
+
+fn mixed(v: int) -> int8 {
+    if v > 3 { 1 } else { "one" }  #~ ERROR [T0058] branches yield different types (int8 vs str)
+}
+
+fn main() -> int {
+    n: int = narrow(1).into()
+    _l := ladder(1)
+    _s := shape(1)
+    m: int = found(1).into()
+    k: int = mixed(1).into()
+    return n + m + k
+}

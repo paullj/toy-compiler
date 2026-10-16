@@ -39,7 +39,10 @@ fn matchSaturated(cov: Cov, has_wildcard: bool) bool {
 }
 
 pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
-    const st = try bc.typeOf(n.lhs);
+    // The scrutinee takes the arms' expected type only as a hint: `match n.try_into() {
+    // .ok(c) -> c, .. }` needs it, but the scrutinee is no arm (`match 300 { .. }` in an
+    // `int8` fn still matches an `int`).
+    const st = try bc.typeUnder(n.lhs, if (bc.body.expected) |e| .{ .ty = e.ty, .soft = true } else null);
     const arms = Ast.rangeSlice(bc.tree, (n.rhs).int());
     if (st.kind == .invalid) {
         // Poison-absorb: still walk arms (bodies may have their own errors) but
@@ -87,11 +90,13 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
         }
         try checkPattern(bc, arm.lhs, st, &cov, &has_wildcard, !guarded);
         if (guarded) {
-            const gt = try bc.typeOf(h.guard);
+            // A guard is a bool whatever the arms yield, so their expected type is no hint
+            // for it (the scrutinee keeps it: `match n.try_into() { .ok(c) -> c, .. }`).
+            const gt = try bc.typeOfExpected(h.guard, null);
             if (gt.kind != .invalid and gt.kind != .bool)
                 try bc.sink.report(.{ .span = bc.spanOf(h.guard), .code = .T0045 }, "match guard must be bool, got {s}", .{bc.typeName(gt)});
         }
-        const body_ty0 = try bc.typeOfExpected(h.body, bc.expectedTy());
+        const body_ty0 = try bc.typeUnder(h.body, bc.body.expected);
         const body_ty: Type = if (armDiverges(bc, h.body)) Type.never else body_ty0;
         result = try bc.merge(n.main_token, result, body_ty);
     }

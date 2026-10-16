@@ -228,7 +228,7 @@ const Lint = struct {
 /// A type expected of the node being typed. `soft` when it reached a call's receiver from
 /// the call, so it only hints: a literal that cannot produce it takes its own type instead
 /// of an error.
-const Expected = struct { ty: Type, soft: bool = false };
+pub const Expected = struct { ty: Type, soft: bool = false };
 
 /// The state of one body being checked, which a lambda or local fn body replaces whole
 /// while it is checked (`enterBody`/`leaveBody`).
@@ -519,11 +519,12 @@ pub const BodyChecker = struct {
             bc.node_types[(block_idx).int()] = .unit;
             return .unit;
         }
-        // The expected type (a one-shot for an inferred `.V`) applies ONLY to this
-        // block's trailing value expression, never the non-final statements. Capture
-        // it, clear it for the non-final walk, then restore for the trailing expr.
-        const block_expected = bc.expectedTy();
+        // The expected type applies ONLY to this block's trailing value expression, never
+        // the non-final statements. It is restored on return because the caller may check
+        // further arms against it (an `if`'s else, the next match arm).
+        const block_expected = bc.body.expected;
         bc.body.expected = null;
+        defer bc.body.expected = block_expected;
         for (stmts[0 .. stmts.len - 1]) |s| {
             try bc.checkStmt(s); // effect only
             const sn = bc.tree.nodes[(s).int()];
@@ -534,18 +535,18 @@ pub const BodyChecker = struct {
         const last_n = bc.tree.nodes[(last).int()];
         var bt: Type = .unit;
         if (last_n.tag == .expr_stmt) {
-            bt = try bc.typeOfExpected(last_n.lhs, if (want_value) block_expected else null);
+            bt = try bc.typeUnder(last_n.lhs, if (want_value) block_expected else null);
             bc.node_types[(last).int()] = bt; // the expr_stmt carries the value type
             if (!want_value) try bc.warnDroppedValue(last, bt);
         } else if (want_value and last_n.tag == .block) {
-            bt = try bc.typeOfExpected(last, block_expected); // value context: validates + types + memoizes
+            bt = try bc.typeUnder(last, block_expected); // value context: validates + types + memoizes
         } else if (want_value and last_n.tag == .if_stmt and
             Ast.ifHeaderAt(bc.tree, (last_n.rhs).int()).else_node != Ast.none)
         {
             // A value-if needs both arms to yield a value; an else-less trailing
             // `if` produces nothing, so it is an effect statement, not this
             // block's value.
-            bt = try bc.typeOfExpected(last, block_expected); // value context: validates + types + memoizes
+            bt = try bc.typeUnder(last, block_expected); // value context: validates + types + memoizes
         } else {
             try bc.checkStmt(last); // statement context (else-less trailing if / want_value=false)
         }
@@ -716,7 +717,7 @@ pub const BodyChecker = struct {
                     ctx.saw_bare_break = true;
                     if (ctx.is_value) ctx.join = try bc.merge(stmt.main_token, ctx.join, Type.unit);
                 } else {
-                    const vt = try bc.typeOf(stmt.lhs);
+                    const vt = try bc.typeUnder(stmt.lhs, ctx.expected);
                     if (!ctx.is_value) {
                         if (vt.kind != .invalid and vt.kind != .unit)
                             try bc.sink.report(.{ .span = bc.spanOf(stmt_idx), .code = .T0060 }, "cannot break with a value out of a while/for loop", .{});
@@ -915,7 +916,7 @@ pub const BodyChecker = struct {
     }
 
     fn typeOfLabeledBlock(bc: *BodyChecker, block_idx: Ast.Index, label: []const u8, want_value: bool) error{OutOfMemory}!Type {
-        try bc.loop_stack.append(bc.gpa, .{ .kind = .labeled_block, .label = label, .construct_node = block_idx, .is_value = true, .join = .never, .saw_value_break = false, .saw_bare_break = false });
+        try bc.loop_stack.append(bc.gpa, .{ .kind = .labeled_block, .label = label, .construct_node = block_idx, .is_value = true, .join = .never, .saw_value_break = false, .saw_bare_break = false, .expected = if (want_value) bc.body.expected else null });
         const fall = try bc.checkBlock(block_idx, want_value);
         const ctx = bc.loop_stack.pop().?;
         // The trailing-expr value is unreachable iff the block's last statement
@@ -925,9 +926,16 @@ pub const BodyChecker = struct {
     }
 
     pub fn typeOfExpected(bc: *BodyChecker, node_idx: Ast.Index, exp: ?Type) error{OutOfMemory}!Type {
-        if (exp) |want| if (node_idx != Ast.none and node_idx == bc.body.hole) try LambdaChecker.adoptHole(bc, want);
+        return bc.typeUnder(node_idx, if (exp) |t| .{ .ty = t } else null);
+    }
+
+    /// `typeOfExpected` keeping whether the expected type is only a hint, for a node that
+    /// yields its construct's value (an arm, a break, a block's tail): a hint a receiver
+    /// passes on stays one.
+    pub fn typeUnder(bc: *BodyChecker, node_idx: Ast.Index, exp: ?Expected) error{OutOfMemory}!Type {
+        if (exp) |want| if (node_idx != Ast.none and node_idx == bc.body.hole) try LambdaChecker.adoptHole(bc, want.ty);
         const save = bc.body.expected;
-        bc.body.expected = if (exp) |t| .{ .ty = t } else null;
+        bc.body.expected = exp;
         defer bc.body.expected = save;
         return bc.typeOf(node_idx);
     }
@@ -963,6 +971,14 @@ pub const BodyChecker = struct {
     /// the downstream assignability check stays silent — one T0034, never a paired
     /// mismatch. The single source shared by the expression `literal_number` arm and the
     /// PatternChecker numeric-pattern path (both must adopt + range-check identically).
+    /// The width a numeric literal adopts: the expected type, unless that is only a hint
+    /// the literal does not fit, which leaves the literal its own type and no error.
+    fn literalExpected(bc: *const BodyChecker, main_token: u32) ?Type {
+        const e = bc.body.expected orelse return null;
+        if (e.soft and e.ty.isInteger() and !Literal.fitsWidth(bc.tokens[main_token].text(bc.source), e.ty, false)) return null;
+        return e.ty;
+    }
+
     pub fn typeNumericLiteral(bc: *BodyChecker, main_token: u32, expected: ?Type) error{OutOfMemory}!Type {
         const raw = bc.tokens[main_token].text(bc.source);
         if (expected) |e| if (e.isInteger()) {
@@ -1141,7 +1157,7 @@ pub const BodyChecker = struct {
         if (node_idx == Ast.none) return .invalid; // structural poison: no emit (exempt)
         const n = bc.tree.nodes[(node_idx).int()];
         const ty: Type = switch (n.tag) {
-            .literal_number => try bc.typeNumericLiteral(n.main_token, bc.expectedTy()),
+            .literal_number => try bc.typeNumericLiteral(n.main_token, bc.literalExpected(n.main_token)),
             .literal_float => Type.float,
             .literal_bool => Type.bool,
             .literal_string => Type.str,
@@ -2247,7 +2263,9 @@ pub const BodyChecker = struct {
 
     fn typeOfIf(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
         _ = node_idx;
-        const ct = try bc.typeOf(n.lhs);
+        // The expected type is the arms', not the condition's, which types as it does in a
+        // statement `if`.
+        const ct = try bc.typeOfExpected(n.lhs, null);
         if (ct.kind != .invalid and ct.kind != .bool)
             try bc.sink.report(.{ .span = bc.spanOf(n.lhs), .code = .T0045 }, "if condition must be bool", .{});
         try bc.warnConstIfCond(n.lhs);
@@ -2280,7 +2298,7 @@ pub const BodyChecker = struct {
     }
 
     fn typeOfLoop(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, label: ?[]const u8) error{OutOfMemory}!Type {
-        try bc.loop_stack.append(bc.gpa, .{ .kind = .loop, .label = label, .construct_node = node_idx, .is_value = true, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
+        try bc.loop_stack.append(bc.gpa, .{ .kind = .loop, .label = label, .construct_node = node_idx, .is_value = true, .join = Type.never, .saw_value_break = false, .saw_bare_break = false, .expected = bc.body.expected });
         _ = try bc.checkBlock(n.lhs, false); // body in statement ctx; breaks fill join
         const ctx = bc.loop_stack.pop().?;
         const ty: Type = if (!ctx.saw_value_break and !ctx.saw_bare_break) Type.never else ctx.join;
@@ -4551,4 +4569,67 @@ test "a checker diagnostic spans the node it is about, not just its first token"
         .{ .src = "struct P { x: int }\nimpl P { fn bump(mut self, d: int) { self.x = self.x + d } }\nfn mk() -> P { return P { x: 0 } }\nfn f() { mk().bump(1) }\n", .key = "cannot call mutating method", .want = "mk()" },
         .{ .src = "fn f() {\n break\n}\n", .key = "break outside", .want = "break" },
     });
+}
+
+test "every arm of a value if, match, loop or labeled block takes the one expected type" {
+    const shape = "enum Shape { circle(int), square(int) }\n";
+    const cases = [_][]const u8{
+        "fn f(v: int) -> Option[str] { if v > 3 { Option.some(\"big\") } else { Option.none } }\n",
+        "fn f(v: int) -> Option[str] { if v > 3 { Option.none } else { Option.some(\"big\") } }\n",
+        "fn f(v: int) -> int8 { if v > 3 { 1 } else { 2 } }\n",
+        "fn f(v: int, w: int8) -> int8 { if v > 3 { 1 } else { w } }\n",
+        "fn f(v: int, w: int8) -> int8 { if v > 3 { w } else { 1 } }\n",
+        shape ++ "fn f(v: int) -> Shape { if v > 3 { .circle(1) } else { .square(2) } }\n",
+        shape ++ "fn f(v: int) -> Shape { if v > 3 { Shape.circle(1) } else { .square(2) } }\n",
+        shape ++ "fn f(v: int) -> Shape { if v > 3 { .circle(1) } else { Shape.square(2) } }\n",
+        "fn f(v: int) -> Option[str] {\n x: Option[str] = if v > 3 { Option.some(\"big\") } else { Option.none }\n x\n}\n",
+        "fn f(v: int) -> Option[str] {\n x: Option[str] = if v > 3 { Option.none } else { Option.some(\"big\") }\n x\n}\n",
+        "fn f(v: int) -> Option[str] { return if v > 3 { Option.some(\"big\") } else { Option.none } }\n",
+        "fn f(v: int) -> Option[str] { return if v > 3 { Option.none } else { Option.some(\"big\") } }\n",
+        "fn f(v: int) -> Option[str] { if v > 3 { Option.none } else if v > 1 { Option.some(\"mid\") } else { Option.none } }\n",
+        "fn f(v: int) -> Option[str] { if v > 3 { Option.some(\"big\") } else if v > 1 { Option.none } else { Option.none } }\n",
+        "fn f(v: int) -> Option[str] { if v > 3 { Option.none } else if v > 1 { Option.none } else { Option.some(\"x\") } }\n",
+        "fn f(v: int) -> int8 { if v > 3 { 1 } else if v > 1 { 2 } else { 3 } }\n",
+        "fn f(v: int) -> Option[str] { match v { 1 -> Option.some(\"y\"), _ -> if v > 3 { Option.some(\"z\") } else { Option.none } } }\n",
+        "fn f(v: int) -> Option[str] { if (if v > 3 { true } else { false }) { Option.none } else { Option.some(\"x\") } }\n",
+        "fn f(v: int) -> Option[str] { match (if v > 1 { 1 } else { 0 }) { 1 -> Option.none, _ -> Option.some(\"x\") } }\n",
+        "fn f(v: int) -> Option[str] { match v { n if (if n > 3 { true } else { false }) -> Option.some(\"y\"), _ -> Option.none } }\n",
+        "fn f(v: int) -> Option[str] {\n loop {\n  if v > 3 { break Option.none }\n  break Option.some(\"x\")\n }\n}\n",
+        "fn f(v: int) -> Option[str] {\n @l loop {\n  if v > 3 { break @l Option.none }\n  break @l Option.some(\"x\")\n }\n}\n",
+        "fn f(v: int) -> Option[str] {\n @o loop {\n  loop { break @o Option.none }\n }\n}\n",
+        "fn f(v: int) -> Option[str] {\n @b {\n  if v > 3 { break @b Option.none }\n  Option.some(\"x\")\n }\n}\n",
+        "fn f(v: int) -> int8 { loop { if v > 3 { break 1 } else { break 2 } } }\n",
+        "fn f(v: int) -> int8 {\n x: int8 = @b {\n  if v > 3 { break @b 1 }\n  2\n }\n x\n}\n",
+    };
+    for (cases) |src| try Typecheck.expectDiagCodes(src, &.{});
+}
+
+test "an arm checked against the expected type still reports its own mismatch" {
+    try Typecheck.expectDiagCodes("fn f(v: int) -> int8 { if v > 3 { 1 } else { 300 } }\n", &.{.T0034});
+    try Typecheck.expectDiagCodes("fn f(v: int) -> int8 { if v > 3 { 300 } else { 1 } }\n", &.{.T0034});
+    try Typecheck.expectDiagCodes("fn f(v: int) -> int8 { if v > 3 { 1 } else if v > 1 { 2 } else { 300 } }\n", &.{.T0034});
+    try Typecheck.expectDiagCodes("fn f(v: int) -> Option[str] { if v > 3 { Option.some(\"a\") } else { Option.some(5) } }\n", &.{.T0015});
+    try Typecheck.expectDiagCodes("fn f(v: int) -> Option[str] { if v > 3 { Option.none } else if v > 1 { Option.none } else { Option.some(5) } }\n", &.{.T0015});
+    try Typecheck.expectDiagCodes("fn f(v: int) -> int8 { if v > 3 { 1 } else { \"s\" } }\n", &.{.T0058});
+    try Typecheck.expectDiagCodes("fn f(v: int) -> int8 { loop { if v > 3 { break 1 } else { break 300 } } }\n", &.{.T0034});
+}
+
+test "a value if's condition and a match guard take no expected type from the value" {
+    try Typecheck.expectDiagCodes("fn f(v: int) -> int8 { if 300 { 1 } else { 2 } }\n", &.{.T0045});
+    try Typecheck.expectDiagCodes("fn f(v: int) -> int8 { if v > 1 { 1 } else if 300 { 2 } else { 3 } }\n", &.{.T0045});
+    try Typecheck.expectDiagCodes("fn f(v: int) -> int8 { match v { _ if 300 -> 1, _ -> 2 } }\n", &.{.T0045});
+}
+
+test "a receiver's expected type stays a hint through every arm, break and scrutinee" {
+    const small = "impl int { fn small(self) -> int8 { if self > 100 { return 1 }\n return 0 } }\n";
+    const cases = [_][]const u8{
+        small ++ "fn f() -> int8 { 300.small() }\n",
+        small ++ "fn f() -> int8 { (loop { break 300 }).small() }\n",
+        small ++ "fn f() -> int8 { (@b { break @b 300 }).small() }\n",
+        "fn f() -> int8 { match 300 { 300 -> 1, _ -> 2 } }\n",
+    };
+    for (cases) |src| try Typecheck.expectDiagCodes(src, &.{});
+    // A hard expected type still rejects what cannot produce it.
+    try Typecheck.expectDiagCodes("fn f() -> int8 { loop { break 300 } }\n", &.{.T0034});
+    try Typecheck.expectDiagCodes("fn f() -> int8 { @b { break @b 300 } }\n", &.{.T0034});
 }
