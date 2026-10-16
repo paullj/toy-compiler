@@ -285,6 +285,19 @@ test "gc: the collection budget scales with the live heap, not a fixed 256 KiB (
     try std.testing.expectEqual(@as(u8, 1), code);
 }
 
+test "gc: a large object rooted only through its third page survives (every page is in the span table)" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const code = try buildAndRun(gpa, io, ".toy-test-gc-large-interior",
+        \\import core/mem_selftest
+        \\fn main() -> int { return mem_selftest.large_interior_survivor() }
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 9), code);
+}
+
 test "heap: repeated span exhaustion keeps mmapping fresh spans (arena count >= 3)" {
     // Allocating past two full spans forces two refills. This catches a refill that
     // fails to persist the new span's limit: such a bug bumps unbounded off the second
