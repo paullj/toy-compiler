@@ -644,6 +644,22 @@ consumers (BodyChecker types, `lower` symbols, `AstWalk` fingerprint), so they a
 select the identical witness. A `[T has Convert[U]]` bound resolves at the mono worklist
 by substituting the bound's args through the instance type-args before `findConformance`.
 
+**A call on a bounded param takes the bound's conformance.** In `fn use_show[T has
+Show](t: T) -> int { t.render() }`, `t.render()` can only mean `Show.render`, so each
+instance calls the `Show` witness even when its type also has `Debug.render`: the
+bound-as-axiom check records the protocol it resolved the call through, and the
+instance's re-check keeps to that protocol, with the bound's args grounded through the
+instance (`[T has Into[int]]` takes `Into[int]` among `Into[int]` and `Into[bool]`).
+
+**The T0025 hint is written from the case at hand**, and following it compiles. Each
+conformance whose protocol args no other conflicting conformance shares is named by
+them: `.into[int]() or .into[bool]()`. No call syntax names a protocol, so any other
+(a protocol without args, or args another one shares) is reached through a fn bounded by
+it, which the hint spells out: `fn render_via[T has Show](x: T) -> int { x.render() }`.
+A generic type cannot meet a bound yet, so on one the hint says that no call can choose
+those conformances. A method value takes no protocol args (`f := p.into[int]` is T0025
+too), so at one the hint puts them in a lambda's call: `fn() { p.into[int]() }`.
+
 ## Operators: comparison via `Ord`
 
 The four comparison operators desugar to a **single three-way** compare, `Ord::cmp`,

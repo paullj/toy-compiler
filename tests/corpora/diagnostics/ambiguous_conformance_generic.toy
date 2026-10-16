@@ -47,7 +47,7 @@ impl Bag[T] has Stroll {
 }
 
 fn generic(b: Box[int]) -> int {
-    return b.into()  #~ ERROR [T0025] 'into' on 'Box' matches multiple conformances (Into[int] and Into[bool])
+    return b.into()  #~ ERROR [T0025] 'into' on 'Box' matches multiple conformances (Into[int] and Into[bool]); add explicit protocol type arguments, e.g. .into[int]() or .into[bool]()
 }
 
 # The expected type does not choose a conformance.
@@ -57,7 +57,7 @@ fn swapped(s: Swapped[int]) -> int {
 }
 
 fn shown(s: Shown[int]) -> int {
-    return s.render()  #~ ERROR [T0025] 'render' on 'Shown' matches multiple conformances (Show and Debug)
+    return s.render()  #~ ERROR [T0025] 'render' on 'Shown' matches multiple conformances (Show and Debug); no call can choose 'Show' or 'Debug' on a generic type yet
 }
 
 fn bound(b: Box[int]) -> int {
