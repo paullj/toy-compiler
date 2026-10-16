@@ -63,7 +63,16 @@ A struct literal's field value is checked against its field's type (`P { x: 5 }`
 call's expected type belongs to its result, not its receiver: it reaches a receiver
 only as a hint, which a receiver that is itself a literal may take
 (`x: int8 = Box { v: 1 }.get()`) and which never makes an error of its own
-(`fn f() -> Box[str] { return Box { v: 1 }.map(fn(v) { v.to_string() }) }`).
+(`fn f() -> Box[str] { return Box { v: 1 }.map(fn(v) { v.to_string() }) }`, or
+`x: int8 = 300.small()` with `small` on `int`).
+
+A value `if`, `match`, `loop` or labeled block checks every arm against its own expected
+type: each branch of an `if`/`else if` chain, each match arm, and each `break` value, so
+`if c { Option.some(1) } else { Option.none }` checks whichever branch comes first. A
+hint stays a hint there: `(loop { break [1, 2] }).len()` is fine in an `int` slot. A
+condition or a match guard is a `bool` whatever the arms yield, so it takes none, and a
+match scrutinee takes the arms' type only as a hint (`match 300 { .. }` in an `int8` fn
+matches an `int`).
 
 ## Assignability — the one relation
 

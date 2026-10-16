@@ -1430,7 +1430,8 @@ pub const FnSym = struct {
 /// labeled bare block. `is_value` is true for `loop` and `labeled_block`. `label`
 /// is the construct's label name (or null when unlabeled) and `construct_node` is
 /// the inner construct node a `break @L`/`continue @L` matches against. `join`
-/// accumulates the merge of all value-break sites (starting at `never`).
+/// accumulates the merge of all value-break sites (starting at `never`). `expected` is
+/// the type expected of the construct's value, which each value break is checked against.
 const CtxKind = enum { loop, while_for, labeled_block };
 pub const LoopCtx = struct {
     kind: CtxKind,
@@ -1440,6 +1441,7 @@ pub const LoopCtx = struct {
     join: Type,
     saw_value_break: bool,
     saw_bare_break: bool,
+    expected: ?@import("BodyChecker.zig").Expected = null,
 };
 
 gpa: std.mem.Allocator,
@@ -4332,6 +4334,21 @@ pub fn expectCodeCount(src: []const u8, code: codes.Code, n: usize) !void {
         for (r.result.diags) |d| std.debug.print("{s}\n", .{d.message});
         return e;
     };
+}
+
+/// Test support for the checker's files: typecheck `src` and require its diagnostics to
+/// carry exactly `want`'s codes, in order (none for a clean check).
+pub fn expectDiagCodes(src: []const u8, want: []const codes.Code) !void {
+    const gpa = testing.allocator;
+    var r = try checkSource(src);
+    defer r.deinit(gpa);
+    const same = r.result.diags.len == want.len and for (r.result.diags, want) |d, w| {
+        if (d.code != w) break false;
+    } else true;
+    if (same) return;
+    std.debug.print("source:\n{s}\n", .{src});
+    for (r.result.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+    return error.TestExpectedDiagnostic;
 }
 
 /// Typecheck a source and return the diagnostic count (and free everything).

@@ -1,0 +1,48 @@
+# Feature: a method call's expected type reaches its receiver only as a hint, through every
+# arm, break and block tail of a value receiver and through a match scrutinee: a list
+# literal, a generic constructor or a literal that cannot produce it keeps its own type.
+# expect: stdout "3 1 2 2 31 32 33 34 1 1 1\n"
+# expect: exit 1
+import std/io
+import std/option
+import std/str
+import std/vec
+
+impl int {
+    fn small(self) -> int8 {
+        if self > 100 { return 1 }
+        return 0
+    }
+}
+
+fn scrutinee() -> int8 {
+    match 300 {
+        300 -> 1,
+        _ -> 2,
+    }
+}
+
+fn show(o: Option[str]) -> str {
+    o.or_else(fn() { "none" })
+}
+
+fn main() -> int {
+    c := true
+    a: int = (loop { break [1, 2, 3] }).len()
+    b: int = (@b { break @b [4] }).len()
+    d: int = (if c { [1, 2] } else { [3] }).len()
+    e: int = (match a { 3 -> [1, 2], _ -> [3] }).len()
+    s1: Option[str] = (loop { break Option.some(31) }).map(fn(x) { x.to_string() })
+    s2: Option[str] = (@b { break @b Option.some(32) }).map(fn(x) { x.to_string() })
+    s3: Option[str] = (if c { Option.some(33) } else { Option.some(0) }).map(fn(x) { x.to_string() })
+    s4: Option[str] = (match a { 3 -> Option.some(34), _ -> Option.some(0) }).map(fn(x) { x.to_string() })
+    x: int8 = (loop { break 300 }).small()
+    y: int8 = (@b { break @b 300 }).small()
+    z: int8 = 300.small()
+    io.println(" ".join([
+        a.to_string(), b.to_string(), d.to_string(), e.to_string(),
+        show(s1), show(s2), show(s3), show(s4), x.to_string(), y.to_string(), z.to_string(),
+    ]))
+    k: int = scrutinee().into()
+    return k
+}
