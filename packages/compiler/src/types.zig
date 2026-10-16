@@ -1056,6 +1056,33 @@ pub fn findGenericMethod(templates: []const TemplateMethod, ctor: u32, is_enum: 
     return first;
 }
 
+/// What a call of method `name` on a generic-type receiver selects with no explicit
+/// type args (see `pickGenericMethod`).
+pub const TemplatePick = union(enum) { none, one: TemplateMethod, ambiguous };
+
+/// `pickMethodIndex` over the method templates of the receiver's ctor, so a generic
+/// receiver is ambiguous (T0025) exactly where a concrete one is: two or more templates
+/// of that name witness conformances and no type args choose one. Otherwise the only
+/// candidate, or the first, a program's own before a bundled one (see `Site`).
+pub fn pickGenericMethod(templates: []const TemplateMethod, ctor: u32, is_enum: bool, name: []const u8, site: Site) TemplatePick {
+    var first: ?TemplateMethod = null;
+    var first_user: ?TemplateMethod = null;
+    var total: usize = 0;
+    var conform_count: usize = 0;
+    for (templates) |tm| {
+        if (tm.recv_ctor != ctor or tm.recv_is_enum != is_enum or !std.mem.eql(u8, tm.name, name)) continue;
+        if (site == .bundled and tm.shadows) continue;
+        if (first == null) first = tm;
+        if (first_user == null and !tm.bundled) first_user = tm;
+        total += 1;
+        if (tm.protocol_id != null) conform_count += 1;
+    }
+    if (total == 0) return .none;
+    if (total == 1) return .{ .one = first.? };
+    if (conform_count >= 2) return .ambiguous;
+    return .{ .one = first_user orelse first.? };
+}
+
 /// What explicit type args select on a call of method `name` on a generic-type receiver
 /// (`b.m[A..](..)`). The checker and discovery both ask, so they pick one instance.
 pub const ExplicitPick = union(enum) {
@@ -3029,7 +3056,10 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
             if (!recv.isApp()) continue;
             const re = t.composite.at(recv.appIdx());
             const member = mc.tokens[callee.main_token].text(mc.source);
-            const m = findGenericMethod(model.templates, re.ctor, re.ctor_is_enum, member, Site.of(mc.bundled)) orelse continue;
+            const m = switch (pickGenericMethod(model.templates, re.ctor, re.ctor_is_enum, member, Site.of(mc.bundled))) {
+                .one => |m| m,
+                .none, .ambiguous => continue,
+            };
             const mf = model.fns[m.fn_id];
             const out = (if (hasOwnTypeParams(t.composite, mf))
                 try ownGenericArgs(t.gpa, t.composite, mf, m.has_self, tree, node_types, n, recv)
@@ -7142,6 +7172,68 @@ test "a concrete doubly-conforming use with no type-args emits exactly one T0025
     const int_at = std.mem.indexOf(u8, msg, "Into[int]") orelse return error.TestUnexpectedResult;
     const bool_at = std.mem.indexOf(u8, msg, "Into[bool]") orelse return error.TestUnexpectedResult;
     try testing.expect(int_at < bool_at); // source order (Into[int] declared first)
+}
+
+test "a generic receiver with two conformances is T0025 wherever its method is selected by name" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Box[T] { v: T }
+        \\impl Box[T] has Into[bool] { fn into(self) -> bool { true } }
+        \\impl Box[T] has Into[int] { fn into(self) -> int { 7 } }
+        \\fn call(b: Box[int]) -> int { return b.into() }
+        \\fn bound(b: Box[int]) -> int {
+        \\ f := b.into
+        \\ return f()
+        \\}
+        \\fn main() -> int {
+        \\ b := Box { v: 1 }
+        \\ n: int = b.into[int]()
+        \\ t: bool = b.into[bool]()
+        \\ return call(b) + bound(b) + n + (if t { 1 } else { 0 })
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    var n25: usize = 0;
+    for (c.result.diags) |d| {
+        try testing.expectEqual(codes.Code.T0025, d.code);
+        n25 += 1;
+        const bool_at = std.mem.indexOf(u8, d.message, "Into[bool]") orelse return error.TestUnexpectedResult;
+        const int_at = std.mem.indexOf(u8, d.message, "Into[int]") orelse return error.TestUnexpectedResult;
+        try testing.expect(bool_at < int_at);
+    }
+    try testing.expectEqual(@as(usize, 2), n25);
+}
+
+test "pickGenericMethod is ambiguous only between conformances" {
+    const inherent: TemplateMethod = .{ .recv_ctor = 0, .recv_is_enum = false, .name = "m", .fn_id = 0 };
+    var a = inherent;
+    a.fn_id = 1;
+    a.protocol_id = 0;
+    var b = inherent;
+    b.fn_id = 2;
+    b.protocol_id = 1;
+    var std_m = inherent;
+    std_m.fn_id = 3;
+    std_m.bundled = true;
+    var other = a;
+    other.recv_ctor = 1;
+    const Case = struct { table: []const TemplateMethod, want: std.meta.Tag(TemplatePick), fn_id: u32 = 0 };
+    const cases = [_]Case{
+        .{ .table = &.{}, .want = .none },
+        .{ .table = &.{a}, .want = .one, .fn_id = 1 },
+        .{ .table = &.{ a, b }, .want = .ambiguous },
+        .{ .table = &.{ a, other, inherent }, .want = .one, .fn_id = 1 },
+        .{ .table = &.{ std_m, a }, .want = .one, .fn_id = 1 },
+        .{ .table = &.{ inherent, b, other }, .want = .one, .fn_id = 0 },
+        .{ .table = &.{ inherent, a, b }, .want = .ambiguous },
+    };
+    for (cases) |k| {
+        const got = pickGenericMethod(k.table, 0, false, "m", .program);
+        try testing.expectEqual(k.want, std.meta.activeTag(got));
+        if (got == .one) try testing.expectEqual(k.fn_id, got.one.fn_id);
+    }
+    try testing.expect(pickGenericMethod(&.{ a, b }, 0, true, "m", .program) == .none);
 }
 
 test "an explicit-args concrete use v.into[int]() selects the Into[int] witness, no error" {

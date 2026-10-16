@@ -798,7 +798,7 @@ pub const BodyChecker = struct {
     fn checkForIn(bc: *BodyChecker, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMemory}!void {
         const stmt = bc.tree.nodes[(stmt_idx).int()];
         const recv = try bc.typeOf(stmt.rhs);
-        const iter_ty = bc.resolveIterType(recv) orelse blk: {
+        const iter_ty = try bc.resolveIterType(recv, stmt.rhs) orelse blk: {
             // A non-iterable receiver: name the protocol so the error is greppable.
             if (recv.kind != .invalid)
                 try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0023 }, "type '{s}' does not conform to protocol 'Iterator'", .{bc.typeName(recv)});
@@ -827,7 +827,7 @@ pub const BodyChecker = struct {
         const stmt = bc.tree.nodes[stmt_idx.int()];
         const h = Ast.forIn2HeaderAt(bc.tree, stmt.lhs.int());
         const recv = try bc.typeOf(stmt.rhs);
-        const iter_ty = bc.resolveIterType(recv) orelse blk: {
+        const iter_ty = try bc.resolveIterType(recv, stmt.rhs) orelse blk: {
             if (recv.kind != .invalid)
                 try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0023 }, "type '{s}' does not conform to protocol 'Iterator'", .{bc.typeName(recv)});
             break :blk Type.invalid;
@@ -863,13 +863,21 @@ pub const BodyChecker = struct {
     /// has no such method. Only a generic-type (`App`) receiver is supported this
     /// milestone (Vec); the impl's type-params bind by matching the template's `Self`
     /// pattern against the receiver's args — the SAME `Infer.match` `dispatchAppMethod`
-    /// runs. `.invalid` when `iter()` exists but is malformed (self-less / arity).
-    fn resolveIterType(bc: *BodyChecker, recv: Type) ?Type {
+    /// runs. `.invalid` when `iter()` exists but is malformed (self-less / arity), or is
+    /// ambiguous (T0025 at `iterable`).
+    fn resolveIterType(bc: *BodyChecker, recv: Type, iterable: Ast.Index) error{OutOfMemory}!?Type {
         if (!recv.isApp()) return null;
         const e = bc.composite.at(recv.appIdx());
         // A desugar resolves at the program's site wherever it is written, as lower and
         // discovery resolve it (`StdNames.desugarMethods`).
-        const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, StdNames.method_iter, .program) orelse return null;
+        const m = switch (Typecheck.pickGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, StdNames.method_iter, .program)) {
+            .one => |m| m,
+            .ambiguous => {
+                try bc.emitAmbiguousConformance(bc.spanOf(iterable), recv, StdNames.method_iter);
+                return Type.invalid;
+            },
+            .none => return null,
+        };
         const mf = bc.model.fns[m.fn_id];
         if (!m.has_self or mf.params.len != 1) return Type.invalid; // iter(self), no extra args
         const targs = (Typecheck.bindImplParams(bc.gpa, bc.composite, mf, e.args) catch return Type.invalid) orelse return Type.invalid;
@@ -1707,7 +1715,7 @@ pub const BodyChecker = struct {
                     return ty;
                 },
                 .ambiguous => {
-                    try bc.emitAmbiguousConformance(fa.main_token, recv_ty, member);
+                    try bc.emitAmbiguousConformance(bc.tokSpan(fa.main_token), recv_ty, member);
                     return bc.poison();
                 },
                 .none => {},
@@ -1717,7 +1725,15 @@ pub const BodyChecker = struct {
         }
         if (recv_ty.isApp()) {
             const e = bc.composite.at(recv_ty.appIdx());
-            if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite())) |m| {
+            const picked: ?Typecheck.TemplateMethod = switch (Typecheck.pickGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite())) {
+                .one => |m| m,
+                .ambiguous => {
+                    try bc.emitAmbiguousConformance(bc.tokSpan(fa.main_token), recv_ty, member);
+                    return bc.poison();
+                },
+                .none => null,
+            };
+            if (picked) |m| {
                 if (!m.has_self) return try bc.reportStaticBound(fa, member);
                 const mf = bc.model.fns[m.fn_id];
                 // A method's own `[U]` is fixed per call, which a value could not do.
@@ -2741,28 +2757,58 @@ pub const BodyChecker = struct {
         return mf.ret;
     }
 
-    /// Emit the T0025 ambiguity diagnostic: the receiver conforms to one generic
-    /// protocol MULTIPLE times and the use site gave no disambiguating type-args. Names the
+    /// Emit the T0025 ambiguity diagnostic: the receiver conforms more than once with a
+    /// method `member` and the use site gave no disambiguating type-args. Names the
     /// conflicting conformances in table (source fn-id) order — deterministic at any `-jN`.
-    fn emitAmbiguousConformance(bc: *BodyChecker, at_tok: u32, recv: Type, member: []const u8) error{OutOfMemory}!void {
-        var list: std.ArrayList(Typecheck.Method) = .empty;
-        defer list.deinit(bc.gpa);
-        try Typecheck.conformancesFor(bc.model.methods, recv, member, bc.gpa, &list);
-        var names: std.ArrayList(u8) = .empty;
-        defer names.deinit(bc.gpa);
-        for (list.items, 0..) |m, i| {
-            if (i != 0) try names.appendSlice(bc.gpa, " and ");
-            try names.appendSlice(bc.gpa, bc.model.protocols[m.protocol_id.?].name);
-            if (m.protocol_args.len > 0) {
-                try names.append(bc.gpa, '[');
-                for (m.protocol_args, 0..) |pa, j| {
-                    if (j != 0) try names.appendSlice(bc.gpa, ", ");
-                    try names.appendSlice(bc.gpa, bc.typeName(pa));
-                }
-                try names.append(bc.gpa, ']');
+    /// A generic receiver's are its ctor's templates, their arg patterns grounded through
+    /// the receiver's args.
+    fn emitAmbiguousConformance(bc: *BodyChecker, at: Span, recv: Type, member: []const u8) error{OutOfMemory}!void {
+        var confs: std.ArrayList(AmbiguousConformance) = .empty;
+        defer confs.deinit(bc.gpa);
+        var arg_buf: std.ArrayList(Type) = .empty;
+        defer arg_buf.deinit(bc.gpa);
+        if (recv.isApp()) {
+            const e = bc.composite.at(recv.appIdx());
+            const site = bc.methodSite();
+            for (bc.model.templates) |tm| {
+                if (tm.recv_ctor != e.ctor or tm.recv_is_enum != e.ctor_is_enum or !std.mem.eql(u8, tm.name, member)) continue;
+                if (site == .bundled and tm.shadows) continue;
+                const pid = tm.protocol_id orelse continue;
+                const start = arg_buf.items.len;
+                for (tm.protocol_args) |pa| try arg_buf.append(bc.gpa, try conform.substPattern(bc.composite, bc.gpa, pa, e.args));
+                try confs.append(bc.gpa, .{ .pid = pid, .args_start = start, .args_len = arg_buf.items.len - start });
+            }
+        } else {
+            var list: std.ArrayList(Typecheck.Method) = .empty;
+            defer list.deinit(bc.gpa);
+            try Typecheck.conformancesFor(bc.model.methods, recv, member, bc.gpa, &list);
+            for (list.items) |m| {
+                const start = arg_buf.items.len;
+                try arg_buf.appendSlice(bc.gpa, m.protocol_args);
+                try confs.append(bc.gpa, .{ .pid = m.protocol_id.?, .args_start = start, .args_len = m.protocol_args.len });
             }
         }
-        try bc.sink.report(.{ .span = bc.tokSpan(at_tok), .code = .T0025 }, "ambiguous conformance: '{s}' on '{s}' matches multiple conformances ({s}); add explicit protocol type arguments, e.g. .{s}[int]()", .{ member, bc.typeName(recv), names.items, member });
+        var names: std.ArrayList(u8) = .empty;
+        defer names.deinit(bc.gpa);
+        for (confs.items, 0..) |c, i| {
+            if (i != 0) try names.appendSlice(bc.gpa, " and ");
+            try names.appendSlice(bc.gpa, bc.model.protocols[c.pid].name);
+            try bc.appendTypeArgs(&names, arg_buf.items[c.args_start..][0..c.args_len]);
+        }
+        try bc.sink.report(.{ .span = at, .code = .T0025 }, "ambiguous conformance: '{s}' on '{s}' matches multiple conformances ({s}); add explicit protocol type arguments, e.g. .{s}[int]()", .{ member, bc.typeName(recv), names.items, member });
+    }
+
+    const AmbiguousConformance = struct { pid: u32, args_start: usize, args_len: usize };
+
+    /// `[A, B]` after a name, or nothing for no args.
+    fn appendTypeArgs(bc: *BodyChecker, out: *std.ArrayList(u8), args: []const Type) error{OutOfMemory}!void {
+        if (args.len == 0) return;
+        try out.append(bc.gpa, '[');
+        for (args, 0..) |a, j| {
+            if (j != 0) try out.appendSlice(bc.gpa, ", ");
+            try out.appendSlice(bc.gpa, bc.typeName(a));
+        }
+        try out.append(bc.gpa, ']');
     }
 
     /// Type an explicit-protocol-args method call `v.m[int](args)`: the callee is a
@@ -3077,7 +3123,7 @@ pub const BodyChecker = struct {
             },
             .ambiguous => {
                 try bc.drainArgs(args);
-                try bc.emitAmbiguousConformance(callee.main_token, ty, member);
+                try bc.emitAmbiguousConformance(bc.tokSpan(callee.main_token), ty, member);
             },
             .none => {
                 try bc.drainArgs(args);
@@ -3678,7 +3724,7 @@ pub const BodyChecker = struct {
             },
             .ambiguous => {
                 try bc.drainArgs(args);
-                try bc.emitAmbiguousConformance(callee.main_token, recv_ty, member);
+                try bc.emitAmbiguousConformance(bc.tokSpan(callee.main_token), recv_ty, member);
                 return .invalid;
             },
             .none => {},
@@ -3826,7 +3872,16 @@ pub const BodyChecker = struct {
         const member = bc.nameText(callee.main_token);
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         const e = bc.composite.at(recv_ty.appIdx());
-        if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite())) |m| {
+        const picked: ?Typecheck.TemplateMethod = switch (Typecheck.pickGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite())) {
+            .one => |m| m,
+            .ambiguous => {
+                try bc.drainArgs(args);
+                try bc.emitAmbiguousConformance(bc.tokSpan(callee.main_token), recv_ty, member);
+                return .invalid;
+            },
+            .none => null,
+        };
+        if (picked) |m| {
             // An associated (self-less) function is not callable on a value receiver —
             // it must be reached via `Type[args].fn()`.
             if (!m.has_self) {
@@ -3858,7 +3913,7 @@ pub const BodyChecker = struct {
         }
         // A compiler-provided inherent method on the prelude `Option`/`Result`
         // enums: recognized by ctor id, NOT a `t.methods` entry (source-
-        // less, like the builtin scalar `eq`/`hash`), so `findGenericMethod`
+        // less, like the builtin scalar `eq`/`hash`), so `pickGenericMethod`
         // misses above. `is_some`/`is_none`/`is_ok`/`is_err` -> bool (arity 0);
         // `unwrap` -> the payload type-arg (arity 0); `unwrap_or` -> the payload
         // type-arg (arity 1, default assignable to it). The receiver is an `App`

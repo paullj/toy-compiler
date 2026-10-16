@@ -1,0 +1,79 @@
+import std/vec
+
+protocol Show { fn render(self) -> int }
+protocol Debug { fn render(self) -> int }
+
+struct Box[T] { v: T }
+
+impl Box[T] has Into[int] {
+    fn into(self) -> int { 7 }
+}
+
+impl Box[T] has Into[bool] {
+    fn into(self) -> bool { true }
+}
+
+struct Swapped[T] { v: T }
+
+impl Swapped[T] has Into[bool] {
+    fn into(self) -> bool { true }
+}
+
+impl Swapped[T] has Into[int] {
+    fn into(self) -> int { 7 }
+}
+
+struct Shown[T] { v: T }
+
+impl Shown[T] has Show {
+    fn render(self) -> int { 1 }
+}
+
+impl Shown[T] has Debug {
+    fn render(self) -> int { 2 }
+}
+
+protocol Walk { fn iter(self) -> VecIter[int] }
+protocol Stroll { fn iter(self) -> VecIter[int] }
+
+struct Bag[T] { xs: Vec[int] }
+
+impl Bag[T] has Walk {
+    fn iter(self) -> VecIter[int] { self.xs.iter() }
+}
+
+impl Bag[T] has Stroll {
+    fn iter(self) -> VecIter[int] { self.xs.iter() }
+}
+
+fn generic(b: Box[int]) -> int {
+    return b.into()  #~ ERROR [T0025] 'into' on 'Box' matches multiple conformances (Into[int] and Into[bool])
+}
+
+# The expected type does not choose a conformance.
+fn swapped(s: Swapped[int]) -> int {
+    n: int = s.into()  #~ ERROR [T0025] 'into' on 'Swapped' matches multiple conformances (Into[bool] and Into[int])
+    return n
+}
+
+fn shown(s: Shown[int]) -> int {
+    return s.render()  #~ ERROR [T0025] 'render' on 'Shown' matches multiple conformances (Show and Debug)
+}
+
+fn bound(b: Box[int]) -> int {
+    f := b.into  #~ ERROR [T0025] 'into' on 'Box' matches multiple conformances
+    return f()
+}
+
+fn walk(b: Bag[int]) -> int {
+    t := 0
+    for x in b {  #~ ERROR [T0025] 'iter' on 'Bag' matches multiple conformances (Walk and Stroll)
+        t = t + x
+    }
+    return t
+}
+
+fn main() -> int {
+    b := Box { v: 1 }
+    return generic(b) + swapped(Swapped { v: 1 }) + shown(Shown { v: 1 }) + bound(b) + walk(Bag[int] { xs: [1] }) + b.into[int]()
+}

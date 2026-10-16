@@ -1,4 +1,4 @@
-# Feature: explicit type args on a method of a generic type (#31). A method's own type params come from the `[..]` (`b.none[int]()`, whose `U` no argument names; `b.pair[str]("x")`; piped as `b |> .pair[int](1)`; `Box[int].with[bool](..)` on the type), the impl's from the receiver; each `[..]` is its own instance. A conformance method takes protocol args, as on a concrete type: `b.into[bool]()` picks `Into[bool]` among the receiver's conformances.
+# Feature: explicit type args on a method of a generic type (#31). A method's own type params come from the `[..]` (`b.none[int]()`, whose `U` no argument names; `b.pair[str]("x")`; piped as `b |> .pair[int](1)`; `Box[int].with[bool](..)` on the type), the impl's from the receiver; each `[..]` is its own instance. A conformance method takes protocol args, as on a concrete type: `b.into[bool]()` picks `Into[bool]` among the receiver's conformances, and with two of them a bare `b.into()` is T0025.
 # expect: stdout "dflt\n7\n21\n7\n14\n9\nq\n1\n40\ntrue\n40\n3\nfalse\n8\n42\n"
 # expect: exit 0
 import std/io
@@ -57,7 +57,7 @@ fn main() -> int {
     io.println(if nothing(b).is_none() && nothing(Box { v: "s" }).is_none() { "1" } else { "0" })
     io.println(b.into[int]().to_string())
     io.println(b.into[bool]().to_string())
-    n: int = b.into()
+    n: int = b.into[int]()
     io.println(n.to_string())
     io.println(Box[int].with[bool](3, true).get().to_string())
     xs := [1, 2, 3]
