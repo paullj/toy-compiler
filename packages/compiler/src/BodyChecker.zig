@@ -2573,24 +2573,24 @@ pub const BodyChecker = struct {
             if (i != 0) try out.appendSlice(bc.gpa, ", ");
             if (Modes.isMut(sig.mut_mask, i)) try out.appendSlice(bc.gpa, "mut ");
             if (targs) |ta| {
-                try bc.writeTypeNamed(out, substTy(bc, p, ta), sig.generic_names, open);
+                try bc.writeTypeNamed(out, substTy(bc, p, ta), sig.generic_names, open, bc.openOrdBase());
                 continue;
             }
             // A mapped param's leftover type_vars belong to the caller's scope, not the
             // callee's, so only a raw param takes the callee's names.
             const raw = sig.map == .id or sig.map == .unbound;
-            if (raw) try bc.writeTypeNamed(out, p, sig.generic_names, null) else try out.appendSlice(bc.gpa, bc.typeName(bc.paramWant(sig, p)));
+            if (raw) try bc.writeTypeNamed(out, p, sig.generic_names, null, 0) else try out.appendSlice(bc.gpa, bc.typeName(bc.paramWant(sig, p)));
         }
         try out.append(bc.gpa, ')');
     }
 
-    /// `t` as `typeName` spells it, except that a type var `ord` with a name in `names`
-    /// (and, when `open` is given, still open there) prints as that name, at any depth. A
-    /// fn type's label is fixed when the type is interned, so a fn type is spelled from
-    /// its parts here.
-    pub fn writeTypeNamed(bc: *BodyChecker, out: *std.ArrayList(u8), t: Type, names: []const []const u8, open: ?[]const bool) error{OutOfMemory}!void {
-        if (t.isTypeVar()) {
-            const ord = t.typeVarOrd();
+    /// `t` as `typeName` spells it, except that a type var `base + ord` with a name in
+    /// `names` (and, when `open` is given, still open there) prints as that name, at any
+    /// depth. A fn type's label is fixed when the type is interned, so a fn type is
+    /// spelled from its parts here.
+    pub fn writeTypeNamed(bc: *BodyChecker, out: *std.ArrayList(u8), t: Type, names: []const []const u8, open: ?[]const bool, base: u32) error{OutOfMemory}!void {
+        if (t.isTypeVar() and t.typeVarOrd() >= base) {
+            const ord = t.typeVarOrd() - base;
             const is_open = if (open) |o| ord < o.len and o[ord] else true;
             if (ord < names.len and is_open) return out.appendSlice(bc.gpa, names[ord]);
         }
@@ -2599,12 +2599,12 @@ pub const BodyChecker = struct {
         try out.appendSlice(bc.gpa, "fn(");
         for (parts.params, 0..) |fp, i| {
             if (i != 0) try out.appendSlice(bc.gpa, ", ");
-            if (fp.kind == .unit) try out.appendSlice(bc.gpa, "()") else try bc.writeTypeNamed(out, fp, names, open);
+            if (fp.kind == .unit) try out.appendSlice(bc.gpa, "()") else try bc.writeTypeNamed(out, fp, names, open, base);
         }
         try out.append(bc.gpa, ')');
         if (parts.ret.kind == .unit) return;
         try out.appendSlice(bc.gpa, " -> ");
-        try bc.writeTypeNamed(out, parts.ret, names, open);
+        try bc.writeTypeNamed(out, parts.ret, names, open, base);
     }
 
     pub fn setCallee(bc: *BodyChecker, call: Ast.Node, c: Callee) void {
@@ -4110,6 +4110,28 @@ pub const BodyChecker = struct {
         return true;
     }
 
+    /// Whether `t` gives a lambda param or a `_` capture's param its type: a ground type,
+    /// or in a bounded template's abstract check one that also holds the template's own
+    /// type vars, which are as known there as any concrete type. A var of a generic call
+    /// that is still open takes an ordinal past them (`openOrdBase`), so it gives none.
+    pub fn givesType(bc: *BodyChecker, t: Type) bool {
+        if (t.isTypeVar()) return bc.abstract_template and t.typeVarOrd() < bc.openOrdBase();
+        if (t.isApp() or t.isFunc()) {
+            const e = bc.composite.at(t.struct_id);
+            for (e.args) |a| if (!bc.givesType(a)) return false;
+            return true;
+        }
+        return true;
+    }
+
+    /// Where a generic call's still-open var `ord` sits in the type a waiting arg is
+    /// checked against: at `openOrdBase() + ord`. In a bounded template's abstract check
+    /// that is past the template's own vars, which a bound var may stand for, so the two
+    /// never share an ordinal.
+    pub fn openOrdBase(bc: *const BodyChecker) u32 {
+        return if (bc.abstract_template) @intCast(bc.subst.?.types.len) else 0;
+    }
+
     /// The `T` of a prelude `Ref[T]` App, or `.invalid` for any other type.
     fn refPayload(bc: *BodyChecker, t: Type) Type {
         if (!t.isApp()) return .invalid;
@@ -4256,6 +4278,10 @@ pub const BodyChecker = struct {
     }
 
     pub fn typeName(bc: *const BodyChecker, ty: Type) []const u8 {
+        // A bounded template's abstract check holds its own params as type vars, which
+        // read as the template spells them.
+        if (bc.abstract_template and ty.isTypeVar() and ty.typeVarOrd() < bc.subst.?.names.len)
+            return bc.subst.?.names[ty.typeVarOrd()];
         return refs.typeName(bc, ty);
     }
 

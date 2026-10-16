@@ -59,20 +59,20 @@ fn waitsForTypeArgs(bc: *const BodyChecker, arg: Ast.Index) bool {
 }
 
 /// The partly bound param `want` as a waiting arg's expected type, only when it gives
-/// the arg a type: a ground type for the hole, a fn type that types one of a lambda's
-/// unannotated params. Otherwise null, and the arg is typed as it was before any
-/// other arg could bind, so an expected fn type on the call still types it
+/// the arg a type (`givesType`): the whole type for the hole, a fn type's param for one
+/// of a lambda's unannotated params. Otherwise null, and the arg is typed as it was
+/// before any other arg could bind, so an expected fn type on the call still types it
 /// (`g: fn(int) -> int = id(fn(x) { x + 1 })`). A fn type of another arity is passed
 /// on, so the lambda reports the count rather than an untypable param.
 fn helpfulWant(bc: *BodyChecker, arg: Ast.Index, want: Type) ?Type {
     if (want.kind == .invalid) return null;
-    if (bc.body.hole != Ast.none and arg == bc.body.hole) return if (bc.isGround(want)) want else null;
+    if (bc.body.hole != Ast.none and arg == bc.body.hole) return if (bc.givesType(want)) want else null;
     if (!want.isFunc()) return null;
     const parts = Composite.fnParts(bc.composite.at(want.funcIdx()));
     const proto = Ast.protoAt(bc.tree, bc.tree.nodes[arg.int()].lhs.int());
     if (parts.params.len != proto.params.len) return want;
     for (proto.params, parts.params) |p, wp| {
-        if (bc.tree.nodes[p.int()].lhs == Ast.none and bc.isGround(wp)) return want;
+        if (bc.tree.nodes[p.int()].lhs == Ast.none and bc.givesType(wp)) return want;
     }
     return null;
 }
@@ -85,11 +85,12 @@ pub fn typeOfGenericArg(bc: *BodyChecker, arg: Ast.Index, typing: ArgTyping, wan
     return if (typing == .call_expected) bc.typeOf(arg) else bc.typeOfExpected(arg, null);
 }
 
-/// An open var substitutes to itself, which `typeOfLambda` and `adoptHole` treat as
-/// giving no type.
-fn fillOpen(targs: []Type, bound: []const bool) void {
+/// An open var substitutes to itself at `base + ord`, clear of the vars a bound one may
+/// stand for (`BodyChecker.openOrdBase`), which `typeOfLambda` and `adoptHole` treat as
+/// giving no type and a diagnostic names apart from them.
+fn fillOpen(targs: []Type, bound: []const bool, base: u32) void {
     for (targs, bound, 0..) |*t, b, ord| {
-        if (!b) t.* = Type.typeVar(@intCast(ord));
+        if (!b) t.* = Type.typeVar(base + @as(u32, @intCast(ord)));
     }
 }
 
@@ -135,7 +136,7 @@ pub fn inferArgs(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, pa
         arg_types[0] = r;
         _ = Infer.match(n_gp, params[0..1], arg_types[0..1], targs, bnd, fp, dec);
     }
-    fillOpen(targs, bnd);
+    fillOpen(targs, bnd, bc.openOrdBase());
     const mark = bc.sink.count();
     var waiting = false;
     for (nodes[first..], first..) |a, i| {
@@ -168,7 +169,7 @@ pub fn inferArgs(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, pa
                 arg_types[i] = try typeOfGenericArg(bc, a, typing, null);
                 continue;
             }
-            fillOpen(targs, bnd);
+            fillOpen(targs, bnd, bc.openOrdBase());
             for (open, bnd) |*o, b| o.* = !b;
             arg_types[i] = try typeOfGenericArg(bc, a, typing, helpfulWant(bc, a, BC.substTy(bc, params[i], targs)));
             res = Infer.match(n_gp, params, arg_types, targs, bnd, fp, dec);
@@ -182,7 +183,7 @@ pub fn inferArgs(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, pa
             if (recv != null and c.first_pos == 0) {
                 @memset(bnd, false);
                 _ = Infer.match(n_gp, params[0..1], arg_types[0..1], targs, bnd, fp, dec);
-                fillOpen(targs, bnd);
+                fillOpen(targs, bnd, bc.openOrdBase());
                 if (try reportMisfit(bc, site, nodes, first, params, arg_types, targs, bnd)) return .failed;
             }
             try reportInferConflict(bc, nodes, names, c);
@@ -193,7 +194,7 @@ pub fn inferArgs(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, pa
             // An `.invalid` arg was diagnosed where it went wrong (a resolve error, say);
             // the hole being typed is invalid only because it waits for this call.
             for (nodes[first..], arg_types[first..]) |a, at| if (at.kind == .invalid and a != bc.body.hole) return .failed;
-            fillOpen(targs, bnd);
+            fillOpen(targs, bnd, bc.openOrdBase());
             if (try reportMisfit(bc, site, nodes, first, params, arg_types, targs, bnd)) return .failed;
             return .{ .unbound = u.ord };
         },
@@ -232,7 +233,7 @@ fn reportMisfit(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, fir
         var text: std.ArrayList(u8) = .empty;
         defer text.deinit(bc.gpa);
         try text.print(bc.gpa, "argument {d}{s}: expected ", .{ pos, bc.pipedArgHint(site.call, pos) });
-        try bc.writeTypeNamed(&text, want, site.sig.generic_names, open);
+        try bc.writeTypeNamed(&text, want, site.sig.generic_names, open, bc.openOrdBase());
         try text.print(bc.gpa, ", got {s}", .{bc.typeName(arg_types[i])});
         try bc.writeSigSuffixOpen(&text, site.sig, targs, open);
         try bc.sink.report(.{ .span = bc.spanOf(a), .code = .T0040, .related = site.sig.decl }, "{s}", .{text.items});
@@ -297,7 +298,7 @@ fn reportOwnGenericArity(bc: *BodyChecker, call: Ast.Index, got: usize, sig: Bod
     const fp = try bc.gpa.alloc(usize, n_gp);
     defer bc.gpa.free(fp);
     _ = Infer.match(n_gp, &.{self_pat}, &.{recv_ty}, targs, bnd, fp, bc.composite.decomposer());
-    fillOpen(targs, bnd);
+    fillOpen(targs, bnd, bc.openOrdBase());
     const open = try bc.gpa.alloc(bool, n_gp);
     defer bc.gpa.free(open);
     for (open, bnd) |*o, b| o.* = !b;

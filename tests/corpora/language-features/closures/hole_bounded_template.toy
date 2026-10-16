@@ -1,0 +1,47 @@
+# Feature: in a bounded generic fn, a '_' capture or an untyped lambda param whose position wants the fn's own type param takes that param as its type, as a typed lambda 'fn(o: T) { .. }' does, also beside a callee's own still-open param ('o.map(v.add(_))' with 'V' and 'map's 'U' at one ordinal)
+# expect: exit 30
+import std/option
+
+protocol Add {
+    fn add(self, o: Self) -> Self
+}
+
+struct N { v: int }
+
+impl N has Add {
+    fn add(self, o: N) -> N { N { v: self.v + o.v } }
+}
+
+fn twice[T](f: fn(T) -> T, x: T) -> T { f(f(x)) }
+
+fn go[T has Add](t: T) -> T {
+    twice(t.add(_), t)
+}
+
+fn go_lambda[T has Add](t: T) -> T {
+    twice(fn(o) { t.add(o) }, t)
+}
+
+fn g[T has Add](t: T) -> T {
+    f := t.add(_)
+    f(t)
+}
+
+fn bound_place[T has Add](t: T) -> T {
+    f: fn(T) -> T = fn(o) { t.add(o) }
+    f(t)
+}
+
+fn shift[K, V has Add](o: Option[V], v: V) -> Option[V] {
+    o.map(v.add(_)) |> .map(fn(x) { x.add(v) })
+}
+
+fn main() -> int {
+    one := N { v: 1 }
+    a := go(one).v
+    b := go_lambda(one).v
+    c := g(N { v: 2 }).v
+    d := bound_place(N { v: 3 }).v
+    e := shift[int, N](Option.some(N { v: 4 }), N { v: 5 }).unwrap().v
+    return a + b + c + d + e
+}
