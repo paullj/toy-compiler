@@ -229,6 +229,7 @@ pub fn printCliErrors(out: *Io.Writer, level: Style.ColorLevel, errs: []const cl
         try out.writeAll(": ");
         switch (e.kind) {
             .unknown_flag => try out.print("unknown flag: {s}", .{e.arg}),
+            .declined_flag => try out.print("'{s}' is a {s} option; '{s}' does not take it", .{ e.arg, e.expected, e.where }),
             .missing_value => try out.print("{s} requires a value ({s})", .{ e.arg, e.expected }),
             // Enum bad_value carries the choice list; list it as `(one of: a|b|c)` and,
             // when the input was close to a choice, add a faint `did you mean 'X'?` note.

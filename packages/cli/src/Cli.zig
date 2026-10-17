@@ -76,8 +76,8 @@ const files_pos: []const Spec.Positional = &.{
 /// (pretty snippets vs stable NDJSON); `--deny/--warn/--allow` are the repeatable
 /// severity overrides; `--deny-warnings` promotes any surviving warning to an error
 /// for the exit gate; `--exit-zero` forces a 0 exit even with errors (editors that read
-/// the stream, not the status); `--watch` is a forward-compatible no-op stub; `--color`
-/// and `--target` mirror the shared spellings.
+/// the stream, not the status); `--watch` is a forward-compatible no-op stub; `--color`,
+/// `--target` and `--timings` mirror the shared spellings.
 const check_opts: []const Spec.Option = &.{
     .{ .long = "format", .value = .{ .@"enum" = &.{ "human", "ndjson" } }, .value_name = "FORM", .help = "Diagnostic output form (human snippets or line-delimited JSON; default human)" },
     .{ .long = "deny", .value = .string, .action = .append, .value_name = "CODE", .help = "Treat a diagnostic code or band as an error (repeatable, e.g. --deny R0001 or --deny T)" },
@@ -88,6 +88,17 @@ const check_opts: []const Spec.Option = &.{
     .{ .long = "watch", .action = .set_true, .help = "Re-check on file changes (not yet implemented; accepted as a no-op)" },
     .{ .long = "color", .value = .{ .@"enum" = &.{ "auto", "always", "never" } }, .value_name = "WHEN", .help = "Colorize output (default auto: on when stdout is a tty)" },
     .{ .long = "target", .value = .string, .value_name = "TRIPLE", .help = "Compilation target (default: native)" },
+    .{ .long = "timings", .action = .set_true, .help = "Print the per-stage wall-clock profile" },
+};
+
+/// The build options `check` does not take, so that using one names it as a build option.
+const check_declined: []const Spec.Option = blk: {
+    var list: []const Spec.Option = &.{};
+    for (shared_opts) |o| {
+        const taken = if (o.long) |l| hasLong(check_opts, l) else false;
+        if (!taken) list = list ++ &[_]Spec.Option{o};
+    }
+    break :blk list;
 };
 
 /// The optional `<CODE>` positional for `toy explain` (e.g. `R0001`); omitted for
@@ -117,7 +128,7 @@ pub const spec: Spec.Cli = .{
         .subcommands = &.{
             .{ .name = "build", .about = "Compile to a signed executable (the default action)", .options = shared_opts, .positionals = files_pos },
             .{ .name = "run", .about = "Build, then execute the binary and report its exit status", .options = shared_opts, .positionals = files_pos },
-            .{ .name = "check", .about = "Check syntax and types without building; report all diagnostics", .options = check_opts, .positionals = files_pos },
+            .{ .name = "check", .about = "Check syntax and types without building; report all diagnostics", .options = check_opts, .positionals = files_pos, .declined = .{ .owner = "build", .options = check_declined } },
             .{ .name = "explain", .about = "Print the documentation for a diagnostic code, or --list all codes", .options = explain_opts, .positionals = explain_pos },
             // The language server over stdio (JSON-RPC). No options or positionals: it
             // talks LSP on stdin/stdout, so an empty option set is intentional (the
@@ -158,7 +169,7 @@ comptime {
     if (hasLong(check_opts, "emit"))
         @compileError("`check` must never register `--emit`");
     // check_opts must carry ONLY the restricted, non-codegen knobs.
-    for ([_][]const u8{ "output", "j", "O", "opt", "no-opt", "dump", "codegen-stats", "verify", "no-cache", "opt-stats", "no-specialize", "timings", "emit" }) |banned| {
+    for ([_][]const u8{ "output", "j", "O", "opt", "no-opt", "dump", "codegen-stats", "verify", "no-cache", "opt-stats", "no-specialize", "emit" }) |banned| {
         if (hasLong(check_opts, banned))
             @compileError("`check` option set must not contain build/codegen/opt flags");
     }
