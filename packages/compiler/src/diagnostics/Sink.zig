@@ -103,6 +103,12 @@ pub fn merge(self: *DiagnosticSink, other: *DiagnosticSink) !void {
     other.owned.clearAndFree(other.gpa);
 }
 
+/// Take ownership of `msg`, a message a caller set on one or more of this sink's
+/// diagnostics in place of theirs.
+pub fn adopt(self: *DiagnosticSink, msg: []u8) !void {
+    try self.owned.append(self.gpa, msg);
+}
+
 /// Deterministic stable in-place ordering of an arbitrary diagnostic slice on the
 /// canonical key `(scope, byte_offset, code, message)` — the SAME key a sink's own
 /// `sort` uses. Exists for the driver seam where per-stage slices (parse, resolve,
