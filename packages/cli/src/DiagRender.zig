@@ -149,7 +149,7 @@ pub fn renderScopedDiags(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.C
         if (SevCfg.resolve(d.code, d.severity, cfg) == null) continue; // --ignore: skip
         if (drawn == DIAG_CAP) break;
         const m = moduleAt(g, d.scope); // NO_SCOPE / out-of-range -> entry
-        const sm = try cache.get(gpa, d.scope, m.path, m.source);
+        const sm = try cache.get(gpa, d.scope, m.displayName(), m.source);
         _ = try renderSinkDiag(out, level, sm, d, cfg);
         drawn += 1;
     }
@@ -193,12 +193,12 @@ pub fn renderGraphError(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.Co
     // (missing/escape/cycle) carry no parse_diags and fall through unchanged.
     if (e.kind == .parse and e.parse_diags.len > 0) {
         const m = moduleAt(g, e.module orelse g.entry_index);
-        var sm = try Rr.SourceMap.init(gpa, m.path, m.source);
+        var sm = try Rr.SourceMap.init(gpa, m.displayName(), m.source);
         defer sm.deinit(gpa);
         for (e.parse_diags) |d| _ = try renderSinkDiag(out, level, &sm, d, cfg);
         return;
     }
-    const name = if (e.module) |m| moduleAt(g, m).path else if (g.modules.len > 0) g.entry().path else "<entry>";
+    const name = if (e.module) |m| moduleAt(g, m).displayName() else if (g.modules.len > 0) g.entry().displayName() else "<entry>";
     const has_src = e.module != null or g.modules.len > 0;
     if (e.span != null and has_src) {
         const src: []const u8 = if (e.module) |m| moduleAt(g, m).source else g.entry().source;
@@ -213,9 +213,9 @@ pub fn renderGraphError(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.Co
 pub fn renderGraphEmit(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, g: *const Graph.Graph, e: Codegen.EmitError) !void {
     const m = if (e.module) |mi| moduleAt(g, mi) else g.entry();
     if (e.span) |span| {
-        try renderLocated(gpa, out, level, m.path, m.source, span, e.message, "", null);
+        try renderLocated(gpa, out, level, m.displayName(), m.source, span, e.message, "", null);
     } else {
-        try renderPlainError(out, level, m.path, e.message, "", null);
+        try renderPlainError(out, level, m.displayName(), e.message, "", null);
     }
 }
 
