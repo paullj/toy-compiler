@@ -76,6 +76,13 @@ pub const Module = struct {
         return .{ .nodes = m.nodes, .extra = m.extra, .pub_bits = m.pub_bits };
     }
 
+    /// The name a diagnostic location shows. A user module shows its file as given, so
+    /// editors and terminals can open `<file>:<line>:<col>`. A bundled module has no file
+    /// the user can open, and an in-memory one has none at all, so they show the module name.
+    pub fn displayName(m: *const Module) []const u8 {
+        return if (m.bundled or m.file.len == 0) m.path else m.file;
+    }
+
     /// The bundled `core/` layer — the sole place `extern` decls and heap
     /// intrinsics may be declared/named. `std/` is bundled but NOT core, so it
     /// calls core's safe members without itself naming an intrinsic.
@@ -1195,6 +1202,40 @@ test "discover: 3-module graph (entry -> two imports, one shared)" {
         }
     };
     try withFixture(".toy-test-graph-3mod", files, "main.toy", Check.run);
+}
+
+test "displayName: a user module shows its file as given, a bundled one its module name" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import std/io
+        \\import util/helper
+        \\fn main() -> int { return helper.get() }
+        \\
+        },
+        .{ .path = "util/helper.toy", .source =
+        \\pub fn get() -> int { return 2 }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            try testing.expect(g.err == null);
+            try testing.expectEqualStrings(".toy-test-graph-display/main.toy", g.entry().displayName());
+            var seen: usize = 0;
+            for (g.modules) |*m| {
+                if (std.mem.eql(u8, m.path, "util/helper")) {
+                    try testing.expectEqualStrings(".toy-test-graph-display/util/helper.toy", m.displayName());
+                    seen += 1;
+                }
+                if (std.mem.eql(u8, m.path, "std/io")) {
+                    try testing.expectEqualStrings("std/io", m.displayName());
+                    seen += 1;
+                }
+            }
+            try testing.expectEqual(@as(usize, 2), seen);
+        }
+    };
+    try withFixture(".toy-test-graph-display", files, "main.toy", Check.run);
 }
 
 test "discover: import cycle is rejected with a cycle path" {

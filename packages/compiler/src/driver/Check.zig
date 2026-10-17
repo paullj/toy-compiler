@@ -13,8 +13,8 @@
 //!   "line","col","message","file","rendered","labels"}`. `byte`..`byte_end` is the
 //!   primary span. `code` is null for an uncoded
 //!   diagnostic. `line`/`col` are 1-based, computed from the owning file's SourceMap.
-//!   `file` is the diagnostic's source path (the module path in graph mode, else the
-//!   input file). `rendered` is the PLAIN (uncolored) pretty single-diagnostic render
+//!   `file` is the diagnostic's source path (a bundled module's name in graph mode, else
+//!   the file as given). `rendered` is the PLAIN (uncolored) pretty single-diagnostic render
 //!   string, JSON-escaped (embedded newlines become `\n`). `labels` is an array of
 //!   SECONDARY labels: a duplicate-definition carries its "previously defined here"
 //!   label as `{message,file,line,col,byte_start,byte_end,is_primary:false}`.
@@ -222,18 +222,18 @@ pub fn tallyAll(results: []const Driver.FileResult, cfg: SevCfg.SeverityConfig) 
 // and a valid multi-module program reports ZERO diagnostics. The graph carries a
 // FLAT diagnostic slice (resolve + typecheck), each tagged with its owning module
 // via `Diagnostic.scope`; these helpers tally + serialize that slice, mapping each
-// diagnostic's `file` to its OWNING module's path (`graph.modules[scope].path`),
+// diagnostic's `file` to its OWNING module's display name (`Module.displayName`),
 // not always the entry. The NDJSON wire schema is byte-identical to the per-file
 // form (`writeNdjsonLine` is shared), so a single-module graph emits exactly what
 // the old single-file path did.
 
-/// The module a diagnostic's scope points at: the owning module's on-disk file path,
-/// so the NDJSON `file` field and the human render both attribute a diagnostic from
-/// an imported module to THAT module. `NO_SCOPE` (single-file) or an out-of-range id
+/// The module a diagnostic's scope points at, by the name its locations show (see
+/// `Module.displayName`), so the NDJSON `file` field and the human render both attribute
+/// a diagnostic from an imported module to THAT module. `NO_SCOPE` (single-file) or an out-of-range id
 /// falls back to the entry module (matching `DiagRender.moduleAt`).
 fn moduleFileFor(g: *const Graph.Graph, scope: u32) []const u8 {
-    if (scope != NO_SCOPE and scope < g.modules.len) return g.modules[scope].file;
-    return g.entry().file;
+    if (scope != NO_SCOPE and scope < g.modules.len) return g.modules[scope].displayName();
+    return g.entry().displayName();
 }
 
 /// The owning module's SOURCE for a diagnostic's scope (same fallback as `moduleFileFor`).

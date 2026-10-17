@@ -1505,3 +1505,40 @@ test "lsp: one check per document version, however many requests read it; a chan
     _ = try s.feed(in.written(), &out.writer);
     try testing.expect(s.analyses.get(main_uri) == null);
 }
+
+test "lsp: each module of a multi-module program publishes its own diagnostics under its own uri" {
+    const gpa = testing.allocator;
+    var ts = TestSession.init(gpa);
+    defer ts.deinit();
+
+    // The import sits in a subdirectory of the entry's.
+    const main_uri = "file:///w/main.toy";
+    const helper_uri = "file:///w/util/helper.toy";
+    const helper_src = "fn add(a: int, b: int) -> int { return a + b }\npub fn get() -> int {\n    add(1)\n}\n";
+    const main_src = "import util/helper\n\nfn main() -> int {\n    z: int = \"b\"\n    helper.get() + z\n}\n";
+    try ts.initialize(.{});
+    try ts.open(helper_uri, helper_src);
+    try ts.open(main_uri, main_src);
+    try ts.finish();
+
+    const publishes = try ts.publishes();
+    try testing.expectEqual(@as(usize, 2), publishes.len);
+
+    const helper_pub = publishes[0];
+    try testing.expectEqualStrings(helper_uri, getStr(helper_pub, "uri").?);
+    const hd = objGet(helper_pub, "diagnostics").?.array.items;
+    try testing.expectEqual(@as(usize, 1), hd.len);
+    try testing.expectEqualStrings("T0039", getStr(hd[0], "code").?);
+    try testing.expectEqual(@as(i64, 2), field(hd[0], "range", "start").?.object.get("line").?.integer);
+    const rel = objGet(hd[0], "relatedInformation").?.array.items[0];
+    try testing.expectEqualStrings(helper_uri, getStr(objGet(rel, "location").?, "uri").?);
+    try testing.expectEqual(@as(i64, 0), field(objGet(rel, "location").?, "range", "start").?.object.get("line").?.integer);
+
+    // The importer's publish carries only its own error: the helper's belongs to the helper.
+    const main_pub = publishes[1];
+    try testing.expectEqualStrings(main_uri, getStr(main_pub, "uri").?);
+    const md = objGet(main_pub, "diagnostics").?.array.items;
+    try testing.expectEqual(@as(usize, 1), md.len);
+    try testing.expectEqualStrings("T0041", getStr(md[0], "code").?);
+    try testing.expectEqual(@as(i64, 3), field(md[0], "range", "start").?.object.get("line").?.integer);
+}

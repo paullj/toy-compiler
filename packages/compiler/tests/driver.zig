@@ -529,7 +529,7 @@ test "check follows imports: a VALID multi-module program reports zero diagnosti
         // The diagnostic is coded R0001 and its location names the IMPORTED module.
         try testing.expect(std.mem.indexOf(u8, res.out, "error[R0001]:") != null);
         try testing.expect(std.mem.indexOf(u8, res.out, "nope_zzq") != null);
-        try testing.expect(std.mem.indexOf(u8, res.out, "helper:2") != null);
+        try testing.expect(std.mem.indexOf(u8, res.out, "--> " ++ helper_path ++ ":2:10") != null);
         try testing.expectEqual(@as(usize, 1), countCarets(res.out));
     }
     // (b') DIFFERENTIAL: build fails on the same broken import too (exit != 0).
@@ -538,6 +538,82 @@ test "check follows imports: a VALID multi-module program reports zero diagnosti
         const res = try spawnToy(gpa, io, &.{ "build", main_path, "-o", out_bin });
         defer gpa.free(res.out);
         try testing.expect(res.term != .exited or res.term.exited != 0);
+    }
+}
+
+test "a diagnostic in any user module names its file, not its module, in check and build (#88)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try harness.requireToy(io);
+
+    // The cwd (the repo root) is not the entry's dir, and one import sits in a subdirectory.
+    const dir_name = ".toy-test-driver-diag-file-paths";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name ++ "/util");
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const main_path = dir_name ++ "/main.toy";
+    const helper_path = dir_name ++ "/util/helper.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = main_path, .data = "import std/io\nimport util/helper\n\nfn main() -> int {\n    z: int = \"b\"\n    helper.get()\n}\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = helper_path, .data = "fn add(a: int, b: int) -> int { return a + b }\npub fn get() -> int {\n    add(1)\n}\n" });
+
+    const located = [_][]const u8{
+        "--> " ++ main_path ++ ":5:14",
+        "--> " ++ helper_path ++ ":3:8",
+    };
+    {
+        const res = try spawnToy(gpa, io, &.{ "check", main_path });
+        defer gpa.free(res.out);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+        for (located) |l| try testing.expect(std.mem.indexOf(u8, res.out, l) != null);
+        try testing.expect(std.mem.indexOf(u8, res.out, "--> " ++ main_path ++ ":1:8") != null); // W0004
+        try testing.expect(std.mem.indexOf(u8, res.out, "defined here") != null);
+        try testing.expect(std.mem.indexOf(u8, res.out, "--> main:") == null);
+        try testing.expect(std.mem.indexOf(u8, res.out, "--> util/helper:") == null);
+    }
+    {
+        const res = try spawnToy(gpa, io, &.{ "check", "--format", "ndjson", main_path });
+        defer gpa.free(res.out);
+        try testing.expect(std.mem.indexOf(u8, res.out, "\"file\":\"" ++ helper_path ++ "\"") != null);
+        try testing.expect(std.mem.indexOf(u8, res.out, "--> " ++ helper_path ++ ":3:8") != null);
+    }
+    {
+        const res = try spawnToy(gpa, io, &.{ "build", main_path, "-o", dir_name ++ "/prog" });
+        defer gpa.free(res.out);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+        for (located) |l| try testing.expect(std.mem.indexOf(u8, res.out, l) != null);
+    }
+
+    // A single-module build names the file too, as `check` always did.
+    const solo_path = dir_name ++ "/solo.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = solo_path, .data = "fn main() -> int {\n    x: int = \"a\"\n    x\n}\n" });
+    {
+        const res = try spawnToy(gpa, io, &.{ "build", solo_path, "-o", dir_name ++ "/solo" });
+        defer gpa.free(res.out);
+        try testing.expect(std.mem.indexOf(u8, res.out, "--> " ++ solo_path ++ ":2:14") != null);
+    }
+
+    // Discovery errors: a parse error inside an imported module and a missing import.
+    const broken_path = dir_name ++ "/util/broken.toy";
+    const uses_broken = dir_name ++ "/uses_broken.toy";
+    const missing = dir_name ++ "/missing.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = broken_path, .data = "pub fn f() -> int {\n    return )\n}\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = uses_broken, .data = "import util/broken\nfn main() -> int { broken.f() }\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = missing, .data = "import util/nope\nfn main() -> int { 0 }\n" });
+    const runs = [_]struct { argv: []const []const u8, want: []const u8 }{
+        .{ .argv = &.{ "check", uses_broken }, .want = "--> " ++ broken_path ++ ":2:12" },
+        .{ .argv = &.{ "build", uses_broken, "-o", dir_name ++ "/p" }, .want = "--> " ++ broken_path ++ ":2:12" },
+        .{ .argv = &.{ "check", missing }, .want = "--> " ++ missing ++ ":1:" },
+        .{ .argv = &.{ "build", missing, "-o", dir_name ++ "/p" }, .want = "--> " ++ missing ++ ":1:" },
+    };
+    for (runs) |r| {
+        const res = try spawnToy(gpa, io, r.argv);
+        defer gpa.free(res.out);
+        try testing.expect(std.mem.indexOf(u8, res.out, r.want) != null);
     }
 }
 
@@ -4795,7 +4871,7 @@ test "a type too large for any frame is T0077 at build, not a codegen panic (#51
         defer gpa.free(res.err);
         try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
         try testing.expect(std.mem.indexOf(u8, res.out, "error[T0077]: struct 'G' is 16777216 bytes") != null);
-        try testing.expect(std.mem.indexOf(u8, res.out, "--> big:7:8") != null);
+        try testing.expect(std.mem.indexOf(u8, res.out, "--> " ++ path ++ ":7:8") != null);
         try testing.expect(std.mem.indexOf(u8, res.err, "panic") == null);
     }
 }
@@ -4835,7 +4911,7 @@ test "a codegen diagnostic is printed with its text" {
     try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
     try testing.expect(std.mem.indexOf(u8, res.out, "function frame too large for codegen") != null);
     // The diagnostic has no position of its own; it points at the function to split.
-    try testing.expect(std.mem.indexOf(u8, res.out, "--> big:9:4") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "--> " ++ path ++ ":9:4") != null);
     try testing.expect(std.mem.indexOf(u8, res.out, "CodegenDiagnostic") == null);
     try testing.expect(std.mem.indexOf(u8, res.err, "CodegenDiagnostic") == null);
 }
