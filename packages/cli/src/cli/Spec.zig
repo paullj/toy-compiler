@@ -58,6 +58,14 @@ pub const Command = struct {
     options: []const Option = &.{},
     positionals: []const Positional = &.{},
     subcommands: []const Command = &.{},
+    declined: Declined = .{},
+};
+
+/// Options that another command takes and this one does not. A use is reported as
+/// belonging to `owner`, since "unknown flag" reads like a typo of a flag the help lists.
+pub const Declined = struct {
+    owner: []const u8 = "",
+    options: []const Option = &.{},
 };
 
 pub const Cli = struct {
@@ -179,6 +187,17 @@ pub fn checkCommand(comptime c: Command) ?[]const u8 {
         for (o.requires) |ref| {
             if (!hasOptionNamed(c, ref))
                 return "requires references unknown option: " ++ ref;
+        }
+    }
+
+    if (c.declined.options.len != 0 and c.declined.owner.len == 0)
+        return "declined options must name the command that takes them";
+    for (c.declined.options) |o| {
+        if (o.long) |l| {
+            if (hasOptionNamed(c, l)) return "option --" ++ l ++ " is both taken and declined";
+        }
+        if (o.short) |sh| {
+            if (hasOptionNamed(c, &[_]u8{sh})) return "option -" ++ &[_]u8{sh} ++ " is both taken and declined";
         }
     }
 
@@ -461,6 +480,20 @@ test "accept conflicts referencing existing option by long or short" {
         },
     };
     try std.testing.expect(comptime checkCommand(c) == null);
+}
+
+test "reject a declined option that the command also takes" {
+    const c = Command{
+        .name = "c",
+        .options = &.{.{ .long = "timings" }},
+        .declined = .{ .owner = "build", .options = &.{ .{ .long = "no-cache" }, .{ .long = "timings" } } },
+    };
+    try std.testing.expect(comptime checkCommand(c) != null);
+}
+
+test "reject a declined option with no owner" {
+    const c = Command{ .name = "c", .declined = .{ .options = &.{.{ .long = "no-cache" }} } };
+    try std.testing.expect(comptime checkCommand(c) != null);
 }
 
 test "error in subcommand is reported via recursion" {

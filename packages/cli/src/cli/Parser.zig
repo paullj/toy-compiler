@@ -203,7 +203,23 @@ fn handleLong(
             }
         }
     }
+    inline for (cmd.declined.options) |o| {
+        if (o.long) |l| {
+            if (std.mem.eql(u8, l, lv.name)) {
+                // Take the value too, or it would bind as a positional.
+                if (comptime !isFlag(o)) {
+                    if (lv.inline_val == null and i.* + 1 < argv.len) i.* += 1;
+                }
+                try sink.add(gpa, declinedErr(cmd, "--" ++ l));
+                return;
+            }
+        }
+    }
     try sink.add(gpa, .{ .kind = .unknown_flag, .arg = argv[i.*] });
+}
+
+fn declinedErr(comptime cmd: Spec.Command, comptime spelled: []const u8) Sink.Error {
+    return .{ .kind = .declined_flag, .arg = spelled, .expected = cmd.declined.owner, .where = cmd.name };
 }
 
 // ---- short clusters --------------------------------------------------------
@@ -256,8 +272,25 @@ fn handleShortCluster(
                 }
             }
         }
-        if (!matched)
+        if (!matched) {
+            inline for (cmd.declined.options) |o| {
+                if (o.short) |s| {
+                    if (!matched and s == c) {
+                        matched = true;
+                        try sink.add(gpa, declinedErr(cmd, "-" ++ &[_]u8{s}));
+                        if (comptime !isFlag(o)) {
+                            if (k + 1 == bytes.len and i.* + 1 < argv.len) i.* += 1;
+                            return .none;
+                        }
+                    }
+                }
+            }
+        }
+        if (!matched) {
+            // The rest of the cluster may be this flag's value, so one error covers it.
             try sink.add(gpa, .{ .kind = .unknown_flag, .arg = argv[i.*] });
+            return .none;
+        }
     }
     return .none;
 }
@@ -1027,4 +1060,43 @@ test "ok path leaks nothing: deinit frees the arena under testing.allocator" {
     var r = try parse(testing.allocator, cmd, &.{ "-D", "x", "a.zig", "b.zig" }, &sink);
     r.deinit(); // testing.allocator fails the test on any leak.
     _ = &r;
+}
+
+test "an unknown short flag is reported once, whatever follows it in the cluster" {
+    const cmd = comptime repCmd();
+    var sink: Sink = .{};
+    defer sink.deinit(testing.allocator);
+
+    var r = try parse(testing.allocator, cmd, &.{ "-Z1", "-Zav", "in.zig" }, &sink);
+    defer r.deinit();
+    try testing.expect(r.value == .errors);
+    try testing.expectEqual(@as(usize, 2), sink.count());
+    try testing.expectEqualStrings("-Z1", sink.items()[0].arg);
+    try testing.expectEqualStrings("-Zav", sink.items()[1].arg);
+}
+
+test "a declined option is named with its owner, and its value is not taken for a positional" {
+    const cmd = comptime Spec.Command{
+        .name = "check",
+        .positionals = &.{.{ .name = "input", .value = .string }},
+        .declined = .{ .owner = "build", .options = &.{
+            .{ .short = 'O', .value = .{ .int = .{ .min = 0, .max = 1 } } },
+            .{ .long = "output", .short = 'o', .value = .string },
+            .{ .long = "no-cache", .action = .set_true },
+        } },
+    };
+    var sink: Sink = .{};
+    defer sink.deinit(testing.allocator);
+
+    var r = try parse(testing.allocator, cmd, &.{ "-O1", "-O", "1", "-o", "x", "--output=y", "--output", "z", "--no-cache", "in" }, &sink);
+    defer r.deinit();
+    try testing.expect(r.value == .errors);
+    const want = [_][]const u8{ "-O", "-O", "-o", "--output", "--output", "--no-cache" };
+    try testing.expectEqual(want.len, sink.count());
+    for (want, sink.items()) |w, e| {
+        try testing.expectEqual(Sink.Kind.declined_flag, e.kind);
+        try testing.expectEqualStrings(w, e.arg);
+        try testing.expectEqualStrings("build", e.expected);
+        try testing.expectEqualStrings("check", e.where);
+    }
 }

@@ -52,17 +52,21 @@ const sty_ok = DiagRender.sty_ok;
 const sty_head = DiagRender.sty_head;
 const sty_faint = DiagRender.sty_faint;
 
-/// Resolve the colour level ONCE from an explicit `choice`, the tty-ness of STDOUT
-/// (diagnostics + status all go to `out` == stdout, so probing stdout is what makes
-/// a pipe/redirect/CI resolve `.none`), and the environment (NO_COLOR / CLICOLOR /
-/// CLICOLOR_FORCE / TERM). Called twice by design: with `.auto` for the pre-parse
-/// error path (a bad `--color` must not break error colouring), then with the
-/// parsed `--color` for all status + diagnostics.
-fn resolveLevel(init: std.process.Init, io: Io, choice: Terminal.ColorChoice) Style.ColorLevel {
-    const is_tty = Terminal.detectTty(std.Io.File.stdout(), io);
+/// Resolve the colour level of what goes to `file` from an explicit `choice`, its
+/// tty-ness (so a pipe/redirect/CI resolves `.none`), and the environment (NO_COLOR /
+/// CLICOLOR / CLICOLOR_FORCE / TERM). Status + diagnostics go to stdout, usage errors to
+/// stderr, and each stream is probed for itself. The usage level is resolved twice: with
+/// `.auto` for the pre-parse error path (a bad `--color` must not break error colouring),
+/// then with the parsed `--color`.
+fn resolveLevel(init: std.process.Init, io: Io, file: Io.File, choice: Terminal.ColorChoice) Style.ColorLevel {
+    const is_tty = Terminal.detectTty(file, io);
     const env = Terminal.EnvView.fromEnv(init.environ_map.*);
     return Terminal.resolve(choice, is_tty, env);
 }
+
+/// Where usage and argument errors go: stderr, so they never mix with the diagnostics and
+/// output a script reads from stdout.
+const Usage = struct { w: *Io.Writer, level: Style.ColorLevel };
 
 pub fn main(init: std.process.Init) !void {
     // The per-fn codegen fan-out + parallel link tail hammer the allocator from
@@ -86,6 +90,8 @@ pub fn main(init: std.process.Init) !void {
     // none of which are seekable. Positional writes corrupt ordering there.
     var stdout_writer = Io.File.stdout().writerStreaming(io, &stdout_buf);
     const out = &stdout_writer.interface;
+    var stderr_buf: [1024]u8 = undefined;
+    var stderr_writer = Io.File.stderr().writerStreaming(io, &stderr_buf);
 
     // The DRIVER STATE the post-parse tail reads. Declared up front (identical set
     // to the old hand-rolled loop's locals) so the post-parse tail below stays a
@@ -120,7 +126,7 @@ pub fn main(init: std.process.Init) !void {
     // Resolve a PRE-PARSE colour level for the error path with `.auto` (env + tty
     // only): a parse error may itself be a bad `--color`, so the error colouring
     // must not depend on the value we are about to reject.
-    const err_level = resolveLevel(init, io, .auto);
+    const pre_usage: Usage = .{ .w = &stderr_writer.interface, .level = resolveLevel(init, io, Io.File.stderr(), .auto) };
 
     var root_res = try cli.Parser.parse(gpa, comptime AppCli.spec.root, argv, &sink);
     defer root_res.deinit();
@@ -137,15 +143,12 @@ pub fn main(init: std.process.Init) !void {
             return;
         },
         .errors => {
-            try DiagRender.printCliErrors(out, err_level, sink.items());
-            try out.flush();
+            try DiagRender.printCliErrors(pre_usage.w, pre_usage.level, sink.items());
+            try pre_usage.w.flush();
             std.process.exit(1);
         },
         .ok => |p| {
-            if (try applyParsed(gpa, AppCli.spec.root, p, out, err_level, &st, &sev_rules)) |code| {
-                try out.flush(); // exit skips defers; flush the styled arg-error line
-                std.process.exit(code);
-            }
+            if (try applyParsed(gpa, AppCli.spec.root, p, pre_usage, &st, &sev_rules)) |code| std.process.exit(code);
         },
         .subcommand => |sc| {
             // FLAT subcommand model: re-enter `parse` on the matched subcommand.
@@ -185,8 +188,8 @@ pub fn main(init: std.process.Init) !void {
                             return;
                         },
                         .errors => {
-                            try DiagRender.printCliErrors(out, err_level, sink.items());
-                            try out.flush();
+                            try DiagRender.printCliErrors(pre_usage.w, pre_usage.level, sink.items());
+                            try pre_usage.w.flush();
                             std.process.exit(1);
                         },
                         .ok => |p| {
@@ -205,7 +208,7 @@ pub fn main(init: std.process.Init) !void {
                                 const code = try lsp.serve(gpa, &stdin_r.interface, out);
                                 std.process.exit(@intFromEnum(code));
                             } else if (comptime std.mem.eql(u8, sub.name, "explain")) {
-                                try runExplain(out, err_level, p.code, p.list);
+                                try runExplain(out, resolveLevel(init, io, Io.File.stdout(), .auto), pre_usage, p.code, p.list);
                                 try out.flush();
                                 return;
                             } else if (comptime std.mem.eql(u8, sub.name, "check")) {
@@ -215,15 +218,9 @@ pub fn main(init: std.process.Init) !void {
                                 // (`emit`,`dump`,`O`,...) that `Parsed(check)` no longer has.
                                 // It fills `st` (paths, target, color, sev rules) + the
                                 // check-only knobs, and exit-2's on a bad severity spec.
-                                if (try applyCheckParsed(gpa, p, out, err_level, &st, &sev_rules)) |code| {
-                                    try out.flush(); // exit skips defers; flush the styled arg-error line
-                                    std.process.exit(code);
-                                }
+                                if (try applyCheckParsed(gpa, p, pre_usage, &st, &sev_rules)) |code| std.process.exit(code);
                                 st.check_seen = true;
-                            } else if (try applyParsed(gpa, sub, p, out, err_level, &st, &sev_rules)) |code| {
-                                try out.flush(); // exit skips defers; flush the styled arg-error line
-                                std.process.exit(code);
-                            }
+                            } else if (try applyParsed(gpa, sub, p, pre_usage, &st, &sev_rules)) |code| std.process.exit(code);
                         },
                         // A subcommand has no sub-subcommands in this spec.
                         .subcommand => unreachable,
@@ -233,9 +230,10 @@ pub fn main(init: std.process.Init) !void {
         },
     }
 
-    // The FINAL colour level: now that `--color` is known, resolve once for all
-    // status + diagnostics. Still probes stdout, so a piped run stays `.none`.
-    const level = resolveLevel(init, io, st.color_choice);
+    // The FINAL colour levels: now that `--color` is known, resolve once for all
+    // status + diagnostics (stdout) and once for usage errors (stderr).
+    const level = resolveLevel(init, io, Io.File.stdout(), st.color_choice);
+    const usage: Usage = .{ .w = pre_usage.w, .level = resolveLevel(init, io, Io.File.stderr(), st.color_choice) };
 
     // Post-parse tail (reproduces the old hand-rolled tail verbatim).
 
@@ -244,10 +242,10 @@ pub fn main(init: std.process.Init) !void {
         // distinct from a compile failure's 1). Asking to emit (`-o`) with no input is
         // likewise an error, not usage.
         if (st.check_seen) {
-            try argLine(out, level, "check: no input file");
+            try argLine(usage, "check: no input file");
             std.process.exit(2);
         }
-        if (st.out_path != null) argErr(out, level, "no input file"); // flushes + exit(1)
+        if (st.out_path != null) argErr(usage, "no input file"); // flushes + exit(1)
         // No input, no `-o`: print short help and exit 0 (replaces usage()).
         try cli.Help.renderHelp(comptime AppCli.spec.root, out, .short);
         try out.flush();
@@ -259,7 +257,7 @@ pub fn main(init: std.process.Init) !void {
     // the severity config, and returns an exit code: 0 clean, 1 when >=1 error survives
     // the config, 2 on a hard CLI/IO error. `--exit-zero` forces 0 regardless.
     if (st.check_seen) {
-        std.process.exit(try runCheck(gpa, out, level, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.sev));
+        std.process.exit(try runCheck(gpa, out, level, usage, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.timings, st.sev));
     }
 
     // The DEFAULT action is to BUILD a signed executable: a bare `toy <file>` (and any
@@ -272,16 +270,16 @@ pub fn main(init: std.process.Init) !void {
     const run_after = st.command == .run;
     // Worker threads the build will use (for the "built with N threads" line).
     const threads: usize = if (st.job_count != 0) st.job_count else (std.Thread.getCpuCount() catch 1);
-    if (build_exe and !Decide.isAarch64Macos(st.target)) argErr(out, level, "code emission only supports aarch64-macos");
+    if (build_exe and !Decide.isAarch64Macos(st.target)) argErr(usage, "code emission only supports aarch64-macos");
 
     // Build the executable: output → `-o`/`--output`, else the default build dir.
     if (build_exe) {
-        std.process.exit(try emitExecutable(gpa, out, level, st.target, st.paths.items, st.out_path, run_after, st.mode, st.codegen_stats, st.opt, st.specialize, st.opt_stats, st.timings, st.jlimit, threads, st.sev));
+        std.process.exit(try emitExecutable(gpa, out, level, usage, st.target, st.paths.items, st.out_path, run_after, st.mode, st.codegen_stats, st.opt, st.specialize, st.opt_stats, st.timings, st.jlimit, threads, st.sev));
     }
 
     // `--emit ir`: print the target-independent IR for the whole program.
     if (st.emit == .ir) {
-        std.process.exit(try emitIr(gpa, out, level, st.target, st.paths.items, st.opt, st.specialize, st.jlimit, st.sev));
+        std.process.exit(try emitIr(gpa, out, level, usage, st.target, st.paths.items, st.opt, st.specialize, st.jlimit, st.sev));
     }
 
     const results = try Driver.run(gpa, io, st.emit, st.target, st.paths.items);
@@ -347,7 +345,7 @@ const State = struct {
 /// reified types with the identical field set (the shared option/positional consts);
 /// fields are read by name. Returns a non-null `?u8` exit code when the driver
 /// detects a bad value the grammar can't express (an unknown/empty opt pass name).
-fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytype, out: *Io.Writer, level: Style.ColorLevel, st: *State, sev_rules: *std.ArrayList(SevCfg.Rule)) !?u8 {
+fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytype, usage: Usage, st: *State, sev_rules: *std.ArrayList(SevCfg.Rule)) !?u8 {
     _ = cmd;
     st.dump = p.dump;
     st.codegen_stats = p.codegen_stats;
@@ -395,18 +393,18 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
         st.opt = .O0;
         var it = std.mem.splitScalar(u8, list, ',');
         while (it.next()) |name| {
-            if (name.len == 0) return argErrCode(out, level, "--opt expects a comma-separated pass list (fold,branch,dce,forward)");
-            const pass = Decide.passByName(name) orelse return argErrCode(out, level, "--opt: unknown pass (expected fold,branch,dce,forward)");
+            if (name.len == 0) return argErrCode(usage, "--opt expects a comma-separated pass list (fold,branch,dce,forward)");
+            const pass = Decide.passByName(name) orelse return argErrCode(usage, "--opt: unknown pass (expected fold,branch,dce,forward)");
             st.opt.set(pass, true);
         }
     }
     // --no-opt=<pass>: turn each named pass OFF from the current config.
     for (p.no_opt) |name| {
-        const pass = Decide.passByName(name) orelse return argErrCode(out, level, "--no-opt: unknown pass (expected fold,branch,dce,forward)");
+        const pass = Decide.passByName(name) orelse return argErrCode(usage, "--no-opt: unknown pass (expected fold,branch,dce,forward)");
         st.opt.set(pass, false);
     }
     // Severity overrides; a bad spec is a build arg-error (exit 1). See `buildSevRules`.
-    if (try buildSevRules(gpa, p, sev_rules)) |msg| return argErrCode(out, level, msg);
+    if (try buildSevRules(gpa, p, sev_rules)) |msg| return argErrCode(usage, msg);
     st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
     // p.file is a variadic slice borrowing argv/arena; copy the ELEMENTS (slices) —
     // not the bytes — into paths, which shares argv's lifetime, so nothing dangles.
@@ -421,7 +419,7 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
 /// check-only knobs. Returns a non-null `?u8` exit code on a bad severity spec: unlike
 /// the build path's arg-errors (exit 1), a check-path usage error exits 2 (consistent
 /// with `check`'s missing-input-file exit 2 — a bad `--warn BOGUS` is the same class).
-fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, out: *Io.Writer, level: Style.ColorLevel, st: *State, sev_rules: *std.ArrayList(SevCfg.Rule)) !?u8 {
+fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, usage: Usage, st: *State, sev_rules: *std.ArrayList(SevCfg.Rule)) !?u8 {
     st.target = p.target orelse Driver.default_target;
     st.color_choice = switch (p.color orelse .auto) {
         .auto => .auto,
@@ -430,9 +428,10 @@ fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, out: *Io.Writer, level: 
     };
     st.check_ndjson = if (p.format) |f| (f == .ndjson) else false;
     st.check_exit_zero = p.exit_zero;
+    st.timings = p.timings;
     // Severity overrides; a bad spec is a check USAGE error -> exit 2 (not the build
     // path's 1). See `buildSevRules`.
-    if (try buildSevRules(gpa, p, sev_rules)) |msg| return usageCode(out, level, msg);
+    if (try buildSevRules(gpa, p, sev_rules)) |msg| return usageCode(usage, msg);
     st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
     for (p.file) |f| try st.paths.append(gpa, f);
     return null;
@@ -466,8 +465,8 @@ fn buildSevRules(gpa: std.mem.Allocator, p: anytype, sev_rules: *std.ArrayList(S
 /// Like `argErrCode` but returns `2` (a USAGE error, not a compile failure): the `check`
 /// path treats a bad severity-flag value as a usage error, consistent with a missing
 /// input file (exit 2). Prints the styled `error:` line and returns `2`.
-fn usageCode(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) !?u8 {
-    try argLine(out, level, message);
+fn usageCode(usage: Usage, message: []const u8) !?u8 {
+    try argLine(usage, message);
     return 2;
 }
 
@@ -579,21 +578,21 @@ fn lapNs(io: Io, timings: bool, last: *i128) u64 {
 }
 
 /// Print the `--timings` per-stage breakdown (ms + % of the wall-clock total).
-/// `total` is the BUILD WALL-CLOCK (`elapsed`), and the printed stage rows + the
+/// `total` is the command's WALL-CLOCK, and the printed stage rows + the
 /// `other/overhead` reconciliation row SUM TO IT — there is no unattributed time left
-/// hiding. Each cache-backed stage (discover, lower) carries a compute / cache-get /
+/// hiding. A cache-backed stage (discover, lower) carries a compute / cache-get /
 /// cache-put sub-split (the discover split is file-read+lex+parse compute vs the
 /// lex/parse content cache; the lower split is codegen compute vs the codegen cache);
 /// the barrier-join stages (resolve, typecheck) have no cache so report compute only.
 /// `setup` is the pre-stage window (cache open + the one bulk `pack.load`);
-/// `other/overhead` = total - sum(setup..image) is the small residual the named rows
-/// don't cover (the stats-print window + measurement slop).
+/// `other/overhead` = total - sum(rows) is the small residual the named rows
+/// don't cover (measurement slop).
 /// CRITICAL colour discipline: only the LABEL is ever styled — the `{d} ms` numeric
 /// token is emitted RAW so `--color=always | awk '/total/{print $2}'` in profile.sh
 /// still parses. The `timings:` header and the `total` row's label are bold; every
 /// stage/sub label is plain. At `.none` all `styled` calls write only text, so the
 /// coloured output is byte-identical to plain (and profile.sh always pipes => `.none`).
-fn printTimings(out: *Io.Writer, level: Style.ColorLevel, total: u64, setup: u64, discover: u64, resolve: u64, typecheck: u64, lower: u64, post: u64, image: u64, disc_sub: ?StageSub, low_sub: ?LowerSub) !void {
+fn printTimings(out: *Io.Writer, level: Style.ColorLevel, total: u64, rows: []const TimingRow) !void {
     const tot_f: f64 = @floatFromInt(if (total == 0) 1 else total);
     const row = struct {
         // The label field is width-11; pad with RAW spaces to that width (SGR bytes
@@ -619,31 +618,16 @@ fn printTimings(out: *Io.Writer, level: Style.ColorLevel, total: u64, setup: u64
     };
     try sty_head.styled(out, level, "timings:");
     try out.writeByte('\n');
-    try row.p(out, level, "setup", setup, tot_f);
-    try row.p(out, level, "discover", discover, tot_f);
-    if (disc_sub) |s| {
-        try row.sub_p(out, "compute", s.compute_ns, discover, "discover");
-        try row.sub_p(out, "cache-get", s.get_ns, discover, "discover");
-        try row.sub_p(out, "cache-put", s.put_ns, discover, "discover");
+    var named: u64 = 0;
+    for (rows) |r| {
+        try row.p(out, level, r.name, r.ns, tot_f);
+        for (r.subs) |sub| try row.sub_p(out, sub.name, sub.ns, r.ns, r.name);
+        named +|= r.ns;
     }
-    try row.p(out, level, "resolve", resolve, tot_f);
-    try row.p(out, level, "typecheck", typecheck, tot_f);
-    try row.p(out, level, "lower", lower, tot_f);
-    if (low_sub) |s| {
-        try row.sub_p(out, "compute", s.compute_ns, lower, "lower");
-        try row.sub_p(out, "cache-get", s.get_ns, lower, "lower");
-        try row.sub_p(out, "cache-put", s.put_ns, lower, "lower");
-        try row.sub_p(out, "link-tail", s.link_ns, lower, "lower");
-    }
-    // The stats-print window (reads ~0 unless `--codegen-stats`/`--opt-stats` print).
-    try row.p(out, level, "post", post, tot_f);
-    try row.p(out, level, "image+sign", image, tot_f);
     // RECONCILE TO TOTAL: everything the named rows didn't cover (measurement slop +
-    // the tiny tail after the image lap). Printed, never hidden — a saturating
+    // the tiny tail after the last lap). Printed, never hidden — a saturating
     // subtraction so clock jitter can't underflow it.
-    const named = setup +| discover +| resolve +| typecheck +| lower +| post +| image;
-    const other = total -| named;
-    try row.p(out, level, "other/ovh", other, tot_f);
+    try row.p(out, level, "other/ovh", total -| named, tot_f);
     // total row: label bold (padded raw first), numeric raw.
     try out.writeAll("  ");
     try sty_head.styled(out, level, "total");
@@ -652,13 +636,18 @@ fn printTimings(out: *Io.Writer, level: Style.ColorLevel, total: u64, setup: u64
     try out.flush();
 }
 
-/// A cache-backed stage's compute/get/put sub-split (the generic `StageProbe` snapshot).
-/// Used for `discover` (file-read+lex+parse compute vs the lex/parse content cache).
-const StageSub = struct { compute_ns: u64, get_ns: u64, put_ns: u64 };
+/// One `--timings` stage row and its sub-split, if any.
+const TimingRow = struct { name: []const u8, ns: u64, subs: []const TimingSub = &.{} };
+const TimingSub = struct { name: []const u8, ns: u64 };
 
-/// The `--timings` sub-breakdown of `lower`: codegen compute (summed across workers),
-/// cache get/put I/O (summed across workers), and the serial relink/link tail.
-const LowerSub = struct { compute_ns: u64, get_ns: u64, put_ns: u64, link_ns: u64 };
+/// A cache-backed stage's compute/get/put sub-split, read from its probe.
+fn probeSubs(probe: *const Engine.StageProbe) [3]TimingSub {
+    return .{
+        .{ .name = "compute", .ns = probe.compute_ns.load(.monotonic) },
+        .{ .name = "cache-get", .ns = probe.get_ns.load(.monotonic) },
+        .{ .name = "cache-put", .ns = probe.put_ns.load(.monotonic) },
+    };
+}
 
 /// Run lex→parse→check→codegen→link→sign for a single input and write the signed
 /// executable to `out_path` (mode 0o755). Returns the process exit code: 0 on
@@ -667,6 +656,7 @@ fn emitExecutable(
     gpa: std.mem.Allocator,
     out: *Io.Writer,
     level: Style.ColorLevel,
+    usage: Usage,
     target: []const u8,
     paths: []const []const u8,
     out_path: ?[]const u8,
@@ -687,7 +677,7 @@ fn emitExecutable(
     // because the `1` bubbles up through `std.process.exit(try emitExecutable(...))`
     // in main, which skips defers and never flushes `out` on its own.
     if (paths.len != 1) {
-        try argLine(out, level, "-o takes exactly one input file (the entry module)");
+        try argLine(usage, "-o takes exactly one input file (the entry module)");
         return 1;
     }
 
@@ -888,19 +878,20 @@ fn emitExecutable(
     try printBuildTime(out, level, threads, if (elapsed > 0) @intCast(elapsed) else 0);
     try out.flush();
     if (timings) {
-        const low_sub: LowerSub = .{
-            .compute_ns = lower_probe.compute_ns.load(.monotonic),
-            .get_ns = lower_probe.get_ns.load(.monotonic),
-            .put_ns = lower_probe.put_ns.load(.monotonic),
-            .link_ns = link_ns,
-        };
-        const disc_sub: StageSub = .{
-            .compute_ns = discover_probe.compute_ns.load(.monotonic),
-            .get_ns = discover_probe.get_ns.load(.monotonic),
-            .put_ns = discover_probe.put_ns.load(.monotonic),
-        };
+        const low = probeSubs(&lower_probe);
+        const low_subs = low ++ [_]TimingSub{.{ .name = "link-tail", .ns = link_ns }};
+        const disc_subs = probeSubs(&discover_probe);
         const total_wall: u64 = if (elapsed > 0) @intCast(elapsed) else 0;
-        try printTimings(out, level, total_wall, ns_setup, ns_discover, ns_resolve, ns_typecheck, ns_lower, ns_post, ns_image, disc_sub, low_sub);
+        try printTimings(out, level, total_wall, &.{
+            .{ .name = "setup", .ns = ns_setup },
+            .{ .name = "discover", .ns = ns_discover, .subs = &disc_subs },
+            .{ .name = "resolve", .ns = ns_resolve },
+            .{ .name = "typecheck", .ns = ns_typecheck },
+            .{ .name = "lower", .ns = ns_lower, .subs = &low_subs },
+            // The stats-print window (reads ~0 unless `--codegen-stats`/`--opt-stats` print).
+            .{ .name = "post", .ns = ns_post },
+            .{ .name = "image+sign", .ns = ns_image },
+        });
     }
     // `run`: execute the freshly built binary and adopt its exit status.
     if (run_after) return runBinary(gpa, io, out, level, resolved_out);
@@ -958,6 +949,7 @@ fn emitIr(
     gpa: std.mem.Allocator,
     out: *Io.Writer,
     level: Style.ColorLevel,
+    usage: Usage,
     target: []const u8,
     paths: []const []const u8,
     opt: Opt.Config,
@@ -970,7 +962,7 @@ fn emitIr(
     // flushes, because the `1` bubbles up through `std.process.exit(try emitIr(...))`
     // in main, which skips defers and never flushes `out` on its own.
     if (paths.len != 1) {
-        try argLine(out, level, "--emit ir takes exactly one input file (the entry module)");
+        try argLine(usage, "--emit ir takes exactly one input file (the entry module)");
         return 1;
     }
 
@@ -1062,26 +1054,25 @@ fn writeExecutable(io: Io, path: []const u8, image: []const u8) !void {
 /// Emit one `error: <message>` line styled at `sty_err` (the `error` word coloured,
 /// gate-safe at `.none`), then FLUSH. The in-body file-count checks that RETURN (not
 /// exit) a `1` bubble up through `std.process.exit(try emit*(...))` in `main`, which
-/// skips defers and never flushes `out` — so the flush MUST happen here or the error
-/// line is silently dropped. `argErr`/`argErrCode` re-flush (idempotent, harmless).
-fn argLine(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) !void {
-    try sty_err.styled(out, level, "error");
-    try out.print(": {s}\n", .{message});
-    try out.flush();
+/// skips defers and never flushes the writer — so the flush MUST happen here or the error
+/// line is silently dropped.
+fn argLine(usage: Usage, message: []const u8) !void {
+    try sty_err.styled(usage.w, usage.level, "error");
+    try usage.w.print(": {s}\n", .{message});
+    try usage.w.flush();
 }
 
 /// A fatal arg error for the post-parse checks (no-input, aarch64, ...): print a
 /// styled `error:` line, flush, and EXIT 1. Never returns.
-fn argErr(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) noreturn {
-    argLine(out, level, message) catch {};
-    out.flush() catch {};
+fn argErr(usage: Usage, message: []const u8) noreturn {
+    argLine(usage, message) catch {};
     std.process.exit(1);
 }
 
 /// Like `argErr` but for `applyParsed`, which returns `!?u8` rather than exiting
 /// directly: print the styled `error:` line and return `1` as the exit code.
-fn argErrCode(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) !?u8 {
-    try argLine(out, level, message);
+fn argErrCode(usage: Usage, message: []const u8) !?u8 {
+    try argLine(usage, message);
     return 1;
 }
 
@@ -1094,7 +1085,8 @@ fn argErrCode(out: *Io.Writer, level: Style.ColorLevel, message: []const u8) !?u
 /// NDJSON stream. Returns the process exit code: 0 when nothing survives the config as
 /// an error, 1 when >=1 error remains (incl. a structural graph error like a real
 /// missing import — matching `build`), 2 on a hard CLI/IO failure (a missing/unreadable
-/// ENTRY file). `exit_zero` forces 0. `ndjson` picks the wire form.
+/// ENTRY file). `exit_zero` forces 0. `ndjson` picks the wire form. `timings` prints the
+/// stages it ran after the diagnostics (on stderr under ndjson).
 ///
 /// This is the bug fix: the old path fanned out over `paths` as INDEPENDENT single
 /// files (`Driver.run(.check)`), discovering no imports, so a valid multi-module
@@ -1104,17 +1096,19 @@ fn runCheck(
     gpa: std.mem.Allocator,
     out: *Io.Writer,
     level: Style.ColorLevel,
+    usage: Usage,
     target: []const u8,
     paths: []const []const u8,
     ndjson: bool,
     exit_zero: bool,
+    timings: bool,
     sev: SevCfg.SeverityConfig,
 ) !u8 {
     // `check` takes the 1 ROOT (entry) file, exactly like a `-o`/`--emit ir` build:
     // discover its transitive import graph. More than one bare input is a usage error
     // (exit 2), consistent with `emitExecutable`/`emitIr` rejecting multi-entry.
     if (paths.len != 1) {
-        try argLine(out, level, "check takes exactly one input file (the entry module)");
+        try argLine(usage, "check takes exactly one input file (the entry module)");
         return 2;
     }
     const entry = paths[0];
@@ -1126,20 +1120,55 @@ fn runCheck(
     defer tail_io.deinit();
     const cio = tail_io.io();
 
+    // Declared before the `--timings` defer so that the profile prints, on every exit
+    // path, before they are torn down.
+    var graph_slot: ?Graph.Graph = null;
+    defer if (graph_slot) |*g| g.deinit(gpa);
+    var res_slot: ?ResolveGraph.GraphResult = null;
+    defer if (res_slot) |*r| r.deinit(gpa);
+    // `tc` is kept alive (fn-scope optional) so its borrowed messages outlive every render.
+    var tc: ?TypecheckGraph.GraphResult = null;
+    defer if (tc) |*t| t.deinit(gpa);
+
+    // `--timings`: each stage is lapped as it ends, and whatever follows the last stage
+    // (rendering the diagnostics) is the `render` row. Under ndjson the profile goes to
+    // stderr, so stdout stays one JSON object per line.
+    const start_ns: i128 = if (timings) nowNs(cio) else 0;
+    var last_ns = start_ns;
+    var ns_setup: u64 = 0;
+    var ns_discover: u64 = 0;
+    var ns_resolve: u64 = 0;
+    var ns_typecheck: u64 = 0;
+    var discover_probe: Engine.StageProbe = .{};
+    defer if (timings) {
+        const ns_render = lapNs(cio, true, &last_ns);
+        const disc_subs = probeSubs(&discover_probe);
+        const total: u64 = if (last_ns > start_ns) @intCast(last_ns - start_ns) else 0;
+        printTimings(if (ndjson) usage.w else out, if (ndjson) usage.level else level, total, &.{
+            .{ .name = "setup", .ns = ns_setup },
+            .{ .name = "discover", .ns = ns_discover, .subs = &disc_subs },
+            .{ .name = "resolve", .ns = ns_resolve },
+            .{ .name = "typecheck", .ns = ns_typecheck },
+            .{ .name = "render", .ns = ns_render },
+        }) catch {};
+    };
+
     var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
     const cache = Driver.openCache(cio, &dir_buf) catch |e| {
-        try argLine(out, level, @errorName(e));
+        try argLine(usage, @errorName(e));
         return 2;
     };
+    ns_setup = lapNs(cio, timings, &last_ns);
 
     // DISCOVER the whole module graph (following imports), reusing `build`'s discoverer.
     // A true I/O/OOM failure propagates as a Zig error (exit 2); a STRUCTURAL problem
     // (missing import, escape, cycle, tainted parse) is recorded in `graph.err`.
-    var graph = Graph.discover(gpa, cio, cache, target, entry, .{}) catch |e| {
-        try argLine(out, level, @errorName(e));
+    graph_slot = Graph.discover(gpa, cio, cache, target, entry, .{ .probe = if (timings) &discover_probe else null }) catch |e| {
+        try argLine(usage, @errorName(e));
         return 2;
     };
-    defer graph.deinit(gpa);
+    const graph = &graph_slot.?;
+    ns_discover = lapNs(cio, timings, &last_ns);
 
     if (graph.err) |ge| {
         // A tainted parse in the ENTRY renders the entry's FULL coded parse-diagnostic
@@ -1148,13 +1177,13 @@ fn runCheck(
         // error in an IMPORTED module instead falls through to `renderGraphError` (matching
         // `build` — discovery never enters an import past a broken one).
         const parse_in_entry = ge.kind == .parse and (ge.module == null or ge.module == graph.entry_index);
-        if (parse_in_entry) return reportEntryFile(gpa, out, level, &graph, ndjson, ge.parse_diags, &.{}, &.{}, sev, exit_zero);
+        if (parse_in_entry) return reportEntryFile(gpa, out, level, graph, ndjson, ge.parse_diags, &.{}, &.{}, sev, exit_zero);
         // A missing/unreadable ENTRY file (kind=.missing, module=null) is a hard CLI/IO
         // failure -> exit 2, matching `check`'s single-file missing-input contract. Every
         // OTHER structural error (a real missing/mis-cased IMPORT, a path escape, an import
         // cycle, a tainted parse in a discovered import) is a compile-level error `build`
         // reports too -> render it against its owning module and exit 1.
-        try DiagRender.renderGraphError(gpa, out, level, &graph, ge, sev);
+        try DiagRender.renderGraphError(gpa, out, level, graph, ge, sev);
         try out.flush();
         if (exit_zero) return 0;
         return if (ge.kind == .missing and ge.module == null) 2 else 1;
@@ -1163,25 +1192,24 @@ fn runCheck(
     // RESOLVE the whole graph. Report ALL resolve diagnostics; only when resolve is clean
     // do we proceed to typecheck (you cannot type unresolved code, but each stage reports
     // ALL of its own diagnostics — `resolveGraph`/`checkGraph` do so internally).
-    var res = ResolveGraph.resolveGraph(gpa, &graph) catch |e| {
-        try argLine(out, level, @errorName(e));
+    res_slot = ResolveGraph.resolveGraph(gpa, graph) catch |e| {
+        try argLine(usage, @errorName(e));
         return 2;
     };
-    defer res.deinit(gpa);
+    const res = &res_slot.?;
+    ns_resolve = lapNs(cio, timings, &last_ns);
 
     // Typecheck only when resolve is error-free (you cannot type unresolved code). BOTH
     // stages' diagnostics are reported — resolve carries the unused-variable warnings
     // (W0001), which the old code dropped by collapsing to `tc.?.diags` on a clean
-    // resolve. `tc` is kept alive (fn-scope optional) so its borrowed messages outlive
-    // every render below.
-    var tc: ?TypecheckGraph.GraphResult = null;
-    defer if (tc) |*t| t.deinit(gpa);
+    // resolve.
     if (!Decide.resolveHasError(res.diags)) {
-        tc = TypecheckGraph.checkGraph(gpa, &graph, &res, cio, 0) catch |e| {
-            try argLine(out, level, @errorName(e));
+        tc = TypecheckGraph.checkGraph(gpa, graph, res, cio, 0) catch |e| {
+            try argLine(usage, @errorName(e));
             return 2;
         };
     }
+    ns_typecheck = lapNs(cio, timings, &last_ns);
     const type_diags: []const toyc.DiagnosticSink.Diagnostic = if (tc) |t| t.diags else &.{};
 
     // SINGLE-MODULE (no imports discovered): render against the entry's ON-DISK `file`,
@@ -1190,7 +1218,7 @@ fn runCheck(
     // routed above, so a single-module graph carries resolve (incl. warnings) + type
     // diagnostics. Both wire forms share `reportEntryFile` with the tainted-entry path.
     if (graph.modules.len == 1)
-        return reportEntryFile(gpa, out, level, &graph, ndjson, &.{}, res.diags, type_diags, sev, exit_zero);
+        return reportEntryFile(gpa, out, level, graph, ndjson, &.{}, res.diags, type_diags, sev, exit_zero);
 
     // Multi-module: combine resolve + type diagnostics into ONE slice (single cap + single
     // tally). Each stage sorts its own half, but the resolve-then-type concatenation is
@@ -1206,13 +1234,13 @@ fn runCheck(
         // NDJSON over the graph's flat slice: each diagnostic's `file` is its OWNING
         // module path (not always the entry), so an imported module's error is attributed
         // correctly. Schema byte-identical to the single-file form.
-        const counts = try Check.emitNdjsonGraph(out, gpa, &graph, combined, sev);
+        const counts = try Check.emitNdjsonGraph(out, gpa, graph, combined, sev);
         try out.flush();
         return Decide.checkExit(counts, exit_zero);
     }
     // Human form: pretty per-module snippets (reusing the multi-module renderer, which
     // builds ONE SourceMap per scope) + a program-wide `N error(s), M warning(s)` summary.
-    try DiagRender.renderScopedDiags(gpa, out, level, &graph, combined, sev);
+    try DiagRender.renderScopedDiags(gpa, out, level, graph, combined, sev);
     const counts = Check.tallyGraph(combined, sev);
     try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
     try out.flush();
@@ -1270,15 +1298,14 @@ fn reportEntryFile(
 /// arg error and EXITS 2 (an argument error, distinct from a compile failure's 1).
 /// `--list` (or the bare word `list`) enumerates every code instead; a bare `explain`
 /// with neither a code nor `--list` is a usage error (exit 2).
-fn runExplain(out: *Io.Writer, level: Style.ColorLevel, code: ?[]const u8, list: bool) !void {
+fn runExplain(out: *Io.Writer, level: Style.ColorLevel, usage: Usage, code: ?[]const u8, list: bool) !void {
     // `--list`, or `toy explain list`, prints the whole registry.
     if (list or (code != null and std.mem.eql(u8, code.?, "list"))) {
         try listCodes(out, level);
         return;
     }
     const c = code orelse {
-        argLine(out, level, "specify a diagnostic code (e.g. R0001) or --list") catch {};
-        out.flush() catch {};
+        argLine(usage, "specify a diagnostic code (e.g. R0001) or --list") catch {};
         std.process.exit(2);
     };
     if (toyc.diagnostics.explain.docForStr(c)) |doc| {
@@ -1288,8 +1315,7 @@ fn runExplain(out: *Io.Writer, level: Style.ColorLevel, code: ?[]const u8, list:
     }
     var buf: [128]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, "unknown diagnostic code: {s}", .{c}) catch "unknown diagnostic code";
-    argLine(out, level, msg) catch {};
-    out.flush() catch {};
+    argLine(usage, msg) catch {};
     std.process.exit(2);
 }
 

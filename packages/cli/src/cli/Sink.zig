@@ -14,6 +14,9 @@ list: std.ArrayList(Error) = .empty,
 
 pub const Kind = enum {
     unknown_flag,
+    /// A flag of another command: `arg` is its spelling, `expected` that command, `where`
+    /// the command parsed.
+    declined_flag,
     missing_value,
     bad_value,
     missing_required,

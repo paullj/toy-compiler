@@ -282,8 +282,8 @@ test "a pre-verb CLI error is reported once, not doubled by the subcommand re-pa
     try harness.requireToy(io);
     const bin_abs = harness.toy_exe;
 
-    var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "--color", "alwyas", "build", "x.toy" }, .stdout = .pipe });
-    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "--color", "alwyas", "build", "x.toy" }, .stderr = .pipe });
+    var rdr = child.stderr.?.readerStreaming(io, &.{});
     const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
     defer gpa.free(got);
     const term = try child.wait(io);
@@ -315,8 +315,8 @@ test "explain: a known code prints its doc (exit 0); an unknown code arg-errors 
     }
     // Unknown code: an argument error, exit 2.
     {
-        var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "explain", "BOGUS" }, .stdout = .pipe });
-        var rdr = child.stdout.?.readerStreaming(io, &.{});
+        var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "explain", "BOGUS" }, .stderr = .pipe });
+        var rdr = child.stderr.?.readerStreaming(io, &.{});
         const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
         defer gpa.free(got);
         const term = try child.wait(io);
@@ -1310,8 +1310,9 @@ test "unwrap on an aggregate payload compiles and runs (result-slot copy, not a 
 }
 
 /// Spawn `toy` with `args` over a one-file fixture (the `return nope` R0001 program),
-/// capturing stdout+stderr merged and the exit code. Returns the captured bytes (the
-/// caller frees) and the term.
+/// capturing stdout and the exit code. Returns the captured bytes (the caller frees) and
+/// the term. Stderr (usage errors) is dropped: inherited, it reaches the build runner,
+/// which then prints the passing step as a failed command.
 fn runToyOnFixture(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, src: []const u8, args: []const []const u8) !struct { out: []u8, term: std.process.Child.Term } {
     try harness.requireToy(io);
     Io.Dir.cwd().deleteTree(io, dir_name) catch {};
@@ -1327,7 +1328,7 @@ fn runToyOnFixture(gpa: std.mem.Allocator, io: Io, dir_name: []const u8, src: []
     for (args) |a| try argv.append(gpa, a);
     try argv.append(gpa, path);
 
-    var child = try std.process.spawn(io, .{ .argv = argv.items, .stdout = .pipe });
+    var child = try std.process.spawn(io, .{ .argv = argv.items, .stdout = .pipe, .stderr = .ignore });
     var rdr = child.stdout.?.readerStreaming(io, &.{});
     const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
     const term = try child.wait(io);
@@ -1465,13 +1466,16 @@ test "`toy check` unknown --warn spec is a USAGE error (exit 2)" {
     // Migrated from `--emit check` to `toy check`, which fixes the exit code: a bad
     // severity-flag value on the check path is a USAGE error (exit 2), consistent with
     // `check`'s missing-input-file exit 2 — NOT the generic CLI-parse exit 1.
-    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--warn", "BOGUS" }) catch |e| {
-        if (e == error.SkipZigTest) return error.SkipZigTest;
-        return e;
-    };
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    const path = dir_name ++ "/one.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = c3_fixture });
+    const res = try spawnToyBoth(gpa, io, &.{ "check", "--warn", "BOGUS", path });
     defer gpa.free(res.out);
+    defer gpa.free(res.err);
 
-    try testing.expect(std.mem.indexOf(u8, res.out, "unknown code or band") != null);
+    try testing.expect(std.mem.indexOf(u8, res.err, "unknown code or band") != null);
+    try testing.expectEqualStrings("", res.out);
     try testing.expectEqual(std.process.Child.Term{ .exited = 2 }, res.term);
 }
 
@@ -4914,4 +4918,89 @@ test "a codegen diagnostic is printed with its text" {
     try testing.expect(std.mem.indexOf(u8, res.out, "--> " ++ path ++ ":9:4") != null);
     try testing.expect(std.mem.indexOf(u8, res.out, "CodegenDiagnostic") == null);
     try testing.expect(std.mem.indexOf(u8, res.err, "CodegenDiagnostic") == null);
+}
+
+test "`toy check --timings` prints the stages check runs (#66)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toy-test-driver-check-timings";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const path = dir_name ++ "/main.toy";
+    const bad = dir_name ++ "/bad.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "fn main() -> int {\n    return 0\n}\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = bad, .data = "fn main() -> int {\n    return nope\n}\n" });
+
+    const runs = [_]struct { argv: []const []const u8, exit: u8 }{
+        .{ .argv = &.{ "check", "--timings", path }, .exit = 0 },
+        .{ .argv = &.{ "--timings", "check", path }, .exit = 0 },
+        .{ .argv = &.{ "check", "--timings", bad }, .exit = 1 },
+    };
+    for (runs) |r| {
+        const res = try spawnToyBoth(gpa, io, r.argv);
+        defer gpa.free(res.out);
+        defer gpa.free(res.err);
+        try testing.expectEqual(std.process.Child.Term{ .exited = r.exit }, res.term);
+        try testing.expectEqualStrings("", res.err);
+        const at = std.mem.indexOf(u8, res.out, "timings:\n") orelse return error.TestUnexpectedResult;
+        // The profile follows the diagnostics, row by row.
+        var pos = at;
+        for ([_][]const u8{ "  setup ", "  discover ", "    compute ", "  resolve ", "  typecheck ", "  render ", "  other/ovh ", "  total " }) |row| {
+            pos = std.mem.indexOfPos(u8, res.out, pos, row) orelse return error.TestUnexpectedResult;
+        }
+        try testing.expect(std.mem.indexOf(u8, res.out, "image+sign") == null);
+        if (r.exit == 1) try testing.expect(std.mem.indexOf(u8, res.out, "error[R0001]").? < at);
+    }
+    // With `--format ndjson`, stdout stays one JSON object per line: the profile goes to stderr.
+    const res = try spawnToyBoth(gpa, io, &.{ "check", "--format", "ndjson", "--timings", bad });
+    defer gpa.free(res.out);
+    defer gpa.free(res.err);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    var lines = std.mem.splitScalar(u8, std.mem.trimEnd(u8, res.out, "\n"), '\n');
+    while (lines.next()) |line| try testing.expect(std.mem.startsWith(u8, line, "{\"code\":"));
+    try testing.expect(std.mem.indexOf(u8, res.err, "timings:\n") != null);
+    try testing.expect(std.mem.indexOf(u8, res.err, "  total ") != null);
+}
+
+test "a build-only flag on check is named as one, and each bad flag is reported once, on stderr (#66)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toy-test-driver-check-build-flags";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const path = dir_name ++ "/main.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "fn main() -> int {\n    return 0\n}\n" });
+
+    const runs = [_]struct { argv: []const []const u8, line: []const u8 }{
+        .{ .argv = &.{ "check", "-O1", path }, .line = "error: '-O' is a build option; 'check' does not take it\n" },
+        .{ .argv = &.{ "check", "-O", "1", path }, .line = "error: '-O' is a build option; 'check' does not take it\n" },
+        .{ .argv = &.{ "-O1", "check", path }, .line = "error: '-O' is a build option; 'check' does not take it\n" },
+        .{ .argv = &.{ "check", "--no-cache", path }, .line = "error: '--no-cache' is a build option; 'check' does not take it\n" },
+        .{ .argv = &.{ "check", "-o", dir_name ++ "/out", path }, .line = "error: '-o' is a build option; 'check' does not take it\n" },
+        .{ .argv = &.{ "check", "--output=x", path }, .line = "error: '--output' is a build option; 'check' does not take it\n" },
+        .{ .argv = &.{ "check", "-j4", path }, .line = "error: '-j' is a build option; 'check' does not take it\n" },
+        .{ .argv = &.{ "check", "-O1", path }, .line = "Try 'toy --help' for more information.\n" },
+        .{ .argv = &.{ "check", "-Z1", path }, .line = "error: unknown flag: -Z1\n" },
+        .{ .argv = &.{ "-Z1", path }, .line = "error: unknown flag: -Z1\n" },
+        .{ .argv = &.{ "--color", "alwyas", "build", path }, .line = "error: invalid value 'alwyas' for --color (one of: auto|always|never)\n" },
+    };
+    for (runs) |r| {
+        const res = try spawnToyBoth(gpa, io, r.argv);
+        defer gpa.free(res.out);
+        defer gpa.free(res.err);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+        try testing.expectEqualStrings("", res.out);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, res.err, r.line));
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, res.err, "error: "));
+    }
 }
