@@ -1,0 +1,10 @@
+struct Box[T] { v: T }
+
+impl Box[int] has Into[int] {  #~ ERROR [T0013] a conformance 'impl' on a concrete type instance is not yet supported (use 'impl Box[T]')
+    fn into(self) -> int { self.v }
+}
+
+fn main() -> int {
+    b := Box { v: 7 }
+    return b.into()
+}

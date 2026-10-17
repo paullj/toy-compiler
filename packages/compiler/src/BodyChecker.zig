@@ -1681,6 +1681,7 @@ pub const BodyChecker = struct {
                 if (std.mem.eql(u8, dn, fname)) return substTy(bc, sym.field_types[j], e.args);
             }
             if (try bc.tryBoundMethod(node_idx, n, base)) |t| return t;
+            if (bc.rejectedMethod(base, fname)) return .invalid;
             try bc.emitNoField(bc.tokSpan(n.main_token), fname, sym.name, sym.field_names);
             return .invalid;
         }
@@ -3196,6 +3197,7 @@ pub const BodyChecker = struct {
     fn reportNoExplicitMethod(bc: *BodyChecker, n: Ast.Node, recv_ty: Type) error{OutOfMemory}!Type {
         try bc.drainArgs(Ast.rangeSlice(bc.tree, (n.rhs).int()));
         const fa = bc.tree.nodes[bc.tree.nodes[(n.lhs).int()].lhs.int()];
+        if (bc.rejectedMethod(recv_ty, bc.nameText(fa.main_token))) return .invalid;
         try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0018 }, "no method '{s}' on type '{s}' for the given protocol type arguments", .{ bc.nameText(fa.main_token), bc.typeName(recv_ty) });
         return .invalid;
     }
@@ -3397,6 +3399,7 @@ pub const BodyChecker = struct {
                 // An instance has no methods of its own (`impl Box[int]` is rejected), so a
                 // member no template declares names nothing.
                 try bc.drainArgs(args);
+                if (bc.rejectedOnType(e.ctor, e.ctor_is_enum, member)) return .invalid;
                 const name = bc.nameText(bc.tree.nodes[recv.lhs.int()].main_token);
                 const ref_struct = if (bc.model.prelude) |pre| pre.ref_struct else null;
                 var hb: [64]u8 = undefined;
@@ -3432,6 +3435,10 @@ pub const BodyChecker = struct {
                         if (try CallInfer.inferAssociatedCall(bc, node_idx, n, callee, m, args)) |t| return t;
                         try bc.drainArgs(args);
                         try CallInfer.reportUninferableAssociated(bc, recv, member, sid, null, &.{}, null);
+                        return .invalid;
+                    }
+                    if (bc.rejectedOnType(sid, false, member)) {
+                        try bc.drainArgs(args);
                         return .invalid;
                     }
                     // `Ref` is a prelude type, but its API is library code: name the import
@@ -4707,6 +4714,7 @@ pub const BodyChecker = struct {
     /// candidate set is the concrete-receiver methods plus, for a generic-instance (`App`)
     /// receiver, its ctor's template methods (so `xs.pushh(1)` on a Vec suggests `push`).
     fn emitNoMethod(bc: *BodyChecker, at: Span, member: []const u8, recv_ty: Type) error{OutOfMemory}!void {
+        if (bc.rejectedMethod(recv_ty, member)) return;
         if (bc.methodFamily(recv_ty)) |fam| if (bc.stdMethodModule(fam, member)) |module|
             return bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'; " ++ StdNames.add_import, .{ member, bc.typeName(recv_ty), module });
         var iter = MethodNameIter{ .methods = bc.model.methods, .recv = recv_ty };
@@ -4721,6 +4729,23 @@ pub const BodyChecker = struct {
             try bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'; did you mean '{s}'?", .{ member, bc.typeName(recv_ty), cand })
         else
             try bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'", .{ member, bc.typeName(recv_ty) });
+    }
+
+    /// Whether `member` on `recv_ty` is a method of an impl T0013 rejected. That rejection
+    /// is the error, so a use of the method reports nothing more.
+    fn rejectedMethod(bc: *const BodyChecker, recv_ty: Type, member: []const u8) bool {
+        if (Typecheck.rejectedProtocolMethod(bc.model.rejected_impls, bc.model.protocols, bc.composite, recv_ty, member)) return true;
+        if (!recv_ty.isApp()) return false;
+        const e = bc.composite.at(recv_ty.appIdx());
+        return bc.rejectedOnType(e.ctor, e.ctor_is_enum, member);
+    }
+
+    /// `rejectedMethod` for a call through the generic type itself (`Box.make()`).
+    fn rejectedOnType(bc: *const BodyChecker, ctor: u32, is_enum: bool, member: []const u8) bool {
+        for (bc.model.rejected_methods) |r| {
+            if (r.recv_ctor == ctor and r.recv_is_enum == is_enum and std.mem.eql(u8, r.name, member)) return true;
+        }
+        return false;
     }
 
     /// Where this body's method calls are written (see `Typecheck.Site`).
