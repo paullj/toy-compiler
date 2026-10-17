@@ -1679,6 +1679,10 @@ mono_depth_capped: bool = false,
 /// The nodes `scanCalls` has visited (see `GraphResult.mono_scanned_nodes`).
 mono_scanned_nodes: usize = 0,
 
+/// The instance re-checks' hints as their templates spell them (see
+/// `BodyChecker.template_spellings`), until `unifyInstanceHints` consumes them. Owned.
+instance_hints: std.ArrayList(BodyChecker.TemplateSpelling) = .empty,
+
 /// Per-global-fn-id poison flags: true for a BOUNDED generic template whose
 /// bound-as-axiom body check (`bodyUnit`) emitted at least one diagnostic. The mono
 /// tail (`enqueueInstance`) skips instantiating a poisoned template so a definition
@@ -2077,6 +2081,8 @@ pub fn checkGraph(
         t.fn_struct_dedup.deinit(gpa);
         for (t.reified_names.items) |nm| gpa.free(nm);
         t.reified_names.deinit(gpa);
+        for (t.instance_hints.items) |h| gpa.free(h.template);
+        t.instance_hints.deinit(gpa);
         for (t.fns.items) |f| {
             gpa.free(f.params);
             if (f.generic_params.len > 0) gpa.free(@constCast(f.generic_params));
@@ -2786,10 +2792,50 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     try derive_synth.synthesizeDescriptors(t);
 
     t.sealCallees();
+    try t.unifyInstanceHints();
 
     // The mono tail may have emitted instance-body diagnostics (and T0014); re-sort
     // the shared stream so the final (scope, byte_offset) order is deterministic.
     t.sink.sort();
+}
+
+/// An unbounded template's body is checked once per instance, so a T0016 or T0025 hint
+/// in it names each instance's own types: one report per instance, and following one
+/// breaks the others. Where the reports at one site differ but all read alike as the
+/// template spells them, each takes that text, and the sink's dedup keeps one. Where
+/// they agree already, a concrete type that one instance's binding merely equals stays
+/// as written.
+fn unifyInstanceHints(t: *Typecheck) !void {
+    defer {
+        for (t.instance_hints.items) |h| t.gpa.free(h.template);
+        t.instance_hints.clearRetainingCapacity();
+    }
+    const diags = t.sink.diags.items;
+    for (t.instance_hints.items) |*h| {
+        if (h.template.len == 0) continue;
+        const d = for (diags) |d| {
+            if (d.message.ptr == h.message.ptr) break d;
+        } else continue;
+        var differ = false;
+        var alike = true;
+        for (diags) |e| if (e.scope == d.scope and e.byte_offset == d.byte_offset and e.code == d.code) {
+            if (!std.mem.eql(u8, e.message, d.message)) differ = true;
+            if (!std.mem.eql(u8, t.templateText(e.message), h.template)) alike = false;
+        };
+        if (!differ or !alike) continue;
+        try t.sink.adopt(h.template);
+        const text = h.template;
+        h.template = &.{};
+        for (diags) |*e| if (e.scope == d.scope and e.byte_offset == d.byte_offset and e.code == d.code) {
+            e.message = text;
+        };
+    }
+}
+
+/// `message` as its instance's template spells it: its recorded spelling, else itself.
+fn templateText(t: *const Typecheck, message: []const u8) []const u8 {
+    for (t.instance_hints.items) |h| if (h.message.ptr == message.ptr) return if (h.template.len == 0) message else h.template;
+    return message;
 }
 
 /// Resolve every pending slot: only now are receiver types reified and every method row appended.
@@ -3393,6 +3439,8 @@ fn recheck(t: *Typecheck, model: *const Model, gid: u32, args: []const Type, spa
     errdefer t.gpa.free(inst_callees);
     // Merge the instance's diagnostics into the shared stream (sorted at the end).
     try t.sink.merge(&bc.sink);
+    try t.instance_hints.appendSlice(t.gpa, bc.template_spellings.items);
+    bc.template_spellings.clearRetainingCapacity();
     // A derivable-struct `==` reached ONLY from an unbounded generic body is seen for the
     // first time here (Pass C skips unbounded templates), so drain the structural-Eq
     // requests recorded during this re-check; `synthesizeDerives` dedups+sorts afterward.
@@ -7500,6 +7548,47 @@ test "every T0025 hint at a method value compiles when it is followed literally"
         }
         errdefer std.debug.print("{s}\n", .{msg});
         try testing.expectEqual(k.offered, offered);
+    }
+}
+
+test "an unbounded template's per-instance T0025 and T0016 hints read as the template does" {
+    const gpa = testing.allocator;
+    const box = "struct Box[T] { v: T }\nimpl Box[T] has Into[T] { fn into(self) -> T { self.v } }\nimpl Box[T] has Into[bool] { fn into(self) -> bool { true } }\n";
+    const pick = "fn pick[A, B](a: A) -> A { a }\n";
+    const Case = struct { src: []const u8, code: codes.Code, hint: []const u8, fixed: []const u8 };
+    const cases = [_]Case{
+        .{
+            .src = box ++ "fn h[T](b: Box[T]) -> int {\n _x := b.into()\n 0\n}\nfn main() -> int { return h(Box { v: 1 }) + h(Box { v: \"s\" }) }\n",
+            .code = .T0025,
+            .hint = "(Into[T] and Into[bool]); add explicit protocol type arguments, e.g. .into[T]() or .into[bool]()",
+            .fixed = box ++ "fn h[T](b: Box[T]) -> int {\n _x := b.into[T]()\n 0\n}\nfn main() -> int { return h(Box { v: 1 }) + h(Box { v: \"s\" }) }\n",
+        },
+        .{
+            .src = pick ++ "fn g[T](t: T) -> T { pick(t) }\nfn main() -> int {\n x := g(1)\n y := g(\"s\")\n return x + y.len()\n}\n",
+            .code = .T0016,
+            .hint = "e.g. pick[T, int](..)",
+            .fixed = pick ++ "fn g[T](t: T) -> T { pick[T, int](t) }\nfn main() -> int {\n x := g(1)\n y := g(\"s\")\n return x + y.len()\n}\n",
+        },
+        // A concrete arg that one instance's binding happens to equal still reads as written.
+        .{
+            .src = pick ++ "fn g[T](t: T) -> T {\n _p := pick(5)\n t\n}\nfn main() -> int {\n x := g(1)\n y := g(\"s\")\n return x + y.len()\n}\n",
+            .code = .T0016,
+            .hint = "e.g. pick[int, int](..)",
+            .fixed = pick ++ "fn g[T](t: T) -> T {\n _p := pick[int, int](5)\n t\n}\nfn main() -> int {\n x := g(1)\n y := g(\"s\")\n return x + y.len()\n}\n",
+        },
+    };
+    for (cases) |k| {
+        var c = try checkSource(k.src);
+        defer c.deinit(gpa);
+        errdefer for (c.result.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+        var n: usize = 0;
+        for (c.result.diags) |d| if (d.severity == .err) {
+            try testing.expectEqual(k.code, d.code);
+            try testing.expect(std.mem.endsWith(u8, d.message, k.hint));
+            n += 1;
+        };
+        try testing.expectEqual(@as(usize, 1), n);
+        try expectNoErrors(k.fixed);
     }
 }
 

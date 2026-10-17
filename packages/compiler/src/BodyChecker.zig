@@ -374,6 +374,13 @@ pub const BodyChecker = struct {
     /// name (`T`) rather than the opaque `type_var` tag. Borrowed source slices.
     gph_generic_params: []const []const u8 = &.{},
 
+    /// Set while a hint is written as its template spells it (`templateSpelling`).
+    spell_as_template: bool = false,
+    /// Each T0016/T0025 this instance re-check reported whose text names the instance's
+    /// own types, with the text as the template spells it (owned), for the mono tail to
+    /// unify the reports one site gets from several instances (`unifyInstanceHints`).
+    template_spellings: std.ArrayList(TemplateSpelling) = .empty,
+
     /// Structural derive requests this fn's body recorded: a `==`/`!=` on a
     /// derivable type with no impl. Moved out into the `BodyResult` after the walk;
     /// merged fn-id-ordered by `checkBodies`. THREAD-LOCAL (one list per BodyChecker),
@@ -402,6 +409,10 @@ pub const BodyChecker = struct {
     /// generic-param order (`names[i]` binds `types[i]`).
     pub const Subst = struct { names: []const []const u8, types: []const Type };
 
+    /// `message` is the reported text (the sink's own buffer); `template` the same text with
+    /// each instance type arg written as its param (owned).
+    pub const TemplateSpelling = struct { message: []const u8, template: []u8 };
+
     pub fn deinit(bc: *BodyChecker) void {
         bc.slot_types.deinit(bc.gpa);
         bc.loop_stack.deinit(bc.gpa);
@@ -413,6 +424,8 @@ pub const BodyChecker = struct {
         bc.derive_reqs.deinit(bc.gpa);
         bc.descriptor_reqs.deinit(bc.gpa);
         bc.conforms_memo.deinit(bc.gpa);
+        for (bc.template_spellings.items) |ts| bc.gpa.free(ts.template);
+        bc.template_spellings.deinit(bc.gpa);
     }
 
     /// Walk this fn's body: rebuild the slot table, type the body block against the
@@ -2831,16 +2844,24 @@ pub const BodyChecker = struct {
                 try confs.append(bc.gpa, .{ .pid = m.protocol_id.?, .args_start = start, .args_len = m.protocol_args.len });
             }
         }
-        var names: std.ArrayList(u8) = .empty;
-        defer names.deinit(bc.gpa);
-        for (confs.items, 0..) |c, i| {
-            if (i != 0) try names.appendSlice(bc.gpa, " and ");
-            try bc.writeConformance(&names, c, arg_buf.items);
-        }
-        var hint: std.ArrayList(u8) = .empty;
-        defer hint.deinit(bc.gpa);
-        try bc.writeAmbiguityHint(&hint, recv, member, confs.items, arg_buf.items, value_recv);
-        try bc.sink.report(.{ .span = at, .code = .T0025 }, "ambiguous conformance: '{s}' on '{s}' matches multiple conformances ({s}); {s}", .{ member, bc.typeName(recv), names.items, hint.items });
+        const Msg = struct {
+            recv: Type,
+            member: []const u8,
+            confs: []const AmbiguousConformance,
+            buf: []const Type,
+            value_recv: ?Ast.Index,
+
+            fn write(m: @This(), b: *BodyChecker, out: *std.ArrayList(u8)) error{OutOfMemory}!void {
+                try out.print(b.gpa, "ambiguous conformance: '{s}' on '{s}' matches multiple conformances (", .{ m.member, b.typeName(m.recv) });
+                for (m.confs, 0..) |c, i| {
+                    if (i != 0) try out.appendSlice(b.gpa, " and ");
+                    try b.writeConformance(out, c, m.buf);
+                }
+                try out.appendSlice(b.gpa, "); ");
+                try b.writeAmbiguityHint(out, m.recv, m.member, m.confs, m.buf, m.value_recv);
+            }
+        };
+        try bc.reportHinted(.{ .span = at, .code = .T0025 }, Msg{ .recv = recv, .member = member, .confs = confs.items, .buf = arg_buf.items, .value_recv = value_recv });
     }
 
     const AmbiguousConformance = struct {
@@ -3001,13 +3022,22 @@ pub const BodyChecker = struct {
     /// the rest of the expression (`.ok`, or `(..)` standing for the args), and
     /// `then_args`, when given, the type args after it (an associated fn's own).
     pub fn reportUninferable(bc: *BodyChecker, at: Span, comptime what: []const u8, what_args: anytype, name: []const u8, args: []const Type, rest: []const []const u8, then_args: ?[]const Type) error{OutOfMemory}!void {
-        var hint: std.ArrayList(u8) = .empty;
-        defer hint.deinit(bc.gpa);
-        try hint.appendSlice(bc.gpa, name);
-        try bc.writeHintArgs(&hint, args);
-        for (rest) |r| try hint.appendSlice(bc.gpa, r);
-        if (then_args) |ta| try bc.writeHintArgs(&hint, ta);
-        try bc.sink.report(.{ .span = at, .code = .T0016 }, "cannot infer type parameter" ++ what ++ "; add explicit type arguments, e.g. {s}", what_args ++ .{hint.items});
+        const Hint = struct {
+            what_args: @TypeOf(what_args),
+            name: []const u8,
+            args: []const Type,
+            rest: []const []const u8,
+            then_args: ?[]const Type,
+
+            fn write(h: @This(), b: *BodyChecker, out: *std.ArrayList(u8)) error{OutOfMemory}!void {
+                try out.print(b.gpa, "cannot infer type parameter" ++ what ++ "; add explicit type arguments, e.g. ", h.what_args);
+                try out.appendSlice(b.gpa, h.name);
+                try b.writeHintArgs(out, h.args);
+                for (h.rest) |r| try out.appendSlice(b.gpa, r);
+                if (h.then_args) |ta| try b.writeHintArgs(out, ta);
+            }
+        };
+        try bc.reportHinted(.{ .span = at, .code = .T0016 }, Hint{ .what_args = what_args, .name = name, .args = args, .rest = rest, .then_args = then_args });
     }
 
     /// `[A, B]`, with `int` for an open (`.invalid`) arg.
@@ -3020,9 +3050,43 @@ pub const BodyChecker = struct {
         try out.append(bc.gpa, ']');
     }
 
+    /// Report the message `hint.write` builds. In an instance re-check its text may name
+    /// the instance's types, so it is also written as the template spells it, for
+    /// `Typecheck.unifyInstanceHints`.
+    fn reportHinted(bc: *BodyChecker, r: DiagnosticSink.Report, hint: anytype) error{OutOfMemory}!void {
+        var text: std.ArrayList(u8) = .empty;
+        defer text.deinit(bc.gpa);
+        try hint.write(bc, &text);
+        try bc.sink.report(r, "{s}", .{text.items});
+        if (bc.subst == null or bc.abstract_template) return;
+        var tmpl: std.ArrayList(u8) = .empty;
+        defer tmpl.deinit(bc.gpa);
+        bc.spell_as_template = true;
+        defer bc.spell_as_template = false;
+        try hint.write(bc, &tmpl);
+        if (std.mem.eql(u8, tmpl.items, text.items)) return;
+        const reported = bc.sink.items()[bc.sink.count() - 1].message;
+        try bc.template_spellings.ensureUnusedCapacity(bc.gpa, 1);
+        bc.template_spellings.appendAssumeCapacity(.{ .message = reported, .template = try tmpl.toOwnedSlice(bc.gpa) });
+    }
+
+    /// In an instance re-check, the template param whose arg `t` is, when exactly one is:
+    /// spelled with it, a hint reads alike in every instance whose args differ there.
+    fn templateSpelling(bc: *const BodyChecker, t: Type) ?[]const u8 {
+        if (!bc.spell_as_template) return null;
+        const s = bc.subst orelse return null;
+        var found: ?[]const u8 = null;
+        for (s.names, s.types) |name, ty| if (Type.eql(ty, t)) {
+            if (found != null) return null;
+            found = name;
+        };
+        return found;
+    }
+
     /// `t` as source spells it, generic args included, so a hint that names it compiles
     /// where it is pasted. A type var `ord` with a name in `names` prints as that name.
     pub fn writeTypeSource(bc: *BodyChecker, out: *std.ArrayList(u8), t: Type, names: []const []const u8) error{OutOfMemory}!void {
+        if (bc.templateSpelling(t)) |name| return out.appendSlice(bc.gpa, name);
         if (t.kind == .unit) return out.appendSlice(bc.gpa, "()");
         if (t.isApp()) {
             try out.appendSlice(bc.gpa, bc.typeName(t));

@@ -666,7 +666,10 @@ them: `.into[int]() or .into[bool]()`. No call syntax names a protocol, so any o
 it, which the hint spells out: `fn render_via[T has Show](x: T) -> int { x.render() }`.
 A generic type cannot meet a bound yet, so on one the hint says that no call can choose
 those conformances. A method value takes no protocol args (`f := p.into[int]` is T0025
-too), so at one the hint puts them in a lambda's call: `fn() { p.into[int]() }`.
+too), so at one the hint puts them in a lambda's call: `fn() { p.into[int]() }`. In an
+unbounded template, which only its instances check, the instances' reports at one site
+that differ only by the template's type args become one, written with the template's own
+params: `.into[T]()`, or for **T0016** `pick[T, int](..)`.
 
 ## Operators: comparison via `Ord`
 
