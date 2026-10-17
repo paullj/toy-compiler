@@ -293,9 +293,14 @@ receiver's, and args no conformance has are **T0018**. A generic method is not a
 (**T0013** at the call): such a method would be a template on a concrete receiver, which
 the method table, discovery, the seal and the LSP all treat as one row per method. A method's own type parameter may not reuse a name of its
 impl's (`impl Box[T] { fn conv[T](..) }`), and no fn declares one name twice
-(**T0053**). An inherent impl's pattern names each type parameter once
-(`impl Pair[A, B]`); a partly concrete or repeated one (`impl Pair[T, int]`,
-`impl Pair[T, T]`) is **T0013**.
+(**T0053**). An impl's pattern, inherent or a conformance, names each type parameter
+once (`impl Pair[A, B]`); one on a single instance (`impl Box[int]`,
+`impl Box[int] has Into[int]`) or a partly concrete or repeated one
+(`impl Pair[T, int]`, `impl Pair[T, T]`) is **T0013**, and that is the impl's only
+error: its methods are not checked against the protocol (no **T0024**), a call of one,
+on a value or through the type, reports nothing more (no **T0018**), and a bound it
+would have met is not reported unmet (no **T0023**). So is a conformance rejected for a
+composite protocol argument (`impl P has Into[Option[int]]`).
 
 ## Associated functions
 
@@ -400,8 +405,11 @@ inside a block). It is checked bidirectionally, like a literal:
   type expected where the lambda is written: an annotated binding, an assignment, a
   parameter of a known function or method (a `Vec[fn(int) -> int]`'s `push` too), a
   struct field, a list element, a `return` or a trailing value. An expected function of
-  another arity, or a part holding a type variable (a generic callee's `fn(T) -> T`),
-  provides nothing; a parameter left with no type is **T0050**. In a generic call a
+  another arity, or a part holding a type variable the call has yet to bind (a generic
+  callee's `fn(T) -> T`), provides nothing; a parameter left with no type is **T0050**.
+  A template's own type parameters are types like any other there: in
+  `fn g[T has Addable](t: T)`, `fn(o) { t.add(o) }` needs no annotation where a
+  `fn(T) -> T` is expected. In a generic call a
   lambda is checked after the call's other arguments and its receiver, against what
   they bind (see [Generic calls](#generic-calls-inference-order)), so
   `apply(fn(x) { x * 7 }, 1)` and `b.map(fn(x) { x + 1 })` need no annotation; a type
@@ -451,7 +459,7 @@ boxes and other closures stay alive with them; a function holds each of its boxe
 
 A `_` that is a whole call argument makes the call a lambda of one parameter, a
 **capture**: `add(1, _)` is `fn(v) { add(1, v) }`, and it is checked and lowered as that
-lambda. Its parameter type is the expected function type's when that is ground, else the
+lambda. Its parameter type is the expected function type's when that gives one, else the
 type the call wants at the `_` (a known function's, method's or constructor's parameter),
 so `inc := add(1, _)` is `fn(int) -> int` with no annotation. In a generic call that is
 the parameter with what the call's other arguments bind, so `pair(1, _)` is
