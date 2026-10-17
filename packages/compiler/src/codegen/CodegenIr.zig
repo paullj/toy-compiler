@@ -49,6 +49,10 @@ const S2: u32 = 11;
 // between two far frame cells keeps both bases; no other code uses them.
 const FA: u32 = 12;
 const FB: u32 = 13;
+// An offset past what an add's shifted imm12 reaches (16 MiB) is built here whole
+// first. Only `regAddr` writes it, for its next instruction, so it is never a caller's
+// base or destination.
+const FO: u32 = 14;
 
 // Scratch D-registers (SIMD&FP file, caller-saved) for the float load/compute/store
 // pattern. Distinct index space from the GPR scratch above; D-regs appear ONLY in
@@ -181,14 +185,14 @@ const Gen = struct {
 
     const MemOp = enum { ldr, str, ldr_fp, str_fp };
 
-    /// A 64-bit load or store of `rt` at `[sp, #off]`, for any frame offset. One
-    /// instruction while the scaled imm12 reaches `off`, so a frame that fits it keeps its
-    /// bytes; past it, the 4 KiB-aligned part goes into FA first.
+    /// A 64-bit load or store of `rt` at `[sp, #off]`, for any offset. One instruction
+    /// while the scaled imm12 reaches `off`, so a frame that fits it keeps its bytes; past
+    /// it, the 4 KiB-aligned part goes into FA first.
     fn spMem(g: *Gen, op: MemOp, rt: u32, off: u32) error{OutOfMemory}!void {
         const direct = off / 8 <= Aarch64.max_scaled;
         const base: u32 = if (direct) Aarch64.SP else FA;
         const rest: u32 = if (direct) off else off & 0xFFF;
-        if (!direct) try g.emit(Aarch64.addImmLsl12(FA, Aarch64.SP, @intCast(off >> 12)));
+        if (!direct) try g.regAddr(FA, Aarch64.SP, off & ~@as(u32, 0xFFF));
         try g.emit(switch (op) {
             .ldr => Aarch64.ldrRegUoff(rt, base, rest),
             .str => Aarch64.strRegUoff(rt, base, rest),
@@ -202,13 +206,21 @@ const Gen = struct {
         return g.regAddr(rd, Aarch64.SP, off);
     }
 
-    /// `rd = base + off` for an offset below 16 MiB: `add rd, base, #off` while it fits
-    /// the unshifted imm12, else the 4 KiB pages then the rest.
+    /// `rd = base + off` for any offset: `add rd, base, #off` while it fits the unshifted
+    /// imm12, else the 4 KiB pages then the rest while the page count fits an imm12, else
+    /// `off` built whole in FO. Frames and types (T0077) stop below 16 MiB, so the last
+    /// form is a backstop that keeps an offset past them correct instead of truncated.
     fn regAddr(g: *Gen, rd: u32, base: u32, off: u32) error{OutOfMemory}!void {
         std.debug.assert(rd != Aarch64.SP);
         if (off <= 0xFFF) return g.emit(Aarch64.addImm(rd, base, @intCast(off)));
-        try g.emit(Aarch64.addImmLsl12(rd, base, @intCast(off >> 12)));
-        if (off & 0xFFF != 0) try g.emit(Aarch64.addImm(rd, rd, @intCast(off & 0xFFF)));
+        if (off >> 12 <= 0xFFF) {
+            try g.emit(Aarch64.addImmLsl12(rd, base, @intCast(off >> 12)));
+            if (off & 0xFFF != 0) try g.emit(Aarch64.addImm(rd, rd, @intCast(off & 0xFFF)));
+            return;
+        }
+        try g.emit(Aarch64.movz(FO, @truncate(off), 0));
+        try g.emit(Aarch64.movk(FO, @intCast(off >> 16), 1));
+        try g.emit(Aarch64.addRegExt(rd, base, FO));
     }
 };
 
@@ -1769,6 +1781,53 @@ test "ir-codegen: copyBytes past the immediate walks FA and FB a 32 KiB window a
     try testing.expectEqual(Aarch64.addImmLsl12(FB, FB, 8), at(g.code.items, 3 + 2 * 4096));
     try testing.expectEqual(Aarch64.ldrRegUoff(S2, FB, 0), at(g.code.items, 4 + 2 * 4096));
     try testing.expectEqual(Aarch64.strRegUoff(S2, FA, 0), at(g.code.items, 5 + 2 * 4096));
+}
+
+test "ir-codegen: an offset of 16 MiB or more is built whole in FO, never truncated (#51)" {
+    const gpa = testing.allocator;
+    var func = try slotsOnlyFn(gpa, &.{});
+    defer func.deinit(gpa);
+    gpa.free(func.values);
+    func.values = try gpa.dupe(Ir.ValueDef, &.{ .{ .type = Type.int }, .{ .type = Type.int } });
+    var fl = try FrameLayout.compute(gpa, &func, &.{}, &.{});
+    defer fl.deinit(gpa);
+    var g: Gen = .{ .gpa = gpa, .func = &func, .layouts = &.{}, .enum_layouts = &.{}, .is_entry = false, .fl = fl, .params = undefined, .block_labels = &.{} };
+    defer g.code.deinit(gpa);
+    try genInstr(&g, .{ .result = 1, .op = .{ .field_addr = .{ .base = 0, .off = 0x0100_0010, .ty = Type.int } } });
+    try g.regAddr(S1, Aarch64.SP, 0x0100_0000);
+    try g.regAddr(S1, S0, 0x00FF_FFFF);
+    try g.regAddr(S1, S0, 0xFFFF_FFF8);
+    try copyBytes(&g, S0, 0, S1, 0x0123_4560, 8);
+    try g.spMem(.ldr, S2, 0x0100_1008);
+    const want = [_]u32{
+        Aarch64.ldrRegUoff(S0, Aarch64.SP, fl.value_off[0]),
+        Aarch64.movz(FO, 0x0010, 0),
+        Aarch64.movk(FO, 0x0100, 1),
+        Aarch64.addRegExt(S0, S0, FO),
+        Aarch64.strRegUoff(S0, Aarch64.SP, fl.value_off[1]),
+        // sp as the base takes the extended-register add.
+        Aarch64.movz(FO, 0, 0),
+        Aarch64.movk(FO, 0x0100, 1),
+        Aarch64.addRegExt(S1, Aarch64.SP, FO),
+        // Just below 16 MiB keeps the page form.
+        Aarch64.addImmLsl12(S1, S0, 0xFFF),
+        Aarch64.addImm(S1, S1, 0xFFF),
+        Aarch64.movz(FO, 0xFFF8, 0),
+        Aarch64.movk(FO, 0xFFFF, 1),
+        Aarch64.addRegExt(S1, S0, FO),
+        Aarch64.addImm(FA, S0, 0),
+        Aarch64.movz(FO, 0x4560, 0),
+        Aarch64.movk(FO, 0x0123, 1),
+        Aarch64.addRegExt(FB, S1, FO),
+        Aarch64.ldrRegUoff(S2, FB, 0),
+        Aarch64.strRegUoff(S2, FA, 0),
+        Aarch64.movz(FO, 0x1000, 0),
+        Aarch64.movk(FO, 0x0100, 1),
+        Aarch64.addRegExt(FA, Aarch64.SP, FO),
+        Aarch64.ldrRegUoff(S2, FA, 8),
+    };
+    try testing.expectEqual(want.len * 4, g.code.items.len);
+    for (want, 0..) |w, i| try testing.expectEqual(w, std.mem.readInt(u32, g.code.items[i * 4 ..][0..4], .little));
 }
 
 test "ir-codegen: genArith width-normalizes narrow results (and platform int does not)" {
