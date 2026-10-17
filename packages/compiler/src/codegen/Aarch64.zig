@@ -74,6 +74,13 @@ pub fn addReg(rd: u32, rn: u32, rm: u32) u32 {
     return 0x8B000000 | (rm << 16) | (rn << 5) | rd;
 }
 
+/// add rd, rn, rm, uxtx — the extended-register form, the one whose `rn` may be sp
+/// (in `addReg`'s shifted-register form, register 31 is xzr). add x9,x9,x14,uxtx →
+/// 0x8B2E6129; add x1,sp,x14 → 0x8B2E63E1.
+pub fn addRegExt(rd: u32, rn: u32, rm: u32) u32 {
+    return 0x8B206000 | (rm << 16) | (rn << 5) | rd;
+}
+
 /// sub rd, rn, rm. sub x5,x0,x1 → 0xCB010005.
 pub fn subReg(rd: u32, rn: u32, rm: u32) u32 {
     return 0xCB000000 | (rm << 16) | (rn << 5) | rd;
@@ -641,6 +648,9 @@ test "add/sub immediate" {
 
 test "data-processing register" {
     try testing.expectEqual(@as(u32, 0x8B010000), addReg(0, 0, 1)); // add x0,x0,x1
+    try testing.expectEqual(@as(u32, 0x8B2E6129), addRegExt(9, 9, 14)); // add x9,x9,x14,uxtx
+    try testing.expectEqual(@as(u32, 0x8B2E63E1), addRegExt(1, SP, 14)); // add x1,sp,x14
+    try testing.expectEqual(@as(u32, 0x8B2E600C), addRegExt(12, 0, 14)); // add x12,x0,x14,uxtx
     try testing.expectEqual(@as(u32, 0xCB010005), subReg(5, 0, 1)); // sub x5,x0,x1
     try testing.expectEqual(@as(u32, 0xCB010000), subReg(0, 0, 1)); // sub x0,x0,x1
     try testing.expectEqual(@as(u32, 0x9B017C02), mul(2, 0, 1)); // mul x2,x0,x1
