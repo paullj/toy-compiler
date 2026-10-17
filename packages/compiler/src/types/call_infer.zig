@@ -44,7 +44,8 @@ const ArgTyping = enum {
 };
 
 /// `.failed`: an error is already reported. `.unbound`: the ordinal no arg binds, for
-/// the caller to report in its own words.
+/// the caller to report in its own words, with what the args did bind in the type args
+/// and `.invalid` for each open one.
 const InferResult = union(enum) { ok, failed, unbound: u32 };
 
 /// Whether `arg` takes its type from what a generic call's other args bind: a lambda
@@ -196,6 +197,9 @@ pub fn inferArgs(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, pa
             for (nodes[first..], arg_types[first..]) |a, at| if (at.kind == .invalid and a != bc.body.hole) return .failed;
             fillOpen(targs, bnd, bc.openOrdBase());
             if (try reportMisfit(bc, site, nodes, first, params, arg_types, targs, bnd)) return .failed;
+            for (targs, bnd) |*t, b| if (!b) {
+                t.* = .invalid;
+            };
             return .{ .unbound = u.ord };
         },
         .ok => return .ok,
@@ -273,11 +277,8 @@ pub fn checkOwnGenericCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, c
     switch (try inferArgs(bc, .{ .call = node_idx, .sig = sig }, nodes, params, mf.generic_params, recv_ty, .receiver, arg_types, targs)) {
         .failed => return .invalid,
         .unbound => |ord| {
-            const own = mf.generic_params.len - Typecheck.implParamCount(bc.composite, mf);
-            var ints: std.ArrayList(u8) = .empty;
-            defer ints.deinit(bc.gpa);
-            for (0..own) |k| try ints.appendSlice(bc.gpa, if (k == 0) "int" else ", int");
-            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0016 }, "cannot infer type parameter '{s}' of method '{s}' from its arguments; add explicit type arguments, as in '{s}[{s}](..)'", .{ mf.generic_params[ord], member, member, ints.items });
+            const n_impl = Typecheck.implParamCount(bc.composite, mf);
+            try bc.reportUninferable(bc.spanOf(node_idx), " '{s}' of method '{s}' from its arguments", .{ mf.generic_params[ord], member }, member, targs[n_impl..], &.{"(..)"}, null);
             return .invalid;
         },
         .ok => {},
@@ -308,9 +309,31 @@ fn reportOwnGenericArity(bc: *BodyChecker, call: Ast.Index, got: usize, sig: Bod
     try bc.emitArity(call, sig.params.len, got, sig.decl, suffix.items);
 }
 
-pub fn reportUninferableAssociated(bc: *BodyChecker, recv: Ast.Node, member: []const u8) error{OutOfMemory}!void {
+/// T0016 for `Pair.make(..)` on the bare generic struct `sid`. When the call was inferred,
+/// `mf` is the fn, `fn_args` what the call bound of its type params (`.invalid` when
+/// open) and `open` the one no arg binds. The hint names the struct's args through the
+/// impl's pattern, then the fn's own args when it has any, so it gets past T0016 for both.
+pub fn reportUninferableAssociated(bc: *BodyChecker, recv: Ast.Node, member: []const u8, sid: u32, mf: ?FnSym, fn_args: []const Type, open: ?u32) error{OutOfMemory}!void {
     const name = bc.nameText(recv.main_token);
-    try bc.sink.report(.{ .span = bc.tokSpan(recv.main_token), .code = .T0016 }, "cannot infer type parameter for '{s}.{s}'; add explicit type arguments, e.g. {s}[int].{s}", .{ name, member, name, member });
+    const n = bc.structSyms()[sid].generic_params.len;
+    const args = try bc.gpa.alloc(Type, n);
+    defer bc.gpa.free(args);
+    @memset(args, .invalid);
+    var own: ?[]const Type = null;
+    if (mf) |f| {
+        if (f.self_type.isApp()) {
+            const pat = bc.composite.at(f.self_type.appIdx()).args;
+            for (args[0..@min(n, pat.len)], pat[0..@min(n, pat.len)]) |*a, p| {
+                if (p.isTypeVar() and p.typeVarOrd() < fn_args.len) a.* = fn_args[p.typeVarOrd()];
+            }
+        }
+        const n_impl = Typecheck.implParamCount(bc.composite, f);
+        if (f.generic_params.len > n_impl) own = fn_args[n_impl..];
+    }
+    if (open) |ord|
+        try bc.reportUninferable(bc.tokSpan(recv.main_token), " '{s}' for '{s}.{s}'", .{ mf.?.generic_params[ord], name, member }, name, args, &.{ ".", member }, own)
+    else
+        try bc.reportUninferable(bc.tokSpan(recv.main_token), " for '{s}.{s}'", .{ name, member }, name, args, &.{ ".", member }, own);
 }
 
 /// Type a bare `Box.new(5)`: bind the impl's type params from the value args alone,
@@ -334,8 +357,8 @@ pub fn inferAssociatedCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, c
     const recv = bc.tree.nodes[(callee.lhs).int()];
     switch (try inferArgs(bc, .{ .call = node_idx, .sig = bc.fnSig(mf, bc.nameText(callee.main_token)) }, args, mf.params, mf.generic_params, null, .none, arg_types, out)) {
         .failed => return .invalid,
-        .unbound => {
-            try reportUninferableAssociated(bc, recv, bc.nameText(callee.main_token));
+        .unbound => |ord| {
+            try reportUninferableAssociated(bc, recv, bc.nameText(callee.main_token), bc.composite.at(mf.self_type.appIdx()).ctor, mf, out, ord);
             return .invalid;
         },
         .ok => {},
