@@ -1,0 +1,20 @@
+# The T0016 hint names every type parameter: the known ones as inferred, `int` for each
+# open one, so it compiles in place of the callee.
+enum Either[A, B] { left(A), right(B) }
+
+struct Pair[A, B] { a: A }
+
+impl Pair[A, B] {
+    fn make(a: A) -> Pair[A, B] { Pair[A, B] { a: a } }
+}
+
+fn pick[A, B](a: A) -> A { a }
+
+fn main() -> int {
+    _r := Result.ok(4)  #~ ERROR [T0016] cannot infer type parameter 'E' for 'Result.ok'; add explicit type arguments, e.g. Result[int, int].ok
+    _e := Either.right("s")  #~ ERROR [T0016] e.g. Either[int, str].right
+    _p := Pair { a: true }  #~ ERROR [T0016] e.g. Pair[bool, int]{ .. }
+    _m := Pair.make("s")  #~ ERROR [T0016] e.g. Pair[str, int].make
+    _f := pick(true)  #~ ERROR [T0016] cannot infer type parameter 'B'; add explicit type arguments, e.g. pick[bool, int](..)
+    return 0
+}

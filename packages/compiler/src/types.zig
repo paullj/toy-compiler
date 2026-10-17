@@ -5573,6 +5573,24 @@ test "Ref[int] and Ref[bool] reify to DISTINCT structs, each tagged native_famil
     try testing.expectEqual(@as(u32, 8), c.result.layouts[ref_int.?].size);
 }
 
+test "an associated fn's T0016 hint names its own type params too, and compiles" {
+    const Case = struct { decl: []const u8, call: []const u8, message: []const u8, fixed: []const u8 };
+    const cases = [_]Case{
+        .{ .decl = "fn mk[V](_v: T) -> int { 0 }", .call = "Box.mk(1)", .message = "cannot infer type parameter 'V' for 'Box.mk'; add explicit type arguments, e.g. Box[int].mk[int]", .fixed = "Box[int].mk[int](1)" },
+        .{ .decl = "fn mk[U, V](v: T, _u: U) -> Box[T] { Box { v: v } }", .call = "Box.mk(1, \"s\").v", .message = "cannot infer type parameter 'V' for 'Box.mk'; add explicit type arguments, e.g. Box[int].mk[str, int]", .fixed = "Box[int].mk[str, int](1, \"s\").v" },
+    };
+    for (cases) |k| {
+        const pre = try std.fmt.allocPrint(testing.allocator, "struct Box[T] {{ v: T }}\nimpl Box[T] {{ {s} }}\nfn main() -> int {{ return ", .{k.decl});
+        defer testing.allocator.free(pre);
+        const src = try std.mem.concat(testing.allocator, u8, &.{ pre, k.call, " }\n" });
+        defer testing.allocator.free(src);
+        try expectOneDiag(src, .T0016, k.message);
+        const fixed = try std.mem.concat(testing.allocator, u8, &.{ pre, k.fixed, " }\n" });
+        defer testing.allocator.free(fixed);
+        try expectNoErrors(fixed);
+    }
+}
+
 test "an associated fn of a bare generic struct infers its type params from its value args" {
     const gpa = testing.allocator;
     const decls =
@@ -5600,7 +5618,7 @@ test "an associated fn of a bare generic struct infers its type params from its 
         // The inferred `T` is the arg's own type, so a mismatched annotation is still caught.
         .{ .stmt = "_y: Box[bool] = Box.new(5)", .code = .T0041, .message = "cannot bind Box to '_y' of type Box" },
         // No value arg binds `T`: the turbofish is still required.
-        .{ .stmt = "_e := Box.empty()", .code = .T0016, .message = "cannot infer type parameter for 'Box.empty'; add explicit type arguments, e.g. Box[int].empty" },
+        .{ .stmt = "_e := Box.empty()", .code = .T0016, .message = "cannot infer type parameter 'T' for 'Box.empty'; add explicit type arguments, e.g. Box[int].empty" },
         .{ .stmt = "_p := Box.pair(1, true)", .code = .T0015, .message = "conflicting types for type parameter 'T': int vs bool" },
         // The count is checked first, as for a generic fn: a turbofish would not help.
         .{ .stmt = "_q := Box.new(1, 2)", .code = .T0039, .message = "expected 1 argument(s), got 2; 'new' takes (T)" },
@@ -7415,6 +7433,61 @@ test "a call on a bounded param takes the bound's conformance in each instance" 
         };
     }
     try testing.expectEqual(@as(usize, 4), seen);
+}
+
+test "the T0016 hint, in place of the callee, gets past T0001 and T0016 at every site" {
+    const gpa = testing.allocator;
+    const decls =
+        \\enum Either[A, B] { left(A), right(B) }
+        \\struct Pair[A, B] { a: A }
+        \\impl Pair[A, B] {
+        \\    fn make(a: A) -> Pair[A, B] { Pair[A, B] { a: a } }
+        \\    fn with[U](a: A, _u: U) -> Pair[A, B] { Pair[A, B] { a: a } }
+        \\    fn conv[U, V](self, _v: V) -> Option[U] { Option[U].none }
+        \\}
+        \\fn pick[A, B](a: A) -> A { a }
+        \\
+    ;
+    const Case = struct { stmt: []const u8, callee: []const u8, hint: []const u8 };
+    const cases = [_]Case{
+        .{ .stmt = "_r := Either.left(true)", .callee = "Either.left", .hint = "Either[bool, int].left" },
+        .{ .stmt = "_r := Either.right(\"s\")", .callee = "Either.right", .hint = "Either[int, str].right" },
+        .{ .stmt = "_r := Pair { a: true }", .callee = "Pair", .hint = "Pair[bool, int]{ .. }" },
+        .{ .stmt = "_r := pick(true)", .callee = "pick", .hint = "pick[bool, int](..)" },
+        .{ .stmt = "_r := Pair.make(true)", .callee = "Pair.make", .hint = "Pair[bool, int].make" },
+        .{ .stmt = "_r := Pair.with[str](true, \"s\")", .callee = "Pair.with", .hint = "Pair[int, int].with" },
+        .{ .stmt = "_r := Pair[int, int] { a: 1 }.conv(true)", .callee = "conv", .hint = "conv[int, bool](..)" },
+    };
+    for (cases) |k| {
+        const src = try std.mem.concat(gpa, u8, &.{ decls, "fn main() -> int {\n ", k.stmt, "\n return 0\n}\n" });
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        var msg: ?[]const u8 = null;
+        for (c.result.diags) |d| if (d.code == codes.Code.T0016) {
+            msg = d.message;
+        };
+        const m = msg orelse {
+            for (c.result.diags) |d| std.debug.print("{s}: got {s}: {s}\n", .{ k.stmt, @tagName(d.code), d.message });
+            return error.TestExpectedDiagnostic;
+        };
+        const text = m[std.mem.indexOf(u8, m, "e.g. ").? + 5 ..];
+        errdefer std.debug.print("{s}: hint '{s}'\n", .{ k.stmt, text });
+        try testing.expectEqualStrings(k.hint, text);
+        // The hint names the callee with its type args; `{ .. }` and `(..)` stand for the
+        // rest of the expression, which stays as written.
+        const callee_text = if (std.mem.endsWith(u8, text, "{ .. }")) text[0 .. text.len - 6] else if (std.mem.endsWith(u8, text, "(..)")) text[0 .. text.len - 4] else text;
+        const fixed_stmt = try std.mem.replaceOwned(u8, gpa, k.stmt, k.callee, callee_text);
+        defer gpa.free(fixed_stmt);
+        const fixed = try std.mem.concat(gpa, u8, &.{ decls, "fn main() -> int {\n ", fixed_stmt, "\n return 0\n}\n" });
+        defer gpa.free(fixed);
+        var f = try checkSource(fixed);
+        defer f.deinit(gpa);
+        for (f.result.diags) |d| {
+            errdefer std.debug.print("{s}: got {s}: {s}\n", .{ fixed_stmt, @tagName(d.code), d.message });
+            try testing.expect(d.code != codes.Code.T0001 and d.code != codes.Code.T0016);
+        }
+    }
 }
 
 test "pickGenericMethod is ambiguous only between conformances" {
@@ -10488,7 +10561,7 @@ test "a method's own type param no arg fixes is T0016, and explicit args fix it"
     const gpa = testing.allocator;
     const src = own_box_pre ++ "fn main() -> int {\n b := Box { v: 20 }\n return b.tag()\n}\n";
     try expectOnlyDiag(src, .T0016);
-    try expectOneDiag(src, .T0016, "cannot infer type parameter 'U' of method 'tag' from its arguments; add explicit type arguments, as in 'tag[int](..)'");
+    try expectOneDiag(src, .T0016, "cannot infer type parameter 'U' of method 'tag' from its arguments; add explicit type arguments, e.g. tag[int](..)");
     var c = try checkSource(own_box_pre ++ "fn main() -> int {\n b := Box { v: 20 }\n return b.tag[int]()\n}\n");
     defer c.deinit(gpa);
     try expectOwnGenericOk(&c);

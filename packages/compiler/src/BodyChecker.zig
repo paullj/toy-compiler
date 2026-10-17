@@ -1531,7 +1531,10 @@ pub const BodyChecker = struct {
                         },
                         .err => return .invalid,
                         .unbound => |ord| {
-                            try bc.sink.report(.{ .span = bc.tokSpan(lhs.main_token), .code = .T0016 }, "cannot infer type parameter '{s}' for '{s}'; add explicit type arguments, e.g. {s}[int]{{ .. }}", .{ gsym.generic_params[ord], disp_name, disp_name });
+                            for (out, bnd) |*o, b| if (!b) {
+                                o.* = .invalid;
+                            };
+                            try bc.reportUninferable(bc.tokSpan(lhs.main_token), " '{s}' for '{s}'", .{ gsym.generic_params[ord], disp_name }, disp_name, out, &.{"{ .. }"}, null);
                             return .invalid;
                         },
                     },
@@ -2007,7 +2010,10 @@ pub const BodyChecker = struct {
                 .ok => return bc.checkVariantPayloads(site, enum_id, vtok, node_form, args, out, pre),
                 .err => return .invalid,
                 .unbound => |ord| {
-                    try bc.sink.report(.{ .span = bc.tokSpan(vtok), .code = .T0016 }, "cannot infer type parameter '{s}' for '{s}.{s}'; add explicit type arguments, e.g. {s}[int].{s}", .{ e.generic_params[ord], e.name, vname, e.name, vname });
+                    for (out, bnd) |*o, b| if (!b) {
+                        o.* = .invalid;
+                    };
+                    try bc.reportUninferable(bc.tokSpan(vtok), " '{s}' for '{s}.{s}'", .{ e.generic_params[ord], e.name, vname }, e.name, out, &.{ ".", vname }, null);
                     return .invalid;
                 },
             },
@@ -2981,6 +2987,38 @@ pub const BodyChecker = struct {
         return if (std.mem.indexOfScalar(u8, text, '\n') == null) text else null;
     }
 
+    /// A callee as written (`pick`, `lib.pick`), or its own name when it spans lines.
+    fn calleeText(bc: *const BodyChecker, callee: Ast.Index) []const u8 {
+        const sp = bc.spanOf(callee);
+        const text = bc.source[sp.start..sp.end];
+        return if (std.mem.indexOfScalar(u8, text, '\n') == null) text else bc.nameText(bc.tree.nodes[callee.int()].main_token);
+    }
+
+    /// T0016, with a hint that names the callee with explicit type args, `name[A, B]`:
+    /// each arg already known spelled out and `int` for each open one (`.invalid`), so
+    /// the hint where the call names its callee gets past T0001 and T0016. `rest` spells
+    /// the rest of the expression (`.ok`, or `(..)` standing for the args), and
+    /// `then_args`, when given, the type args after it (an associated fn's own).
+    pub fn reportUninferable(bc: *BodyChecker, at: Span, comptime what: []const u8, what_args: anytype, name: []const u8, args: []const Type, rest: []const []const u8, then_args: ?[]const Type) error{OutOfMemory}!void {
+        var hint: std.ArrayList(u8) = .empty;
+        defer hint.deinit(bc.gpa);
+        try hint.appendSlice(bc.gpa, name);
+        try bc.writeHintArgs(&hint, args);
+        for (rest) |r| try hint.appendSlice(bc.gpa, r);
+        if (then_args) |ta| try bc.writeHintArgs(&hint, ta);
+        try bc.sink.report(.{ .span = at, .code = .T0016 }, "cannot infer type parameter" ++ what ++ "; add explicit type arguments, e.g. {s}", what_args ++ .{hint.items});
+    }
+
+    /// `[A, B]`, with `int` for an open (`.invalid`) arg.
+    fn writeHintArgs(bc: *BodyChecker, out: *std.ArrayList(u8), args: []const Type) error{OutOfMemory}!void {
+        try out.append(bc.gpa, '[');
+        for (args, 0..) |a, i| {
+            if (i != 0) try out.appendSlice(bc.gpa, ", ");
+            if (a.kind == .invalid) try out.appendSlice(bc.gpa, "int") else try bc.writeTypeSource(out, a, bc.gph_generic_params);
+        }
+        try out.append(bc.gpa, ']');
+    }
+
     /// `t` as source spells it, generic args included, so a hint that names it compiles
     /// where it is pasted. A type var `ord` with a name in `names` prints as that name.
     pub fn writeTypeSource(bc: *BodyChecker, out: *std.ArrayList(u8), t: Type, names: []const []const u8) error{OutOfMemory}!void {
@@ -3127,7 +3165,7 @@ pub const BodyChecker = struct {
                 if (sid < bc.structSyms().len and bc.structSyms()[sid].is_generic) {
                     if (Typecheck.findGenericMethod(bc.model.templates, sid, false, member, bc.methodSite()) != null) {
                         try bc.drainArgs(args);
-                        try CallInfer.reportUninferableAssociated(bc, recv, member);
+                        try CallInfer.reportUninferableAssociated(bc, recv, member, sid, null, &.{}, null);
                         return .invalid;
                     }
                 }
@@ -3393,7 +3431,7 @@ pub const BodyChecker = struct {
                     if (Typecheck.findGenericMethod(bc.model.templates, sid, false, member, bc.methodSite())) |m| {
                         if (try CallInfer.inferAssociatedCall(bc, node_idx, n, callee, m, args)) |t| return t;
                         try bc.drainArgs(args);
-                        try CallInfer.reportUninferableAssociated(bc, recv, member);
+                        try CallInfer.reportUninferableAssociated(bc, recv, member, sid, null, &.{}, null);
                         return .invalid;
                     }
                     // `Ref` is a prelude type, but its API is library code: name the import
@@ -3874,7 +3912,7 @@ pub const BodyChecker = struct {
             switch (try CallInfer.inferArgs(bc, .{ .call = node_idx, .sig = sig }, args, f.params, f.generic_params, null, .call_expected, arg_types, out)) {
                 .failed => return .invalid,
                 .unbound => |ord| {
-                    try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0016 }, "cannot infer type parameter '{s}'; add explicit type arguments, e.g. f[int](..)", .{f.generic_params[ord]});
+                    try bc.reportUninferable(bc.spanOf(node_idx), " '{s}'", .{f.generic_params[ord]}, bc.calleeText(n.lhs), out, &.{"(..)"}, null);
                     return .invalid;
                 },
                 .ok => {
