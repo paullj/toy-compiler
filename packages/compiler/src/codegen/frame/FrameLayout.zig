@@ -37,7 +37,8 @@
 //!
 //! GUARDS (surfaced as errors so codegen can emit the SAME diagnostic strings):
 //!   * frame > MAX_FRAME     -> error.FrameTooLarge        ("function frame too
-//!                              large for codegen (too many locals)")
+//!                              large for codegen (..)", which names one value
+//!                              that nearly fills the frame by itself)
 //!   * an incoming stack-arg scaled offset > 4095*8 -> error.ParamOffsetTooLarge
 //!                              ("too many parameters for codegen ...")
 //! Codegen reaches an offset past an instruction's immediate through a base it builds
@@ -61,7 +62,8 @@ const FrameLayout = @This();
 const MAX_SCALED_OFFSET: u32 = 4095 * 8;
 
 /// The largest frame codegen addresses: every offset below it splits into a 4 KiB page
-/// count and a remainder that each fit an imm12.
+/// count and a remainder that each fit an imm12. The checker caps every struct and enum
+/// at it too (T0077), since any value of one has to fit in a frame.
 pub const MAX_FRAME: u32 = (4095 << 12) | 0xFF0;
 
 /// `sret_save_off == NO_SRET` means the function does not return a >16B
@@ -105,6 +107,14 @@ fn roundUp8(n: u32) u32 {
 
 fn roundUp16(n: u32) u32 {
     return (n + 15) / 16 * 16;
+}
+
+/// The largest slot `func`'s frame holds, over its slots and its values.
+pub fn largestSlot(func: *const Ir.Function, layouts: []const Layout, enum_layouts: []const EnumLayout) u32 {
+    var max: u32 = 0;
+    for (func.slots) |sl| max = @max(max, slotSize(sl.type, layouts, enum_layouts));
+    for (func.values) |v| max = @max(max, slotSize(v.type, layouts, enum_layouts));
+    return max;
 }
 
 /// Per-slot frame size: a slot must hold the WHOLE value. str is 16 (ptr,len);

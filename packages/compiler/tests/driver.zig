@@ -4753,6 +4753,53 @@ fn spawnToyBoth(gpa: std.mem.Allocator, io: Io, argv_tail: []const []const u8) !
     return .{ .out = out, .err = got, .term = term };
 }
 
+test "a type too large for any frame is T0077 at build, not a codegen panic (#51)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toy-test-driver-type-too-large";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    // `Big.tail` sits 16 MiB past its base, reached through `mut self` and a `mut` param.
+    var src: std.Io.Writer.Allocating = .init(gpa);
+    defer src.deinit();
+    try src.writer.writeAll("struct A { a0: int, a1: int, a2: int, a3: int, a4: int, a5: int, a6: int, a7: int }\n");
+    const nest = [_][2][]const u8{ .{ "B", "A" }, .{ "C", "B" }, .{ "D", "C" }, .{ "E", "D" }, .{ "F", "E" }, .{ "G", "F" } };
+    for (nest) |pair| {
+        try src.writer.print("struct {s} {{ ", .{pair[0]});
+        for (0..8) |i| try src.writer.print("{s}x{d}: {s}, ", .{ pair[0], i, pair[1] });
+        try src.writer.writeAll("}\n");
+    }
+    try src.writer.writeAll(
+        \\struct Big { g: G, tail: int }
+        \\impl Big {
+        \\    fn bump(mut self) { self.tail = self.tail + 1 }
+        \\}
+        \\fn poke(mut b: Big) { b.tail = 1 }
+        \\fn main() -> int {
+        \\    return 0
+        \\}
+        \\
+    );
+    const path = dir_name ++ "/big.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src.written() });
+
+    for ([_][]const u8{ "-O0", "-O1" }) |opt| {
+        const res = try spawnToyBoth(gpa, io, &.{ "build", "--no-cache", opt, path, "-o", dir_name ++ "/big" });
+        defer gpa.free(res.out);
+        defer gpa.free(res.err);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+        try testing.expect(std.mem.indexOf(u8, res.out, "error[T0077]: struct 'G' is 16777216 bytes") != null);
+        try testing.expect(std.mem.indexOf(u8, res.out, "--> big:7:8") != null);
+        try testing.expect(std.mem.indexOf(u8, res.err, "panic") == null);
+    }
+}
+
 test "a codegen diagnostic is printed with its text" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -4765,18 +4812,20 @@ test "a codegen diagnostic is printed with its text" {
     try Io.Dir.cwd().createDirPath(io, dir_name);
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    // A local past the 16 MiB frame codegen can address: an enum whose one variant holds
-    // 16 MiB, built as its other variant so nothing copies it.
+    // Two locals that together pass the 16 MiB frame codegen can address (one alone is a
+    // type T0077 rejects): an enum whose one variant holds 14 MiB, built as its other
+    // variant so nothing else copies it.
     var src: std.Io.Writer.Allocating = .init(gpa);
     defer src.deinit();
     try src.writer.writeAll("struct A { a0: int, a1: int, a2: int, a3: int, a4: int, a5: int, a6: int, a7: int }\n");
     const nest = [_][2][]const u8{ .{ "B", "A" }, .{ "C", "B" }, .{ "D", "C" }, .{ "E", "D" }, .{ "F", "E" }, .{ "G", "F" } };
     for (nest) |pair| {
         try src.writer.print("struct {s} {{ ", .{pair[0]});
-        for (0..8) |i| try src.writer.print("{s}x{d}: {s}, ", .{ pair[0], i, pair[1] });
+        const n: usize = if (std.mem.eql(u8, pair[0], "G")) 7 else 8;
+        for (0..n) |i| try src.writer.print("{s}x{d}: {s}, ", .{ pair[0], i, pair[1] });
         try src.writer.writeAll("}\n");
     }
-    try src.writer.writeAll("enum H { Small, Huge(G) }\nfn main() -> int {\n    h := H.Small\n    return match h { H.Small -> 1, H.Huge(_) -> 2 }\n}\n");
+    try src.writer.writeAll("enum H { Small, Huge(G) }\nfn main() -> int {\n    h := H.Small\n    k := h\n    return match k { H.Small -> 1, H.Huge(_) -> 2 }\n}\n");
     const path = dir_name ++ "/big.toy";
     try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = src.written() });
 

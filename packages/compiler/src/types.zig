@@ -74,6 +74,7 @@ const Typecheck = @This();
 /// `checkGraph`/`runGraph`) and consumes the laid syms through the re-exported aliases.
 const LayoutEngine = @import("layout/Engine.zig");
 const Abi = @import("codegen/abi/Abi.zig");
+const FrameLayout = @import("codegen/frame/FrameLayout.zig");
 
 // Re-export the algebra/layout value types so every downstream importer keeps
 // reading `Typecheck.Type`/`.Layout`/`.EnumLayout` etc. unchanged.
@@ -1920,6 +1921,13 @@ pub fn layoutEnv(t: *Typecheck) LayoutEngine.Env {
             const tc: *Typecheck = @ptrCast(@alignCast(ctx));
             try tc.sink.report(.{ .span = at, .code = .T0006 }, "empty enum '{s}' is not allowed", .{name});
         }
+        fn emitTooLarge(ctx: *anyopaque, at: Span, w: LayoutEngine.TooLarge) error{OutOfMemory}!void {
+            const tc: *Typecheck = @ptrCast(@alignCast(ctx));
+            if (w.holding) |h|
+                try tc.sink.report(.{ .span = at, .code = .T0077 }, "an instance of {s} '{s}' holding '{s}' is {d} bytes, over the {d}-byte limit for a value; hold large data in a Vec", .{ @tagName(w.kind), w.name, h, w.size, w.limit })
+            else
+                try tc.sink.report(.{ .span = at, .code = .T0077 }, "{s}{s} '{s}' is {d} bytes, over the {d}-byte limit for a value; hold large data in a Vec", .{ if (w.instance) "an instance of " else "", @tagName(w.kind), w.name, w.size, w.limit });
+        }
         fn reifyApp(ctx: *anyopaque, app_idx: u32) error{OutOfMemory}!Type {
             const tc: *Typecheck = @ptrCast(@alignCast(ctx));
             return reify.reifyAppTo(tc, app_idx);
@@ -1937,6 +1945,9 @@ pub fn layoutEnv(t: *Typecheck) LayoutEngine.Env {
         .emitRecursive = T.emitRecursive,
         .emitEmptyStruct = T.emitEmptyStruct,
         .emitEmptyEnum = T.emitEmptyEnum,
+        // A value lives in a frame, so the largest frame codegen addresses bounds it.
+        .max_size = FrameLayout.MAX_FRAME,
+        .emitTooLarge = T.emitTooLarge,
         .tree = T.castTree,
         .reifyApp = T.reifyApp,
     };
