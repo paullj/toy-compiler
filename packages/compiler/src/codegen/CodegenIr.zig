@@ -245,6 +245,14 @@ pub fn verifyRefsSpilled(
     }
 }
 
+/// A struct or enum may take a whole frame (T0077 stops only a larger one), and then the
+/// frame has no room for the fn's other values; "too many locals" would misname that.
+fn frameTooLargeMessage(func: *const Ir.Function, layouts: []const Layout, enum_layouts: []const EnumLayout) []const u8 {
+    if (FrameLayout.largestSlot(func, layouts, enum_layouts) > FrameLayout.MAX_FRAME - 64 * 1024)
+        return "function frame too large for codegen (one value nearly fills the 16 MiB frame; hold large data in a Vec)";
+    return "function frame too large for codegen (too many locals)";
+}
+
 /// Whether `func`'s frame fits codegen's budget. Only `FrameTooLarge` says no: any other
 /// layout error is `lowerIr`'s to report, whatever the caller does about the frame.
 pub fn frameFits(
@@ -278,7 +286,7 @@ pub fn lowerIr(
     const fl = FrameLayout.compute(gpa, func, layouts, enum_layouts) catch |e| switch (e) {
         error.OutOfMemory => return error.OutOfMemory,
         error.FrameTooLarge => {
-            try out_diags.append(gpa, .{ .byte_offset = 0, .end = 0, .message = "function frame too large for codegen (too many locals)" });
+            try out_diags.append(gpa, .{ .byte_offset = 0, .end = 0, .message = frameTooLargeMessage(func, layouts, enum_layouts) });
             return emptyFn(gpa, func.name);
         },
         error.ParamOffsetTooLarge => {
@@ -1346,6 +1354,27 @@ test "ir-codegen: frameFits is false only past FrameLayout.MAX_FRAME" {
     defer func.deinit(gpa);
     try testing.expect(try frameFits(gpa, &func, &small, &.{}));
     try testing.expect(!try frameFits(gpa, &func, &big, &.{}));
+}
+
+test "ir-codegen: a frame that one value nearly fills says so, not too many locals" {
+    const gpa = testing.allocator;
+    const Case = struct { sizes: []const u32, message: []const u8 };
+    const cases = [_]Case{
+        .{ .sizes = &.{ FrameLayout.MAX_FRAME, 8 }, .message = "function frame too large for codegen (one value nearly fills the 16 MiB frame; hold large data in a Vec)" },
+        .{ .sizes = &.{ 14 << 20, 14 << 20 }, .message = "function frame too large for codegen (too many locals)" },
+    };
+    for (cases) |k| {
+        var layouts: [2]Layout = undefined;
+        for (&layouts, k.sizes) |*l, sz| l.* = .{ .name = "S", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = sz, .@"align" = 8 };
+        var func = try slotsOnlyFn(gpa, &.{ Type.structT(0), Type.structT(1) });
+        defer func.deinit(gpa);
+        var diags: std.ArrayList(Diagnostic) = .empty;
+        defer diags.deinit(gpa);
+        var fc = try lowerIr(gpa, &func, &layouts, &.{}, false, &diags);
+        defer fc.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), diags.items.len);
+        try testing.expectEqualStrings(k.message, diags.items[0].message);
+    }
 }
 
 test "ir-codegen: fn_addr emits adrp+add with two .func relocs" {

@@ -246,10 +246,24 @@ fn scalarAlign(kind: Kind) u32 {
         else => 1,
     };
 }
-fn roundUp(n: u32, a: u32) u32 {
+fn roundUp(n: u64, a: u32) u64 {
     if (a == 0) return n;
     return (n + a - 1) / a * a;
 }
+
+/// What `Env.emitTooLarge` reports: an aggregate laid out larger than `Env.max_size`.
+pub const TooLarge = struct {
+    kind: enum { @"struct", @"enum" },
+    /// The declared name; for a generic instance, its template's.
+    name: []const u8,
+    /// `name` is a generic template, and one of its instances is this large.
+    instance: bool = false,
+    /// For an instance of a template with no declaration, the field type it is reported
+    /// at, whose size is what makes it large.
+    holding: ?[]const u8 = null,
+    size: u64,
+    limit: u32,
+};
 
 /// The narrowed checker context the layout recursion needs. The engine owns the
 /// laying machinery but borrows the checker's tables + per-module accessors via
@@ -278,6 +292,10 @@ pub const Env = struct {
     emitEmptyStruct: *const fn (ctx: *anyopaque, at: Span, name: []const u8) error{OutOfMemory}!void,
     /// "empty enum '{s}' is not allowed" at `at`.
     emitEmptyEnum: *const fn (ctx: *anyopaque, at: Span, name: []const u8) error{OutOfMemory}!void,
+    /// The largest struct or enum a value can be. A larger one is reported with
+    /// `emitTooLarge` and poisoned, so no stage past the checker sees a size above it.
+    max_size: u32,
+    emitTooLarge: *const fn (ctx: *anyopaque, at: Span, what: TooLarge) error{OutOfMemory}!void,
     /// The active tree (after `gphSelect`). Resolved lazily inside the engine so
     /// the read happens AFTER the active-module swap (mirroring the checker).
     tree: *const fn (ctx: *anyopaque) Ast.Tree,
@@ -358,13 +376,18 @@ pub fn layoutStruct(env: Env, id: u32) error{OutOfMemory}!void {
         break;
     };
     if (all_unit) try env.emitEmptyStruct(env.ctx, env.tokSpan(env.ctx, decl.main_token), env.structs.items[id].name);
-    const poisoned = acc.poisoned or empty_poison or all_unit;
+    const poisoned = try capSize(env, acc.poisoned or empty_poison or all_unit, env.tokSpan(env.ctx, decl.main_token), .{
+        .kind = .@"struct",
+        .name = env.structs.items[id].name,
+        .size = acc.size,
+        .limit = env.max_size,
+    });
 
     env.structs.items[id].field_names = names;
     env.structs.items[id].field_types = types;
     env.structs.items[id].offsets = offsets;
     env.structs.items[id].@"align" = acc.@"align";
-    env.structs.items[id].size = if (poisoned) 0 else acc.size;
+    env.structs.items[id].size = if (poisoned) 0 else @intCast(acc.size);
     env.structs.items[id].poisoned = poisoned;
     env.structs.items[id].state = .done;
 }
@@ -387,8 +410,8 @@ pub fn layoutReified(env: Env, id: u32) error{OutOfMemory}!void {
 
     const types = env.structs.items[id].field_types;
     // A reified managed-box instance (`Ref$int`) inherits decl_node == Ast.none from its
-    // AST-less template; anchor the (poison-only) diagnostic at byte 0 rather than
-    // OOB-derefing the tree on maxInt(u32). A concrete instance never poisons.
+    // AST-less template; anchor its diagnostics at byte 0 rather than OOB-derefing the
+    // tree on maxInt(u32), and T0077 at its largest field's declaration.
     const decl_node = env.structs.items[id].decl_node;
     const at: Span = if (decl_node == Ast.none) .{ .start = 0, .end = 0 } else env.tokSpan(env.ctx, env.tree(env.ctx).nodes[decl_node.int()].main_token);
     const name = env.structs.items[id].name;
@@ -408,11 +431,18 @@ pub fn layoutReified(env: Env, id: u32) error{OutOfMemory}!void {
         break;
     };
     if (all_unit and !acc.poisoned) try env.emitEmptyStruct(env.ctx, at, name);
-    const poisoned = acc.poisoned or all_unit;
+    const fields = [_][]const Type{types};
+    const poisoned = try capSizeAt(env, acc.poisoned or all_unit, if (decl_node == Ast.none) instanceAnchor(env, &fields) else null, at, .{
+        .kind = .@"struct",
+        .name = templateName(name),
+        .instance = true,
+        .size = acc.size,
+        .limit = env.max_size,
+    });
 
     env.structs.items[id].offsets = offsets;
     env.structs.items[id].@"align" = acc.@"align";
-    env.structs.items[id].size = if (poisoned) 0 else acc.size;
+    env.structs.items[id].size = if (poisoned) 0 else @intCast(acc.size);
     env.structs.items[id].poisoned = poisoned;
     env.structs.items[id].state = .done;
 }
@@ -434,15 +464,15 @@ pub fn layoutReifiedEnum(env: Env, id: u32) error{OutOfMemory}!void {
     defer _ = env.gphSelect(env.ctx, prev);
 
     // A reified prelude-enum instance (Option$int/Result$int$str) inherits decl_node ==
-    // Ast.none from its AST-less template; anchor the (poison-only) diagnostic at byte 0
-    // rather than OOB-derefing the tree on maxInt(u32). A concrete instance never poisons.
+    // Ast.none from its AST-less template; anchor its diagnostics at byte 0 rather than
+    // OOB-derefing the tree on maxInt(u32), and T0077 at its largest payload's declaration.
     const decl_node = env.enums.items[id].decl_node;
     const at: Span = if (decl_node == Ast.none) .{ .start = 0, .end = 0 } else env.tokSpan(env.ctx, env.tree(env.ctx).nodes[decl_node.int()].main_token);
     const name = env.enums.items[id].name;
     const variants = env.enums.items[id].variants;
 
     var poisoned = false;
-    var max_payload_size: u32 = 0;
+    var max_payload_size: u64 = 0;
     var max_payload_align: u32 = 1;
     for (variants) |*v| {
         const foffs = try env.gpa.alloc(u32, v.field_types.len);
@@ -450,19 +480,30 @@ pub fn layoutReifiedEnum(env: Env, id: u32) error{OutOfMemory}!void {
         const acc = try accumulatePayload(env, v.field_types, foffs, at, name);
         poisoned = poisoned or acc.poisoned;
         v.offsets = foffs;
-        v.payload_size = acc.size;
+        v.payload_size = clampU32(acc.size);
         v.payload_align = acc.@"align";
         if (acc.size > max_payload_size) max_payload_size = acc.size;
         if (acc.@"align" > max_payload_align) max_payload_align = acc.@"align";
     }
 
     const tag_size: u32 = 8;
-    const payload_off = roundUp(tag_size, max_payload_align);
+    const payload_off: u32 = @intCast(roundUp(tag_size, max_payload_align));
     const aln = @max(@as(u32, 8), max_payload_align);
+    const size = roundUp(payload_off + max_payload_size, aln);
+    var payloads: std.ArrayList([]const Type) = .empty;
+    defer payloads.deinit(env.gpa);
+    if (decl_node == Ast.none) for (variants) |v| try payloads.append(env.gpa, v.field_types);
+    poisoned = try capSizeAt(env, poisoned, if (decl_node == Ast.none) instanceAnchor(env, payloads.items) else null, at, .{
+        .kind = .@"enum",
+        .name = templateName(name),
+        .instance = true,
+        .size = size,
+        .limit = env.max_size,
+    });
     env.enums.items[id].tag_size = tag_size;
     env.enums.items[id].payload_off = payload_off;
     env.enums.items[id].@"align" = aln;
-    env.enums.items[id].size = if (poisoned) 0 else roundUp(payload_off + max_payload_size, aln);
+    env.enums.items[id].size = if (poisoned) 0 else @intCast(size);
     env.enums.items[id].poisoned = poisoned;
     env.enums.items[id].state = .done;
 }
@@ -495,7 +536,7 @@ fn layoutReferent(env: Env, ty: Type, at: Span, requester: []const u8, requester
     }
 }
 
-const Accum = struct { size: u32, @"align": u32, poisoned: bool };
+const Accum = struct { size: u64, @"align": u32, poisoned: bool };
 
 /// The one per-field ABI offset formula, shared by the direct (`layoutStruct`) and
 /// reified (`layoutReified`) struct paths so their reg-pair↔indirect boundary can never
@@ -507,7 +548,7 @@ const Accum = struct { size: u32, @"align": u32, poisoned: bool };
 /// kernel is diagnostic-free (bar the recursion diagnostic intrinsic to `layoutReferent`).
 fn accumulateOffsets(env: Env, sizing_types: []const Type, offsets_out: []u32, at: Span, requester: []const u8) error{OutOfMemory}!Accum {
     std.debug.assert(offsets_out.len == sizing_types.len);
-    var running: u32 = 0;
+    var running: u64 = 0;
     var max_align: u32 = 1;
     var poisoned = false;
     for (sizing_types, 0..) |sty, i| {
@@ -519,7 +560,7 @@ fn accumulateOffsets(env: Env, sizing_types: []const Type, offsets_out: []u32, a
             falign = sz.@"align";
         }
         const off = roundUp(running, falign);
-        offsets_out[i] = off;
+        offsets_out[i] = clampU32(off);
         running = off + fsize;
         if (falign > max_align) max_align = falign;
     }
@@ -532,6 +573,68 @@ fn accumulateOffsets(env: Env, sizing_types: []const Type, offsets_out: []u32, a
 /// sharing the one kernel.
 fn accumulatePayload(env: Env, sizing_types: []const Type, offsets_out: []u32, at: Span, requester: []const u8) error{OutOfMemory}!Accum {
     return accumulateOffsets(env, sizing_types, offsets_out, at, requester);
+}
+
+/// Whether an aggregate is poisoned: already, or now for passing its size limit, which
+/// reports it. Only the first reason is reported, and a type holding a poisoned one
+/// sizes it as 0, so one oversized type yields one diagnostic.
+fn capSize(env: Env, poisoned: bool, at: Span, what: TooLarge) error{OutOfMemory}!bool {
+    return capSizeAt(env, poisoned, null, at, what);
+}
+
+/// `capSize` reporting at `anchor` when one is given, else at `at`.
+fn capSizeAt(env: Env, poisoned: bool, anchor: ?Anchor, at: Span, what: TooLarge) error{OutOfMemory}!bool {
+    if (poisoned) return true;
+    if (what.size <= what.limit) return false;
+    const a = anchor orelse {
+        try env.emitTooLarge(env.ctx, at, what);
+        return true;
+    };
+    const prev = env.gphSelect(env.ctx, a.mod);
+    defer _ = env.gphSelect(env.ctx, prev);
+    var w = what;
+    w.holding = a.name;
+    try env.emitTooLarge(env.ctx, env.tokSpan(env.ctx, env.tree(env.ctx).nodes[a.decl.int()].main_token), w);
+    return true;
+}
+
+const Anchor = struct { mod: u32, decl: Ast.Index, name: []const u8 };
+
+/// Where an instance of a template with no declaration (a prelude `Option`, `Ref`) is
+/// reported: at its largest struct or enum field's declaration, since that field is
+/// what makes it large. Null when no field has one, which leaves byte 0 of the module.
+fn instanceAnchor(env: Env, field_lists: []const []const Type) ?Anchor {
+    var best: ?Anchor = null;
+    var best_size: u32 = 0;
+    for (field_lists) |fts| for (fts) |ft| {
+        const sym: struct { mod: u32, decl: Ast.Index, name: []const u8, size: u32 } = switch (ft.kind) {
+            .@"struct" => blk: {
+                const s = env.structs.items[ft.struct_id];
+                break :blk .{ .mod = s.mod, .decl = s.decl_node, .name = s.name, .size = s.size };
+            },
+            .@"enum" => blk: {
+                const e = env.enums.items[ft.enum_id];
+                break :blk .{ .mod = e.mod, .decl = e.decl_node, .name = e.name, .size = e.size };
+            },
+            else => continue,
+        };
+        if (sym.decl == Ast.none or (best != null and sym.size <= best_size)) continue;
+        best = .{ .mod = sym.mod, .decl = sym.decl, .name = sym.name };
+        best_size = sym.size;
+    };
+    return best;
+}
+
+/// Sizes add up in u64 so a type of several GiB is measured, not overflowed. Only a
+/// type past `max_size`, poisoned, has a field or payload that far, so a clamped
+/// offset is never read.
+fn clampU32(n: u64) u32 {
+    return std.math.cast(u32, n) orelse std.math.maxInt(u32);
+}
+
+/// A reified instance's minted name (`Box$s3`) leads with its template's name.
+fn templateName(instance_name: []const u8) []const u8 {
+    return instance_name[0 .. std.mem.indexOfScalar(u8, instance_name, '$') orelse instance_name.len];
 }
 
 /// Lay out enum `id`: an 8-byte tag at offset 0, then payload storage sized to the
@@ -565,7 +668,7 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
         env.gpa.free(v.offsets);
     };
 
-    var max_payload_size: u32 = 0;
+    var max_payload_size: u64 = 0;
     var max_payload_align: u32 = 1;
     for (variant_nodes, 0..) |vnode_idx, vi| {
         const vnode = tree.nodes[vnode_idx.int()];
@@ -622,7 +725,7 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
             .field_names = fnames,
             .field_types = ftypes,
             .offsets = foffs,
-            .payload_size = acc.size,
+            .payload_size = clampU32(acc.size),
             .payload_align = acc.@"align",
         };
         vbuilt += 1;
@@ -631,13 +734,20 @@ pub fn layoutEnum(env: Env, id: u32) error{OutOfMemory}!void {
     }
 
     const tag_size: u32 = 8;
-    const payload_off = roundUp(tag_size, max_payload_align);
+    const payload_off: u32 = @intCast(roundUp(tag_size, max_payload_align));
     const aln = @max(@as(u32, 8), max_payload_align);
+    const size = roundUp(payload_off + max_payload_size, aln);
+    poisoned = try capSize(env, poisoned, env.tokSpan(env.ctx, decl.main_token), .{
+        .kind = .@"enum",
+        .name = env.enums.items[id].name,
+        .size = size,
+        .limit = env.max_size,
+    });
     env.enums.items[id].variants = variants;
     env.enums.items[id].tag_size = tag_size;
     env.enums.items[id].payload_off = payload_off;
     env.enums.items[id].@"align" = aln;
-    env.enums.items[id].size = if (poisoned) 0 else roundUp(payload_off + max_payload_size, aln);
+    env.enums.items[id].size = if (poisoned) 0 else @intCast(size);
     env.enums.items[id].poisoned = poisoned;
     env.enums.items[id].state = .done;
 }
@@ -784,6 +894,7 @@ const Harness = struct {
     structs: std.ArrayList(StructSym),
     enums: std.ArrayList(EnumSym),
     diags: std.ArrayList(CapturedDiag),
+    max_size: u32 = std.math.maxInt(u32),
 
     fn init(gpa: std.mem.Allocator) Harness {
         return .{
@@ -921,6 +1032,8 @@ const Harness = struct {
             .emitRecursive = stubEmitRecursive,
             .emitEmptyStruct = stubEmitEmptyStruct,
             .emitEmptyEnum = stubEmitEmptyEnum,
+            .max_size = h.max_size,
+            .emitTooLarge = stubEmitTooLarge,
             .tree = stubTree,
             .reifyApp = stubReifyApp,
         };
@@ -960,6 +1073,9 @@ fn stubEmitEmptyStruct(ctx: *anyopaque, at: Span, name: []const u8) error{OutOfM
 }
 fn stubEmitEmptyEnum(ctx: *anyopaque, at: Span, name: []const u8) error{OutOfMemory}!void {
     return pushDiag(ctx, at.start, "empty enum '{s}' is not allowed", .{name});
+}
+fn stubEmitTooLarge(ctx: *anyopaque, at: Span, w: TooLarge) error{OutOfMemory}!void {
+    return pushDiag(ctx, at.start, "{s}{s} '{s}' is {d} bytes, over the {d}-byte limit", .{ if (w.instance) "an instance of " else "", @tagName(w.kind), w.name, w.size, w.limit });
 }
 fn stubReifyApp(_: *anyopaque, _: u32) error{OutOfMemory}!Type {
     // The layout unit tests never build a struct with a concrete `App` field, so this
@@ -1212,6 +1328,83 @@ test "engine: an all-() struct is rejected as zero-sized" {
     try testing.expect(h.structs.items[0].poisoned);
     try testing.expectEqual(@as(u32, 0), h.structs.items[0].size);
     try testing.expectEqual(@as(usize, 1), countDiag(&h, "empty struct 'S' is not allowed"));
+}
+
+test "engine: a struct or enum past max_size is poisoned with one diagnostic; one at it is not (#51)" {
+    var h = Harness.init(testing.allocator);
+    defer h.deinit();
+    h.max_size = 64;
+    var eight: [8]Ast.Index = undefined;
+    for (&eight) |*f| f.* = try h.field("x", Type.int);
+    const at = try h.struct_("At", &eight);
+    var nine: [9]Ast.Index = undefined;
+    for (&nine) |*f| f.* = try h.field("x", Type.int);
+    const over = try h.struct_("Over", &nine);
+    const outer = try h.struct_("Outer", &.{ try h.field("o", Type.structT(over)), try h.field("n", Type.int) });
+    const fits = try h.enum_("Fits", &.{try h.vTuple("a", &.{ Type.int, Type.int, Type.int, Type.int, Type.int, Type.int, Type.int })});
+    const big = try h.enum_("Big", &.{ try h.vTuple("a", &.{Type.structT(at)}), try h.vUnit("b") });
+    for ([_]u32{ at, over, outer }) |id| try layoutStruct(h.env(), id);
+    for ([_]u32{ fits, big }) |id| try layoutEnum(h.env(), id);
+
+    try testing.expect(!h.structs.items[at].poisoned);
+    try testing.expectEqual(@as(u32, 64), h.structs.items[at].size);
+    try testing.expect(h.structs.items[over].poisoned);
+    try testing.expectEqual(@as(u32, 0), h.structs.items[over].size);
+    // A type holding the oversized one is not reported again.
+    try testing.expect(!h.structs.items[outer].poisoned);
+    try testing.expectEqual(@as(u32, 8), h.structs.items[outer].size);
+    try testing.expect(!h.enums.items[fits].poisoned);
+    try testing.expectEqual(@as(u32, 64), h.enums.items[fits].size);
+    try testing.expect(h.enums.items[big].poisoned);
+    try testing.expectEqual(@as(u32, 0), h.enums.items[big].size);
+
+    try testing.expectEqual(@as(usize, 2), h.diags.items.len);
+    try testing.expectEqual(@as(usize, 1), countDiag(&h, "struct 'Over' is 72 bytes, over the 64-byte limit"));
+    try testing.expectEqual(@as(usize, 1), countDiag(&h, "enum 'Big' is 72 bytes, over the 64-byte limit"));
+    try testing.expectEqual(h.starts.items[h.nodes.items[h.structs.items[over].decl_node.int()].main_token], h.diags.items[0].byte);
+}
+
+test "engine: a generic instance past max_size names its template (#51)" {
+    var h = Harness.init(testing.allocator);
+    defer h.deinit();
+    h.max_size = 8;
+    const tmpl = try h.struct_("Pair", &.{try h.field("a", Type.int)});
+    const decl = h.structs.items[tmpl].decl_node;
+    const types = try h.gpa.dupe(Type, &.{ Type.int, Type.int });
+    const names = try h.gpa.dupe([]const u8, &.{ "a", "b" });
+    try h.structs.append(h.gpa, .{ .decl_node = decl, .name = "Pair$int", .field_names = names, .field_types = types });
+    const rid: u32 = @intCast(h.structs.items.len - 1);
+    try layoutReified(h.env(), rid);
+    try testing.expect(h.structs.items[rid].poisoned);
+    try testing.expectEqual(@as(u32, 0), h.structs.items[rid].size);
+
+    const variants = try h.gpa.alloc(VariantSym, 1);
+    variants[0] = .{ .name = "some", .form = .tuple, .field_names = try h.gpa.alloc([]const u8, 0), .field_types = try h.gpa.dupe(Type, &.{Type.int}) };
+    try h.enums.append(h.gpa, .{ .decl_node = Ast.none, .name = "Opt$int", .variants = variants });
+    try layoutReifiedEnum(h.env(), 0);
+    try testing.expect(h.enums.items[0].poisoned);
+
+    try testing.expectEqual(@as(usize, 1), countDiag(&h, "an instance of struct 'Pair' is 16 bytes, over the 8-byte limit"));
+    try testing.expectEqual(@as(usize, 1), countDiag(&h, "an instance of enum 'Opt' is 16 bytes, over the 8-byte limit"));
+}
+
+test "engine: an aggregate past 4 GiB is measured and reported, not overflowed (#51)" {
+    var h = Harness.init(testing.allocator);
+    defer h.deinit();
+    const huge = try h.struct_("Huge", &.{});
+    h.structs.items[huge].size = 3 << 30;
+    h.structs.items[huge].@"align" = 8;
+    h.structs.items[huge].state = .done;
+    const two = try h.struct_("Two", &.{ try h.field("a", Type.structT(huge)), try h.field("b", Type.structT(huge)), try h.field("n", Type.int) });
+    try layoutStruct(h.env(), two);
+    try testing.expect(h.structs.items[two].poisoned);
+    try testing.expectEqual(@as(u32, 0), h.structs.items[two].size);
+    try testing.expectEqual(@as(usize, 1), countDiag(&h, "struct 'Two' is 6442450952 bytes, over the 4294967295-byte limit"));
+
+    const e = try h.enum_("E", &.{try h.vTuple("v", &.{ Type.structT(huge), Type.structT(huge) })});
+    try layoutEnum(h.env(), e);
+    try testing.expect(h.enums.items[e].poisoned);
+    try testing.expectEqual(@as(usize, 1), countDiag(&h, "enum 'E' is 6442450952 bytes, over the 4294967295-byte limit"));
 }
 
 test "engine: snapshot owns its strings and omits poison; poisoned struct snapshots size 0" {

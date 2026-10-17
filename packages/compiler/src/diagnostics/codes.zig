@@ -129,6 +129,7 @@ pub const Code = enum(u16) {
     T0074, // index-element-assign (`xs[i] = v`: an index element is no place to store to)
     T0075, // temporary-field-assign (`f(..).x = v` writes a field of a temporary copy)
     T0076, // receiver-mode-mismatch (a conformance method's `self`/`mut self` differs from its protocol's)
+    T0077, // type-too-large (a struct or enum larger than the largest value codegen can address)
 
     // Warning band (W####).
     W0001, // unused-variable
@@ -270,6 +271,7 @@ pub const table = [_]Entry{
     .{ .code = .T0074, .str = "T0074", .slug = "index-element-assign" },
     .{ .code = .T0075, .str = "T0075", .slug = "temporary-field-assign" },
     .{ .code = .T0076, .str = "T0076", .slug = "receiver-mode-mismatch" },
+    .{ .code = .T0077, .str = "T0077", .slug = "type-too-large" },
     .{ .code = .W0001, .str = "W0001", .slug = "unused-variable", .default_severity = .warning },
     .{ .code = .W0002, .str = "W0002", .slug = "unused-parameter", .default_severity = .warning },
     .{ .code = .W0003, .str = "W0003", .slug = "unused-function", .default_severity = .warning },
@@ -567,6 +569,8 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("temporary-field-assign", slug(.T0075).?);
     try testing.expectEqualStrings("receiver-mode-mismatch", slug(.T0076).?);
     try testing.expectEqual(Code.T0076, fromStr("T0076").?);
+    try testing.expectEqualStrings("type-too-large", slug(.T0077).?);
+    try testing.expectEqual(Code.T0077, fromStr("T0077").?);
 
     try testing.expectEqualStrings("W0013", str(.W0013).?);
     try testing.expectEqualStrings("fn-field-method-clash", slug(.W0013).?);
