@@ -68,8 +68,12 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
                 continue;
             };
 
-            // Completeness: every method the protocol requires must be provided.
             const provided = Ast.implMethods(t.tree, decl);
+            // T0013 rejected the receiver pattern: the impl conforms to nothing, so it has
+            // no completeness or signature to get wrong.
+            if (t.implRejected(mod, decl.lhs)) continue;
+
+            // Completeness: every method the protocol requires must be provided.
             for (t.protocols.items[pid].methods) |req| {
                 var found = false;
                 for (provided) |mnode| {
@@ -114,6 +118,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
             var pargs_buf: std.ArrayList(Type) = .empty;
             defer pargs_buf.deinit(t.gpa);
             var pargs_ok = true;
+            var rejected = false;
             for (arg_nodes) |an| {
                 const aty = t.typeFromNode(an);
                 switch (aty.kind) {
@@ -122,10 +127,12 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
                     else => {
                         try t.sink.report(.{ .span = t.spanOf(an), .code = .T0013 }, "a generic-protocol argument must be a concrete non-composite value type (composite protocol args are not yet supported)", .{});
                         pargs_ok = false;
+                        rejected = true;
                     },
                 }
                 try pargs_buf.append(t.gpa, aty);
             }
+            if (rejected) try t.noteRejectedImpl(mod, decl.lhs, recv);
             if (!pargs_ok) continue;
             const pargs = pargs_buf.items;
 

@@ -763,6 +763,43 @@ pub const TemplateMethod = struct {
     protocol_args: []const Type = &.{},
 };
 
+/// An impl T0013 rejected: for its receiver pattern (`impl Box[int]`), or for a protocol
+/// arg it cannot take (`impl P has Into[Option[int]]`). That is its only error, so a
+/// conformance or method it would have provided is not reported missing.
+pub const RejectedImpl = struct {
+    mod: u32,
+    /// The impl's receiver type-ref node.
+    recv_node: Ast.Index,
+    /// The receiver: a concrete type, or for a generic one its ctor as a nominal type
+    /// (`structT(ctor)`), which no value has.
+    recv: Type,
+    /// The protocol of a conformance, null for an inherent impl.
+    protocol: ?u32,
+
+    fn receives(r: RejectedImpl, composite: *Composite, ty: Type) bool {
+        if (!ty.isApp()) return Type.eql(r.recv, ty);
+        const e = composite.at(ty.appIdx());
+        const kind: Kind = if (e.ctor_is_enum) .@"enum" else .@"struct";
+        return r.recv.kind == kind and r.recv.nominalId() == e.ctor;
+    }
+};
+
+/// Whether a rejected impl would have made `ty` conform to `pid`.
+pub fn rejectedConformance(rejected: []const RejectedImpl, composite: *Composite, ty: Type, pid: u32) bool {
+    for (rejected) |r| if (r.protocol == pid and r.receives(composite, ty)) return true;
+    return false;
+}
+
+/// Whether a rejected conformance would have given `ty` method `member`.
+pub fn rejectedProtocolMethod(rejected: []const RejectedImpl, protocols: []const ProtocolSym, composite: *Composite, ty: Type, member: []const u8) bool {
+    for (rejected) |r| {
+        const pid = r.protocol orelse continue;
+        if (!r.receives(composite, ty)) continue;
+        for (protocols[pid].methods) |m| if (std.mem.eql(u8, m, member)) return true;
+    }
+    return false;
+}
+
 /// Where a method call is written, which decides between same-named methods. In the
 /// program, its own method wins over a bundled one. In a bundled module, a program's
 /// method that shadows a bundled method or a builtin (`Method.shadows`) is not a
@@ -1520,6 +1557,14 @@ methods: std.ArrayList(Method) = .empty,
 /// turns each reachable `(instance, template)` into a concrete reified `methods` entry.
 templates: std.ArrayList(TemplateMethod) = .empty,
 
+/// The methods of every impl that T0013 rejects for its receiver pattern (see
+/// `implPatternFault`), shaped like `templates` but never dispatched. They exist so that
+/// the rejection is the impl's only error: a call of one is not reported again.
+rejected_methods: std.ArrayList(TemplateMethod) = .empty,
+
+/// Every impl T0013 rejects, once each (see `RejectedImpl`).
+rejected_impls: std.ArrayList(RejectedImpl) = .empty,
+
 /// The program-wide protocol table, built SERIALLY in Phase 0c
 /// (`registerProtocols`) in module-then-decl order (a protocol's global id is its
 /// index here). Frozen onto the `Model`; freed at teardown (each entry's `methods`
@@ -1756,6 +1801,11 @@ pub const Model = struct {
     /// The generic-type method TEMPLATE table, frozen from Pass A. Read-only during
     /// the parallel body pass; drives `BodyChecker` generic-receiver dispatch.
     templates: []const TemplateMethod,
+    /// The methods of the impls T0013 rejected, frozen from Pass A (see
+    /// `Typecheck.rejected_methods`). Read only to keep a call of one from a second error.
+    rejected_methods: []const TemplateMethod,
+    /// The impls T0013 rejected, frozen after coherence (see `RejectedImpl`).
+    rejected_impls: []const RejectedImpl,
     /// The program-wide protocol table + recorded conformances, frozen before
     /// the parallel body pass. Read-only; no Pass-C consumer (sets up the conformance query).
     protocols: []const ProtocolSym,
@@ -1791,6 +1841,8 @@ fn buildModel(t: *Typecheck) Model {
         .gph_fn_names = t.gph_fn_names,
         .methods = t.methods.items,
         .templates = t.templates.items,
+        .rejected_methods = t.rejected_methods.items,
+        .rejected_impls = t.rejected_impls.items,
         .protocols = t.protocols.items,
         .conformances = t.conformances.items,
         .template_conformances = t.template_conformances.items,
@@ -2069,6 +2121,8 @@ pub fn checkGraph(
         // The template table owns no per-entry heap data (names are borrowed source);
         // on success `toOwnedSlice` empties it, so this frees only the backing array.
         t.templates.deinit(gpa);
+        t.rejected_methods.deinit(gpa);
+        t.rejected_impls.deinit(gpa);
         // On success `toOwnedSlice` empties the protocol table (the result frees it).
         freeProtocolEntries(gpa, t.protocols.items);
         t.protocols.deinit(gpa);
@@ -3272,6 +3326,7 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
         if (subst_buf.len == 0 and isDerivableProtocol(model, pid) and
             try conform.structural(model.structs, model.enums, model.conformances, args[ord], pid, &cmemo, t.gpa, t.composite, &.{}))
             continue;
+        if (rejectedConformance(model.rejected_impls, t.composite, args[ord], pid)) return;
         _ = t.gphSelect(mod);
         const tname = t.typeName(args[ord]);
         const pname = model.protocols[pid].name;
@@ -4084,26 +4139,11 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
             // A generic receiver `impl Box[T]`: `self_ty` is a check-time `App`.
             // Record its ctor into the TEMPLATE table so `findGenericMethod` dispatches
             // off a concrete receiver `App`'s ctor without dereferencing the
-            // (post-typecheck-freed) composite. A fully-GROUND receiver App (no `type_var`
-            // arg) would be a concrete-type inherent impl (`impl Box[int]`), which is
-            // coherence territory — reject it cleanly rather than mint an
-            // uninstantiable template.
+            // (post-typecheck-freed) composite. A pattern no template can serve (see
+            // `implPatternFault`) is rejected rather than minted as an uninstantiable
+            // template.
             const e = t.composite.at(self_ty.appIdx());
-            var any_var = false;
-            for (e.args) |a| if (a.isTypeVar()) {
-                any_var = true;
-            };
-            if (!any_var) {
-                try t.sink.report(.{ .span = t.spanOf(recv_type), .code = .T0013 }, "an inherent 'impl' on a concrete type instance is not yet supported (use 'impl Box[T]')", .{});
-                return;
-            }
-            // The impl's params are the pattern's args, in order: a concrete or repeated
-            // arg would leave a param no receiver binds.
-            for (e.args, 0..) |a, i| if (!a.isTypeVar() or a.typeVarOrd() != i) {
-                try t.sink.report(.{ .span = t.spanOf(recv_type), .code = .T0013 }, "an inherent 'impl' whose pattern is partly concrete or repeats a name is not yet supported; name each type parameter once, as in 'impl Pair[A, B]'", .{});
-                return;
-            };
-            try t.templates.append(t.gpa, .{
+            const tm: TemplateMethod = .{
                 .recv_ctor = e.ctor,
                 .recv_is_enum = e.ctor_is_enum,
                 .name = name,
@@ -4111,7 +4151,14 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                 .mut_self = mut_self,
                 .has_self = has_self,
                 .bundled = t.graph.mods[mod].bundled,
-            });
+            };
+            if (implPatternFault(e.args)) |fault| {
+                try t.reportImplPattern(recv_type, e, fault);
+                try t.rejected_methods.append(t.gpa, tm);
+                try t.noteRejectedImpl(mod, recv_type, if (e.ctor_is_enum) Type.enumT(e.ctor) else Type.structT(e.ctor));
+                return;
+            }
+            try t.templates.append(t.gpa, tm);
         } else {
             try t.methods.append(t.gpa, .{
                 .recv = self_ty,
@@ -4123,6 +4170,75 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
             });
         }
     }
+}
+
+/// Why an impl's receiver pattern cannot be a template: a fully ground receiver
+/// (`impl Box[int]`) is a concrete-type impl, which is coherence territory; a partly
+/// concrete or repeated arg (`impl Pair[T, int]`, `impl Pair[T, T]`) would leave an impl
+/// param that no receiver binds, since the impl's params are the pattern's args, in order.
+const ImplPatternFault = enum { concrete, partial };
+
+fn implPatternFault(args: []const Type) ?ImplPatternFault {
+    var any_var = false;
+    for (args) |a| if (a.isTypeVar()) {
+        any_var = true;
+    };
+    if (!any_var) return .concrete;
+    for (args, 0..) |a, i| if (!a.isTypeVar() or a.typeVarOrd() != i) return .partial;
+    return null;
+}
+
+/// T0013 at an impl's receiver pattern. It names the kind of impl and suggests the
+/// pattern spelled with the type's own params (`impl Cell[T]`).
+fn reportImplPattern(t: *Typecheck, recv_type: Ast.Index, e: anytype, fault: ImplPatternFault) !void {
+    const kind = if (t.implProtocolOf(recv_type) != null) "a conformance" else "an inherent";
+    const sym_name = if (e.ctor_is_enum) t.enums.items[e.ctor].name else t.structs.items[e.ctor].name;
+    const sym_params = if (e.ctor_is_enum) t.enums.items[e.ctor].generic_params else t.structs.items[e.ctor].generic_params;
+    const pattern: ImplPattern = .{ .name = sym_name, .params = sym_params };
+    switch (fault) {
+        .concrete => try t.sink.report(.{ .span = t.spanOf(recv_type), .code = .T0013 }, "{s} 'impl' on a concrete type instance is not yet supported (use 'impl {f}')", .{ kind, pattern }),
+        .partial => try t.sink.report(.{ .span = t.spanOf(recv_type), .code = .T0013 }, "{s} 'impl' whose pattern is partly concrete or repeats a name is not yet supported; name each type parameter once, as in 'impl {f}'", .{ kind, pattern }),
+    }
+}
+
+const ImplPattern = struct {
+    name: []const u8,
+    params: []const []const u8,
+
+    pub fn format(p: ImplPattern, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.print("{s}[", .{p.name});
+        for (p.params, 0..) |n, i| {
+            if (i != 0) try w.writeAll(", ");
+            try w.writeAll(n);
+        }
+        try w.writeByte(']');
+    }
+};
+
+/// The protocol ref of the conformance (`has P`) whose receiver type-ref is `recv_type`,
+/// or null for an inherent impl. The fn table records only the receiver node, so this
+/// finds the impl that owns it.
+fn implProtocolOf(t: *const Typecheck, recv_type: Ast.Index) ?Ast.Index {
+    const prog = t.tree.nodes[Ast.root(t.tree.nodes).int()];
+    if (prog.tag != .program) return null;
+    for (Ast.rangeSlice(t.tree, prog.lhs.int())) |d| {
+        const decl = t.tree.nodes[d.int()];
+        if (decl.tag == .impl_has_decl and decl.lhs == recv_type) return Ast.implProtocol(t.tree, decl);
+    }
+    return null;
+}
+
+/// Record the impl at receiver node `recv_node` of module `mod` as rejected, once.
+pub fn noteRejectedImpl(t: *Typecheck, mod: u32, recv_node: Ast.Index, recv: Type) !void {
+    if (t.implRejected(mod, recv_node)) return;
+    const pid = if (t.implProtocolOf(recv_node)) |pr| t.protocolIdFromNode(pr) else null;
+    try t.rejected_impls.append(t.gpa, .{ .mod = mod, .recv_node = recv_node, .recv = recv, .protocol = pid });
+}
+
+/// Whether the impl at receiver node `recv_node` of module `mod` was rejected.
+pub fn implRejected(t: *const Typecheck, mod: u32, recv_node: Ast.Index) bool {
+    for (t.rejected_impls.items) |r| if (r.mod == mod and r.recv_node == recv_node) return true;
+    return false;
 }
 
 /// Decode a bodyless `extern fn` signature into the global fn table (kind `.import`).
@@ -10741,6 +10857,114 @@ test "an impl pattern that is partly concrete or repeats a name is T0013" {
         try expectOnlyDiag(src, .T0013);
         try expectOneDiag(src, .T0013, want);
     }
+}
+
+test "an impl rejected for its pattern is its only error: no conformance check, no error at its calls (#66)" {
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src =
+        \\struct Box[T] { v: T }
+        \\impl Box[int] has Into[int] {
+        \\    fn into(self) -> int { self.v }
+        \\}
+        \\fn main() -> int {
+        \\    b := Box { v: 7 }
+        \\    f := b.into
+        \\    return b.into() + (b |> .into()) + f()
+        \\}
+        \\
+        , .want = "a conformance 'impl' on a concrete type instance is not yet supported (use 'impl Box[T]')" },
+        .{ .src =
+        \\struct Cell[T] { v: T }
+        \\impl Cell[int] {
+        \\    fn get(self) -> int { self.v }
+        \\    fn twice(self) -> int { self.v * 2 }
+        \\}
+        \\fn main() -> int {
+        \\    c := Cell { v: 7 }
+        \\    return c.get() + c.twice()
+        \\}
+        \\
+        , .want = "an inherent 'impl' on a concrete type instance is not yet supported (use 'impl Cell[T]')" },
+        .{ .src =
+        \\struct Pair[K, V] { k: K, v: V }
+        \\impl Pair[K, K] has Into[int] {
+        \\    fn into(self) -> int { 1 }
+        \\}
+        \\fn main() -> int {
+        \\    p := Pair { k: 1, v: 2 }
+        \\    return p.into()
+        \\}
+        \\
+        , .want = "a conformance 'impl' whose pattern is partly concrete or repeats a name is not yet supported; name each type parameter once, as in 'impl Pair[K, V]'" },
+        .{ .src =
+        \\enum Opt[T] { some(T), none }
+        \\impl Opt[int] {
+        \\    fn get(self) -> int { 1 }
+        \\}
+        \\fn main() -> int {
+        \\    o := Opt.some(1)
+        \\    return o.get()
+        \\}
+        \\
+        , .want = "an inherent 'impl' on a concrete type instance is not yet supported (use 'impl Opt[T]')" },
+        // A bound the rejected conformance would have met is not reported unmet.
+        .{ .src =
+        \\protocol Show { fn render(self) -> int }
+        \\struct Cell[T] { v: T }
+        \\impl Cell[int] has Show { fn render(self) -> int { self.v } }
+        \\fn use_show[T has Show](t: T) -> int { t.render() }
+        \\fn main() -> int {
+        \\    b := Cell { v: 7 }
+        \\    return use_show(b)
+        \\}
+        \\
+        , .want = "a conformance 'impl' on a concrete type instance is not yet supported (use 'impl Cell[T]')" },
+        // Nor is a call of its method through the type.
+        .{ .src =
+        \\struct Box[T] { v: T }
+        \\impl Box[int] {
+        \\    fn make() -> Box[int] { Box { v: 1 } }
+        \\    fn get(self) -> int { self.v }
+        \\}
+        \\fn main() -> int {
+        \\    b := Box[int].make()
+        \\    c := Box.make()
+        \\    return b.get() + c.v + Box.get(b)
+        \\}
+        \\
+        , .want = "an inherent 'impl' on a concrete type instance is not yet supported (use 'impl Box[T]')" },
+        // A conformance rejected for its protocol args is the only error too.
+        .{ .src =
+        \\struct P { x: int }
+        \\impl P has Into[Option[int]] { fn into(self) -> Option[int] { Option.some(self.x) } }
+        \\fn main() -> int {
+        \\    p := P { x: 1 }
+        \\    _o: Option[int] = p.into[Option[int]]()
+        \\    return 0
+        \\}
+        \\
+        , .want = "a generic-protocol argument must be a concrete non-composite value type (composite protocol args are not yet supported)" },
+    };
+    for (cases) |c| {
+        try expectOnlyDiag(c.src, .T0013);
+        try expectOneDiag(c.src, .T0013, c.want);
+    }
+
+    // A method the rejected impl does not provide is still an error.
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Box[T] { v: T }
+        \\impl Box[int] { fn get(self) -> int { self.v } }
+        \\fn main() -> int {
+        \\    b := Box { v: 7 }
+        \\    return b.get() + b.nope()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0013, c.result.diags[0].code);
+    try testing.expectEqual(codes.Code.T0018, c.result.diags[1].code);
 }
 
 test "an associated fn named through a type is not a value" {
