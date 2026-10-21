@@ -539,15 +539,7 @@ pub const GraphResult = struct {
         gpa.free(self.owned_msgs);
         for (self.sigs) |s| gpa.free(@constCast(s.params));
         gpa.free(self.sigs);
-        for (self.layouts) |l| {
-            gpa.free(l.name);
-            for (l.field_names) |fn_| gpa.free(fn_);
-            gpa.free(l.field_names);
-            gpa.free(l.field_types);
-            gpa.free(l.offsets);
-            if (l.fn_sig) |fs| gpa.free(fs.params);
-        }
-        gpa.free(self.layouts);
+        LayoutEngine.freeLayouts(gpa, self.layouts);
         for (self.enum_layouts) |e| {
             gpa.free(e.name);
             for (e.variants) |v| {
@@ -4688,6 +4680,28 @@ test "an uninstantiated generic enum (and struct) is clean and reifies NOTHING" 
     try testing.expectEqual(@as(usize, 0), reified);
     // The un-gated generic STRUCT case stays clean too (regression guard).
     try testing.expectEqual(@as(usize, 0), try checkDiagCount("struct Box[T] { v: T }\nfn main() -> int { return 0 }\n"));
+}
+
+test "a reified struct instance keeps its template name as source_name; a plain struct has none" {
+    const gpa = testing.allocator;
+    var c = try checkSource("struct Pair[T] { a: T, b: T }\nstruct Wrap[T] { p: Pair[T] }\nstruct P { x: int }\nfn main() -> int {\n w := Wrap{ p: Pair{ a: 1, b: 2 } }\n q := P{ x: 3 }\n return w.p.a + q.x\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    var pairs: usize = 0;
+    var wraps: usize = 0;
+    for (c.result.layouts) |l| {
+        if (std.mem.startsWith(u8, l.name, "Pair$")) {
+            pairs += 1;
+            try testing.expectEqualStrings("Pair", l.source_name.?);
+        } else if (std.mem.startsWith(u8, l.name, "Wrap$")) {
+            wraps += 1;
+            try testing.expectEqualStrings("Wrap", l.source_name.?);
+        } else if (std.mem.eql(u8, l.name, "P")) {
+            try testing.expect(l.source_name == null);
+        }
+    }
+    try testing.expectEqual(@as(usize, 1), pairs);
+    try testing.expectEqual(@as(usize, 1), wraps);
 }
 
 test "an inherent method typechecks clean; the call types to the method return; one method-table entry" {

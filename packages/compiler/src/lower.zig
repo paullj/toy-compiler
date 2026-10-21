@@ -1559,6 +1559,10 @@ pub fn hashStrAtPtr(b: *Builder, base: Ir.ValueId) error{OutOfMemory}!Ir.ValueId
 /// `gc_alloc`'d packed byte buffer and returns the str reg-pair {ptr,len} (x0:x1).
 const int_to_str_sym: Link.SymName = .{ .kind = .builtin, .name = "__int_to_str" };
 
+/// The `__uint_to_str` builtin's stable symbol identity — `__int_to_str`'s unsigned twin
+/// for the 64-bit unsigned types, whose top bit would otherwise render as a sign.
+const uint_to_str_sym: Link.SymName = .{ .kind = .builtin, .name = "__uint_to_str" };
+
 /// The `__str_concat` builtin's stable symbol identity — joins two str values into a fresh
 /// `gc_alloc`'d packed byte buffer and returns the str reg-pair {ptr,len} (x0:x1).
 const str_concat_sym: Link.SymName = .{ .kind = .builtin, .name = "__str_concat" };
@@ -1680,7 +1684,8 @@ pub fn appendPiece(b: *Builder, acc: Ir.SlotId, piece: Ir.SlotId) error{OutOfMem
 /// The SOLE producer of a value's `str` rendering — the authority `to_string` (and the
 /// derive `display` emitters) consume. `op` is `ty`'s already-lowered operand. Returns a `str` slot:
 ///   * str    -> the operand's own slot (identity, no alloc).
-///   * int    -> `__int_to_str` into a fresh cell (i64::MIN-correct never-negate render).
+///   * int    -> `__int_to_str` into a fresh cell (i64::MIN-correct never-negate render);
+///     a 64-bit unsigned int goes to `__uint_to_str` instead.
 ///   * bool   -> `cond_br` selecting the const-data `"true"`/`"false"` literal.
 ///   * unit   -> the const-data `"()"` literal (no alloc).
 ///   * struct/enum (incl `char`) -> resolve the `display` witness and call it -> a fresh
@@ -1707,7 +1712,8 @@ pub fn displayToSlot(b: *Builder, ty: Typecheck.Type, op: Ir.Operand) error{OutO
             errdefer b.gpa.free(args);
             args[0] = .{ .value = v };
             const slot = try b.addSlot(Typecheck.Type.str);
-            _ = try b.emit(.{ .call = .{ .callee = int_to_str_sym, .args = args, .ret_slot = slot } }, null);
+            const callee = if (ty.isUnsignedInt() and ty.intBits() == 64) uint_to_str_sym else int_to_str_sym;
+            _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = slot } }, null);
             return slot;
         },
         .bool => {
@@ -2425,8 +2431,8 @@ noinline fn lowerBuiltinMethod(b: *Builder, node_idx: Ast.Index, n: Ast.Node, k:
         },
         .scalar_to_string => {
             // The `displayToSlot` renderer. `str` is identity (share the immutable receiver,
-            // no alloc); int/bool/unit build a fresh str (via `__int_to_str` / the literal
-            // cond / the const-data `"()"`).
+            // no alloc); int/bool/unit build a fresh str (via `__int_to_str` or
+            // `__uint_to_str` / the literal cond / the const-data `"()"`).
             const recv_ty = b.in.nodes.typeOf(recv);
             if (recv_ty.kind == .str) return try lowerExpr(b, recv);
             const op = try lowerExpr(b, recv);

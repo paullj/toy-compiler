@@ -179,6 +179,7 @@ fn reifyAppToStruct(t: *Typecheck, app_idx: u32) error{OutOfMemory}!u32 {
     try t.structs.append(t.gpa, .{
         .decl_node = tmpl.decl_node,
         .name = name,
+        .source_name = tmpl.name,
         .mod = tmpl.mod,
         .is_generic = false,
         // Tag the reified instance by the PRELUDE template id (not the mangled name — a

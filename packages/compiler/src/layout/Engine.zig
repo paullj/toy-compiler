@@ -45,12 +45,21 @@ pub const Layout = struct {
     /// carried through so codegen reads it directly rather than re-deriving tuple-ness
     /// by sniffing whether the first field name leads with a digit.
     is_tuple: bool = false,
+    /// The template name of a reified generic instance (`Pair` for `Pair$int`), else null.
+    /// Owned. Copied from `StructSym`; see `displayName`.
+    source_name: ?[]const u8 = null,
     /// See `NativeStructFamily`: `.ref`/`.gc_array` on a reified managed-box instance,
     /// else `.none`. Copied from `StructSym` in `snapshotLayouts`; lets the table-aware
     /// reference predicate recognize a managed box per-instance (not by live App index).
     native_family: NativeStructFamily = .none,
     /// Set on the `{code, env}` pair a function type reifies to; `params` owned.
     fn_sig: ?FnSig = null,
+
+    /// The name a value of this struct renders under: the mangled instance name carries
+    /// its type arguments as ids (`Pair$int`, `Box$s3`), which are not source syntax.
+    pub fn displayName(l: Layout) []const u8 {
+        return l.source_name orelse l.name;
+    }
 };
 
 /// A function type's signature. Pre-reify it borrows a composite fn entry's `args`; on a
@@ -159,6 +168,9 @@ pub const StructSym = struct {
     /// (`N(args)` is positional, not `N{..}`) and `.N` access in the checker. Layout /
     /// derive / Display reuse the record machinery over the numeric field names.
     is_tuple: bool = false,
+    /// The template name of a reified generic instance, else null. Set in
+    /// `reifyAppToStruct`; borrows the template's `name`.
+    source_name: ?[]const u8 = null,
     /// See `NativeStructFamily`: `.ref`/`.gc_array` on a reified managed-box instance,
     /// else `.none`. Set in `reifyAppToStruct` (keyed off the prelude template id);
     /// copied into the snapshot `Layout`.
@@ -778,6 +790,7 @@ pub fn snapshotLayouts(gpa: std.mem.Allocator, structs: []const StructSym) ![]La
             .size = s.size,
             .@"align" = s.@"align",
             .is_tuple = s.is_tuple,
+            .source_name = if (s.source_name) |sn| try gpa.dupe(u8, sn) else null,
             .native_family = s.native_family,
             .fn_sig = if (s.fn_sig) |fs| .{ .params = try gpa.dupe(Type, fs.params), .ret = fs.ret } else null,
         };
@@ -789,6 +802,7 @@ pub fn snapshotLayouts(gpa: std.mem.Allocator, structs: []const StructSym) ![]La
 pub fn freeLayouts(gpa: std.mem.Allocator, layouts: []const Layout) void {
     for (layouts) |l| {
         gpa.free(l.name);
+        if (l.source_name) |sn| gpa.free(sn);
         for (l.field_names) |fn_| gpa.free(fn_);
         gpa.free(l.field_names);
         gpa.free(l.field_types);
@@ -1453,6 +1467,26 @@ test "engine: snapshotLayouts carries native_family onto the Layout" {
     const l2 = try snapshotLayouts(testing.allocator, h.structs.items);
     defer freeLayouts(testing.allocator, l2);
     try testing.expectEqual(NativeStructFamily.none, l2[uid].native_family);
+}
+
+test "engine: snapshotLayouts carries source_name; displayName prefers it over the mangled name" {
+    var h = Harness.init(testing.allocator);
+    defer h.deinit();
+    const f = try h.field("a", Type.int);
+    const id = try h.struct_("Pair$int", &.{f});
+    h.structs.items[id].source_name = "Pair";
+    try layoutStruct(h.env(), id);
+    const g = try h.field("x", Type.int);
+    const uid = try h.struct_("Plain", &.{g});
+    try layoutStruct(h.env(), uid);
+
+    const layouts = try snapshotLayouts(testing.allocator, h.structs.items);
+    defer freeLayouts(testing.allocator, layouts);
+    try testing.expectEqualStrings("Pair$int", layouts[id].name);
+    try testing.expectEqualStrings("Pair", layouts[id].source_name.?);
+    try testing.expectEqualStrings("Pair", layouts[id].displayName());
+    try testing.expect(layouts[uid].source_name == null);
+    try testing.expectEqualStrings("Plain", layouts[uid].displayName());
 }
 
 test "engine: memoization — a second layoutStruct is a no-op (state stays done)" {
