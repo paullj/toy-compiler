@@ -14,6 +14,8 @@ list: std.ArrayList(Error) = .empty,
 
 pub const Kind = enum {
     unknown_flag,
+    /// A first positional close to a subcommand name; `suggestion` is that name.
+    unknown_command,
     /// A flag of another command: `arg` is its spelling, `expected` that command, `where`
     /// the command parsed.
     declined_flag,
@@ -34,7 +36,8 @@ pub const Error = struct {
     got: []const u8 = "",
     expected: []const u8 = "",
     where: []const u8 = "",
-    // enum `bad_value` only: a near-miss choice, a slice into the static choice list.
+    // A near miss from the spec (an enum choice, a long name without its dashes, or a
+    // subcommand name), a slice into static spec data; "" when nothing is close.
     suggestion: []const u8 = "",
 };
 

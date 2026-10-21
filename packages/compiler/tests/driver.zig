@@ -5031,6 +5031,45 @@ test "a build-only flag on check is named as one, and each bad flag is reported 
     }
 }
 
+test "an unknown command or long flag suggests the near name, and a second input names the command (#70)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toy-test-driver-near-names";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const a = dir_name ++ "/a.toy";
+    const b = dir_name ++ "/b.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = a, .data = "fn main() -> int {\n    return 0\n}\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = b, .data = "fn main() -> int {\n    return 0\n}\n" });
+
+    const trailer = "Try 'toy --help' for more information.\n";
+    const runs = [_]struct { argv: []const []const u8, err: []const u8 }{
+        .{ .argv = &.{ "buidl", a }, .err = "error: unknown command 'buidl'\ndid you mean 'build'?\n" ++ trailer },
+        .{ .argv = &.{ "chek", a }, .err = "error: unknown command 'chek'\ndid you mean 'check'?\n" ++ trailer },
+        .{ .argv = &.{"lps"}, .err = "error: unknown command 'lps'\ndid you mean 'lsp'?\n" ++ trailer },
+        .{ .argv = &.{ "--colr", a }, .err = "error: unknown flag: --colr\ndid you mean '--color'?\n" ++ trailer },
+        .{ .argv = &.{ "check", "--no-cahce", a }, .err = "error: unknown flag: --no-cahce\ndid you mean '--no-cache'?\n" ++ trailer },
+        .{ .argv = &.{ "check", "-Z", a }, .err = "error: unknown flag: -Z\n" ++ trailer },
+        .{ .argv = &.{ a, b }, .err = "error: toy takes exactly one input file (the entry module)\n" },
+        .{ .argv = &.{ "rn", a }, .err = "error: toy takes exactly one input file (the entry module)\n" },
+        .{ .argv = &.{ "build", a, b }, .err = "error: build takes exactly one input file (the entry module)\n" },
+        .{ .argv = &.{ "run", a, b }, .err = "error: run takes exactly one input file (the entry module)\n" },
+    };
+    for (runs) |r| {
+        const res = try spawnToyBoth(gpa, io, r.argv);
+        defer gpa.free(res.out);
+        defer gpa.free(res.err);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+        try testing.expectEqualStrings("", res.out);
+        try testing.expectEqualStrings(r.err, res.err);
+    }
+}
+
 test "every enum or range flag lists its valid values, on build, run and check (#70)" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
@@ -5154,4 +5193,28 @@ test "severity flags list the bands and suggest a near code; explain ignores cas
         try testing.expect(std.mem.indexOf(u8, res.out, "code or band (L|P|R|T|W)") != null);
         try testing.expect(std.mem.indexOf(u8, res.out, "code or band (W)") != null);
     }
+}
+
+test "a word near a command that names an existing file still builds (#70)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.requireToy(io);
+
+    const dir_name = ".toy-test-driver-near-name-files";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src = "fn main() -> int {\n    return 3\n}\n";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir_name ++ "/fun", .data = src });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir_name ++ "/lisp", .data = src });
+    const abs = try Io.Dir.cwd().realPathFileAlloc(io, dir_name, gpa);
+    defer gpa.free(abs);
+
+    try harness.buildIn(gpa, io, abs, &.{ "fun", "-o", "f1" });
+    try harness.buildIn(gpa, io, abs, &.{ "lisp", "-o", "f2" });
+    try testing.expectEqual(@as(u8, 3), try harness.runExitIn(gpa, io, abs, "f1"));
+    try testing.expectEqual(@as(u8, 3), try harness.runExitIn(gpa, io, abs, "f2"));
 }
