@@ -1,0 +1,24 @@
+# expect: exit 117
+# Feature: `std/gc` forces a collection and counts them. Nothing has collected before the
+# first `gc.collect()`, so `gc.collections()` reads exactly 1 after it. Churning ~20000
+# dead `Vec[int]` past the growth watermark must collect again, so the count rises; the
+# rooted `keep` survives every collection and still reads 7. Each check has its own
+# decimal place: 1*100 + 1*10 + 7 = 117.
+import std/gc
+import std/vec
+
+fn main() -> int {
+    keep: Vec[int] = []
+    keep.push(7)
+    gc.collect()
+    forced := gc.collections()
+    i := 0
+    loop {
+        if i >= 20000 { break }
+        junk: Vec[int] = []
+        junk.push(i)
+        i = i + 1
+    }
+    rose := if gc.collections() > forced { 1 } else { 0 }
+    return forced * 100 + rose * 10 + keep[0]
+}

@@ -131,6 +131,7 @@ const import_hints = std.StaticStringMap(ImportHint).initComptime(.{
     .{ "io", ImportHint{ .module = "io" } },
     .{ "math", ImportHint{ .module = "math" } },
     .{ "iter", ImportHint{ .module = "iter" } },
+    .{ "gc", ImportHint{ .module = "gc" } },
     .{ "vec", ImportHint{ .module = "vec" } },
     .{ "map", ImportHint{ .module = "map" } },
     .{ "set", ImportHint{ .module = "set" } },
@@ -221,6 +222,7 @@ test "importHintFor: exact stdlib names hint; typos, prelude generics, and unkno
 
     inline for (.{ "Map", "Set", "map", "set", "vec", "math", "iter" }) |n|
         try std.testing.expect(importHintFor(n) != null);
+    try std.testing.expectEqualStrings("gc", importHintFor("gc").?.module);
     try std.testing.expectEqualStrings("ref", importHintFor("Ref").?.module);
     try std.testing.expect(importHintFor("Ref").?.spelling == null);
 

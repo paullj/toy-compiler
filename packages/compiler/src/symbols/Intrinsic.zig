@@ -35,15 +35,16 @@ pub fn name(k: Kind) []const u8 {
     };
 }
 
-/// Which modules may name an intrinsic. The `Ref` cell intrinsics back `std/ref`'s methods,
-/// so std must reach them too; the raw heap/pointer ones stay inside `core`. No `Kind` is
-/// `.global`: that is the scope of the resolver's other seeded builtin, `panic`, which
-/// shares this enum so one seeding table covers both.
+/// Which modules may name an intrinsic. The `Ref` cell intrinsics back `std/ref`'s methods
+/// and the collection trigger and counter back `std/gc`, so std must reach them too; they
+/// take no pointer, so naming them cannot break memory safety. The raw heap/pointer ones
+/// stay inside `core`. No `Kind` is `.global`: that is the scope of the resolver's other
+/// seeded builtin, `panic`, which shares this enum so one seeding table covers both.
 pub const Scope = enum { global, core, bundled };
 
 pub fn scope(k: Kind) Scope {
     return switch (k) {
-        .ref_new, .ref_get, .ref_set => .bundled,
+        .ref_new, .ref_get, .ref_set, .gc_collect, .gc_stats => .bundled,
         else => .core,
     };
 }
@@ -62,4 +63,11 @@ test "name/lookup round-trip over every Kind, in seed order" {
     try std.testing.expectEqual(Kind.ref_set, order[order.len - 1]);
     for (order) |k| try std.testing.expectEqual(k, lookup(name(k)).?);
     try std.testing.expect(lookup("not_an_intrinsic") == null);
+}
+
+test "scope: std reaches the Ref cells and the gc counters; raw heap stays core" {
+    for ([_]Kind{ .ref_new, .ref_get, .ref_set, .gc_collect, .gc_stats }) |k|
+        try std.testing.expectEqual(Scope.bundled, scope(k));
+    for ([_]Kind{ .gc_alloc, .gc_span_count, .gc_array, .store, .load, .offset }) |k|
+        try std.testing.expectEqual(Scope.core, scope(k));
 }
