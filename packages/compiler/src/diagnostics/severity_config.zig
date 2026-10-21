@@ -8,7 +8,9 @@ const std = @import("std");
 const codes = @import("codes.zig");
 const model = @import("model.zig");
 
-/// What a rule does to a matched code: promote to error, demote to warning, or drop.
+/// What a rule does to a matched code: promote to error, show as a warning, or drop.
+/// `.warning` and `.ignore` never apply to a code whose default is an error; the CLI
+/// also rejects a spec that names only errors (`codes.errorOnly`).
 pub const Action = enum { err, warning, ignore };
 
 /// One override: `match` is a full code string ("R0001") or a single band letter
@@ -37,6 +39,10 @@ pub fn resolve(code: codes.Code, default: model.Severity, cfg: SeverityConfig) ?
     var eff: ?model.Severity = default;
     for (cfg.rules) |r| {
         if (!matches(r, code)) continue;
+        // An error stops the build whatever it renders as, so weakening one would only
+        // hide why. The CLI rejects error-only specs; this also covers a band that
+        // holds both errors and warnings.
+        if (default == .err and r.action != .err) continue;
         eff = switch (r.action) {
             .err => .err,
             .warning => .warning,
@@ -61,21 +67,29 @@ test "empty config is identity (byte-identity gate)" {
 }
 
 test "exact downgrades; band downgrades a whole band; other bands untouched" {
-    const one = [_]Rule{.{ .match = "R0001", .action = .warning }};
-    try testing.expectEqual(model.Severity.warning, resolve(.R0001, .err, .{ .rules = &one }).?);
-    try testing.expectEqual(model.Severity.err, resolve(.R0002, .err, .{ .rules = &one }).?);
-    const band = [_]Rule{.{ .match = "T", .action = .warning }};
-    try testing.expectEqual(model.Severity.warning, resolve(.T0001, .err, .{ .rules = &band }).?);
-    try testing.expectEqual(model.Severity.warning, resolve(.T0012, .err, .{ .rules = &band }).?);
-    try testing.expectEqual(model.Severity.err, resolve(.R0001, .err, .{ .rules = &band }).?);
+    const deny = [_]Rule{ .{ .match = "W", .action = .err }, .{ .match = "W0001", .action = .warning } };
+    try testing.expectEqual(model.Severity.warning, resolve(.W0001, .warning, .{ .rules = &deny }).?);
+    try testing.expectEqual(model.Severity.err, resolve(.W0002, .warning, .{ .rules = &deny }).?);
+    const band = [_]Rule{ .{ .match = "W", .action = .err }, .{ .match = "W", .action = .warning } };
+    try testing.expectEqual(model.Severity.warning, resolve(.W0001, .warning, .{ .rules = &band }).?);
+    try testing.expectEqual(model.Severity.warning, resolve(.W0002, .warning, .{ .rules = &band }).?);
+    try testing.expectEqual(model.Severity.warning, resolve(.T0005, .warning, .{ .rules = &.{.{ .match = "W", .action = .err }} }).?);
 }
 
 test "ignore returns null (drop); last-match-wins" {
-    const ig = [_]Rule{.{ .match = "R0001", .action = .ignore }};
-    try testing.expectEqual(@as(?model.Severity, null), resolve(.R0001, .err, .{ .rules = &ig }));
-    const chain = [_]Rule{ .{ .match = "R", .action = .warning }, .{ .match = "R0001", .action = .err } };
-    try testing.expectEqual(model.Severity.err, resolve(.R0001, .err, .{ .rules = &chain }).?);
-    try testing.expectEqual(model.Severity.warning, resolve(.R0002, .err, .{ .rules = &chain }).?);
+    const ig = [_]Rule{.{ .match = "W0001", .action = .ignore }};
+    try testing.expectEqual(@as(?model.Severity, null), resolve(.W0001, .warning, .{ .rules = &ig }));
+    const chain = [_]Rule{ .{ .match = "W", .action = .ignore }, .{ .match = "W0001", .action = .err } };
+    try testing.expectEqual(model.Severity.err, resolve(.W0001, .warning, .{ .rules = &chain }).?);
+    try testing.expectEqual(@as(?model.Severity, null), resolve(.W0002, .warning, .{ .rules = &chain }));
+}
+
+test "an error-default code is never weakened, even by a band rule that also names warnings" {
+    const rules = [_]Rule{ .{ .match = "R", .action = .warning }, .{ .match = "R0001", .action = .ignore } };
+    try testing.expectEqual(model.Severity.err, resolve(.R0001, .err, .{ .rules = &rules }).?);
+    try testing.expectEqual(model.Severity.err, resolve(.R0002, .err, .{ .rules = &rules }).?);
+    try testing.expectEqual(model.Severity.warning, resolve(.T0005, .warning, .{ .rules = &.{.{ .match = "T", .action = .warning }} }).?);
+    try testing.expectEqual(@as(?model.Severity, null), resolve(.T0005, .warning, .{ .rules = &.{.{ .match = "T", .action = .ignore }} }));
 }
 
 test "deny_warnings promotes a surviving warning but never resurrects an ignored one" {
@@ -83,8 +97,8 @@ test "deny_warnings promotes a surviving warning but never resurrects an ignored
     try testing.expectEqual(model.Severity.err, resolve(.R0001, .err, .{ .deny_warnings = true }).?);
     const ig = [_]Rule{.{ .match = "W0001", .action = .ignore }};
     try testing.expectEqual(@as(?model.Severity, null), resolve(.W0001, .warning, .{ .rules = &ig, .deny_warnings = true }));
-    const w = [_]Rule{.{ .match = "R0001", .action = .warning }};
-    try testing.expectEqual(model.Severity.err, resolve(.R0001, .err, .{ .rules = &w, .deny_warnings = true }).?);
+    const w = [_]Rule{.{ .match = "W0001", .action = .warning }};
+    try testing.expectEqual(model.Severity.err, resolve(.W0001, .warning, .{ .rules = &w, .deny_warnings = true }).?);
 }
 
 test ".none never matches a band/exact rule" {

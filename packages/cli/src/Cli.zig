@@ -53,10 +53,11 @@ const post_emit: []const Spec.Option = &.{
     .{ .long = "timings", .action = .set_true, .help = "Print the per-stage wall-clock profile" },
     .{ .long = "color", .value = .{ .@"enum" = &.{ "auto", "always", "never" } }, .value_name = "WHEN", .help = "Colorize output (default auto: on when stdout is a tty)" },
     // Per-code severity overrides. Repeatable; take a code (R0001) or a band
-    // letter (L/P/R/T/W). Fixed precedence allow > warn > deny; last match wins.
+    // letter (L/P/R/T/W), but --warn/--allow only a warning one, since an error stops the
+    // build whatever it is shown as. Fixed precedence allow > warn > deny; last match wins.
     .{ .long = "deny", .value = .string, .action = .append, .value_name = "CODE", .help = "Treat a diagnostic code or band as an error (repeatable, e.g. --deny R0001 or --deny T)" },
-    .{ .long = "warn", .value = .string, .action = .append, .value_name = "CODE", .help = "Downgrade a diagnostic code or band to a warning (repeatable)" },
-    .{ .long = "allow", .value = .string, .action = .append, .value_name = "CODE", .help = "Suppress a diagnostic code or band from output (repeatable)" },
+    .{ .long = "warn", .value = .string, .action = .append, .value_name = "CODE", .help = "Keep a warning code or band a warning, overriding --deny (repeatable; not for error codes)" },
+    .{ .long = "allow", .value = .string, .action = .append, .value_name = "CODE", .help = "Suppress a warning code or band from output (repeatable; not for error codes)" },
     .{ .long = "deny-warnings", .action = .set_true, .help = "Treat any surviving warning as an error (non-zero exit)" },
 };
 
@@ -83,8 +84,8 @@ const files_pos: []const Spec.Positional = &.{
 const check_opts: []const Spec.Option = &.{
     .{ .long = "format", .value = .{ .@"enum" = &.{ "human", "ndjson" } }, .value_name = "FORM", .help = "Diagnostic output form (human snippets or line-delimited JSON; default human)" },
     .{ .long = "deny", .value = .string, .action = .append, .value_name = "CODE", .help = "Treat a diagnostic code or band as an error (repeatable, e.g. --deny R0001 or --deny T)" },
-    .{ .long = "warn", .value = .string, .action = .append, .value_name = "CODE", .help = "Downgrade a diagnostic code or band to a warning (repeatable)" },
-    .{ .long = "allow", .value = .string, .action = .append, .value_name = "CODE", .help = "Suppress a diagnostic code or band from output (repeatable)" },
+    .{ .long = "warn", .value = .string, .action = .append, .value_name = "CODE", .help = "Keep a warning code or band a warning, overriding --deny (repeatable; not for error codes)" },
+    .{ .long = "allow", .value = .string, .action = .append, .value_name = "CODE", .help = "Suppress a warning code or band from output (repeatable; not for error codes)" },
     .{ .long = "deny-warnings", .action = .set_true, .help = "Treat any surviving warning as an error (non-zero exit)" },
     .{ .long = "exit-zero", .action = .set_true, .help = "Always exit 0, even when diagnostics contain errors" },
     .{ .long = "watch", .action = .set_true, .help = "Re-check on file changes (not yet implemented; accepted as a no-op)" },

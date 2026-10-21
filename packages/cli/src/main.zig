@@ -47,6 +47,7 @@ const DiagRender = @import("DiagRender.zig");
 const Check = toyc.Check;
 const Decide = toyc.Decide;
 const SevCfg = toyc.diagnostics.severity_config;
+const codes = toyc.diagnostics.codes;
 const sty_err = DiagRender.sty_err;
 const sty_ok = DiagRender.sty_ok;
 const sty_head = DiagRender.sty_head;
@@ -391,7 +392,8 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
     for (p.opt) |pass| st.opt.set(optPass(pass), true);
     for (p.no_opt) |pass| st.opt.set(optPass(pass), false);
     // Severity overrides; a bad spec is a build arg-error (exit 1). See `buildSevRules`.
-    if (try buildSevRules(gpa, p, sev_rules)) |msg| return argErrCode(usage, msg);
+    var msg_buf: [sev_msg_max]u8 = undefined;
+    if (try buildSevRules(gpa, p, sev_rules, &msg_buf)) |msg| return argErrCode(usage, msg);
     st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
     // p.file is a variadic slice borrowing argv/arena; copy the ELEMENTS (slices) —
     // not the bytes — into paths, which shares argv's lifetime, so nothing dangles.
@@ -424,35 +426,53 @@ fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, usage: Usage, st: *State
     st.timings = p.timings;
     // Severity overrides; a bad spec is a check USAGE error -> exit 2 (not the build
     // path's 1). See `buildSevRules`.
-    if (try buildSevRules(gpa, p, sev_rules)) |msg| return usageCode(usage, msg);
+    var msg_buf: [sev_msg_max]u8 = undefined;
+    if (try buildSevRules(gpa, p, sev_rules, &msg_buf)) |msg| return usageCode(usage, msg);
     st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
     for (p.file) |f| try st.paths.append(gpa, f);
     return null;
 }
+
+/// Room for a `buildSevRules` message: a spec that reaches the formatted text is a
+/// valid code or band, so it is at most 5 bytes.
+const sev_msg_max = 160;
 
 /// Append the `--deny`/`--warn`/`--allow` severity rules onto `sev_rules` in FIXED
 /// severity order — all deny, then all warn, then all allow — so that under `resolve`'s
 /// last-match-wins semantics `allow` dominates `warn` dominates `deny` for a code named
 /// by multiple flags, deterministically and independent of cross-flag argv position (the
 /// flat model loses cross-flag order — the same documented deviation as --verify/--no-cache).
-/// Each spec must be a known code (R0001) or a band letter (L/P/R/T/W). Returns the
-/// offending "<flag>: ..." message on the first invalid spec, or null on success; the
-/// caller maps a non-null message to its own exit code (build exit 1, check exit 2).
+/// Each spec must be a known code (R0001) or a band letter (L/P/R/T/W), and a `--warn` or
+/// `--allow` spec must not name only errors. Returns the offending "<flag>: ..." message
+/// (formatted into `msg_buf`) on the first invalid spec, or null on success; the caller
+/// maps a non-null message to its own exit code (build exit 1, check exit 2).
 /// `--deny-warnings` (read by the caller) promotes surviving warnings uniformly via `resolve`.
-fn buildSevRules(gpa: std.mem.Allocator, p: anytype, sev_rules: *std.ArrayList(SevCfg.Rule)) !?[]const u8 {
+fn buildSevRules(gpa: std.mem.Allocator, p: anytype, sev_rules: *std.ArrayList(SevCfg.Rule), msg_buf: []u8) !?[]const u8 {
     for (p.deny) |m| {
         if (!Decide.validSpec(m)) return "--deny: unknown code or band (e.g. R0001 or R)";
         try sev_rules.append(gpa, .{ .match = m, .action = .err });
     }
     for (p.warn) |m| {
-        if (!Decide.validSpec(m)) return "--warn: unknown code or band (e.g. R0001 or R)";
+        if (warningSpecError("--warn", m, msg_buf)) |msg| return msg;
         try sev_rules.append(gpa, .{ .match = m, .action = .warning });
     }
     for (p.allow) |m| {
-        if (!Decide.validSpec(m)) return "--allow: unknown code or band (e.g. R0001 or R)";
+        if (warningSpecError("--allow", m, msg_buf)) |msg| return msg;
         try sev_rules.append(gpa, .{ .match = m, .action = .ignore });
     }
     return null;
+}
+
+/// The usage message for a `--warn`/`--allow` spec that is unknown or names only errors,
+/// or null when the spec is a usable warning code or band. Even with an error hidden the
+/// build still stops on it (`Orchestrator.hasError`), so allowing one would only make
+/// `build` fail silently and `check` pass a program `build` rejects.
+fn warningSpecError(flag: []const u8, m: []const u8, msg_buf: []u8) ?[]const u8 {
+    if (!Decide.validSpec(m))
+        return std.fmt.bufPrint(msg_buf, "{s}: unknown code or band (e.g. W0001 or W)", .{flag}) catch unreachable;
+    if (!codes.errorOnly(m)) return null;
+    const kind = if (m.len == 1) "band" else "code";
+    return std.fmt.bufPrint(msg_buf, "{s}: '{s}' is an error {s}, and no flag can hide an error; {s} takes only a warning code or band (e.g. W0001 or W)", .{ flag, m, kind, flag }) catch unreachable;
 }
 
 /// Like `argErrCode` but returns `2` (a USAGE error, not a compile failure): the `check`
