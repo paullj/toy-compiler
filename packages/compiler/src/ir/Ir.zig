@@ -208,15 +208,14 @@ pub const Terminator = union(enum) {
     /// Function return. Emitted only by the single EXIT block; `.none` for unit.
     ret: Operand,
     @"unreachable",
-    /// An unconditional hardware trap: codegen emits a single `brk #0`, aborting
-    /// the process with SIGILL. Distinct from `.@"unreachable"` (which emits NOTHING, a
-    /// fall-through preserving the `never` byte budget) so adding it churns no existing
-    /// never-typed FnCode. Terminates its block with no successors (like `ret`); used
-    /// only by `Option`/`Result` `unwrap`'s failure arm.
+    /// The failure arm of `Option`/`Result` `unwrap`: codegen calls the runtime
+    /// `panic` with a fixed message (then a `brk #0` backstop). Distinct from
+    /// `.@"unreachable"`, which emits NOTHING: it ends a block control never reaches
+    /// the end of, such as one ending in a never-typed call. No successors (like `ret`).
     trap,
-    /// A runtime panic with a known cause. Codegens to the same `brk #0` as `.trap`
-    /// for now (message + backtrace deferred); the reason rides the terminator
-    /// so a later pass maps reason -> message with no lower re-plumbing. No successors.
+    /// A runtime panic with a known cause: codegen calls the runtime `panic` with the
+    /// reason's message, which prints it and a backtrace and exits 1 (then a `brk #0`
+    /// backstop). No successors.
     panic: PanicReason,
 
     pub const PanicReason = enum { div_by_zero, rem_by_zero, index_oob };

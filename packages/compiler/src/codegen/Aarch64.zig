@@ -483,9 +483,9 @@ pub const ldpFpLrPost: u32 = 0xA8C17BFD;
 /// ret (returns to x30). → 0xD65F03C0.
 pub const ret: u32 = 0xD65F03C0;
 
-/// brk #0 — a software breakpoint that aborts with SIGILL. The single instruction
-/// emitted for the `.trap` IR terminator (`Option`/`Result` `unwrap`'s failure arm); no
-/// other trap primitive exists on this backend. → 0xD4200000.
+/// brk #0 — a software breakpoint that aborts with SIGILL. The backstop after the
+/// `bl panic` that the `.trap` and `.panic` IR terminators emit, should `panic` ever
+/// return. → 0xD4200000.
 pub const brk0: u32 = 0xD4200000;
 
 /// svc #0x80 — the macOS/XNU supervisor-call gate. XNU takes the syscall number

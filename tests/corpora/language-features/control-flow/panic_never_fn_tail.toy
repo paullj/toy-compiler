@@ -1,0 +1,9 @@
+# expect: exit 1
+# Feature: a fn whose body ends in `panic(..)` needs no dead `return` after it.
+fn boom(_n: int) -> int {
+    panic("bad")
+}
+
+fn main() -> int {
+    return boom(1)
+}

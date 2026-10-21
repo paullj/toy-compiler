@@ -135,24 +135,12 @@ fn familyName(fam: LayoutEngine.NativeEnumFamily) []const u8 {
 
 /// Reachability + must-use lint DECISIONS as pure functions over a read-only cursor,
 /// mirroring `ControlFlow`. Kept beside the divergence walks they consume; the emitting
-/// `BodyChecker.warn*` methods are thin shims that build a `Ctx`, call these, and render
+/// `BodyChecker.warn*` methods are thin shims that build a `ControlFlow.Ctx`, call these, and render
 /// the diagnostic — so the decision logic is unit-tested here without a `DiagnosticSink`.
 const Lint = struct {
-    /// What the lints read: `ControlFlow.Ctx` (divergence is delegated through it so the
-    /// two coverage paths cannot drift) plus the fn table the panic gate needs. A
-    /// by-value struct-of-slices, allocation-free, built once per block.
-    const Ctx = struct {
-        flow: ControlFlow.Ctx,
-        fns: []const FnSym,
-
-        fn fromChecker(bc: anytype) Ctx {
-            return .{ .flow = ControlFlow.Ctx.fromChecker(bc), .fns = bc.model.fns };
-        }
-    };
-
     /// Index into `stmts` of the first statement made unreachable by a preceding always-
     /// diverging statement, or null. (Emit side: W0005, at most once per block.)
-    fn firstUnreachable(ctx: Ctx, stmts: []const Ast.Index) ?usize {
+    fn firstUnreachable(ctx: ControlFlow.Ctx, stmts: []const Ast.Index) ?usize {
         if (stmts.len < 2) return null;
         for (stmts[0 .. stmts.len - 1], 1..) |s, next| {
             if (divergesForReach(ctx, s)) return next;
@@ -163,28 +151,14 @@ const Lint = struct {
     /// Whether `stmt_idx` always transfers control away, so a following statement in the
     /// same block cannot run. `ControlFlow.stmtDiverges` is the shared authority; it is
     /// NOT modified here. The `never` clause additionally catches a `var_decl` bound to a
-    /// diverging value (`x := loop {}`), which `stmtDiverges` leaves `false`, and
-    /// `panic(..)` — a `unit`-typed builtin call no type-based test can see — is caught
-    /// structurally.
-    fn divergesForReach(ctx: Ctx, stmt_idx: Ast.Index) bool {
-        if (ControlFlow.stmtDiverges(ctx.flow, stmt_idx)) return true;
-        if (ctx.flow.node_types[stmt_idx.int()].kind == .never) return true;
-        return stmtIsPanic(ctx, stmt_idx);
-    }
-
-    /// Whether `stmt_idx` is a bare `panic(..)` call statement. Gated on BOTH the seeded
-    /// builtin kind and the name so a user-declared `fn panic` (a `.user_fn`) never fires.
-    fn stmtIsPanic(ctx: Ctx, stmt_idx: Ast.Index) bool {
-        const tree = ctx.flow.tree;
-        const s = tree.nodes[stmt_idx.int()];
-        if (s.tag != .expr_stmt) return false;
-        const inner = tree.nodes[s.lhs.int()];
-        if (inner.tag != .call) return false;
-        const callee = tree.nodes[inner.lhs.int()];
-        if (callee.tag != .identifier) return false;
-        if (ctx.flow.resolutions[inner.lhs.int()] != .func) return false;
-        const f = ctx.fns[ctx.flow.resolutions[inner.lhs.int()].func];
-        return f.kind == .builtin and std.mem.eql(u8, ctx.flow.tokens[callee.main_token].text(ctx.flow.source), "panic");
+    /// diverging value (`x := loop {}`) and a never-typed call statement (`panic(..)`),
+    /// which `stmtDiverges` leaves `false`. A non-final `expr_stmt` carries no type of its
+    /// own, so its expression's type is read.
+    fn divergesForReach(ctx: ControlFlow.Ctx, stmt_idx: Ast.Index) bool {
+        if (ControlFlow.stmtDiverges(ctx, stmt_idx)) return true;
+        const s = ctx.tree.nodes[stmt_idx.int()];
+        const typed = if (s.tag == .expr_stmt) s.lhs else stmt_idx;
+        return ctx.node_types[typed.int()].kind == .never;
     }
 
     /// The literal-bool condition token to warn on (a bare `true`/`false`), or null.
@@ -500,10 +474,6 @@ pub const BodyChecker = struct {
         return ControlFlow.Ctx.fromChecker(bc);
     }
 
-    fn lint(bc: *const BodyChecker) Lint.Ctx {
-        return Lint.Ctx.fromChecker(bc);
-    }
-
     pub fn blockReturns(bc: *const BodyChecker, block_idx: Ast.Index) bool {
         return ControlFlow.blockReturns(bc.cflow(), block_idx);
     }
@@ -579,7 +549,7 @@ pub const BodyChecker = struct {
     /// emits a diagnostic, so it never perturbs the definite-return / fall-off logic
     /// nor the emitted machine code. At most one W0005 per block (no cascade).
     fn warnUnreachable(bc: *BodyChecker, stmts: []const Ast.Index) error{OutOfMemory}!void {
-        const dead = Lint.firstUnreachable(bc.lint(), stmts) orelse return;
+        const dead = Lint.firstUnreachable(bc.cflow(), stmts) orelse return;
         try bc.sink.report(.{ .span = bc.spanOf(stmts[dead]), .code = .W0005 }, "unreachable code; the previous statement always diverges", .{});
     }
 
@@ -3926,25 +3896,19 @@ pub const BodyChecker = struct {
                     },
                 };
             }
-            if (!try bc.checkArity(node_idx, args, 1)) {
-                bc.node_types[(node_idx).int()] = Type.unit;
-                return Type.unit;
-            }
-            const at = try bc.typeOf(args[0]);
-            if (at.kind == .invalid) {
-                // The arg already reported its own error; type the call unit, don't cascade.
-                bc.node_types[(node_idx).int()] = Type.unit;
-                return Type.unit;
-            }
             // `panic(msg)`: the message must be a `str` (it lowers to a raw {ptr,len}
             // write; a non-str arg would be marshalled per its own ABI and misread).
-            // Discriminate by the callee token — the Model fn carries no name. Type the
-            // call `.unit` regardless so a bad arg reports exactly once without cascading.
+            // Discriminate by the callee token — the Model fn carries no name. The call is
+            // `never` on every path, a bad arity or arg included: it still cannot return,
+            // so the enclosing fn or arm must not also report a missing value.
             if (callee.tag == .identifier and std.mem.eql(u8, bc.nameText(callee.main_token), "panic")) {
-                if (at.kind != .str)
-                    try bc.sink.report(.{ .span = bc.spanOf(args[0]), .code = .T0040 }, "panic message must be a 'str', got '{s}'", .{bc.typeName(at)});
-                bc.node_types[(node_idx).int()] = Type.unit;
-                return Type.unit;
+                if (try bc.checkArity(node_idx, args, 1)) {
+                    const at = try bc.typeOf(args[0]);
+                    if (at.kind != .str and at.kind != .invalid and at.kind != .never)
+                        try bc.sink.report(.{ .span = bc.spanOf(args[0]), .code = .T0040 }, "panic message must be a 'str', got '{s}'", .{bc.typeName(at)});
+                }
+                bc.node_types[(node_idx).int()] = Type.never;
+                return Type.never;
             }
             // No other 1-arg builtin exists post the intrinsic switch above; a `.func` here
             // is not a builtin call the checker recognizes. Reject rather than fall into the
@@ -4831,53 +4795,13 @@ pub const BodyChecker = struct {
 };
 
 // The flow-lint decision logic lives in the `Lint` namespace as pure functions over a
-// read-only `Lint.Ctx`, so it is unit-tested here on hand-built node graphs (the same
+// read-only `ControlFlow.Ctx`, so it is unit-tested here on hand-built node graphs (the same
 // idiom `ControlFlow` uses) without standing up a whole `BodyChecker` + `DiagnosticSink`.
 // The `Builder` is reused from `ControlFlow` — the module whose walks `Lint` consumes.
 const testing = std.testing;
 const Builder = @import("ControlFlow.zig").Builder;
 
-test "Lint.stmtIsPanic fires only on the builtin panic call" {
-    var b = Builder.init(testing.allocator);
-    defer b.deinit();
-
-    // panic()  ==  expr_stmt(call(identifier))
-    const callee = try b.add(.{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
-    const call = try b.add(.{ .tag = .call, .main_token = 0, .lhs = callee, .rhs = Ast.none });
-    const stmt = try b.add(.{ .tag = .expr_stmt, .main_token = 0, .lhs = call, .rhs = Ast.none });
-    b.resolutions.items[callee.int()] = .{ .func = 0 };
-    const bare = try b.ret();
-
-    // Build a Lint.Ctx literally so tokens + the fn table can be injected (Builder.ctx
-    // supplies neither). token[0] is the callee name spelled by `src`.
-    const mk = struct {
-        fn ctx(bb: *Builder, toks: []const Token, src: []const u8, fns: []const FnSym) Lint.Ctx {
-            return .{ .flow = .{
-                .tree = .{ .nodes = bb.nodes.items, .extra = bb.extra.items },
-                .resolutions = bb.resolutions.items,
-                .node_types = bb.node_types.items,
-                .enums = &.{},
-                .tokens = toks,
-                .source = src,
-            }, .fns = fns };
-        }
-    }.ctx;
-
-    const panic_toks = [_]Token{.{ .tag = .identifier, .start = 0, .end = 5 }};
-    const builtin_fns = [_]FnSym{.{ .decl_node = Ast.none, .kind = .builtin, .params = &.{}, .ret = .unit }};
-    const user_fns = [_]FnSym{.{ .decl_node = Ast.none, .kind = .user_fn, .params = &.{}, .ret = .unit }};
-
-    // Builtin kind + name "panic" → fires.
-    try testing.expect(Lint.stmtIsPanic(mk(&b, &panic_toks, "panic", &builtin_fns), stmt));
-    // Same spelling but resolving to a user fn → not the builtin panic.
-    try testing.expect(!Lint.stmtIsPanic(mk(&b, &panic_toks, "panic", &user_fns), stmt));
-    // Builtin kind but a different name ("print") → the name gate rejects it.
-    try testing.expect(!Lint.stmtIsPanic(mk(&b, &panic_toks, "print", &builtin_fns), stmt));
-    // A non-call statement never matches.
-    try testing.expect(!Lint.stmtIsPanic(mk(&b, &panic_toks, "panic", &builtin_fns), bare));
-}
-
-test "Lint.divergesForReach unions control-flow divergence, never-typed, and panic" {
+test "Lint.divergesForReach unions control-flow divergence and never-typed statements" {
     var b = Builder.init(testing.allocator);
     defer b.deinit();
 
@@ -4886,13 +4810,23 @@ test "Lint.divergesForReach unions control-flow divergence, never-typed, and pan
     // A `var_decl` bound to a diverging value is `never`-typed (`x := loop {}`).
     const never_stmt = try b.add(.{ .tag = .var_decl, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
     b.node_types.items[never_stmt.int()] = Type.never;
-    // A plain declaration falls through.
+    // `panic(..)` as a non-final statement: only its call is typed, the expr_stmt is not.
+    const callee = try b.add(.{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
+    const call = try b.add(.{ .tag = .call, .main_token = 0, .lhs = callee, .rhs = Ast.none });
+    b.node_types.items[call.int()] = Type.never;
+    const panic_stmt = try b.add(.{ .tag = .expr_stmt, .main_token = 0, .lhs = call, .rhs = Ast.none });
+    // A plain declaration and a unit call statement fall through.
     const plain = try b.add(.{ .tag = .var_decl, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
+    const unit_call = try b.add(.{ .tag = .call, .main_token = 0, .lhs = callee, .rhs = Ast.none });
+    b.node_types.items[unit_call.int()] = Type.unit;
+    const unit_stmt = try b.add(.{ .tag = .expr_stmt, .main_token = 0, .lhs = unit_call, .rhs = Ast.none });
 
-    const c = Lint.Ctx{ .flow = b.ctx(), .fns = &.{} };
+    const c = b.ctx();
     try testing.expect(Lint.divergesForReach(c, ret_loop));
     try testing.expect(Lint.divergesForReach(c, never_stmt));
+    try testing.expect(Lint.divergesForReach(c, panic_stmt));
     try testing.expect(!Lint.divergesForReach(c, plain));
+    try testing.expect(!Lint.divergesForReach(c, unit_stmt));
 }
 
 test "Lint.firstUnreachable returns the first dead index, or null when nothing follows a divergence" {
@@ -4903,7 +4837,7 @@ test "Lint.firstUnreachable returns the first dead index, or null when nothing f
     const p1 = try b.add(.{ .tag = .var_decl, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
     const p2 = try b.add(.{ .tag = .var_decl, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
 
-    const c = Lint.Ctx{ .flow = b.ctx(), .fns = &.{} };
+    const c = b.ctx();
     // [diverge, dead, dead] → first unreachable at index 1 (reported once).
     try testing.expectEqual(@as(?usize, 1), Lint.firstUnreachable(c, &.{ ret_loop, p1, p2 }));
     // Nothing follows the divergence, or there is no divergence → null.

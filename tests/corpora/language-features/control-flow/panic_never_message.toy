@@ -1,0 +1,6 @@
+# expect: exit 1
+# Feature: the message of a panic may itself be `never`: the inner panic runs and
+# the outer one is dead.
+fn main() -> int {
+    panic(panic("inner"))
+}

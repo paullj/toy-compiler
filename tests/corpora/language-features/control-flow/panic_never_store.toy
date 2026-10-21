@@ -1,0 +1,49 @@
+# expect: exit 21
+# Feature: a `panic(..)` (typed `never`) fits as the value of a binding, an
+# assignment or a field store, scalar or not. Every panic here is on a path the
+# program does not take, so lowering must end the block at the panic and drop the
+# store that would follow it.
+struct P { a: int }
+
+fn bound(n: int) -> int {
+    if n < 0 {
+        x: int = panic("bound")
+        return x
+    }
+    return n
+}
+
+fn inferred(n: int) -> int {
+    if n < 0 {
+        x := panic("inferred")
+    }
+    return n
+}
+
+fn assigned(n: int) -> int {
+    y := n
+    if n < 0 { y = panic("assigned") }
+    return y
+}
+
+fn field(n: int) -> int {
+    p := P { a: n }
+    if n < 0 { p.a = panic("field") }
+    return p.a
+}
+
+fn all_arms(n: int, c: bool) -> int {
+    if n < 0 {
+        x := match c { true -> panic("a"), false -> panic("b"), }
+    }
+    return n
+}
+
+fn label(n: int) -> int {
+    s: str = if n > 0 { "abc" } else { panic("label") }
+    return s.len()
+}
+
+fn main() -> int {
+    return bound(1) + inferred(2) + assigned(3) + field(4) + all_arms(5, true) + label(1) * 2
+}

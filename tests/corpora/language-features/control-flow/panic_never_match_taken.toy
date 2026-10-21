@@ -1,0 +1,12 @@
+# expect: exit 1
+# Feature: the panic arm of a match value runs when taken and exits 1.
+fn pick(n: int) -> int {
+    match n {
+        0 -> 10,
+        _ -> panic("bad"),
+    }
+}
+
+fn main() -> int {
+    return pick(3)
+}
