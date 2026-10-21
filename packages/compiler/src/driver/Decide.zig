@@ -16,8 +16,8 @@ const Diagnostic = @import("../diagnostics/Sink.zig").Diagnostic;
 /// least one diagnostic resolved to an error. `--deny-warnings` (-Werror) is applied
 /// UPSTREAM in `SevCfg.resolve`, so a promoted warning already counts as an error in the
 /// tally here — there is no per-warning branch. `--exit-zero` DOMINATES (editors that
-/// read the stream, not the status). IO/CLI failures (exit 2) are handled by the caller
-/// before reaching here.
+/// read the stream, not the status). Usage and IO failures (exit 2) are handled by the
+/// caller before reaching here.
 pub fn checkExit(counts: Check.Counts, exit_zero: bool) u8 {
     if (exit_zero) return 0;
     if (counts.hasErrors()) return 1;
