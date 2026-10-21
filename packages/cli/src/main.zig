@@ -154,7 +154,7 @@ pub fn main(init: std.process.Init) !void {
         .errors => {
             try DiagRender.printCliErrors(pre_usage.w, pre_usage.level, sink.items());
             try pre_usage.w.flush();
-            std.process.exit(1);
+            std.process.exit(usage_exit);
         },
         .ok => |p| {
             if (try applyParsed(gpa, AppCli.spec.root, p, pre_usage, &st, &sev_rules)) |code| std.process.exit(code);
@@ -199,7 +199,7 @@ pub fn main(init: std.process.Init) !void {
                         .errors => {
                             try DiagRender.printCliErrors(pre_usage.w, pre_usage.level, sink.items());
                             try pre_usage.w.flush();
-                            std.process.exit(1);
+                            std.process.exit(usage_exit);
                         },
                         .ok => |p| {
                             // `explain` is a distinct action (print a code's docs, no
@@ -226,7 +226,7 @@ pub fn main(init: std.process.Init) !void {
                                 // `applyCheckParsed` — `applyParsed` reads build fields
                                 // (`emit`,`dump`,`O`,...) that `Parsed(check)` no longer has.
                                 // It fills `st` (paths, target, color, sev rules) + the
-                                // check-only knobs, and exit-2's on a bad severity spec.
+                                // check-only knobs.
                                 if (try applyCheckParsed(gpa, p, pre_usage, &st, &sev_rules)) |code| std.process.exit(code);
                                 st.check_seen = true;
                             } else if (try applyParsed(gpa, sub, p, pre_usage, &st, &sev_rules)) |code| std.process.exit(code);
@@ -247,14 +247,11 @@ pub fn main(init: std.process.Init) !void {
     // Post-parse tail (reproduces the old hand-rolled tail verbatim).
 
     if (st.paths.items.len == 0) {
-        // `check` with no input is an argument error (exit 2, like a CLI/IO failure —
-        // distinct from a compile failure's 1). Asking to emit (`-o`) with no input is
-        // likewise an error, not usage.
-        if (st.check_seen) {
-            try argLine(usage, "check: no input file");
-            std.process.exit(2);
-        }
-        if (st.out_path != null) argErr(usage, "no input file"); // flushes + exit(1)
+        // Asking to check, build, run or emit (`-o`) with no input is an error, not a
+        // request for help; only a bare `toy` prints help.
+        if (st.check_seen) argErr(usage, "check: no input file");
+        if (st.out_path != null) argErr(usage, "no input file");
+        if (st.verb_seen) argErr(usage, if (st.command == .run) "run: no input file" else "build: no input file");
         // No input, no `-o`: print short help and exit 0 (replaces usage()).
         try cli.Help.renderHelp(comptime AppCli.spec.root, out, .short);
         try out.flush();
@@ -264,7 +261,8 @@ pub fn main(init: std.process.Init) !void {
     // `toy check`: the diagnostics-focused front-end. Runs lex->parse->resolve->typecheck
     // over every input (NEVER codegen), reports ALL diagnostics (no early-bail), applies
     // the severity config, and returns an exit code: 0 clean, 1 when >=1 error survives
-    // the config, 2 on a hard CLI/IO error. `--exit-zero` forces 0 regardless.
+    // the config, 2 on a usage error or an unreadable entry. `--exit-zero` forces 0
+    // regardless.
     if (st.check_seen) {
         std.process.exit(try runCheck(gpa, out, level, usage, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.timings, st.sev));
     }
@@ -305,6 +303,11 @@ pub fn main(init: std.process.Init) !void {
     // Signal compilation failure to scripts/CI. (Flush first; exit skips defers.)
     if (failures > 0) std.process.exit(1);
 }
+
+/// The exit code of every usage error (a bad flag, value, command or input count),
+/// kept apart from a compile failure's 1 so a script can tell "you called toy wrong"
+/// from "your program is wrong".
+const usage_exit: u8 = 2;
 
 /// The optional leading subcommand: `build` (compile to an executable, the default)
 /// or `run` (build, then execute the produced binary and report how it ended).
@@ -403,8 +406,7 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
     if (p.opt.len != 0) st.opt = .O0;
     for (p.opt) |pass| st.opt.set(optPass(pass), true);
     for (p.no_opt) |pass| st.opt.set(optPass(pass), false);
-    // Severity overrides; a bad spec is a build arg-error (exit 1). See `buildSevRules`.
-    if (try buildSevRules(gpa, p, sev_rules)) |e| return try sevSpecError(usage, e, 1);
+    if (try buildSevRules(gpa, p, sev_rules)) |e| return try sevSpecError(usage, e);
     st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
     // p.file is a variadic slice borrowing argv/arena; copy the ELEMENTS (slices) —
     // not the bytes — into paths, which shares argv's lifetime, so nothing dangles.
@@ -422,9 +424,7 @@ fn optPass(choice: anytype) Opt.Pass {
 /// from `applyParsed` because `check_opts` (Cli.zig) carries no codegen/emit/opt flags,
 /// so `Parsed(check)` has no `emit`/`dump`/`O`/... fields to read — only the diagnostic-
 /// shaping + input knobs. Fills paths, target, color, the severity rules, and the
-/// check-only knobs. Returns a non-null `?u8` exit code on a bad severity spec: unlike
-/// the build path's arg-errors (exit 1), a check-path usage error exits 2 (consistent
-/// with `check`'s missing-input-file exit 2 — a bad `--warn BOGUS` is the same class).
+/// check-only knobs. Returns a non-null `?u8` exit code on a bad severity spec.
 fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, usage: Usage, st: *State, sev_rules: *std.ArrayList(SevCfg.Rule)) !?u8 {
     st.target = if (p.target) |t| @tagName(t) else Driver.default_target;
     st.color_choice = switch (p.color orelse .auto) {
@@ -435,9 +435,7 @@ fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, usage: Usage, st: *State
     st.check_ndjson = if (p.format) |f| (f == .ndjson) else false;
     st.check_exit_zero = p.exit_zero;
     st.timings = p.timings;
-    // Severity overrides; a bad spec is a check USAGE error -> exit 2 (not the build
-    // path's 1). See `buildSevRules`.
-    if (try buildSevRules(gpa, p, sev_rules)) |e| return try sevSpecError(usage, e, 2);
+    if (try buildSevRules(gpa, p, sev_rules)) |e| return try sevSpecError(usage, e);
     st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
     for (p.file) |f| try st.paths.append(gpa, f);
     return null;
@@ -451,7 +449,7 @@ fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, usage: Usage, st: *State
 /// Each spec must be a known code (R0001) or a band letter, in any case, and a `--warn` or
 /// `--allow` spec must not name only errors. Returns the first invalid spec as a parser-
 /// shaped `bad_value` error, or null on success; the caller renders it with
-/// `printCliErrors` and maps it to its own exit code (build exit 1, check exit 2).
+/// `printCliErrors` as a usage error.
 /// `--deny-warnings` (read by the caller) promotes surviving warnings uniformly via `resolve`.
 fn buildSevRules(gpa: std.mem.Allocator, p: anytype, sev_rules: *std.ArrayList(SevCfg.Rule)) !?cli.Sink.Error {
     for (p.deny) |m| {
@@ -495,11 +493,11 @@ fn warningSpecErr(comptime flag: []const u8, m: []const u8) ?cli.Sink.Error {
     };
 }
 
-/// Render a bad severity spec exactly like a parser error and return `code`.
-fn sevSpecError(usage: Usage, e: cli.Sink.Error, code: u8) !?u8 {
+/// Render a bad severity spec exactly like a parser error, as a usage error.
+fn sevSpecError(usage: Usage, e: cli.Sink.Error) !?u8 {
     try DiagRender.printCliErrors(usage.w, usage.level, &.{e});
     try usage.w.flush();
-    return code;
+    return usage_exit;
 }
 
 /// The default executable output when no `-o`/`--output` is given:
@@ -683,7 +681,8 @@ fn probeSubs(probe: *const Engine.StageProbe) [3]TimingSub {
 
 /// Run lex→parse→check→codegen→link→sign for a single input and write the signed
 /// executable to `out_path` (mode 0o755). Returns the process exit code: 0 on
-/// success, 1 on any failure (front-end errors, no `main`, unsupported node).
+/// success, 1 on any failure (front-end errors, no `main`, unsupported node), and
+/// `usage_exit` for more than one input.
 fn emitExecutable(
     gpa: std.mem.Allocator,
     out: *Io.Writer,
@@ -704,13 +703,12 @@ fn emitExecutable(
     sev: SevCfg.SeverityConfig,
 ) !u8 {
     // A build takes the 1 ROOT (entry) file; the driver discovers the transitive
-    // import graph from it and compiles the whole program. This is an in-body check
-    // that RETURNS 1 (not exit); `argLine` prints the styled error line AND flushes,
-    // because the `1` bubbles up through `std.process.exit(try emitExecutable(...))`
-    // in main, which skips defers and never flushes `out` on its own.
+    // import graph from it and compiles the whole program. `argLine` flushes, because
+    // the code bubbles up through `std.process.exit(try emitExecutable(...))` in main,
+    // which skips defers and never flushes `out` on its own.
     if (paths.len != 1) {
         try argLine(usage, if (run_after) "run takes exactly one input file (the entry module)" else "build takes exactly one input file (the entry module)");
-        return 1;
+        return usage_exit;
     }
 
     // the `-o` build runs on OUR OWN pool sized by `-j`, not the CLI's fixed
@@ -989,13 +987,12 @@ fn emitIr(
     jlimit: Io.Limit,
     sev: SevCfg.SeverityConfig,
 ) !u8 {
-    // `--emit ir` takes the 1 ROOT (entry) file; discover the whole graph. In-body
-    // check that RETURNS 1 (not exit); `argLine` prints the styled error line AND
-    // flushes, because the `1` bubbles up through `std.process.exit(try emitIr(...))`
+    // `--emit ir` takes the 1 ROOT (entry) file; discover the whole graph. `argLine`
+    // flushes, because the code bubbles up through `std.process.exit(try emitIr(...))`
     // in main, which skips defers and never flushes `out` on its own.
     if (paths.len != 1) {
         try argLine(usage, "--emit ir takes exactly one input file (the entry module)");
-        return 1;
+        return usage_exit;
     }
 
     // the whole-graph typecheck Pass-C fans out per-fn body checks across our own
@@ -1085,7 +1082,7 @@ fn writeExecutable(io: Io, path: []const u8, image: []const u8) !void {
 
 /// Emit one `error: <message>` line styled at `sty_err` (the `error` word coloured,
 /// gate-safe at `.none`), then FLUSH. The in-body file-count checks that RETURN (not
-/// exit) a `1` bubble up through `std.process.exit(try emit*(...))` in `main`, which
+/// exit) a code bubble up through `std.process.exit(try emit*(...))` in `main`, which
 /// skips defers and never flushes the writer — so the flush MUST happen here or the error
 /// line is silently dropped.
 fn argLine(usage: Usage, message: []const u8) !void {
@@ -1094,18 +1091,11 @@ fn argLine(usage: Usage, message: []const u8) !void {
     try usage.w.flush();
 }
 
-/// A fatal arg error for the post-parse checks (no-input, aarch64, ...): print a
-/// styled `error:` line, flush, and EXIT 1. Never returns.
+/// A fatal usage error for the post-parse checks: print a styled `error:` line, flush,
+/// and exit `usage_exit`. Never returns.
 fn argErr(usage: Usage, message: []const u8) noreturn {
     argLine(usage, message) catch {};
-    std.process.exit(1);
-}
-
-/// Like `argErr` but for `applyParsed`, which returns `!?u8` rather than exiting
-/// directly: print the styled `error:` line and return `1` as the exit code.
-fn argErrCode(usage: Usage, message: []const u8) !?u8 {
-    try argLine(usage, message);
-    return 1;
+    std.process.exit(usage_exit);
 }
 
 /// `toy check <entry>`: the diagnostics-focused front-end. Runs the SAME graph
@@ -1116,8 +1106,8 @@ fn argErrCode(usage: Usage, message: []const u8) !?u8 {
 /// applies the severity config, and emits either pretty human snippets or a stable
 /// NDJSON stream. Returns the process exit code: 0 when nothing survives the config as
 /// an error, 1 when >=1 error remains (incl. a structural graph error like a real
-/// missing import — matching `build`), 2 on a hard CLI/IO failure (a missing/unreadable
-/// ENTRY file). `exit_zero` forces 0. `ndjson` picks the wire form. `timings` prints the
+/// missing import — matching `build`), 2 on a usage error or a missing/unreadable
+/// ENTRY file. `exit_zero` forces 0. `ndjson` picks the wire form. `timings` prints the
 /// stages it ran after the diagnostics (on stderr under ndjson).
 ///
 /// This is the bug fix: the old path fanned out over `paths` as INDEPENDENT single
@@ -1137,11 +1127,10 @@ fn runCheck(
     sev: SevCfg.SeverityConfig,
 ) !u8 {
     // `check` takes the 1 ROOT (entry) file, exactly like a `-o`/`--emit ir` build:
-    // discover its transitive import graph. More than one bare input is a usage error
-    // (exit 2), consistent with `emitExecutable`/`emitIr` rejecting multi-entry.
+    // discover its transitive import graph.
     if (paths.len != 1) {
         try argLine(usage, "check takes exactly one input file (the entry module)");
-        return 2;
+        return usage_exit;
     }
     const entry = paths[0];
 
@@ -1332,6 +1321,10 @@ fn reportEntryFile(
 /// `--list` (or the bare word `list`) enumerates every code instead; a bare `explain`
 /// with neither a code nor `--list` is a usage error (exit 2).
 fn runExplain(out: *Io.Writer, level: Style.ColorLevel, usage: Usage, code: ?[]const u8, list: bool) !void {
+    if (list and code != null) {
+        argLine(usage, "explain --list takes no code") catch {};
+        std.process.exit(usage_exit);
+    }
     // `--list`, or `toy explain list`, prints the whole registry.
     if (list or (code != null and std.mem.eql(u8, code.?, "list"))) {
         try listCodes(out, level);
@@ -1339,7 +1332,7 @@ fn runExplain(out: *Io.Writer, level: Style.ColorLevel, usage: Usage, code: ?[]c
     }
     const c = code orelse {
         argLine(usage, "specify a diagnostic code (e.g. R0001) or --list") catch {};
-        std.process.exit(2);
+        std.process.exit(usage_exit);
     };
     if (toyc.diagnostics.explain.docForStr(c)) |doc| {
         try out.writeAll(doc);
@@ -1353,7 +1346,7 @@ fn runExplain(out: *Io.Writer, level: Style.ColorLevel, usage: Usage, code: ?[]c
     try sty_faint.styled(usage.w, usage.level, "see 'toy explain --list' for every code");
     try usage.w.writeByte('\n');
     try usage.w.flush();
-    std.process.exit(2);
+    std.process.exit(usage_exit);
 }
 
 /// The band a code prefix belongs to (for `explain --list` grouping headers).

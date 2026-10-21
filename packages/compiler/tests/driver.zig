@@ -287,7 +287,7 @@ test "a pre-verb CLI error is reported once, not doubled by the subcommand re-pa
     const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
     defer gpa.free(got);
     const term = try child.wait(io);
-    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, term);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 2 }, term);
 
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "invalid value 'alwyas'"));
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, got, "did you mean 'always'?"));
@@ -1463,7 +1463,7 @@ test "`toy build`/`toy run` --warn/--allow on an error code or band is a usage e
         defer gpa.free(res.err);
         try testing.expect(std.mem.indexOf(u8, res.err, "is an error") != null);
         try testing.expectEqualStrings("", res.out);
-        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 2 }, res.term);
     }
     try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, out_path, .{}));
 }
@@ -5024,14 +5024,14 @@ test "a build-only flag on check is named as one, and each bad flag is reported 
         const res = try spawnToyBoth(gpa, io, r.argv);
         defer gpa.free(res.out);
         defer gpa.free(res.err);
-        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 2 }, res.term);
         try testing.expectEqualStrings("", res.out);
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, res.err, r.line));
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, res.err, "error: "));
     }
 }
 
-test "an unknown command or long flag suggests the near name, and a second input names the command (#70)" {
+test "an unknown command or long flag suggests the near name, and every usage error exits 2 (#70)" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -5059,12 +5059,17 @@ test "an unknown command or long flag suggests the near name, and a second input
         .{ .argv = &.{ "rn", a }, .err = "error: toy takes exactly one input file (the entry module)\n" },
         .{ .argv = &.{ "build", a, b }, .err = "error: build takes exactly one input file (the entry module)\n" },
         .{ .argv = &.{ "run", a, b }, .err = "error: run takes exactly one input file (the entry module)\n" },
+        .{ .argv = &.{ "--emit", "ir", a, b }, .err = "error: --emit ir takes exactly one input file (the entry module)\n" },
+        .{ .argv = &.{ "-o", dir_name ++ "/out" }, .err = "error: no input file\n" },
+        .{ .argv = &.{"build"}, .err = "error: build: no input file\n" },
+        .{ .argv = &.{"run"}, .err = "error: run: no input file\n" },
+        .{ .argv = &.{ "explain", "--list", "R0001" }, .err = "error: explain --list takes no code\n" },
     };
     for (runs) |r| {
         const res = try spawnToyBoth(gpa, io, r.argv);
         defer gpa.free(res.out);
         defer gpa.free(res.err);
-        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 2 }, res.term);
         try testing.expectEqualStrings("", res.out);
         try testing.expectEqualStrings(r.err, res.err);
     }
@@ -5109,7 +5114,7 @@ test "every enum or range flag lists its valid values, on build, run and check (
         const res = try spawnToyBoth(gpa, io, r.argv);
         defer gpa.free(res.out);
         defer gpa.free(res.err);
-        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 2 }, res.term);
         try testing.expectEqualStrings("", res.out);
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, res.err, r.line));
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, res.err, "error: "));
@@ -5148,10 +5153,10 @@ test "severity flags list the bands and suggest a near code; explain ignores cas
     const trailer = "Try 'toy --help' for more information.\n";
     const list_hint = "see 'toy explain --list' for every code\n";
     const runs = [_]struct { argv: []const []const u8, err: []const u8, rc: u8 }{
-        .{ .argv = &.{ "build", "--deny", "Q", path }, .rc = 1, .err = "error: invalid value 'Q' for --deny (a code like R0001, or a band: one of L|P|R|T|W)\n" ++ trailer },
+        .{ .argv = &.{ "build", "--deny", "Q", path }, .rc = 2, .err = "error: invalid value 'Q' for --deny (a code like R0001, or a band: one of L|P|R|T|W)\n" ++ trailer },
         .{ .argv = &.{ "check", "--warn", "Q", path }, .rc = 2, .err = "error: invalid value 'Q' for --warn (a warning code like W0001, or a band: W)\n" ++ trailer },
         .{ .argv = &.{ "check", "--allow", "w001", path }, .rc = 2, .err = "error: invalid value 'w001' for --allow (a warning code like W0001, or a band: W)\ndid you mean 'W0001'?\n" ++ trailer },
-        .{ .argv = &.{ "build", "--deny", "R0O01", path }, .rc = 1, .err = "error: invalid value 'R0O01' for --deny (a code like R0001, or a band: one of L|P|R|T|W)\ndid you mean 'R0001'?\n" ++ trailer },
+        .{ .argv = &.{ "build", "--deny", "R0O01", path }, .rc = 2, .err = "error: invalid value 'R0O01' for --deny (a code like R0001, or a band: one of L|P|R|T|W)\ndid you mean 'R0001'?\n" ++ trailer },
         .{ .argv = &.{ "explain", "X9999" }, .rc = 2, .err = "error: unknown diagnostic code: X9999\n" ++ list_hint },
         .{ .argv = &.{ "explain", "R001" }, .rc = 2, .err = "error: unknown diagnostic code: R001\ndid you mean 'R0001'?\n" ++ list_hint },
     };
