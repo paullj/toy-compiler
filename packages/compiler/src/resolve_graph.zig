@@ -290,6 +290,8 @@ const GraphResolve = struct {
             try std.testing.expect(seeded_builtins[1 + i].scope == Intrinsic.scope(k));
         }
         try std.testing.expect(Intrinsic.scope(.ref_new) == .bundled);
+        try std.testing.expect(Intrinsic.scope(.gc_collect) == .bundled);
+        try std.testing.expect(Intrinsic.scope(.gc_stats) == .bundled);
         try std.testing.expect(Intrinsic.scope(.gc_alloc) == .core);
     }
 
@@ -2367,6 +2369,23 @@ test "the Ref cell intrinsics are not nameable outside a bundled module (R0001)"
         }
     };
     try withResolvedGraph(".toy-test-ref-intrinsic-noncore", files, "main.toy", Check.run);
+}
+
+test "the gc intrinsics std/gc wraps are not nameable outside a bundled module (R0001)" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+        \\fn main() -> int {
+        \\ gc_collect()
+        \\ return gc_stats()
+        \\}
+        \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 2), countCode(r, .R0001));
+        }
+    };
+    try withResolvedGraph(".toy-test-gc-intrinsic-noncore", files, "main.toy", Check.run);
 }
 
 test "a straight-line overwrite before any read flags the first write W0010" {

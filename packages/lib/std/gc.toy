@@ -1,0 +1,11 @@
+# The collector's public face: tests and programs that must observe a collection force
+# one here instead of importing `core/`.
+
+pub fn collect() {
+    gc_collect()
+}
+
+# Counts allocation-triggered collections too, not only forced ones.
+pub fn collections() -> int {
+    return gc_stats()
+}
