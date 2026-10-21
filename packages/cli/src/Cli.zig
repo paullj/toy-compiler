@@ -9,6 +9,7 @@
 
 const toyc = @import("toy_compiler");
 const Spec = @import("cli/Cli.zig").Spec;
+const Decide = toyc.Decide;
 // Build-time DEV switch (see build.zig): gates the `--emit lex|parse|ir`
 // pipeline-inspection flag on/off. Read at comptime so a release binary (dev_inspect
 // false) never even registers `--emit`; the default Debug build (and every test
@@ -37,7 +38,7 @@ const pre_emit: []const Spec.Option = &.{
     .{ .long = "output", .short = 'o', .value = .string, .value_name = "PATH", .help = "Output path for the built binary (default: .toy/<stamp>/build/<name>)" },
     target_opt,
 };
-const post_emit: []const Spec.Option = &.{
+const post_emit: []const Spec.Option = &[_]Spec.Option{
     // -j: N>=1; the parser rejects -j0/negatives as a bad value via the Range.
     .{ .short = 'j', .value = .{ .int = .{ .min = 1, .max = null } }, .value_name = "N", .help = "Build worker threads (N>=1; -j1 = serial; default cpu-based)" },
     // -O is short-only => Parsed field `O`; -O0 / -O1 / -O 1 all parse, -O2 rejected.
@@ -52,12 +53,16 @@ const post_emit: []const Spec.Option = &.{
     .{ .long = "no-specialize", .action = .set_true, .help = "Call function-typed arguments of generic functions through the erased instance" },
     .{ .long = "timings", .action = .set_true, .help = "Print the per-stage wall-clock profile" },
     .{ .long = "color", .value = .{ .@"enum" = &.{ "auto", "always", "never" } }, .value_name = "WHEN", .help = "Colorize output (default auto: on when stdout is a tty)" },
-    // Per-code severity overrides. Repeatable; take a code (R0001) or a band
-    // letter (L/P/R/T/W), but --warn/--allow only a warning one, since an error stops the
-    // build whatever it is shown as. Fixed precedence allow > warn > deny; last match wins.
-    .{ .long = "deny", .value = .string, .action = .append, .value_name = "CODE", .help = "Treat a diagnostic code or band as an error (repeatable, e.g. --deny R0001 or --deny T)" },
-    .{ .long = "warn", .value = .string, .action = .append, .value_name = "CODE", .help = "Keep a warning code or band a warning, overriding --deny (repeatable; not for error codes)" },
-    .{ .long = "allow", .value = .string, .action = .append, .value_name = "CODE", .help = "Suppress a warning code or band from output (repeatable; not for error codes)" },
+} ++ sev_opts;
+
+// Per-code severity overrides, shared by build/run and check. Repeatable; --warn/--allow
+// take only a warning code or band, since an error stops the build whatever it is shown
+// as. The driver checks the values (Decide.canonicalSpec), as a string flag cannot.
+// Fixed precedence allow > warn > deny; last match wins.
+const sev_opts: []const Spec.Option = &.{
+    .{ .long = "deny", .value = .string, .action = .append, .value_name = "CODE", .help = "Treat a diagnostic code or band (" ++ Decide.sevBands(false) ++ ") as an error (repeatable, e.g. --deny R0001)" },
+    .{ .long = "warn", .value = .string, .action = .append, .value_name = "CODE", .help = "Keep a warning code or band (" ++ Decide.sevBands(true) ++ ") a warning, overriding --deny (repeatable; not for error codes)" },
+    .{ .long = "allow", .value = .string, .action = .append, .value_name = "CODE", .help = "Suppress a warning code or band (" ++ Decide.sevBands(true) ++ ") from output (repeatable; not for error codes)" },
     .{ .long = "deny-warnings", .action = .set_true, .help = "Treat any surviving warning as an error (non-zero exit)" },
 };
 
@@ -81,12 +86,9 @@ const files_pos: []const Spec.Positional = &.{
 /// for the exit gate; `--exit-zero` forces a 0 exit even with errors (editors that read
 /// the stream, not the status); `--watch` is a forward-compatible no-op stub; `--color`,
 /// `--target` and `--timings` mirror the shared spellings.
-const check_opts: []const Spec.Option = &.{
+const check_opts: []const Spec.Option = &[_]Spec.Option{
     .{ .long = "format", .value = .{ .@"enum" = &.{ "human", "ndjson" } }, .value_name = "FORM", .help = "Diagnostic output form (human snippets or line-delimited JSON; default human)" },
-    .{ .long = "deny", .value = .string, .action = .append, .value_name = "CODE", .help = "Treat a diagnostic code or band as an error (repeatable, e.g. --deny R0001 or --deny T)" },
-    .{ .long = "warn", .value = .string, .action = .append, .value_name = "CODE", .help = "Keep a warning code or band a warning, overriding --deny (repeatable; not for error codes)" },
-    .{ .long = "allow", .value = .string, .action = .append, .value_name = "CODE", .help = "Suppress a warning code or band from output (repeatable; not for error codes)" },
-    .{ .long = "deny-warnings", .action = .set_true, .help = "Treat any surviving warning as an error (non-zero exit)" },
+} ++ sev_opts ++ &[_]Spec.Option{
     .{ .long = "exit-zero", .action = .set_true, .help = "Always exit 0, even when diagnostics contain errors" },
     .{ .long = "watch", .action = .set_true, .help = "Re-check on file changes (not yet implemented; accepted as a no-op)" },
     .{ .long = "color", .value = .{ .@"enum" = &.{ "auto", "always", "never" } }, .value_name = "WHEN", .help = "Colorize output (default auto: on when stdout is a tty)" },

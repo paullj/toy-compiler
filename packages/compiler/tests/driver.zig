@@ -1505,7 +1505,7 @@ test "`toy check` unknown --warn spec is a USAGE error (exit 2)" {
     defer gpa.free(res.out);
     defer gpa.free(res.err);
 
-    try testing.expect(std.mem.indexOf(u8, res.err, "unknown code or band") != null);
+    try testing.expect(std.mem.indexOf(u8, res.err, "invalid value 'BOGUS' for --warn") != null);
     try testing.expectEqualStrings("", res.out);
     try testing.expectEqual(std.process.Child.Term{ .exited = 2 }, res.term);
 }
@@ -5089,5 +5089,69 @@ test "every enum or range flag lists its valid values, on build, run and check (
         defer gpa.free(res.err);
         try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
         try testing.expectEqualStrings("", res.err);
+    }
+}
+
+test "severity flags list the bands and suggest a near code; explain ignores case and suggests (#70)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toy-test-driver-sev-bands";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const path = dir_name ++ "/main.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "fn main() -> int {\n    x := 1\n    return 0\n}\n" });
+
+    const trailer = "Try 'toy --help' for more information.\n";
+    const list_hint = "see 'toy explain --list' for every code\n";
+    const runs = [_]struct { argv: []const []const u8, err: []const u8, rc: u8 }{
+        .{ .argv = &.{ "build", "--deny", "Q", path }, .rc = 1, .err = "error: invalid value 'Q' for --deny (a code like R0001, or a band: one of L|P|R|T|W)\n" ++ trailer },
+        .{ .argv = &.{ "check", "--warn", "Q", path }, .rc = 2, .err = "error: invalid value 'Q' for --warn (a warning code like W0001, or a band: W)\n" ++ trailer },
+        .{ .argv = &.{ "check", "--allow", "w001", path }, .rc = 2, .err = "error: invalid value 'w001' for --allow (a warning code like W0001, or a band: W)\ndid you mean 'W0001'?\n" ++ trailer },
+        .{ .argv = &.{ "build", "--deny", "R0O01", path }, .rc = 1, .err = "error: invalid value 'R0O01' for --deny (a code like R0001, or a band: one of L|P|R|T|W)\ndid you mean 'R0001'?\n" ++ trailer },
+        .{ .argv = &.{ "explain", "X9999" }, .rc = 2, .err = "error: unknown diagnostic code: X9999\n" ++ list_hint },
+        .{ .argv = &.{ "explain", "R001" }, .rc = 2, .err = "error: unknown diagnostic code: R001\ndid you mean 'R0001'?\n" ++ list_hint },
+    };
+    for (runs) |r| {
+        const res = try spawnToyBoth(gpa, io, r.argv);
+        defer gpa.free(res.out);
+        defer gpa.free(res.err);
+        try testing.expectEqual(std.process.Child.Term{ .exited = r.rc }, res.term);
+        try testing.expectEqualStrings("", res.out);
+        try testing.expectEqualStrings(r.err, res.err);
+    }
+
+    {
+        // Lower case names the same code: --deny w0001 promotes the unused local.
+        const res = try spawnToyBoth(gpa, io, &.{ "check", "--deny", "w0001", path });
+        defer gpa.free(res.out);
+        defer gpa.free(res.err);
+        try testing.expect(std.mem.indexOf(u8, res.out, "error[W0001]:") != null);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    }
+    {
+        const res = try spawnToyBoth(gpa, io, &.{ "build", "--allow", "w", "-o", dir_name ++ "/a", path });
+        defer gpa.free(res.out);
+        defer gpa.free(res.err);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+        try testing.expect(std.mem.indexOf(u8, res.out, "W0001") == null);
+    }
+    {
+        const res = try spawnToyBoth(gpa, io, &.{ "explain", "r0001" });
+        defer gpa.free(res.out);
+        defer gpa.free(res.err);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+        try testing.expect(std.mem.startsWith(u8, res.out, "# R0001:"));
+    }
+    {
+        const res = try spawnToyBoth(gpa, io, &.{ "build", "--help" });
+        defer gpa.free(res.out);
+        defer gpa.free(res.err);
+        try testing.expect(std.mem.indexOf(u8, res.out, "code or band (L|P|R|T|W)") != null);
+        try testing.expect(std.mem.indexOf(u8, res.out, "code or band (W)") != null);
     }
 }
