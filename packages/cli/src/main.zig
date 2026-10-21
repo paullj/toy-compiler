@@ -270,7 +270,6 @@ pub fn main(init: std.process.Init) !void {
     const run_after = st.command == .run;
     // Worker threads the build will use (for the "built with N threads" line).
     const threads: usize = if (st.job_count != 0) st.job_count else (std.Thread.getCpuCount() catch 1);
-    if (build_exe and !Decide.isAarch64Macos(st.target)) argErr(usage, "code emission only supports aarch64-macos");
 
     // Build the executable: output → `-o`/`--output`, else the default build dir.
     if (build_exe) {
@@ -344,7 +343,7 @@ const State = struct {
 /// `p: anytype` because `Parsed(root)`/`Parsed(build)`/`Parsed(run)` are DISTINCT
 /// reified types with the identical field set (the shared option/positional consts);
 /// fields are read by name. Returns a non-null `?u8` exit code when the driver
-/// detects a bad value the grammar can't express (an unknown/empty opt pass name).
+/// detects a bad value the grammar can't express (a bad severity spec).
 fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytype, usage: Usage, st: *State, sev_rules: *std.ArrayList(SevCfg.Rule)) !?u8 {
     _ = cmd;
     st.dump = p.dump;
@@ -356,7 +355,7 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
     // order, so apply .verify first then let .force win (no script passes both).
     if (p.verify) st.mode = .verify;
     if (p.no_cache) st.mode = .force;
-    st.target = p.target orelse Driver.default_target;
+    st.target = if (p.target) |t| @tagName(t) else Driver.default_target;
     st.out_path = p.output;
     st.color_choice = switch (p.color orelse .auto) {
         .auto => .auto,
@@ -386,23 +385,11 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
     }
     // Base opt level from -O (short-only => field `O`); .max=1 rejects -O2 upstream.
     st.opt = if (p.O) |lvl| (if (lvl == 1) Opt.Config.O1 else Opt.Config.O0) else Opt.Config.O0;
-    // --opt=<list>: reset to level-off, then turn ON each named pass. An empty
-    // element or unknown pass name is a driver arg error (the grammar can't express
-    // pass-name validity), reported + exit 1.
-    if (p.opt) |list| {
-        st.opt = .O0;
-        var it = std.mem.splitScalar(u8, list, ',');
-        while (it.next()) |name| {
-            if (name.len == 0) return argErrCode(usage, "--opt expects a comma-separated pass list (fold,branch,dce,forward)");
-            const pass = Decide.passByName(name) orelse return argErrCode(usage, "--opt: unknown pass (expected fold,branch,dce,forward)");
-            st.opt.set(pass, true);
-        }
-    }
-    // --no-opt=<pass>: turn each named pass OFF from the current config.
-    for (p.no_opt) |name| {
-        const pass = Decide.passByName(name) orelse return argErrCode(usage, "--no-opt: unknown pass (expected fold,branch,dce,forward)");
-        st.opt.set(pass, false);
-    }
+    // --opt: reset to level-off, then turn ON each named pass; each --no-opt then turns
+    // one OFF. The parser has already checked every name against `Opt.Pass`.
+    if (p.opt.len != 0) st.opt = .O0;
+    for (p.opt) |pass| st.opt.set(optPass(pass), true);
+    for (p.no_opt) |pass| st.opt.set(optPass(pass), false);
     // Severity overrides; a bad spec is a build arg-error (exit 1). See `buildSevRules`.
     if (try buildSevRules(gpa, p, sev_rules)) |msg| return argErrCode(usage, msg);
     st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
@@ -410,6 +397,12 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
     // not the bytes — into paths, which shares argv's lifetime, so nothing dangles.
     for (p.file) |f| try st.paths.append(gpa, f);
     return null;
+}
+
+/// The `Opt.Pass` a parsed `--opt`/`--no-opt` choice names. The CLI enum is reified
+/// from `Opt.Pass`'s field names, so the name always maps back.
+fn optPass(choice: anytype) Opt.Pass {
+    return std.meta.stringToEnum(Opt.Pass, @tagName(choice)).?;
 }
 
 /// Map the `check` subcommand's RESTRICTED `Parsed` onto the driver `State`. Distinct
@@ -420,7 +413,7 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
 /// the build path's arg-errors (exit 1), a check-path usage error exits 2 (consistent
 /// with `check`'s missing-input-file exit 2 — a bad `--warn BOGUS` is the same class).
 fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, usage: Usage, st: *State, sev_rules: *std.ArrayList(SevCfg.Rule)) !?u8 {
-    st.target = p.target orelse Driver.default_target;
+    st.target = if (p.target) |t| @tagName(t) else Driver.default_target;
     st.color_choice = switch (p.color orelse .auto) {
         .auto => .auto,
         .always => .always,

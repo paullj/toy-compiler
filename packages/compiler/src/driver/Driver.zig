@@ -30,6 +30,10 @@ pub const cache_root = ".toy";
 /// harness, the LSP) passes this same name rather than a spelling of the host triple.
 pub const default_target = "native";
 
+/// Every `--target` spelling the CLI takes. Code emission is aarch64-macos only, so
+/// `native` names the same target on the one supported host.
+pub const targets = [_][:0]const u8{ default_target, "aarch64-macos" };
+
 /// The buffer size the cache `dir_buf` needs: `.toy/<stamp>/cache`.
 pub const cache_dir_buf_len = cache_root.len + 1 + version.stamp_max + "/cache".len;
 

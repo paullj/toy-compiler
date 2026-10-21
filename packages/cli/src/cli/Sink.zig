@@ -34,10 +34,7 @@ pub const Error = struct {
     got: []const u8 = "",
     expected: []const u8 = "",
     where: []const u8 = "",
-    // enum `bad_value` only: the "a|b|c" choice list (a static comptime literal) and,
-    // when the input is close to one, a near-miss choice (a slice into that literal).
-    // Both are static/borrowed, honouring the Sink's no-owned-strings contract.
-    choices: []const u8 = "",
+    // enum `bad_value` only: a near-miss choice, a slice into the static choice list.
     suggestion: []const u8 = "",
 };
 
