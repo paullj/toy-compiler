@@ -235,12 +235,7 @@ pub fn printCliErrors(out: *Io.Writer, level: Style.ColorLevel, errs: []const cl
             // faint `did you mean 'X'?` note.
             .bad_value => {
                 try out.print("invalid value '{s}' for {s} ({s})", .{ e.got, e.arg, e.expected });
-                if (e.suggestion.len != 0) {
-                    try out.writeByte('\n');
-                    var buf: [96]u8 = undefined;
-                    const s = std.fmt.bufPrint(&buf, "did you mean '{s}'?", .{e.suggestion}) catch "did you mean";
-                    try sty_faint.styled(out, level, s);
-                }
+                if (e.suggestion.len != 0) try didYouMean(out, level, "", e.suggestion);
             },
             .missing_required => try out.print("missing required argument: {s}", .{e.arg}),
             .unexpected_arg => try out.print("unexpected argument: {s}", .{e.arg}),
@@ -251,4 +246,11 @@ pub fn printCliErrors(out: *Io.Writer, level: Style.ColorLevel, errs: []const cl
     }
     try sty_faint.styled(out, level, "Try 'toy --help' for more information.");
     try out.writeByte('\n');
+}
+
+pub fn didYouMean(out: *Io.Writer, level: Style.ColorLevel, prefix: []const u8, suggestion: []const u8) !void {
+    try out.writeByte('\n');
+    var buf: [96]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "did you mean '{s}{s}'?", .{ prefix, suggestion }) catch "did you mean";
+    try sty_faint.styled(out, level, s);
 }

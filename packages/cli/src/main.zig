@@ -334,8 +334,8 @@ const State = struct {
     // The resolved `--color` choice, fed once into `resolveLevel` after the parse.
     color_choice: Terminal.ColorChoice = .auto,
     // Render-time severity overrides (--deny/--warn/--allow) + `--deny-warnings`. Empty
-    // by default == identity, so no-flag runs render byte-identical. `rules` BORROWS argv
-    // bytes via a fn-scope backing list `applyParsed` fills; resolve reads it LATE at render.
+    // by default == identity, so no-flag runs render byte-identical. `rules` lives in a
+    // fn-scope backing list `applyParsed` fills; resolve reads it LATE at render.
     sev: SevCfg.SeverityConfig = .{},
     paths: std.ArrayList([]const u8),
 };
@@ -392,8 +392,7 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
     for (p.opt) |pass| st.opt.set(optPass(pass), true);
     for (p.no_opt) |pass| st.opt.set(optPass(pass), false);
     // Severity overrides; a bad spec is a build arg-error (exit 1). See `buildSevRules`.
-    var msg_buf: [sev_msg_max]u8 = undefined;
-    if (try buildSevRules(gpa, p, sev_rules, &msg_buf)) |msg| return argErrCode(usage, msg);
+    if (try buildSevRules(gpa, p, sev_rules)) |e| return try sevSpecError(usage, e, 1);
     st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
     // p.file is a variadic slice borrowing argv/arena; copy the ELEMENTS (slices) —
     // not the bytes — into paths, which shares argv's lifetime, so nothing dangles.
@@ -426,61 +425,69 @@ fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, usage: Usage, st: *State
     st.timings = p.timings;
     // Severity overrides; a bad spec is a check USAGE error -> exit 2 (not the build
     // path's 1). See `buildSevRules`.
-    var msg_buf: [sev_msg_max]u8 = undefined;
-    if (try buildSevRules(gpa, p, sev_rules, &msg_buf)) |msg| return usageCode(usage, msg);
+    if (try buildSevRules(gpa, p, sev_rules)) |e| return try sevSpecError(usage, e, 2);
     st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
     for (p.file) |f| try st.paths.append(gpa, f);
     return null;
 }
-
-/// Room for a `buildSevRules` message: a spec that reaches the formatted text is a
-/// valid code or band, so it is at most 5 bytes.
-const sev_msg_max = 160;
 
 /// Append the `--deny`/`--warn`/`--allow` severity rules onto `sev_rules` in FIXED
 /// severity order — all deny, then all warn, then all allow — so that under `resolve`'s
 /// last-match-wins semantics `allow` dominates `warn` dominates `deny` for a code named
 /// by multiple flags, deterministically and independent of cross-flag argv position (the
 /// flat model loses cross-flag order — the same documented deviation as --verify/--no-cache).
-/// Each spec must be a known code (R0001) or a band letter (L/P/R/T/W), and a `--warn` or
-/// `--allow` spec must not name only errors. Returns the offending "<flag>: ..." message
-/// (formatted into `msg_buf`) on the first invalid spec, or null on success; the caller
-/// maps a non-null message to its own exit code (build exit 1, check exit 2).
+/// Each spec must be a known code (R0001) or a band letter, in any case, and a `--warn` or
+/// `--allow` spec must not name only errors. Returns the first invalid spec as a parser-
+/// shaped `bad_value` error, or null on success; the caller renders it with
+/// `printCliErrors` and maps it to its own exit code (build exit 1, check exit 2).
 /// `--deny-warnings` (read by the caller) promotes surviving warnings uniformly via `resolve`.
-fn buildSevRules(gpa: std.mem.Allocator, p: anytype, sev_rules: *std.ArrayList(SevCfg.Rule), msg_buf: []u8) !?[]const u8 {
+fn buildSevRules(gpa: std.mem.Allocator, p: anytype, sev_rules: *std.ArrayList(SevCfg.Rule)) !?cli.Sink.Error {
     for (p.deny) |m| {
-        if (!Decide.validSpec(m)) return "--deny: unknown code or band (e.g. R0001 or R)";
-        try sev_rules.append(gpa, .{ .match = m, .action = .err });
+        const spec = Decide.canonicalSpec(m) orelse return unknownSpecErr("--deny", false, m);
+        try sev_rules.append(gpa, .{ .match = spec, .action = .err });
     }
     for (p.warn) |m| {
-        if (warningSpecError("--warn", m, msg_buf)) |msg| return msg;
-        try sev_rules.append(gpa, .{ .match = m, .action = .warning });
+        if (warningSpecErr("--warn", m)) |e| return e;
+        try sev_rules.append(gpa, .{ .match = Decide.canonicalSpec(m).?, .action = .warning });
     }
     for (p.allow) |m| {
-        if (warningSpecError("--allow", m, msg_buf)) |msg| return msg;
-        try sev_rules.append(gpa, .{ .match = m, .action = .ignore });
+        if (warningSpecErr("--allow", m)) |e| return e;
+        try sev_rules.append(gpa, .{ .match = Decide.canonicalSpec(m).?, .action = .ignore });
     }
     return null;
 }
 
-/// The usage message for a `--warn`/`--allow` spec that is unknown or names only errors,
-/// or null when the spec is a usable warning code or band. Even with an error hidden the
-/// build still stops on it (`Orchestrator.hasError`), so allowing one would only make
-/// `build` fail silently and `check` pass a program `build` rejects.
-fn warningSpecError(flag: []const u8, m: []const u8, msg_buf: []u8) ?[]const u8 {
-    if (!Decide.validSpec(m))
-        return std.fmt.bufPrint(msg_buf, "{s}: unknown code or band (e.g. W0001 or W)", .{flag}) catch unreachable;
-    if (!codes.errorOnly(m)) return null;
-    const kind = if (m.len == 1) "band" else "code";
-    return std.fmt.bufPrint(msg_buf, "{s}: '{s}' is an error {s}, and no flag can hide an error; {s} takes only a warning code or band (e.g. W0001 or W)", .{ flag, m, kind, flag }) catch unreachable;
+fn unknownSpecErr(comptime flag: []const u8, comptime warnings_only: bool, m: []const u8) cli.Sink.Error {
+    return .{
+        .kind = .bad_value,
+        .arg = flag,
+        .got = m,
+        .expected = comptime Decide.sevExpected(warnings_only),
+        .suggestion = codes.suggest(m, warnings_only) orelse "",
+    };
 }
 
-/// Like `argErrCode` but returns `2` (a USAGE error, not a compile failure): the `check`
-/// path treats a bad severity-flag value as a usage error, consistent with a missing
-/// input file (exit 2). Prints the styled `error:` line and returns `2`.
-fn usageCode(usage: Usage, message: []const u8) !?u8 {
-    try argLine(usage, message);
-    return 2;
+/// The error for a `--warn`/`--allow` spec that is unknown or names only errors, or null
+/// when it is a usable warning code or band. Even with an error hidden the build still
+/// stops on it (`Orchestrator.hasError`), so allowing one would only make `build` fail
+/// silently and `check` pass a program `build` rejects.
+fn warningSpecErr(comptime flag: []const u8, m: []const u8) ?cli.Sink.Error {
+    const spec = Decide.canonicalSpec(m) orelse return unknownSpecErr(flag, true, m);
+    if (!codes.errorOnly(spec)) return null;
+    const tail = ", and no flag can hide an error; " ++ flag ++ " takes " ++ comptime Decide.sevExpected(true);
+    return .{
+        .kind = .bad_value,
+        .arg = flag,
+        .got = m,
+        .expected = if (spec.len == 1) "it is an error band" ++ tail else "it is an error code" ++ tail,
+    };
+}
+
+/// Render a bad severity spec exactly like a parser error and return `code`.
+fn sevSpecError(usage: Usage, e: cli.Sink.Error, code: u8) !?u8 {
+    try DiagRender.printCliErrors(usage.w, usage.level, &.{e});
+    try usage.w.flush();
+    return code;
 }
 
 /// The default executable output when no `-o`/`--output` is given:
@@ -1307,8 +1314,9 @@ fn reportEntryFile(
 }
 
 /// `toy explain <CODE>`: print the code's embedded documentation. A known code prints
-/// its doc and returns (caller flushes + exits 0); an unknown code prints a styled
-/// arg error and EXITS 2 (an argument error, distinct from a compile failure's 1).
+/// its doc and returns (caller flushes + exits 0); a code matches in any case. An unknown
+/// code prints a styled arg error, a near code when there is one and a pointer to
+/// `--list`, and EXITS 2 (an argument error, distinct from a compile failure's 1).
 /// `--list` (or the bare word `list`) enumerates every code instead; a bare `explain`
 /// with neither a code nor `--list` is a usage error (exit 2).
 fn runExplain(out: *Io.Writer, level: Style.ColorLevel, usage: Usage, code: ?[]const u8, list: bool) !void {
@@ -1326,9 +1334,13 @@ fn runExplain(out: *Io.Writer, level: Style.ColorLevel, usage: Usage, code: ?[]c
         if (doc.len == 0 or doc[doc.len - 1] != '\n') try out.writeByte('\n');
         return;
     }
-    var buf: [128]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, "unknown diagnostic code: {s}", .{c}) catch "unknown diagnostic code";
-    argLine(usage, msg) catch {};
+    try sty_err.styled(usage.w, usage.level, "error");
+    try usage.w.print(": unknown diagnostic code: {s}", .{c});
+    if (codes.suggest(c, false)) |near| try DiagRender.didYouMean(usage.w, usage.level, "", near);
+    try usage.w.writeByte('\n');
+    try sty_faint.styled(usage.w, usage.level, "see 'toy explain --list' for every code");
+    try usage.w.writeByte('\n');
+    try usage.w.flush();
     std.process.exit(2);
 }
 

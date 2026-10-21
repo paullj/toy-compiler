@@ -34,10 +34,36 @@ pub fn resolveHasError(diags: []const Diagnostic) bool {
     return false;
 }
 
-/// True when `m` names a diagnostic override target: a known code string ("R0001")
-/// or a single band letter (L/P/R/T/W). Used to validate --deny/--warn/--allow specs.
-pub fn validSpec(m: []const u8) bool {
-    return codes.fromStr(m) != null or (m.len == 1 and (m[0] == 'L' or m[0] == 'P' or m[0] == 'R' or m[0] == 'T' or m[0] == 'W'));
+/// The registry spelling of a --deny/--warn/--allow spec: a known code ("r0001" gives
+/// "R0001") or a band letter of `codes.prefix_bands`, or null when it names neither.
+/// The result is static, so a severity rule never borrows the user's spelling.
+pub fn canonicalSpec(m: []const u8) ?[]const u8 {
+    if (codes.fromStr(m)) |c| return codes.str(c);
+    return codes.bandOf(m);
+}
+
+/// The bands a severity flag takes, as "A|B": every band, or with `warnings_only`
+/// (--warn/--allow) only the bands that hold a warning.
+pub fn sevBands(comptime warnings_only: bool) []const u8 {
+    comptime {
+        @setEvalBranchQuota(20_000);
+        var list: []const u8 = "";
+        for (codes.prefix_bands) |b| {
+            if (warnings_only and codes.errorOnly(&.{b})) continue;
+            list = list ++ (if (list.len == 0) "" else "|") ++ .{b};
+        }
+        return list;
+    }
+}
+
+/// What a severity flag's value must be, for its bad-value error.
+pub fn sevExpected(comptime warnings_only: bool) []const u8 {
+    comptime {
+        const bands = sevBands(warnings_only);
+        const code = if (warnings_only) "a warning code like W0001" else "a code like R0001";
+        const one_of = if (std.mem.indexOfScalar(u8, bands, '|') != null) "one of " else "";
+        return code ++ ", or a band: " ++ one_of ++ bands;
+    }
 }
 
 /// The basename of a path (after the last '/'), used as the code-signing
@@ -76,15 +102,23 @@ test "resolveHasError: only error severity blocks typecheck" {
     try std.testing.expect(resolveHasError(&.{ warn, err }));
 }
 
-test "validSpec: codes, band letters, and rejects" {
-    try std.testing.expect(validSpec("L"));
-    try std.testing.expect(validSpec("P"));
-    try std.testing.expect(validSpec("R"));
-    try std.testing.expect(validSpec("T"));
-    try std.testing.expect(validSpec("W"));
-    try std.testing.expect(!validSpec("X"));
-    try std.testing.expect(!validSpec(""));
-    try std.testing.expect(!validSpec("ZZ999"));
+test "canonicalSpec: bands come from codes, case is ignored, the rest is rejected" {
+    for (codes.prefix_bands) |b| {
+        try std.testing.expectEqualStrings(&.{b}, canonicalSpec(&.{b}).?);
+        try std.testing.expectEqualStrings(&.{b}, canonicalSpec(&.{std.ascii.toLower(b)}).?);
+    }
+    try std.testing.expectEqualStrings("W0001", canonicalSpec("w0001").?);
+    try std.testing.expectEqualStrings("R0001", canonicalSpec("R0001").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), canonicalSpec("Q"));
+    try std.testing.expectEqual(@as(?[]const u8, null), canonicalSpec(""));
+    try std.testing.expectEqual(@as(?[]const u8, null), canonicalSpec("ZZ999"));
+}
+
+test "sevBands: every band, or only the bands holding a warning" {
+    try std.testing.expectEqualStrings("L|P|R|T|W", comptime sevBands(false));
+    try std.testing.expectEqualStrings("W", comptime sevBands(true));
+    try std.testing.expectEqualStrings("a code like R0001, or a band: one of L|P|R|T|W", comptime sevExpected(false));
+    try std.testing.expectEqualStrings("a warning code like W0001, or a band: W", comptime sevExpected(true));
 }
 
 test "basename: with and without a separator" {

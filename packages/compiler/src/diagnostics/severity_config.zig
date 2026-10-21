@@ -14,8 +14,8 @@ const model = @import("model.zig");
 pub const Action = enum { err, warning, ignore };
 
 /// One override: `match` is a full code string ("R0001") or a single band letter
-/// ("L","P","R","T"). `match` bytes are borrowed (from argv), so a rule slice must
-/// not outlive them.
+/// ("L","P","R","T"), in registry spelling: `matches` compares exactly, so the CLI
+/// canonicalizes the user's spelling first (`Decide.canonicalSpec`).
 pub const Rule = struct { match: []const u8, action: Action };
 
 /// A borrowed, ordered list of override rules. Empty (the default) is the identity

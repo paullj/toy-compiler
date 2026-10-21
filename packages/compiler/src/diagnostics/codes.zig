@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const model = @import("model.zig");
+const nearmiss = @import("nearmiss.zig");
 pub const Severity = model.Severity;
 
 /// The append-only code enum. `none` (ordinal 0) is the "uncoded" sentinel every
@@ -318,10 +319,10 @@ pub fn slug(c: Code) ?[]const u8 {
     unreachable;
 }
 
-/// Parse a human code string ("R0001") back to a `Code`, or null if unknown. Used by
-/// `toy explain <CODE>` and the render-time severity config (`--error R0001`).
+/// Parse a human code string ("R0001", or "r0001": case is ignored) back to a `Code`,
+/// or null if unknown. Used by `toy explain <CODE>` and the severity flags (`--deny R0001`).
 pub fn fromStr(s: []const u8) ?Code {
-    for (table) |e| if (std.mem.eql(u8, e.str, s)) return e.code;
+    for (table) |e| if (std.ascii.eqlIgnoreCase(e.str, s)) return e.code;
     return null;
 }
 
@@ -330,19 +331,65 @@ pub fn hasPrefix(s: []const u8, band: u8) bool {
     return s.len > 0 and s[0] == band;
 }
 
-const prefix_bands = "LPRTW";
+/// Every band letter a code may start with, in `explain --list` order.
+pub const prefix_bands = "LPRTW";
+
+/// The band letter `spec` names ("t" or "T" gives "T"), as a static slice of
+/// `prefix_bands`, or null when `spec` is not a single band letter.
+pub fn bandOf(spec: []const u8) ?[]const u8 {
+    if (spec.len != 1) return null;
+    const i = std.mem.indexOfScalar(u8, prefix_bands, std.ascii.toUpper(spec[0])) orelse return null;
+    return prefix_bands[i .. i + 1];
+}
 
 /// True when a severity spec (a code string or a band letter) names only errors. An
 /// error means the program cannot be built, so `--warn`/`--allow` on such a spec would
 /// only hide the reason a build fails; the CLI rejects it.
 pub fn errorOnly(spec: []const u8) bool {
     if (fromStr(spec)) |c| return defaultSeverity(c) == .err;
-    if (spec.len != 1 or std.mem.indexOfScalar(u8, prefix_bands, spec[0]) == null) return false;
+    const b = bandOf(spec) orelse return false;
     for (table) |e| {
-        if (e.str[0] == spec[0] and e.default_severity != .err) return false;
+        if (e.str[0] == b[0] and e.default_severity != .err) return false;
     }
     return true;
 }
+
+/// A registered code close to the unknown `s`, or null. With `warnings_only` only
+/// warning codes are offered, for `--warn`/`--allow`, which reject the rest.
+pub fn suggest(s: []const u8, warnings_only: bool) ?[]const u8 {
+    // A short numeric tail ("R001" for R0001) is the commonest slip, and nearmiss
+    // cannot catch it: every one-digit-longer code (R0010..R0019) is an equal tie.
+    if (s.len >= 2 and bandOf(s[0..1]) != null and allDigits(s[1..])) {
+        if (std.fmt.parseInt(u16, s[1..], 10)) |n| {
+            var buf: [16]u8 = undefined;
+            const padded = std.fmt.bufPrint(&buf, "{c}{d:0>4}", .{ std.ascii.toUpper(s[0]), n }) catch "";
+            if (fromStr(padded)) |c| {
+                if (!warnings_only or defaultSeverity(c) != .err) return str(c);
+            }
+        } else |_| {}
+    }
+    var upper: [64]u8 = undefined;
+    if (s.len > upper.len) return null;
+    return nearmiss.suggest(std.ascii.upperString(&upper, s), CodeIter{ .warnings_only = warnings_only });
+}
+
+fn allDigits(s: []const u8) bool {
+    for (s) |ch| if (!std.ascii.isDigit(ch)) return false;
+    return true;
+}
+
+const CodeIter = struct {
+    warnings_only: bool,
+    i: usize = 0,
+    pub fn next(self: *CodeIter) ?[]const u8 {
+        while (self.i < table.len) {
+            defer self.i += 1;
+            const e = table[self.i];
+            if (!self.warnings_only or e.default_severity != .err) return e.str;
+        }
+        return null;
+    }
+};
 
 // Build-time registry safety: coverage (every non-none code has exactly one row),
 // uniqueness, prefix membership, and per-band contiguity (tails run 0001,0002,…).
@@ -637,4 +684,25 @@ test "errorOnly: error codes and all-error bands, never W or unknown specs" {
     try testing.expect(!errorOnly("X"));
     try testing.expect(!errorOnly("X9999"));
     try testing.expect(!errorOnly(""));
+}
+
+test "fromStr and bandOf ignore case and return the registry spelling" {
+    try testing.expectEqual(Code.R0001, fromStr("r0001").?);
+    try testing.expectEqualStrings("W0001", str(fromStr("w0001").?).?);
+    try testing.expectEqualStrings("T", bandOf("t").?);
+    for (prefix_bands) |b| try testing.expectEqualStrings(&.{b}, bandOf(&.{b}).?);
+    try testing.expectEqual(@as(?[]const u8, null), bandOf("Q"));
+    try testing.expectEqual(@as(?[]const u8, null), bandOf("RR"));
+    try testing.expect(errorOnly("r"));
+}
+
+test "suggest: a short or long numeric tail, a near code, and nothing for a far one" {
+    try testing.expectEqualStrings("R0001", suggest("R001", false).?);
+    try testing.expectEqualStrings("R0001", suggest("r1", false).?);
+    try testing.expectEqualStrings("W0001", suggest("W00001", true).?);
+    try testing.expectEqualStrings("W0013", suggest("w0O13", true).?);
+    try testing.expectEqual(@as(?[]const u8, null), suggest("R001", true));
+    try testing.expectEqual(@as(?[]const u8, null), suggest("X9999", false));
+    try testing.expectEqual(@as(?[]const u8, null), suggest("Q", false));
+    try testing.expectEqual(@as(?[]const u8, null), suggest("R+1", false));
 }
