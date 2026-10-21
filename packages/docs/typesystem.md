@@ -854,6 +854,10 @@ determinism-critical path):
 | shape | spelling |
 |-------|----------|
 | struct | `Name{field: <v>, field2: <v2>}` — no space after `Name`, `: ` after each field name, `, ` between fields, no trailing space, closing `}` |
+| tuple struct | `Name(<v0>, <v1>)` |
+| generic struct instance | its template's bare name: `Pair[int]` renders `Pair{a: 1, b: 2}` (no type arguments, never the mangled `Pair$int`) |
+| signed int | decimal digits, a leading `-` when negative (`i64::MIN` included) |
+| unsigned int | decimal digits, never a sign: a `uint`/`uint64` of 2^63 or more renders its magnitude |
 | enum unit variant | `variant` |
 | enum payload variant | `variant(<v0>, <v1>)` — payload fields in declaration order, `, `-separated |
 | `str` value | its raw bytes (no surrounding quotes, matching today's `print(str)`) |

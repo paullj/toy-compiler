@@ -39,6 +39,7 @@ pub const hand_builtins = [_]HandBuiltin{
     .{ .name = "text_base", .lower = panic.lowerTextBase },
     .{ .name = "__int_to_str", .lower = str.lowerIntToStr, .static_call_deps = &.{"gc_alloc"} },
     .{ .name = "__str_concat", .lower = str.lowerStrConcat, .static_call_deps = &.{"gc_alloc"} },
+    .{ .name = "__uint_to_str", .lower = str.lowerUintToStr, .static_call_deps = &.{"gc_alloc"} },
 };
 
 /// The `hand_builtins` index of `name`, resolved at comptime — lets a caller name
@@ -68,6 +69,10 @@ test "hand_builtins static_call_deps name real rows; gc_alloc pulls gc_collect" 
     const its = hand_builtins[comptime handBuiltinIndex("__int_to_str")].static_call_deps;
     try std.testing.expectEqual(@as(usize, 1), its.len);
     try std.testing.expectEqualStrings("gc_alloc", its[0]);
+
+    const uts = hand_builtins[comptime handBuiltinIndex("__uint_to_str")].static_call_deps;
+    try std.testing.expectEqual(@as(usize, 1), uts.len);
+    try std.testing.expectEqualStrings("gc_alloc", uts[0]);
 
     const sc = hand_builtins[comptime handBuiltinIndex("__str_concat")].static_call_deps;
     try std.testing.expectEqual(@as(usize, 1), sc.len);

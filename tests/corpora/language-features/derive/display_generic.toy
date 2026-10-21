@@ -1,0 +1,13 @@
+# Feature: a generic struct instance renders under its template name. `Pair[int]` is
+# reified to the mangled `Pair$int`, but its derived `Display` prints `Pair{..}`, also
+# when nested in an `Option` payload or a tuple struct field.
+import std/io
+struct Pair[T] { a: T, b: T }
+struct W(Pair[bool], int)
+fn main() {
+    io.println(Pair{ a: 1, b: 2 })
+    io.println(Option.some(Pair{ a: 1, b: 2 }))
+    io.print(W(Pair{ a: true, b: false }, 3))
+}
+# expect: stdout "Pair{a: 1, b: 2}\nsome(Pair{a: 1, b: 2})\nW(Pair{a: true, b: false}, 3)"
+# expect: exit 0

@@ -1219,7 +1219,7 @@ fn lowerDeriveDisplay(
         .@"struct" => {
             const layout = b.in.layouts[cty.struct_id];
             if (layout.is_tuple) {
-                const open = try std.fmt.allocPrint(gpa, "{s}(", .{layout.name});
+                const open = try std.fmt.allocPrint(gpa, "{s}(", .{layout.displayName()});
                 defer gpa.free(open);
                 try L.appendLiteral(&b, acc, open);
                 for (layout.field_types, layout.offsets, 0..) |fty, off, i| {
@@ -1232,7 +1232,7 @@ fn lowerDeriveDisplay(
                     // Fuse the (separator + field name + `: `) run into ONE interned literal:
                     // `Name{f0: ` for the first field, `, f1: ` for the rest.
                     const lit = if (i == 0)
-                        try std.fmt.allocPrint(gpa, "{s}{{{s}: ", .{ layout.name, fname })
+                        try std.fmt.allocPrint(gpa, "{s}{{{s}: ", .{ layout.displayName(), fname })
                     else
                         try std.fmt.allocPrint(gpa, ", {s}: ", .{fname});
                     defer gpa.free(lit);

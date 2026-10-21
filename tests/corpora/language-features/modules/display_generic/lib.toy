@@ -1,0 +1,2 @@
+pub struct Bx[T] { v: T }
+pub fn bx(v: int) -> Bx[int] { return Bx{ v: v } }

@@ -1,0 +1,10 @@
+# Feature: a generic struct declared in another module renders under its bare template
+# name, the same as a local one: `lib.Bx[int]` prints `Bx{v: 2}`.
+# expect: stdout "Bx{v: 2}"
+# expect: exit 0
+import std/io
+import lib
+
+fn main() {
+    io.print(lib.bx(2))
+}

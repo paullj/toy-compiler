@@ -1,5 +1,5 @@
-//! The hand-emitted `str` builtins: `__int_to_str` and `__str_concat`, both
-//! `gc_alloc`-backed packed-byte-buffer producers appended at link time.
+//! The hand-emitted `str` builtins: `__int_to_str`, `__uint_to_str` and `__str_concat`,
+//! all `gc_alloc`-backed packed-byte-buffer producers appended at link time.
 
 const std = @import("std");
 const Aarch64 = @import("../Aarch64.zig");
@@ -30,6 +30,18 @@ const deinitBuiltinRelocs = em.deinitBuiltinRelocs;
 
 /// Build the `__int_to_str` builtin's FnCode directly. Caller owns the result.
 pub fn lowerIntToStr(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
+    return lowerDigitsToStr(gpa, true);
+}
+
+/// Build the `__uint_to_str` builtin's FnCode directly. Caller owns the result.
+pub fn lowerUintToStr(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
+    return lowerDigitsToStr(gpa, false);
+}
+
+/// A 64-bit unsigned value with bit 63 set reads as a negative i64, so the unsigned
+/// render needs its own udiv loop with no sign handling. Narrower unsigned widths are
+/// zero-extended in x0 and stay on the signed render.
+fn lowerDigitsToStr(gpa: std.mem.Allocator, comptime signed: bool) error{OutOfMemory}!Link.FnCode {
     var code: std.ArrayList(u8) = .empty;
     errdefer code.deinit(gpa);
     var relocs: std.ArrayList(Link.Reloc) = .empty;
@@ -42,28 +54,37 @@ pub fn lowerIntToStr(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     // gc_alloc call), [sp+16 .. sp+48) = 32-byte digit buffer (buf_end = sp+48).
     try emitFramePrologue(&code, gpa);
     try emit(&code, gpa, A.subImm(A.SP, A.SP, 48));
-    try emit(&code, gpa, A.movReg(9, 0)); // x9 = n (saved for the sign test)
+    if (signed) try emit(&code, gpa, A.movReg(9, 0)); // x9 = n (saved for the sign test)
     try emit(&code, gpa, A.movz(11, 10, 0)); // x11 = 10 (divisor)
     try emit(&code, gpa, A.movz(14, 0x30, 0)); // x14 = '0'
     try emit(&code, gpa, A.addImm(10, A.SP, 48)); // x10 = &buf_end (write cursor, grows down)
-    // do-while digit loop (LOOP = this sdiv) — the never-negate render (i64::MIN-correct).
-    try emit(&code, gpa, A.sdiv(12, 0, 11)); // x12 = n / 10
+    // do-while digit loop (LOOP = this div). The signed render never negates n, so
+    // i64::MIN stays correct; it takes |r| per digit instead.
+    if (signed) {
+        try emit(&code, gpa, A.sdiv(12, 0, 11)); // x12 = n / 10
+    } else {
+        try emit(&code, gpa, A.udiv(12, 0, 11)); // x12 = n / 10
+    }
     try emit(&code, gpa, A.mul(13, 12, 11)); // x13 = q * 10
-    try emit(&code, gpa, A.subReg(13, 0, 13)); // x13 = n - q*10 (signed remainder)
-    try emit(&code, gpa, A.cmpImm(13, 0)); // cmp r, #0
-    try emit(&code, gpa, A.bCond(.ge, 2)); // b.ge +2 (skip the neg if r >= 0)
-    try emit(&code, gpa, A.neg(13, 13)); // x13 = -r (|r|, safe: |r| <= 9)
+    try emit(&code, gpa, A.subReg(13, 0, 13)); // x13 = r = n - q*10
+    if (signed) {
+        try emit(&code, gpa, A.cmpImm(13, 0)); // cmp r, #0
+        try emit(&code, gpa, A.bCond(.ge, 2)); // b.ge +2 (skip the neg if r >= 0)
+        try emit(&code, gpa, A.neg(13, 13)); // x13 = -r (|r|, safe: |r| <= 9)
+    }
     try emit(&code, gpa, A.addReg(13, 13, 14)); // x13 = '0' + digit
     try emit(&code, gpa, A.subImm(10, 10, 1)); // --cursor
     try emit(&code, gpa, A.strb(13, 10, 0)); // *cursor = digit char
     try emit(&code, gpa, A.movReg(0, 12)); // n = q
-    try emit(&code, gpa, A.cbnz(0, -10)); // cbnz n, LOOP (back 10 words to the sdiv)
-    // Sign: if the original value was negative, prepend '-'.
-    try emit(&code, gpa, A.cmpImm(9, 0)); // cmp orig, #0
-    try emit(&code, gpa, A.bCond(.ge, 4)); // b.ge +4 (skip the 3 sign instrs if >= 0)
-    try emit(&code, gpa, A.movz(13, 0x2D, 0)); // x13 = '-'
-    try emit(&code, gpa, A.subImm(10, 10, 1)); // --cursor
-    try emit(&code, gpa, A.strb(13, 10, 0)); // *cursor = '-'
+    try emit(&code, gpa, A.cbnz(0, if (signed) -10 else -7)); // cbnz n, LOOP (back to the div)
+    if (signed) {
+        // Sign: if the original value was negative, prepend '-'.
+        try emit(&code, gpa, A.cmpImm(9, 0)); // cmp orig, #0
+        try emit(&code, gpa, A.bCond(.ge, 4)); // b.ge +4 (skip the 3 sign instrs if >= 0)
+        try emit(&code, gpa, A.movz(13, 0x2D, 0)); // x13 = '-'
+        try emit(&code, gpa, A.subImm(10, 10, 1)); // --cursor
+        try emit(&code, gpa, A.strb(13, 10, 0)); // *cursor = '-'
+    }
     // len = buf_end - cursor; save cursor + len across the alloc.
     try emit(&code, gpa, A.addImm(1, A.SP, 48)); // x1 = &buf_end
     try emit(&code, gpa, A.subReg(2, 1, 10)); // x2 = len = end - cursor
@@ -92,7 +113,7 @@ pub fn lowerIntToStr(gpa: std.mem.Allocator) error{OutOfMemory}!Link.FnCode {
     try emit(&code, gpa, A.ldpFpLrPost); // ldp x29,x30,[sp],#16
     try emit(&code, gpa, A.ret);
 
-    return finishBuiltin(&code, &relocs, gpa, "__int_to_str");
+    return finishBuiltin(&code, &relocs, gpa, if (signed) "__int_to_str" else "__uint_to_str");
 }
 
 // __str_concat(lp, ll, rp, rl) builtin body — hand-written, AST/IR-independent. Joins two
@@ -203,6 +224,39 @@ test "ir-codegen: __int_to_str builtin byte shape (prologue, buffer, digit loop,
     try testing.expect(saw_cbnz);
     try testing.expect(saw_strb);
     // It allocates (unlike a bare fd write): a `.call26` reloc to the `gc_alloc` builtin.
+    var saw_gc_alloc = false;
+    for (fc.relocs) |r| {
+        if (r.kind == .call26 and r.target == .func and std.mem.eql(u8, r.target.func.name, "gc_alloc")) saw_gc_alloc = true;
+    }
+    try testing.expect(saw_gc_alloc);
+}
+
+test "ir-codegen: __uint_to_str builtin shape (udiv digit loop, no sign, gc_alloc)" {
+    const gpa = testing.allocator;
+    var fc = try lowerUintToStr(gpa);
+    defer fc.deinit(gpa);
+
+    try testing.expectEqualStrings("__uint_to_str", fc.sym.name);
+    try testing.expectEqual(Link.SymKind.builtin, fc.sym.kind);
+    try testing.expect(fc.code.len % 4 == 0);
+    try testing.expectEqual(Aarch64.stpFpLrPre, std.mem.readInt(u32, fc.code[0..4], .little));
+    const n = fc.code.len;
+    try testing.expectEqual(Aarch64.ret, std.mem.readInt(u32, fc.code[n - 4 ..][0..4], .little));
+    // An unsigned divide with the shorter back-edge, and none of the signed render's
+    // sdiv, remainder negate or '-' store: those are what made 2^63 print negative.
+    var saw_udiv = false;
+    var saw_cbnz = false;
+    var i: usize = 0;
+    while (i < fc.code.len) : (i += 4) {
+        const w = std.mem.readInt(u32, fc.code[i..][0..4], .little);
+        if (w == Aarch64.udiv(12, 0, 11)) saw_udiv = true;
+        if (w == Aarch64.cbnz(0, -7)) saw_cbnz = true;
+        try testing.expect(w != Aarch64.sdiv(12, 0, 11));
+        try testing.expect(w != Aarch64.neg(13, 13));
+        try testing.expect(w != Aarch64.movz(13, 0x2D, 0));
+    }
+    try testing.expect(saw_udiv);
+    try testing.expect(saw_cbnz);
     var saw_gc_alloc = false;
     for (fc.relocs) |r| {
         if (r.kind == .call26 and r.target == .func and std.mem.eql(u8, r.target.func.name, "gc_alloc")) saw_gc_alloc = true;

@@ -1,0 +1,19 @@
+# Feature: unsigned `Display`. A 64-bit unsigned value renders through `__uint_to_str`
+# (udiv digits, no sign), so uint64 max and 2^63 print as their magnitude rather than
+# the negative i64 the same bits mean when signed. Narrower unsigned widths are
+# zero-extended, so they keep the shared `__int_to_str` path.
+import std/io
+struct S { u: uint64 }
+fn main() {
+    m: uint64 = 18446744073709551615
+    io.println(m)
+    h: uint = 9223372036854775808
+    io.println(h)
+    io.println(S{ u: m })
+    b: uint8 = 255
+    io.println(b)
+    z: uint64 = 0
+    io.print(z)
+}
+# expect: stdout "18446744073709551615\n9223372036854775808\nS{u: 18446744073709551615}\n255\n0"
+# expect: exit 0
