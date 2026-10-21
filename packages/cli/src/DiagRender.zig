@@ -228,7 +228,14 @@ pub fn printCliErrors(out: *Io.Writer, level: Style.ColorLevel, errs: []const cl
         try sty_err.styled(out, level, "error");
         try out.writeAll(": ");
         switch (e.kind) {
-            .unknown_flag => try out.print("unknown flag: {s}", .{e.arg}),
+            .unknown_flag => {
+                try out.print("unknown flag: {s}", .{e.arg});
+                if (e.suggestion.len != 0) try didYouMean(out, level, "--", e.suggestion);
+            },
+            .unknown_command => {
+                try out.print("unknown command '{s}'", .{e.arg});
+                try didYouMean(out, level, "", e.suggestion);
+            },
             .declined_flag => try out.print("'{s}' is a {s} option; '{s}' does not take it", .{ e.arg, e.expected, e.where }),
             .missing_value => try out.print("{s} requires a value ({s})", .{ e.arg, e.expected }),
             // `expected` says what the value must be; an enum close to a choice adds a

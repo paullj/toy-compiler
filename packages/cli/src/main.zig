@@ -129,7 +129,15 @@ pub fn main(init: std.process.Init) !void {
     // must not depend on the value we are about to reject.
     const pre_usage: Usage = .{ .w = &stderr_writer.interface, .level = resolveLevel(init, io, Io.File.stderr(), .auto) };
 
-    var root_res = try cli.Parser.parse(gpa, comptime AppCli.spec.root, argv, &sink);
+    var on_disk: std.ArrayList([]const u8) = .empty;
+    defer on_disk.deinit(gpa);
+    for (argv) |a| {
+        if (a.len == 0 or a[0] == '-') continue;
+        Io.Dir.cwd().access(io, a, .{}) catch continue;
+        try on_disk.append(gpa, a);
+    }
+
+    var root_res = try cli.Parser.parseWith(gpa, comptime AppCli.spec.root, argv, &sink, .{ .files = on_disk.items });
     defer root_res.deinit();
     switch (root_res.value) {
         // -h/--help and -V/--version route to the framework's plain-text renderers.
@@ -271,6 +279,10 @@ pub fn main(init: std.process.Init) !void {
     const run_after = st.command == .run;
     // Worker threads the build will use (for the "built with N threads" line).
     const threads: usize = if (st.job_count != 0) st.job_count else (std.Thread.getCpuCount() catch 1);
+
+    // Without a verb, a second word may be a mistyped command too short or far for a
+    // suggestion, so the error must not name a `build` the user never typed.
+    if (build_exe and !st.verb_seen and st.paths.items.len > 1) argErr(usage, "toy takes exactly one input file (the entry module)");
 
     // Build the executable: output → `-o`/`--output`, else the default build dir.
     if (build_exe) {
@@ -691,13 +703,13 @@ fn emitExecutable(
     threads: usize,
     sev: SevCfg.SeverityConfig,
 ) !u8 {
-    // `-o` takes the 1 ROOT (entry) file; the driver discovers the transitive
+    // A build takes the 1 ROOT (entry) file; the driver discovers the transitive
     // import graph from it and compiles the whole program. This is an in-body check
     // that RETURNS 1 (not exit); `argLine` prints the styled error line AND flushes,
     // because the `1` bubbles up through `std.process.exit(try emitExecutable(...))`
     // in main, which skips defers and never flushes `out` on its own.
     if (paths.len != 1) {
-        try argLine(usage, "-o takes exactly one input file (the entry module)");
+        try argLine(usage, if (run_after) "run takes exactly one input file (the entry module)" else "build takes exactly one input file (the entry module)");
         return 1;
     }
 

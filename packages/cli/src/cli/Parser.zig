@@ -49,6 +49,13 @@ pub fn Result(comptime cmd: Spec.Command) type {
     };
 }
 
+/// What the caller knows that the parser, which never touches the disk, cannot.
+pub const Options = struct {
+    /// argv words that name existing files. One of these is bound as a file even when
+    /// it is near a subcommand name, so a file called `fun` still builds.
+    files: []const []const u8 = &.{},
+};
+
 /// Parse `argv` against `cmd`, pushing every failure to `sink` and continuing.
 /// Returns a `Result(cmd)` the caller must `deinit`. Only OutOfMemory escapes.
 pub fn parse(
@@ -56,6 +63,16 @@ pub fn parse(
     comptime cmd: Spec.Command,
     argv: []const []const u8,
     sink: *Sink,
+) std.mem.Allocator.Error!Result(cmd) {
+    return parseWith(gpa, cmd, argv, sink, .{});
+}
+
+pub fn parseWith(
+    gpa: std.mem.Allocator,
+    comptime cmd: Spec.Command,
+    argv: []const []const u8,
+    sink: *Sink,
+    opts: Options,
 ) std.mem.Allocator.Error!Result(cmd) {
     var arena = std.heap.ArenaAllocator.init(gpa);
     errdefer arena.deinit();
@@ -104,7 +121,9 @@ pub fn parse(
         }
 
         // Positional token (or anything after `--`). First bare positional that
-        // matches a subcommand name stops the parent and hands back the tail.
+        // matches a subcommand name stops the parent and hands back the tail; one
+        // near a name is a typo of it, since binding it as a file would only fail later
+        // with a misleading "no such file" or "-o takes one input".
         if (cmd.subcommands.len > 0 and pos_filled == 0 and !positional_only) {
             var dispatched = false;
             inline for (cmd.subcommands, 0..) |sub, j| {
@@ -117,6 +136,13 @@ pub fn parse(
                     } } };
                 }
             }
+            const is_file = for (opts.files) |f| {
+                if (std.mem.eql(u8, f, arg)) break true;
+            } else false;
+            if (!is_file) if (nearmiss.suggest(arg, NameIter([]const u8){ .items = comptime subcommandNames(cmd) })) |near| {
+                try sink.add(gpa, .{ .kind = .unknown_command, .arg = arg, .suggestion = near });
+                continue;
+            };
         }
 
         try bindPositional(cmd, &p, gpa, a, &appends, sink, arg, &pos_filled);
@@ -215,7 +241,31 @@ fn handleLong(
             }
         }
     }
-    try sink.add(gpa, .{ .kind = .unknown_flag, .arg = argv[i.*] });
+    try sink.add(gpa, .{
+        .kind = .unknown_flag,
+        .arg = argv[i.*],
+        .suggestion = nearmiss.suggest(lv.name, NameIter([]const u8){ .items = comptime longNames(cmd) }) orelse "",
+    });
+}
+
+/// Every long name `cmd` recognises, declined ones included: a near miss to a declined
+/// name is still the flag the user meant, and the parser then says who owns it.
+fn longNames(comptime cmd: Spec.Command) []const []const u8 {
+    comptime {
+        var names: []const []const u8 = &.{ "help", "version" };
+        for (cmd.options ++ cmd.declined.options) |o| {
+            if (o.long) |l| names = names ++ &[_][]const u8{l};
+        }
+        return names;
+    }
+}
+
+fn subcommandNames(comptime cmd: Spec.Command) []const []const u8 {
+    comptime {
+        var names: []const []const u8 = &.{};
+        for (cmd.subcommands) |sub| names = names ++ &[_][]const u8{sub.name};
+        return names;
+    }
 }
 
 fn declinedErr(comptime cmd: Spec.Command, comptime spelled: []const u8) Sink.Error {
@@ -552,27 +602,29 @@ fn ElemOf(comptime cmd: Spec.Command, comptime name: [:0]const u8) type {
     return @typeInfo(F).pointer.child;
 }
 
-/// A `next() ?[]const u8` iterator over an enum option's choices, in the shape
-/// `nearmiss.suggest` consumes (it takes the iterator by value). The `[:0]const u8`
-/// choices coerce to `[]const u8` on yield.
-const ChoiceIter = struct {
-    items: []const [:0]const u8,
-    i: usize = 0,
-    pub fn next(self: *ChoiceIter) ?[]const u8 {
-        if (self.i >= self.items.len) return null;
-        defer self.i += 1;
-        return self.items[self.i];
-    }
-};
+/// A `next() ?[]const u8` iterator over a static name list, in the shape
+/// `nearmiss.suggest` consumes (it takes the iterator by value). Generic because enum
+/// choices are `[:0]const u8`, which coerce to `[]const u8` only one at a time.
+fn NameIter(comptime T: type) type {
+    return struct {
+        items: []const T,
+        i: usize = 0,
+        pub fn next(self: *@This()) ?[]const u8 {
+            if (self.i >= self.items.len) return null;
+            defer self.i += 1;
+            return self.items[self.i];
+        }
+    };
+}
 
 /// Build a `bad_value` error that says what the value must be and, for an enum, a
 /// near-miss choice when the input is close to one. The `comptime v == .@"enum"` guard
-/// prunes the nearmiss / ChoiceIter references from non-enum instantiations. Both
+/// prunes the nearmiss / NameIter references from non-enum instantiations. Both
 /// strings are static or borrowed, honouring the Sink's contract.
 fn badValueErr(comptime v: Spec.ValueType, arg: []const u8, got: []const u8) Sink.Error {
     var e: Sink.Error = .{ .kind = .bad_value, .arg = arg, .got = got, .expected = comptime Spec.describe(v) };
     if (comptime v == .@"enum") {
-        e.suggestion = nearmiss.suggest(got, ChoiceIter{ .items = v.@"enum" }) orelse "";
+        e.suggestion = nearmiss.suggest(got, NameIter([:0]const u8){ .items = v.@"enum" }) orelse "";
     }
     return e;
 }
@@ -1122,4 +1174,102 @@ test "a declined option is named with its owner, and its value is not taken for 
         try testing.expectEqualStrings("build", e.expected);
         try testing.expectEqualStrings("check", e.where);
     }
+}
+
+fn verbCmd() Spec.Command {
+    return .{
+        .name = "toy",
+        .options = &.{
+            .{ .long = "color", .value = .{ .@"enum" = &.{ "auto", "never" } } },
+            .{ .short = 'O', .value = .{ .int = .{ .min = 0, .max = 1 } } },
+        },
+        .positionals = &.{.{ .name = "file", .value = .string, .arity = .variadic }},
+        .subcommands = &.{
+            .{ .name = "build", .positionals = &.{.{ .name = "file", .value = .string, .arity = .variadic }} },
+            .{ .name = "check", .positionals = &.{.{ .name = "file", .value = .string, .arity = .variadic }}, .declined = .{ .owner = "build", .options = &.{.{ .long = "no-cache", .action = .set_true }} } },
+            .{ .name = "lsp" },
+        },
+    };
+}
+
+test "a first positional near a subcommand is an unknown command, not a file" {
+    const cmd = comptime verbCmd();
+    var sink: Sink = .{};
+    defer sink.deinit(testing.allocator);
+
+    var r = try parse(testing.allocator, cmd, &.{ "buidl", "x.toy" }, &sink);
+    defer r.deinit();
+    try testing.expect(r.value == .errors);
+    try testing.expectEqual(@as(usize, 1), sink.count());
+    const e = sink.items()[0];
+    try testing.expectEqual(Sink.Kind.unknown_command, e.kind);
+    try testing.expectEqualStrings("buidl", e.arg);
+    try testing.expectEqualStrings("build", e.suggestion);
+}
+
+test "a far first positional binds as a file; an exact name dispatches" {
+    const cmd = comptime verbCmd();
+    var sink: Sink = .{};
+    defer sink.deinit(testing.allocator);
+
+    var r = try parse(testing.allocator, cmd, &.{ "main.toy", "lps" }, &sink);
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 2), r.value.ok.file.len);
+    try testing.expectEqualStrings("lps", r.value.ok.file[1]);
+
+    var r2 = try parse(testing.allocator, cmd, &.{"lsp"}, &sink);
+    defer r2.deinit();
+    try testing.expectEqualStrings("lsp", r2.value.subcommand.name);
+}
+
+test "a near word the caller found on disk binds as a file" {
+    const cmd = comptime verbCmd();
+    var sink: Sink = .{};
+    defer sink.deinit(testing.allocator);
+
+    var r = try parseWith(testing.allocator, cmd, &.{ "lps", "chek" }, &sink, .{ .files = &.{"lps"} });
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 0), sink.count());
+    try testing.expectEqualStrings("lps", r.value.ok.file[0]);
+    try testing.expectEqualStrings("chek", r.value.ok.file[1]);
+}
+
+test "nothing after -- is taken for a command" {
+    const cmd = comptime verbCmd();
+    var sink: Sink = .{};
+    defer sink.deinit(testing.allocator);
+
+    var r = try parse(testing.allocator, cmd, &.{ "--", "chek" }, &sink);
+    defer r.deinit();
+    try testing.expectEqualStrings("chek", r.value.ok.file[0]);
+}
+
+test "an unknown long flag suggests a near long name, including a declined one" {
+    const cmd = comptime verbCmd();
+    var sink: Sink = .{};
+    defer sink.deinit(testing.allocator);
+
+    var r = try parse(testing.allocator, cmd, &.{ "--colr=never", "--frobnicate", "x.toy" }, &sink);
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 2), sink.count());
+    try testing.expectEqual(Sink.Kind.unknown_flag, sink.items()[0].kind);
+    try testing.expectEqualStrings("--colr=never", sink.items()[0].arg);
+    try testing.expectEqualStrings("color", sink.items()[0].suggestion);
+    try testing.expectEqualStrings("", sink.items()[1].suggestion);
+
+    sink.reset();
+    var r2 = try parse(testing.allocator, cmd.subcommands[1], &.{ "--no-cahce", "x.toy" }, &sink);
+    defer r2.deinit();
+    try testing.expectEqualStrings("no-cache", sink.items()[0].suggestion);
+}
+
+test "an unknown short flag gets no suggestion" {
+    const cmd = comptime verbCmd();
+    var sink: Sink = .{};
+    defer sink.deinit(testing.allocator);
+
+    var r = try parse(testing.allocator, cmd, &.{ "-P", "x.toy" }, &sink);
+    defer r.deinit();
+    try testing.expectEqual(Sink.Kind.unknown_flag, sink.items()[0].kind);
+    try testing.expectEqualStrings("", sink.items()[0].suggestion);
 }
