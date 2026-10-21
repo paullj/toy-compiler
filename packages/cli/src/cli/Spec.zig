@@ -18,16 +18,41 @@ pub const ValueType = union(enum) {
     @"enum": []const [:0]const u8,
 };
 
-/// Comptime "a|b|c" join of an enum option's choices — the single piece shared by
-/// help output and the invalid-value error so their wording can't drift.
-pub fn choicesJoined(comptime choices: []const [:0]const u8) []const u8 {
+/// What a value of type `v` must be, as a phrase for help and errors: "one of: a|b|c",
+/// "0 or 1" or "an int >= 1". Help, the bad_value text and the missing_value text all
+/// read it, so their wording cannot drift.
+pub fn describe(comptime v: ValueType) []const u8 {
     comptime {
-        var s: []const u8 = "";
-        for (choices, 0..) |c, i| {
-            if (i != 0) s = s ++ "|";
-            s = s ++ c;
+        return switch (v) {
+            .string => "a string",
+            .boolean => "no value",
+            .int => |r| rangeText("an int", i64, r),
+            .float => |r| rangeText("a number", f64, r),
+            .@"enum" => |choices| blk: {
+                var s: []const u8 = "one of: ";
+                for (choices, 0..) |c, i| {
+                    if (i != 0) s = s ++ "|";
+                    s = s ++ c;
+                }
+                break :blk s;
+            },
+        };
+    }
+}
+
+fn rangeText(comptime noun: []const u8, comptime T: type, comptime range: ?Range(T)) []const u8 {
+    comptime {
+        const r = range orelse return noun;
+        const fmt = std.fmt.comptimePrint;
+        if (r.min) |mn| {
+            if (r.max) |mx| {
+                if (T == i64 and mx - mn == 1) return fmt("{d} or {d}", .{ mn, mx });
+                return fmt("{s} from {d} to {d}", .{ noun, mn, mx });
+            }
+            return fmt("{s} >= {d}", .{ noun, mn });
         }
-        return s;
+        if (r.max) |mx| return fmt("{s} <= {d}", .{ noun, mx });
+        return noun;
     }
 }
 
@@ -494,6 +519,17 @@ test "reject a declined option that the command also takes" {
 test "reject a declined option with no owner" {
     const c = Command{ .name = "c", .declined = .{ .options = &.{.{ .long = "no-cache" }} } };
     try std.testing.expect(comptime checkCommand(c) != null);
+}
+
+test "describe: enum choices, int ranges, and plain kinds" {
+    try std.testing.expectEqualStrings("one of: auto|always|never", comptime describe(.{ .@"enum" = &.{ "auto", "always", "never" } }));
+    try std.testing.expectEqualStrings("0 or 1", comptime describe(.{ .int = .{ .min = 0, .max = 1 } }));
+    try std.testing.expectEqualStrings("an int >= 1", comptime describe(.{ .int = .{ .min = 1 } }));
+    try std.testing.expectEqualStrings("an int <= 9", comptime describe(.{ .int = .{ .max = 9 } }));
+    try std.testing.expectEqualStrings("an int from 1 to 8", comptime describe(.{ .int = .{ .min = 1, .max = 8 } }));
+    try std.testing.expectEqualStrings("an int", comptime describe(.{ .int = null }));
+    try std.testing.expectEqualStrings("a number", comptime describe(.{ .float = null }));
+    try std.testing.expectEqualStrings("a string", comptime describe(.string));
 }
 
 test "error in subcommand is reported via recursion" {

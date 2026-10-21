@@ -181,8 +181,8 @@ fn handleLong(
             if (std.mem.eql(u8, l, lv.name)) {
                 seen[oi] = true;
                 if (comptime isFlag(o)) {
-                    if (lv.inline_val != null) {
-                        try sink.add(gpa, .{ .kind = .bad_value, .arg = argv[i.*], .expected = "no value (flag)" });
+                    if (lv.inline_val) |v| {
+                        try sink.add(gpa, .{ .kind = .bad_value, .arg = "--" ++ l, .got = v, .expected = comptime "it takes " ++ Spec.describe(.boolean) });
                         return;
                     }
                     applyFlag(cmd, o, p);
@@ -195,7 +195,7 @@ fn handleLong(
                     i.* += 1;
                     raw = argv[i.*];
                 } else {
-                    try sink.add(gpa, .{ .kind = .missing_value, .arg = argv[i.*], .expected = valueKindName(o.value) });
+                    try sink.add(gpa, .{ .kind = .missing_value, .arg = argv[i.*], .expected = comptime Spec.describe(o.value) });
                     return;
                 }
                 try applyValue(cmd, o, oi, p, gpa, a, appends, sink, raw);
@@ -263,7 +263,7 @@ fn handleShortCluster(
                             i.* += 1;
                             raw = argv[i.*];
                         } else {
-                            try sink.add(gpa, .{ .kind = .missing_value, .arg = argv[i.*], .expected = valueKindName(o.value) });
+                            try sink.add(gpa, .{ .kind = .missing_value, .arg = argv[i.*], .expected = comptime Spec.describe(o.value) });
                             return .none;
                         }
                         try applyValue(cmd, o, oi, p, gpa, a, appends, sink, raw);
@@ -552,16 +552,6 @@ fn ElemOf(comptime cmd: Spec.Command, comptime name: [:0]const u8) type {
     return @typeInfo(F).pointer.child;
 }
 
-fn valueKindName(comptime v: Spec.ValueType) []const u8 {
-    return switch (v) {
-        .boolean => "boolean",
-        .int => "int",
-        .float => "float",
-        .string => "string",
-        .@"enum" => "one of the choices",
-    };
-}
-
 /// A `next() ?[]const u8` iterator over an enum option's choices, in the shape
 /// `nearmiss.suggest` consumes (it takes the iterator by value). The `[:0]const u8`
 /// choices coerce to `[]const u8` on yield.
@@ -575,16 +565,13 @@ const ChoiceIter = struct {
     }
 };
 
-/// Build a `bad_value` error, attaching the choice list and a near-miss suggestion
-/// for enum options so the renderer can list the choices and offer "did you mean X?".
-/// The `comptime v == .@"enum"` guard prunes the enum-only work (and the nearmiss /
-/// ChoiceIter references) from non-enum instantiations. Both attached strings are
-/// static (a comptime join / a slice into a comptime choice literal), so they honour
-/// the Sink's borrowed-string contract.
+/// Build a `bad_value` error that says what the value must be and, for an enum, a
+/// near-miss choice when the input is close to one. The `comptime v == .@"enum"` guard
+/// prunes the nearmiss / ChoiceIter references from non-enum instantiations. Both
+/// strings are static or borrowed, honouring the Sink's contract.
 fn badValueErr(comptime v: Spec.ValueType, arg: []const u8, got: []const u8) Sink.Error {
-    var e: Sink.Error = .{ .kind = .bad_value, .arg = arg, .got = got, .expected = valueKindName(v) };
+    var e: Sink.Error = .{ .kind = .bad_value, .arg = arg, .got = got, .expected = comptime Spec.describe(v) };
     if (comptime v == .@"enum") {
-        e.choices = comptime Spec.choicesJoined(v.@"enum");
         e.suggestion = nearmiss.suggest(got, ChoiceIter{ .items = v.@"enum" }) orelse "";
     }
     return e;
@@ -890,7 +877,7 @@ test "enum bad value carries the choices list; a far token yields no suggestion"
     try testing.expect(r.value == .errors);
     const e = sink.items()[0];
     try testing.expectEqual(Sink.Kind.bad_value, e.kind);
-    try testing.expectEqualStrings("ir|asm|obj", e.choices);
+    try testing.expectEqualStrings("one of: ir|asm|obj", e.expected);
     try testing.expectEqualStrings("", e.suggestion); // "wat" is far from every choice
 }
 
@@ -904,8 +891,44 @@ test "enum bad value suggests a near miss" {
     try testing.expect(r.value == .errors);
     const e = sink.items()[0];
     try testing.expectEqual(Sink.Kind.bad_value, e.kind);
-    try testing.expectEqualStrings("ir|asm|obj", e.choices);
+    try testing.expectEqualStrings("one of: ir|asm|obj", e.expected);
     try testing.expectEqualStrings("obj", e.suggestion); // single substitution obk->obj
+}
+
+test "bad and missing values say what the value must be" {
+    const cmd = comptime repCmd();
+    var sink: Sink = .{};
+    defer sink.deinit(testing.allocator);
+
+    var r = try parse(testing.allocator, cmd, &.{ "-j0", "--all=yes", "in.zig", "--emit" }, &sink);
+    defer r.deinit();
+    try testing.expect(r.value == .errors);
+    const errs = sink.items();
+    try testing.expectEqual(@as(usize, 3), errs.len);
+    try testing.expectEqual(Sink.Kind.bad_value, errs[0].kind);
+    try testing.expectEqualStrings("--jobs", errs[0].arg);
+    try testing.expectEqualStrings("an int from 1 to 8", errs[0].expected);
+    try testing.expectEqual(Sink.Kind.bad_value, errs[1].kind);
+    try testing.expectEqualStrings("--all", errs[1].arg);
+    try testing.expectEqualStrings("yes", errs[1].got);
+    try testing.expectEqualStrings("it takes no value", errs[1].expected);
+    try testing.expectEqual(Sink.Kind.missing_value, errs[2].kind);
+    try testing.expectEqualStrings("one of: ir|asm|obj", errs[2].expected);
+}
+
+test "a repeated enum append keeps every choice in order" {
+    const cmd = comptime Spec.Command{
+        .name = "c",
+        .options = &.{.{ .long = "opt", .value = .{ .@"enum" = &.{ "fold", "dce" } }, .action = .append }},
+    };
+    var sink: Sink = .{};
+    defer sink.deinit(testing.allocator);
+
+    var r = try parse(testing.allocator, cmd, &.{ "--opt=dce", "--opt", "fold" }, &sink);
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 2), r.value.ok.opt.len);
+    try testing.expect(r.value.ok.opt[0] == .dce);
+    try testing.expect(r.value.ok.opt[1] == .fold);
 }
 
 test "append accumulates into an owned slice; ownership freed by arena deinit" {

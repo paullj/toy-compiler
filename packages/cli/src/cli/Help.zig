@@ -116,7 +116,7 @@ fn renderRow(
 /// invalid-value error list the same set.
 fn enumSuffix(comptime o: Spec.Option) []const u8 {
     return switch (o.value) {
-        .@"enum" => |choices| " (one of: " ++ Spec.choicesJoined(choices) ++ ")",
+        .@"enum" => " (" ++ Spec.describe(o.value) ++ ")",
         else => "",
     };
 }

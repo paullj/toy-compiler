@@ -167,9 +167,9 @@ done
 
 # DCE is exercised across the cascade benches but its standalone counter is only
 # nonzero once a producer pass (fold) has created dead values. Attribute it on
-# const_arith with `--opt=fold,dce`: dced>0, and `-O1 --no-opt=dce` regresses the
+# const_arith with `--opt=fold --opt=dce`: dced>0, and `-O1 --no-opt=dce` regresses the
 # emitted win (the folded const feeders survive as load/op/store words without it).
-sdce="$(limit 30 "$toyc" --no-cache --opt-stats --opt=fold,dce -o "$work/dce.only" "$root/tests/corpora/benchmark/const_arith.toy" 2>&1)"
+sdce="$(limit 30 "$toyc" --no-cache --opt-stats --opt=fold --opt=dce -o "$work/dce.only" "$root/tests/corpora/benchmark/const_arith.toy" 2>&1)"
 dval="$(stat_field "$sdce" dced)"
 sdcefull="$(limit 30 "$toyc" --no-cache --opt-stats -O1 -o "$work/dce.full" "$root/tests/corpora/benchmark/const_arith.toy" 2>&1)"
 edcefull="$(stat_field "$sdcefull" emitted_instrs)"

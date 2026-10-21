@@ -2,9 +2,9 @@
 //! (`main.zig`) parses with `cli.Parser`. `build`/`run` are subcommands sharing
 //! the root's option set + variadic `<file>` positional; a bare `toy` builds/inspects.
 //!
-//! Spellings match the old hand-rolled parser byte-for-byte (tests/corpora depends on them):
+//! Spellings tests/corpora depends on:
 //! - `-O` is short-only (Range 0..1) so `-O0`/`-O1`/`-O 1` parse (`-O2` rejected).
-//! - `--opt`/`--no-opt` are plain strings (the grammar can't validate pass names; the driver does).
+//! - `--opt`/`--no-opt` are repeatable enums over the `Opt.Pass` names, one pass each.
 //! - `-h`/`--help`/`-V`/`--version` are auto-injected by the framework, so not listed here.
 
 const toyc = @import("toy_compiler");
@@ -17,9 +17,6 @@ const Spec = @import("cli/Cli.zig").Spec;
 // importing `build_options` here directly would put that generated file in two modules.
 pub const dev_inspect: bool = toyc.version.dev_inspect;
 
-/// The option set shared verbatim by root, `build`, and `run` (defined once so
-/// they can't drift). `--target` is not defaulted in-spec (stays `?[]const u8`);
-/// the driver applies "native" when null, matching the old behaviour.
 // The DEV pipeline-inspection flag, registered on root/build/run ONLY when
 // `dev_inspect` is true (Debug builds + every test binary). The value list is
 // `{lex,parse,ir}` — NOT `check`: `toy check` is its own subcommand now, so
@@ -29,19 +26,24 @@ const emit_opt: []const Spec.Option = if (dev_inspect) &.{
     .{ .long = "emit", .value = .{ .@"enum" = &.{ "lex", "parse", "ir" } }, .value_name = "STAGE", .help = "Inspect the pipeline instead of building (no binary; dev builds only)" },
 } else &.{};
 
+/// `--target`, shared by every command that takes it, so `check` validates it too.
+const target_opt: Spec.Option = .{ .long = "target", .value = .{ .@"enum" = &toyc.Driver.targets }, .value_name = "TARGET", .help = "Compilation target (default: " ++ toyc.Driver.default_target ++ ")" };
+
+const pass_names = std.meta.fieldNames(toyc.Opt.Pass);
+
 // The build/inspect options MINUS `--emit` (spliced in via `emit_opt` so it can be
 // gated behind `dev_inspect`). `shared_opts` below is `pre_emit ++ emit_opt ++ post_emit`.
 const pre_emit: []const Spec.Option = &.{
     .{ .long = "output", .short = 'o', .value = .string, .value_name = "PATH", .help = "Output path for the built binary (default: .toy/<stamp>/build/<name>)" },
-    .{ .long = "target", .value = .string, .value_name = "TRIPLE", .help = "Compilation target (default: native)" },
+    target_opt,
 };
 const post_emit: []const Spec.Option = &.{
     // -j: N>=1; the parser rejects -j0/negatives as a bad value via the Range.
     .{ .short = 'j', .value = .{ .int = .{ .min = 1, .max = null } }, .value_name = "N", .help = "Build worker threads (N>=1; -j1 = serial; default cpu-based)" },
     // -O is short-only => Parsed field `O`; -O0 / -O1 / -O 1 all parse, -O2 rejected.
     .{ .short = 'O', .value = .{ .int = .{ .min = 0, .max = 1 } }, .value_name = "LEVEL", .help = "IR optimization level (0 = none, 1 = all passes; any pass on also keeps non-escaping closure envs in frames)" },
-    .{ .long = "opt", .value = .string, .value_name = "LIST", .help = "Enable only these passes (fold,branch,dce,forward)" },
-    .{ .long = "no-opt", .value = .string, .action = .append, .value_name = "PASS", .help = "Disable one pass from the current level (repeatable)" },
+    .{ .long = "opt", .value = .{ .@"enum" = pass_names }, .action = .append, .value_name = "PASS", .help = "Enable only the named passes (repeatable)" },
+    .{ .long = "no-opt", .value = .{ .@"enum" = pass_names }, .action = .append, .value_name = "PASS", .help = "Disable one pass from the current level (repeatable)" },
     .{ .long = "dump", .action = .set_true, .help = "Print the emit phase's artifact (tokens, or the AST)" },
     .{ .long = "codegen-stats", .action = .set_true, .help = "Print compiled-vs-cached function counts (with -o)" },
     .{ .long = "verify", .action = .set_true, .help = "Re-lower cached functions and assert they match (with -o)" },
@@ -61,8 +63,8 @@ const post_emit: []const Spec.Option = &.{
 /// The option set shared verbatim by root, `build`, and `run` (defined once so
 /// they can't drift). `--emit` sits between `pre_emit` and `post_emit` and is present
 /// only when `dev_inspect` is true (Debug builds + test binaries); a release build
-/// drops it entirely. `--target` is not defaulted in-spec (stays `?[]const u8`); the
-/// driver applies "native" when null, matching the old behaviour.
+/// drops it entirely. `--target` is not defaulted in-spec; the driver applies
+/// `Driver.default_target` when it is absent.
 const shared_opts: []const Spec.Option = pre_emit ++ emit_opt ++ post_emit;
 
 /// The variadic input-file positional, shared by root/build/run.
@@ -87,7 +89,7 @@ const check_opts: []const Spec.Option = &.{
     .{ .long = "exit-zero", .action = .set_true, .help = "Always exit 0, even when diagnostics contain errors" },
     .{ .long = "watch", .action = .set_true, .help = "Re-check on file changes (not yet implemented; accepted as a no-op)" },
     .{ .long = "color", .value = .{ .@"enum" = &.{ "auto", "always", "never" } }, .value_name = "WHEN", .help = "Colorize output (default auto: on when stdout is a tty)" },
-    .{ .long = "target", .value = .string, .value_name = "TRIPLE", .help = "Compilation target (default: native)" },
+    target_opt,
     .{ .long = "timings", .action = .set_true, .help = "Print the per-stage wall-clock profile" },
 };
 

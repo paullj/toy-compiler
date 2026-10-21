@@ -11,7 +11,6 @@ const std = @import("std");
 const Check = @import("Check.zig");
 const codes = @import("../diagnostics/codes.zig");
 const Diagnostic = @import("../diagnostics/Sink.zig").Diagnostic;
-const Opt = @import("../opt/Opt.zig");
 
 /// Map a `check` tally to the process exit code: 0 clean (or `--exit-zero`), 1 when at
 /// least one diagnostic resolved to an error. `--deny-warnings` (-Werror) is applied
@@ -36,33 +35,10 @@ pub fn resolveHasError(diags: []const Diagnostic) bool {
     return false;
 }
 
-/// Map a `--opt`/`--no-opt` pass name to its `Opt.Pass`, or null if unknown.
-pub fn passByName(name: []const u8) ?Opt.Pass {
-    if (std.mem.eql(u8, name, "fold")) return .fold;
-    if (std.mem.eql(u8, name, "branch")) return .branch;
-    if (std.mem.eql(u8, name, "dce")) return .dce;
-    if (std.mem.eql(u8, name, "forward")) return .forward;
-    return null;
-}
-
 /// True when `m` names a diagnostic override target: a known code string ("R0001")
 /// or a single band letter (L/P/R/T/W). Used to validate --deny/--warn/--allow specs.
 pub fn validSpec(m: []const u8) bool {
     return codes.fromStr(m) != null or (m.len == 1 and (m[0] == 'L' or m[0] == 'P' or m[0] == 'R' or m[0] == 'T' or m[0] == 'W'));
-}
-
-/// True if `target` names the aarch64-macos triple we can emit for (or `native`,
-/// which on this host is aarch64-macos). Accepts the common spellings.
-pub fn isAarch64Macos(target: []const u8) bool {
-    const ok = [_][]const u8{
-        "native",
-        "aarch64-macos",
-        "arm64-macos",
-        "aarch64-apple-macos",
-        "aarch64-apple-darwin",
-    };
-    for (ok) |t| if (std.mem.eql(u8, target, t)) return true;
-    return false;
 }
 
 /// The basename of a path (after the last '/'), used as the code-signing
@@ -101,15 +77,6 @@ test "resolveHasError: only error severity blocks typecheck" {
     try std.testing.expect(resolveHasError(&.{ warn, err }));
 }
 
-test "passByName: known passes and rejects" {
-    try std.testing.expectEqual(Opt.Pass.fold, passByName("fold").?);
-    try std.testing.expectEqual(Opt.Pass.branch, passByName("branch").?);
-    try std.testing.expectEqual(Opt.Pass.dce, passByName("dce").?);
-    try std.testing.expectEqual(Opt.Pass.forward, passByName("forward").?);
-    try std.testing.expect(passByName("") == null);
-    try std.testing.expect(passByName("inline") == null);
-}
-
 test "validSpec: codes, band letters, and rejects" {
     try std.testing.expect(validSpec("L"));
     try std.testing.expect(validSpec("P"));
@@ -119,14 +86,6 @@ test "validSpec: codes, band letters, and rejects" {
     try std.testing.expect(!validSpec("X"));
     try std.testing.expect(!validSpec(""));
     try std.testing.expect(!validSpec("ZZ999"));
-}
-
-test "isAarch64Macos: accepted spellings and rejects" {
-    try std.testing.expect(isAarch64Macos("native"));
-    try std.testing.expect(isAarch64Macos("aarch64-macos"));
-    try std.testing.expect(isAarch64Macos("aarch64-apple-darwin"));
-    try std.testing.expect(!isAarch64Macos("x86_64-linux"));
-    try std.testing.expect(!isAarch64Macos(""));
 }
 
 test "basename: with and without a separator" {

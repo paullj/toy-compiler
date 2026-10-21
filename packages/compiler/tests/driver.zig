@@ -5004,3 +5004,64 @@ test "a build-only flag on check is named as one, and each bad flag is reported 
         try testing.expectEqual(@as(usize, 1), std.mem.count(u8, res.err, "error: "));
     }
 }
+
+test "every enum or range flag lists its valid values, on build, run and check (#70)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir_name = ".toy-test-driver-flag-values";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const path = dir_name ++ "/main.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "fn main() -> int {\n    return 0\n}\n" });
+
+    const bad_target = "error: invalid value 'bogus' for --target (one of: native|aarch64-macos)\n";
+    const near_target = "error: invalid value 'aarch64-mac' for --target (one of: native|aarch64-macos)\ndid you mean 'aarch64-macos'?\n";
+    const passes = "(one of: fold|branch|forward|dce)\n";
+    const runs = [_]struct { argv: []const []const u8, line: []const u8 }{
+        .{ .argv = &.{ "build", "--target", "bogus", path }, .line = bad_target },
+        .{ .argv = &.{ "run", "--target", "bogus", path }, .line = bad_target },
+        .{ .argv = &.{ "check", "--target", "bogus", path }, .line = bad_target },
+        .{ .argv = &.{ "--target=bogus", path }, .line = bad_target },
+        .{ .argv = &.{ "build", "--target", "aarch64-mac", path }, .line = near_target },
+        .{ .argv = &.{ "run", "--target", "aarch64-mac", path }, .line = near_target },
+        .{ .argv = &.{ "check", "--target", "aarch64-mac", path }, .line = near_target },
+        .{ .argv = &.{ "-O2", path }, .line = "error: invalid value '2' for -O (0 or 1)\n" },
+        .{ .argv = &.{ "-j0", path }, .line = "error: invalid value '0' for -j (an int >= 1)\n" },
+        .{ .argv = &.{ "--opt", "bogus", path }, .line = "error: invalid value 'bogus' for --opt " ++ passes },
+        .{ .argv = &.{ "--no-opt", "bogus", path }, .line = "error: invalid value 'bogus' for --no-opt " ++ passes },
+        .{ .argv = &.{ "--opt=fold,dce", path }, .line = "error: invalid value 'fold,dce' for --opt " ++ passes },
+        .{ .argv = &.{ "--dump=1", path }, .line = "error: invalid value '1' for --dump (it takes no value)\n" },
+        .{ .argv = &.{ path, "--color" }, .line = "error: --color requires a value (one of: auto|always|never)\n" },
+        .{ .argv = &.{ "check", path, "--color" }, .line = "error: --color requires a value (one of: auto|always|never)\n" },
+        .{ .argv = &.{ path, "-j" }, .line = "error: -j requires a value (an int >= 1)\n" },
+    };
+    for (runs) |r| {
+        const res = try spawnToyBoth(gpa, io, r.argv);
+        defer gpa.free(res.out);
+        defer gpa.free(res.err);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+        try testing.expectEqualStrings("", res.out);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, res.err, r.line));
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, res.err, "error: "));
+    }
+
+    const oks = [_][]const []const u8{
+        &.{ "build", "--target", "aarch64-macos", "-o", dir_name ++ "/t1", path },
+        &.{ "build", "--target=native", "-o", dir_name ++ "/t2", path },
+        &.{ "check", "--target", "aarch64-macos", path },
+        &.{ "build", "--opt=dce", "-o", dir_name ++ "/t3", path },
+        &.{ "build", "--opt", "fold", "--opt=dce", "--no-opt", "fold", "-o", dir_name ++ "/t4", path },
+    };
+    for (oks) |argv| {
+        const res = try spawnToyBoth(gpa, io, argv);
+        defer gpa.free(res.out);
+        defer gpa.free(res.err);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+        try testing.expectEqualStrings("", res.err);
+    }
+}
