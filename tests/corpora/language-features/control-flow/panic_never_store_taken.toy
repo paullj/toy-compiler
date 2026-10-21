@@ -1,0 +1,7 @@
+# expect: exit 1
+# Feature: a scalar binding whose value is a taken `panic(..)` prints the message
+# and a backtrace and exits 1.
+fn main() -> int {
+    x: int = panic("bound")
+    return x
+}

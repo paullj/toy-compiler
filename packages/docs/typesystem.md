@@ -28,9 +28,13 @@ it being trivially comparable and hashable.
 
 Two special types are not user-spellable:
 
-* **`never`** is **bottom**. A `never` expression (a break-less `loop`, a call to
-  a diverging path) never yields a value, so it fits wherever any value is
-  wanted. It is the *identity* of the `merge` join.
+* **`never`** is **bottom**. A `never` expression (a break-less `loop`, a
+  `panic(..)` call) never yields a value, so it fits wherever a value of a
+  known type is wanted: a fn tail, a `return`, an `if` or `match` arm, a
+  binding, an assignment or a call argument. A fn that ends in `panic("bad")`
+  needs no dead `return`, and an arm may panic while the others yield the
+  value. An operator operand or a condition does not yet accept `never`. It
+  is the *identity* of the `merge` join.
 * **`invalid`** is **poison**. The first time an operand is `invalid`, the
   containing expression silently becomes `invalid` too, so one root mistake
   produces exactly one diagnostic and never cascades. It *absorbs* in both

@@ -9504,6 +9504,46 @@ test "panic with no arguments is an arity error" {
     ));
 }
 
+test "panic is never: a fn tail, an if or match arm, or a value after it checks clean" {
+    const gpa = testing.allocator;
+    const bodies = [_][]const u8{
+        " panic(\"bad\")",
+        " if n > 0 { return n } else { panic(\"negative\") }",
+        " if n > 0 { return n }\n panic(\"negative\")",
+        " x := if n > 0 { n } else { panic(\"negative\") }\n return x",
+        " return if n > 0 { n } else { panic(\"negative\") }",
+        " match n { 0 -> 10, _ -> panic(\"bad\"), }",
+        " return panic(\"bad\")",
+    };
+    for (bodies) |body| {
+        const src = try std.fmt.allocPrint(gpa, "fn pick(n: int) -> int {{\n{s}\n}}\nfn main() -> int {{\n return pick(3)\n}}\n", .{body});
+        defer gpa.free(src);
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        if (c.result.diags.len != 0) {
+            std.debug.print("source:\n{s}\n", .{src});
+            for (c.result.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "a bad panic call is still never, so it reports only its own error" {
+    try expectOnlyDiag("fn f() -> int {\n panic(1)\n}\nfn main() -> int {\n return f()\n}\n", .T0040);
+    // The undeclared `nope` is resolve's error, outside this check; the poisoned call adds none.
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount("fn f() -> int {\n panic(nope)\n}\nfn main() -> int {\n return f()\n}\n"));
+    try testing.expectEqual(@as(usize, 1), try checkDiagCount("fn f() -> int {\n panic()\n}\nfn main() -> int {\n return f()\n}\n"));
+}
+
+test "code after a panic is still unreachable" {
+    try expectOnlyDiag("fn f() -> int {\n panic(\"bad\")\n return 0\n}\nfn main() -> int {\n return f()\n}\n", .W0005);
+}
+
+test "a user fn named panic keeps its declared type" {
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount("fn panic(_s: str) -> int { 7 }\nfn main() -> int {\n return panic(\"x\")\n}\n"));
+    try expectOnlyDiag("fn panic(_s: str) -> int { 7 }\nfn g() -> bool {\n return panic(\"x\")\n}\nfn main() {\n g()\n}\n", .T0042);
+}
+
 test "a bare string literal in int context is a type error" {
     // `x := "x"` makes x a str; `x + 1` then fails (operands of '+' must be int).
     const gpa = testing.allocator;

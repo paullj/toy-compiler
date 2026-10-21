@@ -2044,7 +2044,7 @@ test "`--allow W0005` silences the unreachable-code warning (exit 0)" {
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
 }
 
-test "`toy check` flags code after a panic (the unit-typed diverging builtin)" {
+test "`toy check` flags code after a panic (a never-typed call)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();

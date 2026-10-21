@@ -280,6 +280,18 @@ pub const Builder = struct {
     /// `null` for a result-less op like store/copy/void-call → `none_value`).
     pub fn emit(b: *Builder, op: Ir.Op, ty: ?Typecheck.Type) error{OutOfMemory}!Ir.ValueId {
         const result: Ir.ValueId = if (ty) |t| try b.addValue(t) else Ir.none_value;
+        // Once a divergent sub-expression (a never call, `return`, ...) has terminated
+        // the block, the rest of the enclosing construct is dead. Dropping its ops here
+        // keeps every caller (a store of the never value's `.none` operand, say) from
+        // needing its own guard. Like `setTerm`, free what we were handed.
+        if (b.blocks.items[b.cur].term_set) {
+            switch (op) {
+                .call => |c| b.gpa.free(c.args),
+                .call_indirect => |c| b.gpa.free(c.args),
+                else => {},
+            }
+            return result;
+        }
         try b.blocks.items[b.cur].instrs.append(b.gpa, .{ .result = result, .op = op });
         return result;
     }
@@ -600,7 +612,8 @@ fn storeInto(b: *Builder, home: places.LocalHome, expr: Ast.Index, ty: Typecheck
         .unit => {
             _ = try lowerExpr(b, expr); // for effect
         },
-        .never, .invalid => try b.note(b.in.tree.nodes[(expr).int()].main_token, "aggregate var/assign unsupported in lower"),
+        .never => _ = try lowerExpr(b, expr),
+        .invalid => try b.note(b.in.tree.nodes[(expr).int()].main_token, "aggregate var/assign unsupported in lower"),
     }
 }
 
@@ -2268,8 +2281,16 @@ pub fn emitCall(b: *Builder, target: CallTarget, args: []Ir.Operand, result_ty: 
             _ = try b.emit(callOp(target, args, slot), null);
             return .{ .slot = slot };
         },
-        .unit, .never => {
+        .unit => {
             _ = try b.emit(callOp(target, args, Ir.none_slot), null);
+            return .none;
+        },
+        .never => {
+            // The call does not return, so nothing may follow it in this block: an
+            // enclosing arm or fn tail would otherwise branch a value-less edge into a
+            // join that carries a typed param.
+            _ = try b.emit(callOp(target, args, Ir.none_slot), null);
+            b.setTerm(.@"unreachable");
             return .none;
         },
         .invalid => {

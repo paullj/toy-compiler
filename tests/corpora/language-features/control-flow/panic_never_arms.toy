@@ -1,0 +1,36 @@
+# expect: exit 41
+# Feature: `panic(..)` is typed `never`, so it fits wherever a value is wanted: as a fn
+# tail, as a value-if or match arm, and after an if that returns. Every panic here is
+# on a path the program does not take, so each value flows through.
+fn tail(n: int) -> int {
+    if n > 0 { return n }
+    panic("tail")
+}
+
+fn both_arms(n: int) -> int {
+    if n > 0 { return n } else { panic("both_arms") }
+}
+
+fn bound(n: int) -> int {
+    x := if n > 0 { n } else { panic("bound") }
+    return x
+}
+
+fn returned(n: int) -> int {
+    return if n > 0 { n } else { panic("returned") }
+}
+
+fn arm(n: int) -> int {
+    match n {
+        0 -> 10,
+        _ -> panic("arm"),
+    }
+}
+
+fn label(n: int) -> str {
+    if n > 0 { "pos" } else { panic("label") }
+}
+
+fn main() -> int {
+    return tail(1) + both_arms(2) + bound(3) + returned(4) + arm(0) + label(5).len() * 7
+}

@@ -1,0 +1,8 @@
+# expect: exit 7
+# Feature: a user fn named `panic` keeps its declared type and returns; only the
+# builtin `panic` is `never`.
+fn panic(_s: str) -> int { 7 }
+
+fn main() -> int {
+    return panic("x")
+}

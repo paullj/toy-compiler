@@ -1,0 +1,10 @@
+# expect: exit 1
+# Feature: the panic arm of a value-if runs when taken: it prints its message and a
+# backtrace and exits 1, though the if is typed by its int arm.
+fn pick(n: int) -> int {
+    return if n > 0 { n } else { panic("negative") }
+}
+
+fn main() -> int {
+    return pick(-3)
+}
