@@ -27,9 +27,8 @@ pub fn checkExit(counts: Check.Counts, exit_zero: bool) u8 {
 /// True when any diagnostic in `diags` carries an error-severity REGISTRY DEFAULT — the
 /// gate that decides whether the graph is resolved enough to typecheck. Deliberately
 /// reads the POD default (NOT the render-time config): the ability to typecheck
-/// depends on whether resolution actually succeeded, which `--warn`/`--allow` (a
-/// presentation choice) must never change. So an `--allow`d resolve error still blocks
-/// typecheck, exactly as it does in a `build`.
+/// depends on whether resolution actually succeeded, which a severity rule (a
+/// presentation choice) must never change.
 pub fn resolveHasError(diags: []const Diagnostic) bool {
     for (diags) |d| if (d.severity == .err) return true;
     return false;

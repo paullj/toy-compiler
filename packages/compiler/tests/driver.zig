@@ -1385,7 +1385,7 @@ fn countCarets(got: []const u8) usize {
     return carets;
 }
 
-test "--warn downgrades an error to a warning (render-only, one -->)" {
+test "--warn W0001 demotes a --deny W'd warning back to a warning (render-only, one -->)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1393,51 +1393,82 @@ test "--warn downgrades an error to a warning (render-only, one -->)" {
     const dir_name = ".toy-test-driver-c3-warn";
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    // Migrated from `--emit check` (removed inspection table) to the `toy check` subcommand.
-    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--warn", "R0001" }) catch |e| {
+    // Fixed precedence: warn beats deny for a code named by both.
+    const res = runToyOnFixture(gpa, io, dir_name, unused_local_fixture, &.{ "check", "--deny", "W", "--warn", "W0001" }) catch |e| {
         if (e == error.SkipZigTest) return error.SkipZigTest;
         return e;
     };
     defer gpa.free(res.out);
 
-    try testing.expect(std.mem.indexOf(u8, res.out, "warning[R0001]:") != null);
-    try testing.expect(std.mem.indexOf(u8, res.out, "error[R0001]:") == null);
-    // report-once preserved: exactly one primary caret line.
+    try testing.expect(std.mem.indexOf(u8, res.out, "warning[W0001]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "error[W0001]:") == null);
     try testing.expectEqual(@as(usize, 1), countCarets(res.out));
-    // `toy check`'s summary counts the downgraded diagnostic as a warning; no errors
-    // survive so the exit is 0 (the removed inspection table had no such gate).
     try testing.expect(std.mem.indexOf(u8, res.out, "1 warning(s)") != null);
     try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
 }
 
-test "`toy check` --ignore suppresses a code entirely (zero diagnostic bytes; no errors survive => exit 0)" {
+test "`toy check` --warn/--allow on an error code or band is a USAGE error (exit 2)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const dir_name = ".toy-test-driver-c3-ignore";
+    const dir_name = ".toy-test-driver-c3-err-spec";
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    // Migrated from `--emit check` (removed inspection table) to the `toy check` subcommand.
-    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--allow", "R0001" }) catch |e| {
-        if (e == error.SkipZigTest) return error.SkipZigTest;
-        return e;
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    const path = dir_name ++ "/one.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = c3_fixture });
+    const cases = [_]struct { flag: []const u8, spec: []const u8 }{
+        .{ .flag = "--allow", .spec = "R0001" },
+        .{ .flag = "--warn", .spec = "R0001" },
+        .{ .flag = "--warn", .spec = "R" },
+        .{ .flag = "--allow", .spec = "T" },
     };
-    defer gpa.free(res.out);
-
-    // The ignored diagnostic renders zero bytes: no code, no caret.
-    try testing.expect(std.mem.indexOf(u8, res.out, "R0001") == null);
-    try testing.expectEqual(@as(usize, 0), countCarets(res.out));
-    // `toy check` gates its exit on the effective severity: with the ONLY diagnostic
-    // ignored, zero errors survive, so there is NO error/warning summary line and the
-    // process exits 0. (The removed inspection table always exited 1 on a failed file;
-    // `check` is the new, faithful behaviour.)
-    try testing.expect(std.mem.indexOf(u8, res.out, "error(s)") == null);
-    try testing.expect(std.mem.indexOf(u8, res.out, "warning(s)") == null);
-    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
+    for (cases) |c| {
+        const res = try spawnToyBoth(gpa, io, &.{ "check", c.flag, c.spec, path });
+        defer gpa.free(res.out);
+        defer gpa.free(res.err);
+        try testing.expect(std.mem.indexOf(u8, res.err, c.flag) != null);
+        var quoted: [16]u8 = undefined;
+        try testing.expect(std.mem.indexOf(u8, res.err, try std.fmt.bufPrint(&quoted, "'{s}'", .{c.spec})) != null);
+        try testing.expect(std.mem.indexOf(u8, res.err, "error") != null);
+        try testing.expectEqualStrings("", res.out);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 2 }, res.term);
+    }
 }
 
-test "band flag affects the whole band (--warn R downgrades R0001)" {
+test "`toy build`/`toy run` --warn/--allow on an error code or band is a usage error with a message" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-build-err-spec";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    const path = dir_name ++ "/one.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = c3_fixture });
+    const out_path = dir_name ++ "/out";
+    const cases = [_][]const []const u8{
+        &.{ "build", "--allow", "R0001", "-o", out_path, path },
+        &.{ "build", "--warn", "T", "-o", out_path, path },
+        &.{ "--allow", "R", "-o", out_path, path },
+        &.{ "run", "--allow", "R0001", path },
+    };
+    for (cases) |argv| {
+        const res = try spawnToyBoth(gpa, io, argv);
+        defer gpa.free(res.out);
+        defer gpa.free(res.err);
+        try testing.expect(std.mem.indexOf(u8, res.err, "is an error") != null);
+        try testing.expectEqualStrings("", res.out);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+    }
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, out_path, .{}));
+}
+
+test "band flag affects the whole band (--deny W promotes W0001)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1445,14 +1476,14 @@ test "band flag affects the whole band (--warn R downgrades R0001)" {
     const dir_name = ".toy-test-driver-c3-band";
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    // Migrated from `--emit check` (removed inspection table) to the `toy check` subcommand.
-    const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--warn", "R" }) catch |e| {
+    const res = runToyOnFixture(gpa, io, dir_name, unused_local_fixture, &.{ "check", "--deny", "W" }) catch |e| {
         if (e == error.SkipZigTest) return error.SkipZigTest;
         return e;
     };
     defer gpa.free(res.out);
 
-    try testing.expect(std.mem.indexOf(u8, res.out, "warning[R0001]:") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "error[W0001]:") != null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
 }
 
 test "`toy check` unknown --warn spec is a USAGE error (exit 2)" {
@@ -1537,7 +1568,7 @@ test "duplicate function renders a 'previously defined here' secondary label + a
     try testing.expect(std.mem.indexOf(u8, res.out, "1 error(s)") != null);
 }
 
-test "the summary line counts respect severity config (--warn, --ignore)" {
+test "the summary line counts respect severity config (--deny, --warn, --allow)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1545,29 +1576,25 @@ test "the summary line counts respect severity config (--warn, --ignore)" {
     const dir_name = ".toy-test-driver-c3-summary";
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    // Three independent undeclared names => three R0001 diagnostics (nothing near, so no
-    // "did you mean" hints).
+    // Three unused locals => three W0001 warnings.
     const multi =
         \\fn main() -> int {
-        \\  aaa
-        \\  bbb
-        \\  ccc
+        \\  aaa := 1
+        \\  bbb := 2
+        \\  ccc := 3
         \\  return 0
         \\}
     ;
-    // Migrated from `--emit check` to `toy check` (all three invocations).
-    // Default: three errors.
     {
-        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{"check"}) catch |e| {
+        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{ "check", "--deny", "W0001" }) catch |e| {
             if (e == error.SkipZigTest) return error.SkipZigTest;
             return e;
         };
         defer gpa.free(res.out);
         try testing.expect(std.mem.indexOf(u8, res.out, "3 error(s)") != null);
     }
-    // --warn R0001: counted as warnings, not errors.
     {
-        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{ "check", "--warn", "R0001" }) catch |e| {
+        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{ "check", "--deny", "W", "--warn", "W0001" }) catch |e| {
             if (e == error.SkipZigTest) return error.SkipZigTest;
             return e;
         };
@@ -1575,9 +1602,8 @@ test "the summary line counts respect severity config (--warn, --ignore)" {
         try testing.expect(std.mem.indexOf(u8, res.out, "3 warning(s)") != null);
         try testing.expect(std.mem.indexOf(u8, res.out, "error(s)") == null);
     }
-    // --ignore R0001: excluded from the summary entirely (no diagnostic-count line).
     {
-        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{ "check", "--allow", "R0001" }) catch |e| {
+        const res = runToyOnFixture(gpa, io, dir_name, multi, &.{ "check", "--allow", "W0001" }) catch |e| {
             if (e == error.SkipZigTest) return error.SkipZigTest;
             return e;
         };
@@ -1674,10 +1700,10 @@ test "`toy check --deny-warnings` promotes a surviving warning to a nonzero exit
     const dir_name = ".toy-test-driver-d2-eow";
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
 
-    // --warn R0001 downgrades the only error to a warning. Without --deny-warnings the
-    // exit is 0 (no errors survive); WITH it, the surviving warning forces exit 1.
+    // --deny W then --warn W0001 leaves W0001 a warning: exit 0 alone, exit 1 under
+    // --deny-warnings.
     {
-        const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--warn", "R0001" }) catch |e| {
+        const res = runToyOnFixture(gpa, io, dir_name, unused_local_fixture, &.{ "check", "--deny", "W", "--warn", "W0001" }) catch |e| {
             if (e == error.SkipZigTest) return error.SkipZigTest;
             return e;
         };
@@ -1685,7 +1711,7 @@ test "`toy check --deny-warnings` promotes a surviving warning to a nonzero exit
         try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, res.term);
     }
     {
-        const res = runToyOnFixture(gpa, io, dir_name, c3_fixture, &.{ "check", "--warn", "R0001", "--deny-warnings" }) catch |e| {
+        const res = runToyOnFixture(gpa, io, dir_name, unused_local_fixture, &.{ "check", "--deny", "W", "--warn", "W0001", "--deny-warnings" }) catch |e| {
             if (e == error.SkipZigTest) return error.SkipZigTest;
             return e;
         };

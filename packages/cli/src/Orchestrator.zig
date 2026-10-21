@@ -18,10 +18,10 @@ const SevCfg = toyc.diagnostics.severity_config;
 const Diagnostic = toyc.DiagnosticSink.Diagnostic;
 
 /// True when a diagnostic must block the next stage. A registry-default error
-/// (`d.severity == .err`) ALWAYS bails, independent of `cfg`: `--allow` demotes it
-/// for DISPLAY, but the downstream stage assumes resolution/typing actually succeeded,
-/// so proceeding on an --allow'd resolve/type error would crash in lowering. On top of
-/// that, `deny_warnings` promotes a surviving warning here so -Werror bails the stage
+/// (`d.severity == .err`) ALWAYS bails, independent of `cfg`: the downstream stage
+/// assumes resolution/typing actually succeeded, so proceeding on a resolve/type error
+/// would crash in lowering, which is why the CLI refuses `--warn`/`--allow` on errors.
+/// On top of that, `deny_warnings` promotes a surviving warning here so -Werror bails the stage
 /// exactly as it gates the check exit; a normal or `--allow`/ignore'd warning does not.
 fn hasError(diags: []const Diagnostic, cfg: SevCfg.SeverityConfig) bool {
     for (diags) |d| {

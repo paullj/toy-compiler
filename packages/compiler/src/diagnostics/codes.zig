@@ -332,6 +332,18 @@ pub fn hasPrefix(s: []const u8, band: u8) bool {
 
 const prefix_bands = "LPRTW";
 
+/// True when a severity spec (a code string or a band letter) names only errors. An
+/// error means the program cannot be built, so `--warn`/`--allow` on such a spec would
+/// only hide the reason a build fails; the CLI rejects it.
+pub fn errorOnly(spec: []const u8) bool {
+    if (fromStr(spec)) |c| return defaultSeverity(c) == .err;
+    if (spec.len != 1 or std.mem.indexOfScalar(u8, prefix_bands, spec[0]) == null) return false;
+    for (table) |e| {
+        if (e.str[0] == spec[0] and e.default_severity != .err) return false;
+    }
+    return true;
+}
+
 // Build-time registry safety: coverage (every non-none code has exactly one row),
 // uniqueness, prefix membership, and per-band contiguity (tails run 0001,0002,…).
 comptime {
@@ -614,4 +626,15 @@ test "relatedLabel names what each code's related location is" {
     try testing.expectEqualStrings("outer binding declared here", relatedLabel(.W0009));
     try testing.expectEqualStrings("field declared here", relatedLabel(.W0013));
     try testing.expectEqualStrings("first declared here", relatedLabel(.R0011));
+}
+
+test "errorOnly: error codes and all-error bands, never W or unknown specs" {
+    try testing.expect(errorOnly("R0001"));
+    try testing.expect(errorOnly("T0041"));
+    for ("LPRT") |b| try testing.expect(errorOnly(&.{b}));
+    try testing.expect(!errorOnly("W0001"));
+    try testing.expect(!errorOnly("W"));
+    try testing.expect(!errorOnly("X"));
+    try testing.expect(!errorOnly("X9999"));
+    try testing.expect(!errorOnly(""));
 }
