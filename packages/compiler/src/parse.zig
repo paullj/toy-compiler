@@ -1831,8 +1831,9 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
             },
             // A `.`- or `[`-rooted place: `p.x = v`, `p.a.b = v`, `ps[0].x = v`. Parse the
             // place (a postfix chain over a name); if `=` follows it is a store, otherwise
-            // it is an expression statement (continue the infix climb). An index element
-            // is no place, but parsing it as one lets the checker say so (T0070, T0074).
+            // it is an expression statement (continue the infix climb). `xs[i] = v` is an
+            // element store; a field of an element is no place, but parsing it as one
+            // lets the checker say so (T0070).
             .dot, .l_bracket => {
                 const first = p.index;
                 const place = try p.parsePostfix(try p.parsePrefix());

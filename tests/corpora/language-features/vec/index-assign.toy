@@ -1,0 +1,58 @@
+# Feature: `xs[i] = v` stores a whole element through the Vec's handle: an int element, a
+# struct element, a nested `vs[i][j]`, a field's `h.xs[i]` and `self.xs[i]`, a write from a
+# lambda (which captures the handle, so `xs` is never boxed), a generic `put[T]`, and the
+# `Option.none` and `()` elements.
+# expect: stdout "9\n3\n4\n8\n6\n12\n5\n7\n0\n2\n"
+# expect: exit 0
+import std/io
+import std/vec
+
+struct P { x: int, y: int }
+struct H { xs: Vec[int] }
+
+impl H {
+    fn bump(self, i: int) {
+        self.xs[i] = self.xs[i] + 6
+    }
+}
+
+fn put[T](xs: Vec[T], i: int, v: T) {
+    xs[i] = v
+}
+
+fn main() -> int {
+    xs: Vec[int] = [1, 2, 3]
+    xs[0] = 9
+    io.println(xs[0])
+
+    ps := [P { x: 1, y: 2 }, P { x: 0, y: 0 }]
+    ps[0] = P { x: 3, y: 4 }
+    io.println(ps[0].x)
+    io.println(ps[0].y)
+
+    vs: Vec[Vec[int]] = [[1, 2], [3, 4]]
+    vs[1][0] = 8
+    io.println(vs[1][0])
+
+    h := H { xs: [6, 0] }
+    h.xs[1] = 6
+    io.println(h.xs[1])
+    h.bump(1)
+    io.println(h.xs[1])
+
+    set_first := fn(v: int) { xs[0] = v }
+    set_first(5)
+    io.println(xs[0])
+
+    put(xs, 2, 7)
+    io.println(xs[2])
+
+    os: Vec[Option[int]] = [Option.some(1), Option.some(2)]
+    os[0] = Option.none
+    io.println(match os[0] { .some(v) -> v, .none -> 0 })
+
+    us: Vec[()] = [(), ()]
+    us[1] = ()
+    io.println(us.len())
+    return 0
+}

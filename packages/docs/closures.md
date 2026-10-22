@@ -196,7 +196,7 @@ There is one sharing model, so the `&x` / `*r` operators were removed.
 
 | Type | Methods |
 |---|---|
-| `Vec` | `map`, `filter`, `each`, `fold(init, f)`, `any`, `all`, `find` → `Option`, `sort()` (for `Ord`), `sort_by(less)` |
+| `Vec` | `map`, `filter`, `each`, `fold(init, f)`, `any`, `all`, `find` → `Option`, `sort()` (for `Ord`), `sort_by(less)`, `set(i, x)` (panics out of bounds; `xs[i] = x` is the same store) |
 | `Option` / `Result` | `map(f: fn(T) -> U)`, `then(f: fn(T) -> Option[U])` (and-then; `fn(T) -> Result[U, E]` on `Result`), `or_else(f: fn() -> T) -> T` (`fn(E) -> T` on `Result`), `map_err(f: fn(E) -> F) -> Result[T, F]` |
 | `str` | `split(sep) -> Vec[str]`, `sep.join(parts: Vec[str])`, `trim`, `contains`, `starts_with`, `ends_with`, `replace(from, to)`, `chars()` → `Chars[char]`, an iterator of `char` |
 | `Map` | `each(f: fn(K, V))`, `filter(f: fn(K, V) -> bool) -> Map[K, V]`, `map(f: fn(V) -> W) -> Map[K, W]` (maps the values), `keys() -> Vec[K]`, `values() -> Vec[V]` |

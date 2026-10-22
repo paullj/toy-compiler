@@ -921,8 +921,8 @@ const GraphResolve = struct {
             .assign => {
                 const target = g.nodes()[stmt.lhs.int()];
                 // A `.`-rooted place (`p.x`) resolves as an expression (its root name is
-                // checked there), not as a bare assignable name. So does an index element
-                // (`xs[i]`), which the checker rejects as a target with its type in hand.
+                // checked there), not as a bare assignable name. So does an element store
+                // (`xs[i] = v`), which writes through the handle and assigns no local.
                 if (target.tag == .field_access or target.tag == .tuple_field or target.tag == .index) {
                     try g.resolveExpr(stmt.lhs);
                 } else if (target.tag != .identifier) {

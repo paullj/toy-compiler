@@ -282,8 +282,9 @@ pub const BodyChecker = struct {
     /// The locals an assignment writes (`x = ..`, or a place store rooted at `x`).
     assigned_roots: std.ArrayList(u32) = .empty,
     /// The assignment target being typed, or none: the member it names is a field, never a
-    /// bound method, so `acc.plus = f` stays a missing field. A node, not a flag, so the
-    /// rest of the place (a call's arguments, a lambda's body) still binds.
+    /// bound method, so `acc.plus = f` stays a missing field, and an index it names is a
+    /// store. A node, not a flag, so the rest of the place (a call's arguments, a lambda's
+    /// body) still binds.
     place_target: Ast.Index = Ast.none,
     /// This body's boxed locals, ascending: filled by `classifyCaptures` at the end of the
     /// walk and moved out by the caller.
@@ -620,16 +621,14 @@ pub const BodyChecker = struct {
                         bc.slotType(bc.resolutions[(stmt.lhs).int()].local)
                     else
                         .invalid,
-                    // A `.`-rooted place types as an expression.
-                    .field_access, .tuple_field => blk: {
+                    // A `.`-rooted place and an element type as expressions; an index's
+                    // own errors (`m[k]` on a Map is T0057) know they are on a store.
+                    .field_access, .tuple_field, .index => blk: {
                         const was = bc.place_target;
                         bc.place_target = stmt.lhs;
                         defer bc.place_target = was;
                         break :blk try bc.typeOf(stmt.lhs);
                     },
-                    // Typed for the rhs's expectation and for its own errors (`m[k]` on a
-                    // Map is T0057 there); the store itself is rejected below.
-                    .index => try bc.typeOf(stmt.lhs),
                     else => .invalid,
                 };
                 bc.node_types[(stmt.lhs).int()] = lhs;
@@ -639,11 +638,14 @@ pub const BodyChecker = struct {
                 else
                     try bc.typeOfExpected(stmt.rhs, if (lhs.kind == .invalid) null else lhs);
                 if (!Type.assignable(lhs, rhs)) {
-                    try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0041 }, "cannot assign {s} to variable of type {s}", .{ bc.typeName(rhs), bc.typeName(lhs) });
+                    const what = if (target.tag == .index) "an element" else "variable";
+                    try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0041 }, "cannot assign {s} to {s} of type {s}", .{ bc.typeName(rhs), what, bc.typeName(lhs) });
                 }
-                if (target.tag == .index) {
+                // A plain `xs[i] = v` is the element store `xs.set(i, v)`; a compound one
+                // also reads the element, which has no lowering yet.
+                if (target.tag == .index and bc.tokens[stmt.main_token].tag != .eq) {
                     if (lhs.kind != .invalid)
-                        try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0074 }, "cannot assign to an index element `xs[i]`; a 'Vec' element is not a place and 'Vec' has no index assignment", .{});
+                        try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0074 }, "cannot assign to an index element `xs[i]` with a compound operator; write `xs[i] = xs[i] op v`", .{});
                 } else if (target.tag == .field_access or target.tag == .tuple_field) switch (bc.storeRoot(stmt.lhs)) {
                     .name => {},
                     .index_element => try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0070 }, "cannot assign to a field of an index element `xs[i].field`; the element is a temporary copy, so the write would be lost", .{}),
@@ -1048,11 +1050,14 @@ pub const BodyChecker = struct {
         // generic reject, exactly as `Vec` is recognized by name.
         if (bc.activeStructMap().get(StdNames.map_struct)) |map_ctor| {
             if (!e.ctor_is_enum and e.ctor == map_ctor) {
-                try bc.sink.report(.{ .span = bc.spanOf(site), .code = .T0057 }, "Map has no index operator; use .get", .{});
+                const use = if (site == bc.place_target) ".set(k, v)" else ".get";
+                try bc.sink.report(.{ .span = bc.spanOf(site), .code = .T0057 }, "Map has no index operator; use {s}", .{use});
                 return Type.invalid;
             }
         }
-        if (e.ctor_is_enum or vec_ctor == null or e.ctor != vec_ctor.? or e.args.len != 1) {
+        // Only std's `Vec` has the element primitives the sugar lowers to; a user `struct
+        // Vec` in scope is just another type.
+        if (e.ctor_is_enum or vec_ctor == null or e.ctor != vec_ctor.? or e.args.len != 1 or !bc.isStdVec(e)) {
             // A `Vec` that reached this module through another one (`m.keys()`) still has
             // its methods, but the sugar names `Vec` as this module sees it.
             if (vec_ctor == null and bc.isStdVec(e))

@@ -1,0 +1,25 @@
+# Feature: the handle `xs[i] = v` reads first stays a GC root across the rhs. `fill` builds
+# the Vec in its own frame, so no stale copy of it lingers in `main`'s. The rhs rebinds
+# `xs`, leaving that handle the old Vec's only reference, then forces a collection and
+# allocates `other` from the freed cells. The old Vec must survive and take the write;
+# were it collected, `other` could reuse its cells and the write would land in `other`.
+# expect: exit 101
+import std/gc
+import std/vec
+
+fn main() -> int {
+    xs: Vec[int] = []
+    other: Vec[int] = []
+    fill := fn() {
+        xs = [1, 2, 3]
+    }
+    fill()
+    rhs := fn() -> int {
+        xs = [0]
+        gc.collect()
+        other = [100, 100, 100]
+        7
+    }
+    xs[2] = rhs()
+    return other[2] + xs.len()
+}

@@ -1,0 +1,18 @@
+# Feature: the rhs of `xs[i] = v` may grow the Vec: the handle is read first, the growth
+# moves the backing behind the same header, and the write lands in the new backing.
+# expect: exit 42
+import std/vec
+
+fn main() -> int {
+    xs: Vec[int] = [1]
+    grow := fn() -> int {
+        i := 0
+        while i < 100 {
+            xs.push(i)
+            i = i + 1
+        }
+        42
+    }
+    xs[0] = grow()
+    return if xs.len() == 101 { xs[0] } else { 1 }
+}

@@ -29,6 +29,11 @@ impl Vec[T] {
         return Option[T].none
     }
 
+    # Panics on a bad index, as `xs[i] = x` does: a store has no value to fall back to.
+    fn set(self, i: int, x: T) {
+        mem.ga_set_at[T](self.h, i, x)
+    }
+
     fn first(self) -> Option[T] {
         return self.get(0)
     }

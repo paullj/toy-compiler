@@ -3190,6 +3190,15 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
             try t.discoverRecvMethod(model, recv, dm.name, .program, worklist, seen, .{ .token_of = Ast.Index.from(@intCast(i)) }, mod);
         }
     }
+    // A store's index node precedes its `.assign` (children are built first), so mark the
+    // store targets before the walk that picks each index's element primitive.
+    var stores = try std.DynamicBitSetUnmanaged.initEmpty(t.gpa, nodes.len);
+    defer stores.deinit(t.gpa);
+    for (nodes, range.start..) |n, i| {
+        if (n.tag != .assign) continue;
+        const lhs = Ast.indexStoreTarget(tree, mc.tokens, Ast.Index.from(@intCast(i))) orelse continue;
+        if (lhs.int() >= range.start and lhs.int() < range.end) stores.set(lhs.int() - range.start);
+    }
     // A non-empty list literal `[e0, ..]` desugars to `new()` + one `push` per element
     // over its typed `Vec[V]` receiver, and a `for x in xs` desugars to `it := xs.iter()`
     // then a loop over `it.next()`: discover the template instances lower will call (the
@@ -3208,10 +3217,12 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
                 }
             },
             .index => {
-                // `xs[i]` desugars to `mem.ga_at[V]`; discover that instance keyed on the
-                // index node's element type V so lower can resolve its mangled symbol.
+                // `xs[i]` desugars to `mem.ga_at[V]` and the store `xs[i] = v` to
+                // `mem.ga_set_at[V]`; discover that instance keyed on the index node's
+                // element type V so lower can resolve its mangled symbol.
                 const elem = node_types[i];
-                if (isConcreteValue(elem)) if (gaAtGid(model)) |gid| {
+                const prim: StdNames.ElemPrim = if (stores.isSet(i - range.start)) .set_at else .at;
+                if (isConcreteValue(elem)) if (elemPrimGid(model, prim)) |gid| {
                     const args = [_]Type{elem};
                     try t.enqueueInstance(model, gid, &args, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)) }, mod);
                 };
@@ -3222,7 +3233,7 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
             // leftmost identifier is not `.local`, so this never fires for one.
             .type_app => if (symbols_res.leftmostHeadIsValue(tree, resolutions, n.lhs)) {
                 const elem = node_types[i];
-                if (isConcreteValue(elem)) if (gaAtGid(model)) |gid| {
+                if (isConcreteValue(elem)) if (elemPrimGid(model, .at)) |gid| {
                     const args = [_]Type{elem};
                     try t.enqueueInstance(model, gid, &args, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)) }, mod);
                 };
@@ -3238,14 +3249,13 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
     }
 }
 
-/// The global fn id of `core/mem`'s `ga_at`, the element-read primitive `xs[i]` desugars
-/// to. Found by its qualified name (bundled `core/mem` is always in the graph when a
-/// program indexes a `Vec`); `null` when the name table is absent or the module was not
-/// pulled in.
-fn gaAtGid(model: *const Model) ?u32 {
+/// The global fn id of `core/mem`'s element primitive `prim`. Found by its qualified name
+/// (bundled `core/mem` is always in the graph when a program indexes a `Vec`); `null` when
+/// the name table is absent or the module was not pulled in.
+fn elemPrimGid(model: *const Model, prim: StdNames.ElemPrim) ?u32 {
     const names = model.gph_fn_names orelse return null;
     for (names, 0..) |nm, i| {
-        if (std.mem.eql(u8, nm, StdNames.ga_at)) return @intCast(i);
+        if (std.mem.eql(u8, nm, prim.name())) return @intCast(i);
     }
     return null;
 }
@@ -4994,9 +5004,6 @@ test "a mut argument must be a mutable place (T0019)" {
     const gpa = testing.allocator;
     const bodies = [_][]const u8{
         "fn main() -> int {\n bump(1)\n return 0\n}\n",
-        // The checker indexes any struct named `Vec`, so this stand-in for std's gives an
-        // index element without an import.
-        "struct Vec[T] { first: T }\nfn main() -> int {\n xs := Vec[int] { first: 1 }\n bump(xs[0])\n return xs.first\n}\n",
         "fn main() -> int {\n bump(one())\n return 0\n}\n",
         "fn main() -> int {\n bump(P { x: 1 }.x)\n return 0\n}\n",
         "fn main() -> int {\n reset(inc)\n return 0\n}\n",
@@ -5826,7 +5833,7 @@ test "an associated fn of a bare generic struct infers its type params from its 
     }
 }
 
-test "an index element, a field of one and a field of a call result are no store targets" {
+test "a field of an index element or of a call result is no store target, and a user Vec has no index" {
     const gpa = testing.allocator;
     const decls =
         \\struct P { x: int }
@@ -5838,10 +5845,10 @@ test "an index element, a field of one and a field of a call result are no store
     const cases = [_]struct { stmt: []const u8, code: codes.Code, message: []const u8 }{
         .{ .stmt = "ps[0].x = 5", .code = .T0070, .message = "cannot assign to a field of an index element `xs[i].field`; the element is a temporary copy, so the write would be lost" },
         .{ .stmt = "ps[i].x = 5", .code = .T0070, .message = "cannot assign to a field of an index element `xs[i].field`; the element is a temporary copy, so the write would be lost" },
-        .{ .stmt = "xs[1] = 7", .code = .T0074, .message = "cannot assign to an index element `xs[i]`; a 'Vec' element is not a place and 'Vec' has no index assignment" },
-        .{ .stmt = "h.xs[0] = 7", .code = .T0074, .message = "cannot assign to an index element `xs[i]`; a 'Vec' element is not a place and 'Vec' has no index assignment" },
-        // The element's type is still the rhs's expectation, so a wrong value is named too.
-        .{ .stmt = "xs[1] = true", .code = .T0041, .message = "cannot assign bool to variable of type int" },
+        // The `Vec` here is the user's, which has no element primitives to lower to.
+        .{ .stmt = "xs[1] = 7", .code = .T0057, .message = "cannot index a value of type 'Vec'" },
+        .{ .stmt = "h.xs[0] = 7", .code = .T0057, .message = "cannot index a value of type 'Vec'" },
+        .{ .stmt = "i = xs[0]", .code = .T0057, .message = "cannot index a value of type 'Vec'" },
         // Any other temporary is no place either.
         .{ .stmt = "id[H](h).xs = xs", .code = .T0075, .message = "cannot assign to a field of a temporary value, such as a call result; it is a copy, so the write would be lost" },
     };
