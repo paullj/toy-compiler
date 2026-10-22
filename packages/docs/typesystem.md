@@ -132,10 +132,17 @@ from two angles — assignability is directional (want ← got), join is symmetr
   error (nothing to bind).
 * `name: T = e` — explicit typed local. Parse `T`, `check(e, T)`, bind `name : T`.
 * `name = e` — assignment. `assignable(typeof(name), synth(e))`. The target is a
-  local or a field / tuple-field chain rooted at one. An index element is no place:
-  `xs[i]` reads a copy and `Vec` has no index assignment, so `xs[i] = v` is **T0074**
-  and `xs[i].f = v` is **T0070**. Nor is any other temporary: a field of a call result
-  (`p.get().x = v`) is **T0075**, and a call result itself (`p.get() = v`) **R0007**.
+  local or a field / tuple-field chain rooted at one. An index element is no place,
+  since `xs[i]` reads a copy, so `xs[i].f = v` is **T0070**. Nor is any other temporary:
+  a field of a call result (`p.get().x = v`) is **T0075**, and a call result itself
+  (`p.get() = v`) **R0007**.
+* `xs[i] = e` — element store on a `Vec[T]`. It means `xs.set(i, e)`: `xs`, then `i`,
+  then `e` are evaluated, left to right, then the index is checked and the element
+  stored, so an out-of-bounds `i` panics after `e` has run. `e` is checked against `T`
+  (**T0041** names "an element of type T"). The handle is read before `e`, so an `e`
+  that rebinds `xs` still writes into the `Vec` that `xs` named. A compound
+  `xs[i] op= e` is **T0074**. A `Map` store `m[k] = v` is **T0057** with a hint to
+  `m.set(k, v)`.
 * `place op= e` — compound assignment, for `op` in `+ - * / % | & ^ << >>` and the
   float forms `+. -. *. /.`. It means `place = place op e`: the place is read
   before `e` runs, `e` is typed like a binary operand (a bare integer literal takes the

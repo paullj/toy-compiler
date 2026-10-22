@@ -1,0 +1,28 @@
+# Feature: `xs[i] = v` evaluates the handle, the index and the value left to right, then
+# stores, as `xs.set(i, v)` does. An rhs that rebinds `xs` writes into the Vec the handle
+# named before it ran, and `xs[f()] = v` calls `f` once.
+# expect: stdout "7\n0\n1\n"
+# expect: exit 0
+import std/io
+import std/vec
+
+fn main() -> int {
+    xs: Vec[int] = [0]
+    old := xs
+    rebind := fn() -> int {
+        xs = [0]
+        7
+    }
+    xs[0] = rebind()
+    io.println(old[0])
+    io.println(xs[0])
+
+    calls := 0
+    at := fn() -> int {
+        calls = calls + 1
+        0
+    }
+    xs[at()] = 3
+    io.println(calls)
+    return 0
+}

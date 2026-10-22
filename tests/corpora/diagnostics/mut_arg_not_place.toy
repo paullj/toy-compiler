@@ -1,6 +1,5 @@
-# The corpus checks each fixture as a single file, with no std; the checker indexes any
-# struct named `Vec`, so this stand-in gives `xs[0]` its element type.
-struct Vec[T] { first: T }
+import std/vec
+
 struct P { x: int }
 
 impl P {
@@ -15,7 +14,7 @@ fn inc(v: int) -> int { v + 1 }
 fn main() -> int {
     bump(1)  #~ ERROR [T0019] argument 1 must be a mutable variable (a local or a field of one); 'bump' takes it as 'mut'
     bump(one())  #~ ERROR [T0019] argument 1 must be a mutable variable
-    xs := Vec[int] { first: 1 }
+    xs: Vec[int] = [1]
     bump(xs[0])  #~ ERROR [T0019] argument 1 must be a mutable variable
     bump(P { x: 1 }.x)  #~ ERROR [T0019] argument 1 must be a mutable variable
     reset(inc)  #~ ERROR [T0019] argument 1 must be a mutable variable (a local or a field of one); 'reset' takes it as 'mut'
@@ -26,5 +25,5 @@ fn main() -> int {
     reset(p.add)  #~ ERROR [T0019] argument 1 is a method value, not a place; 'reset' takes it as 'mut'
     c := 0
     bump(c)
-    return c + xs.first
+    return c + xs[0]
 }

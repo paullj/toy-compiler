@@ -1,0 +1,13 @@
+# Feature: `Vec.set(i, x)` overwrites an element in place (bounds-checked, like `xs[i]`),
+# called directly, as a bound method value `f := xs.set`, and through a pipe.
+# expect: exit 123
+import std/vec
+
+fn main() -> int {
+    xs: Vec[int] = [0, 0, 0]
+    xs.set(0, 1)
+    f := xs.set
+    f(1, 2)
+    xs |> .set(2, 3)
+    return xs[0] * 100 + xs[1] * 10 + xs[2]
+}

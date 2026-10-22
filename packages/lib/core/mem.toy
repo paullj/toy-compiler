@@ -47,6 +47,15 @@ pub fn ga_set[T](a: gc_array[T], i: int, x: T) {
     unsafe { store(offset(e, i * size_of[T]()), x) }
 }
 
+# Bounds-checked write, the one `xs[i] = v` desugars to: the same check as `ga_at`, so a
+# store can never land past `len` in the spare capacity a later push would expose.
+pub fn ga_set_at[T](a: gc_array[T], i: int, x: T) {
+    if i < 0 || i >= ga_len[T](a) {
+        panic("index out of bounds")
+    }
+    ga_set[T](a, i, x)
+}
+
 pub fn ga_push[T](a: gc_array[T], x: T) {
     l := unsafe { load(offset(a, 0)) }
     c := unsafe { load(offset(a, 8)) }

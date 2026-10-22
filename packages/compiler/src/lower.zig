@@ -558,6 +558,10 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
                 try lowerFieldStore(b, stmt.lhs, value, place_ty);
                 return;
             }
+            if (Ast.indexStoreTarget(b.in.tree, b.in.tokens, stmt_idx) != null) {
+                try lowerIndexStore(b, stmt.lhs, stmt.rhs, place_ty);
+                return;
+            }
             const home = try places.bindingHome(b, stmt.lhs, place_ty);
             if (isAggregatePass(b, place_ty) and places.stagesStore(b, stmt.lhs, value)) {
                 try places.storeStaged(b, value, try places.homeAddr(b, home), place_ty);
@@ -3053,13 +3057,14 @@ fn lowerListLiteralSlot(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) er
     return slot;
 }
 
-/// The `mem.ga_at[V]` instance a `Vec[V]` index desugars to, or null when the primitive or
-/// its instance is absent (an internal invariant break — scanCalls enqueues the instance
-/// whenever an index node types concrete). The fingerprint folds the same instance ([C2]).
-pub fn gaAtInstance(in: *const Inputs, elem_ty: Typecheck.Type) ?usize {
+/// The `core/mem` element primitive instance `prim[V]` a `Vec[V]` index desugars to, or
+/// null when the primitive or its instance is absent (an internal invariant break —
+/// scanCalls enqueues the instance whenever an index node types concrete). The
+/// fingerprint folds the same instance ([C2]).
+pub fn elemPrimInstance(in: *const Inputs, prim: StdNames.ElemPrim, elem_ty: Typecheck.Type) ?usize {
     var gid: ?u32 = null;
     for (in.names, 0..) |sn, i| {
-        if (sn.kind == .user_fn and std.mem.eql(u8, sn.name, StdNames.ga_at)) {
+        if (sn.kind == .user_fn and std.mem.eql(u8, sn.name, prim.name())) {
             gid = @intCast(i);
             break;
         }
@@ -3069,9 +3074,32 @@ pub fn gaAtInstance(in: *const Inputs, elem_ty: Typecheck.Type) ?usize {
     return Mono.find(in.instances, g, &targs);
 }
 
-fn gaAtCallee(b: *Builder, elem_ty: Typecheck.Type) ?Link.SymName {
-    const ii = gaAtInstance(&b.in, elem_ty) orelse return null;
+fn elemPrimCallee(b: *Builder, prim: StdNames.ElemPrim, elem_ty: Typecheck.Type) ?Link.SymName {
+    const ii = elemPrimInstance(&b.in, prim, elem_ty) orelse return null;
     return .{ .kind = .user_fn, .name = b.in.instances[ii].name.? };
+}
+
+/// Lower `recv[i] = v` as `mem.ga_set_at[V](recv.h, i, v)`: the handle, the index and the
+/// value in source order, then the checked store, as `recv.set(i, v)` evaluates.
+fn lowerIndexStore(b: *Builder, place: Ast.Index, rhs: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!void {
+    const n = b.in.tree.nodes[place.int()];
+    const base = try operandPtr(b, try lowerExpr(b, n.lhs));
+    if (base == Ir.none_value) return;
+    // The rhs may drop the Vec's last other reference (it can rebind `xs`) and collect, so
+    // the handle is typed as a managed box: the root map then keeps the Vec alive.
+    const handle = try b.emit(.{ .load = .{ .addr = base, .ty = Typecheck.Type.int } }, box_repr_ty);
+    const idx_val = operandValue(try lowerExpr(b, n.rhs));
+    const val = try lowerExpr(b, rhs);
+    const callee = elemPrimCallee(b, .set_at, ty) orelse {
+        try b.note(n.main_token, "unresolved 'ga_set_at' index primitive in lower");
+        return;
+    };
+    const args = try b.gpa.alloc(Ir.Operand, 3);
+    errdefer b.gpa.free(args);
+    args[0] = .{ .value = handle };
+    args[1] = .{ .value = idx_val };
+    args[2] = val;
+    _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, null);
 }
 
 /// Lower a value index `recv[i]` reading a `Vec[V]` element. The receiver's single field
@@ -3100,7 +3128,7 @@ fn lowerIndexCore(b: *Builder, recv: Ast.Index, idx: Ast.Index, main_token: u32,
     if (base == Ir.none_value) return .none;
     const handle = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
     const idx_val = operandValue(try lowerExpr(b, idx));
-    const callee = gaAtCallee(b, ty) orelse {
+    const callee = elemPrimCallee(b, .at, ty) orelse {
         try b.note(main_token, "unresolved 'ga_at' index primitive in lower");
         return .none;
     };

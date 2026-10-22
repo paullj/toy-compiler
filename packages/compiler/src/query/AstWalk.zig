@@ -88,6 +88,8 @@ pub const CallVisitor = struct {
     /// CallVisitor constructions that don't fold a `?` widen stay unchanged; a `.try_operator`
     /// with no threaded sig folds nothing (`orelse return`).
     fn_sig: ?Sig = null,
+    /// The index of the plain store `xs[i] = v` being walked, which folds `ga_set_at`.
+    store_target: Ast.Index = Ast.none,
 
     pub fn on(self: *Self, ev: Walk.Event) error{OutOfMemory}!void {
         switch (ev) {
@@ -164,10 +166,13 @@ pub const CallVisitor = struct {
     }
 
     /// Fold what a sugar node calls, which no call slot names: `for`'s `iter` and `next`, a
-    /// list literal's `new` and `push`, an index's `ga_at` instance. Lower resolves each
+    /// list literal's `new` and `push`, an index's element primitive instance. Lower resolves each
     /// through the same helpers, so the fold names what the code relocates to ([C2]).
     fn foldDesugar(self: *Self, idx: Ast.Index, tag: Ast.Node.Tag) error{OutOfMemory}!void {
         const fr = self.frozen;
+        // The walk enters a store's `.assign` before its index, so the index learns here
+        // that it writes.
+        if (tag == .assign) self.store_target = Ast.indexStoreTarget(fr.tree, fr.tokens, idx) orelse Ast.none;
         if (!fr.nodes.has(idx)) return;
         const n = fr.tree.nodes[idx.int()];
         switch (tag) {
@@ -179,15 +184,15 @@ pub const CallVisitor = struct {
             .empty_list, .list_literal => for (StdNames.desugarMethods(tag)) |dm| {
                 if (Typecheck.findMethod(fr.methods, fr.nodes.typeOf(idx), dm.name)) |m| try self.foldWitness(m);
             },
-            .index => try self.foldGaAt(idx),
-            .type_app => if (fr.resolutions.len == fr.tree.nodes.len and symbols_res.leftmostHeadIsValue(fr.tree, fr.resolutions, n.lhs)) try self.foldGaAt(idx),
+            .index => try self.foldElemPrim(idx, if (idx == self.store_target) .set_at else .at),
+            .type_app => if (fr.resolutions.len == fr.tree.nodes.len and symbols_res.leftmostHeadIsValue(fr.tree, fr.resolutions, n.lhs)) try self.foldElemPrim(idx, .at),
             else => {},
         }
     }
 
-    fn foldGaAt(self: *Self, idx: Ast.Index) error{OutOfMemory}!void {
+    fn foldElemPrim(self: *Self, idx: Ast.Index, prim: StdNames.ElemPrim) error{OutOfMemory}!void {
         const fr = self.frozen;
-        const ii = lower.gaAtInstance(fr, fr.nodes.typeOf(idx)) orelse return;
+        const ii = lower.elemPrimInstance(fr, prim, fr.nodes.typeOf(idx)) orelse return;
         const inst = fr.instances[ii];
         try self.out.append(self.gpa, .{ .kind = .user_fn, .name = inst.name.?, .params = inst.params, .ret = inst.ret, .mut_mask = templateMask(fr.sigs, inst) });
     }

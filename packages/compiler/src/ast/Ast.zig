@@ -578,6 +578,15 @@ pub fn isMutParam(tree: Tree, tokens: []const Token, param_idx: Index) bool {
     return n.tag == .param and n.main_token > 0 and tokens[n.main_token - 1].tag == .kw_mut;
 }
 
+/// The `.index` place of a plain `xs[i] = v`, or null. That index is a write through
+/// `ga_set_at`, not the read through `ga_at` an `.index` node is anywhere else. A compound
+/// `xs[i] op= v` is no such store: it reads the element too.
+pub fn indexStoreTarget(tree: Tree, tokens: []const Token, assign: Index) ?Index {
+    const n = tree.nodes[assign.int()];
+    if (n.tag != .assign or tokens[n.main_token].tag != .eq) return null;
+    return if (tree.nodes[n.lhs.int()].tag == .index) n.lhs else null;
+}
+
 /// True when token `i` is the identifier `self`: a method's receiver, recognized by its
 /// text like `mut` by adjacency (see `isMutParam`).
 pub fn isSelfTok(tokens: []const Token, src: []const u8, i: usize) bool {
@@ -1448,6 +1457,30 @@ test "isMutParam detects a kw_mut token immediately before the param name" {
     const tree = Tree{ .nodes = &nodes, .extra = &.{} };
     try testing.expect(isMutParam(tree, &toks, Index.from(0)));
     try testing.expect(!isMutParam(tree, &toks, Index.from(1)));
+}
+
+test "indexStoreTarget names the index of a plain store only" {
+    // tokens: [0]=xs [1]=`=` [2]=`+=` [3]=x
+    const toks = [_]Token{
+        .{ .tag = .identifier, .start = 0, .end = 2 },
+        .{ .tag = .eq, .start = 3, .end = 4 },
+        .{ .tag = .plus_eq, .start = 5, .end = 7 },
+        .{ .tag = .identifier, .start = 8, .end = 9 },
+    };
+    var nodes = [_]Node{
+        .{ .tag = .identifier, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .literal_number, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .index, .main_token = 0, .lhs = Index.from(0), .rhs = Index.from(1) },
+        .{ .tag = .assign, .main_token = 1, .lhs = Index.from(2), .rhs = Index.from(1) }, // xs[0] = 0
+        .{ .tag = .assign, .main_token = 2, .lhs = Index.from(2), .rhs = Index.from(1) }, // xs[0] += 0
+        .{ .tag = .identifier, .main_token = 3, .lhs = none, .rhs = none },
+        .{ .tag = .assign, .main_token = 1, .lhs = Index.from(5), .rhs = Index.from(1) }, // x = 0
+    };
+    const tree = Tree{ .nodes = &nodes, .extra = &.{} };
+    try testing.expectEqual(@as(?Index, Index.from(2)), indexStoreTarget(tree, &toks, Index.from(3)));
+    try testing.expectEqual(@as(?Index, null), indexStoreTarget(tree, &toks, Index.from(4)));
+    try testing.expectEqual(@as(?Index, null), indexStoreTarget(tree, &toks, Index.from(6)));
+    try testing.expectEqual(@as(?Index, null), indexStoreTarget(tree, &toks, Index.from(2)));
 }
 
 test "protoAt decodes a non-empty generic-param run" {

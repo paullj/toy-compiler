@@ -26,8 +26,20 @@ pub const method_push = "push";
 pub const method_iter = "iter";
 pub const method_next = "next";
 
-/// The `core/mem` element-read primitive `xs[i]` desugars to, by qualified name.
-pub const ga_at = "core/mem.ga_at";
+/// The `core/mem` element primitives an index desugars to: `xs[i]` reads through `at`,
+/// `xs[i] = v` writes through `set_at`. Discovery, the fingerprint fold and lower all name
+/// the primitive through this one table, so the instance discovered is the one called.
+pub const ElemPrim = enum {
+    at,
+    set_at,
+
+    pub fn name(p: ElemPrim) []const u8 {
+        return switch (p) {
+            .at => "core/mem.ga_at",
+            .set_at => "core/mem.ga_set_at",
+        };
+    }
+};
 
 /// Where a receiver-method desugar reads the receiver type it selects the method on.
 pub const RecvSource = enum {
@@ -45,7 +57,7 @@ pub const DesugarMethod = struct { recv: RecvSource, name: []const u8 };
 /// discover and the set they emit provably agree (a method added here reaches both, and
 /// lower's positional reads assert the length so a divergence is a compile error, not a
 /// miscompile). Sugars that desugar to a free primitive rather than a receiver method
-/// (`xs[i]` -> `ga_at`) are not receiver-method desugars and are not listed here.
+/// (`xs[i]` -> `ElemPrim`) are not receiver-method desugars and are not listed here.
 pub fn desugarMethods(tag: Ast.Node.Tag) []const DesugarMethod {
     return switch (tag) {
         .empty_list => &.{.{ .recv = .node, .name = method_new }},
@@ -147,12 +159,12 @@ pub fn importHintFor(name: []const u8) ?ImportHint {
     return import_hints.get(name);
 }
 
-test "method names are distinct, non-empty, and ga_at is qualified" {
+test "method names are distinct, non-empty, and the element primitives are qualified" {
     const methods = [_][]const u8{ method_new, method_push, method_iter, method_next };
     for (methods) |m| try std.testing.expect(m.len != 0);
     for (methods, 0..) |a, i| for (methods[i + 1 ..]) |b|
         try std.testing.expect(!std.mem.eql(u8, a, b));
-    try std.testing.expect(std.mem.indexOfScalar(u8, ga_at, '.') != null);
+    for (std.enums.values(ElemPrim)) |p| try std.testing.expect(std.mem.startsWith(u8, p.name(), "core/mem."));
     try std.testing.expect(vec_struct.len != 0 and iter_protocol.len != 0);
 }
 
@@ -178,8 +190,21 @@ test "desugarMethods enumerates each sugar's receiver methods in expansion order
 
     try std.testing.expect(map_struct.len != 0 and entry_struct.len != 0);
 
-    // A sugar with no receiver-method desugar (indexing goes through `ga_at`).
+    // A sugar with no receiver-method desugar (indexing goes through `ElemPrim`).
     try std.testing.expectEqual(@as(usize, 0), desugarMethods(.index).len);
+}
+
+test "core/mem declares every element primitive" {
+    const BundledStd = @import("bundled_std");
+    const mem = for (BundledStd.modules) |m| {
+        if (std.mem.eql(u8, m.path, "core/mem")) break m.source;
+    } else return error.TestExpectedCoreMem;
+    for (std.enums.values(ElemPrim)) |p| {
+        const short = p.name()["core/mem.".len..];
+        var buf: [64]u8 = undefined;
+        const decl = try std.fmt.bufPrint(&buf, "pub fn {s}[T](", .{short});
+        try std.testing.expect(std.mem.indexOf(u8, mem, decl) != null);
+    }
 }
 
 test "no bundled module writes a desugared method call" {
