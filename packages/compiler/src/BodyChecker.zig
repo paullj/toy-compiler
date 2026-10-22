@@ -1243,84 +1243,8 @@ pub const BodyChecker = struct {
                     lt = try bc.typeOfExpected(n.lhs, e.ty);
                     rt = try bc.typeOfExpected(n.rhs, e.ty);
                 };
-                const op = bc.tokens[n.main_token].tag;
-                const op_text = bc.tokens[n.main_token].text(bc.source);
-                switch (op) {
-                    .plus, .minus, .star, .slash => {
-                        // `+`/`-`/`*`/`/` desugar to the arithmetic protocols Add/Sub/Mul/Div
-                        //. Builtin `int` stays inline (a single machine add/sub/mul/sdiv,
-                        // no witness). Otherwise HOMOGENEOUS like `==`/`<`: require the same
-                        // type FIRST, then type to the operand type (`Out = Self`) iff it
-                        // conforms to the operator's protocol — a user struct/enum `impl T has
-                        // Add`, or a `[T has Add]` bound in a generic body. str/bool have NO
-                        // arithmetic impl (str concat allocates, deferred), so they fall to T0028.
-                        if (lt.isInteger() and Type.eql(lt, rt)) break :blk lt;
-                        const ap = bc.arithProtocol(op);
-                        if (!Type.eql(lt, rt)) {
-                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must have the same type", .{op_text});
-                        } else if (bc.conformsToArith(lt, ap.pid)) {
-                            break :blk lt;
-                        } else {
-                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0028 }, "'{s}' requires an '{s}' impl for type '{s}'", .{ op_text, ap.name, bc.typeName(lt) });
-                        }
-                    },
-                    .lt, .lt_eq, .gt, .gt_eq => {
-                        // `<`/`>`/`<=`/`>=` desugar to a discriminant test on `Ord::cmp`'s
-                        // result. HOMOGENEOUS like `==`: require the same type FIRST,
-                        // then type to bool iff the operand conforms to `Ord` — a concrete
-                        // int/str/bool prelude conformance or user struct/enum `impl T has Ord`,
-                        // or a `[T has Ord]` bound in a generic body.
-                        if (!Type.eql(lt, rt)) {
-                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must have the same type", .{op_text});
-                        } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().ord, node_idx)) {
-                            break :blk Type.bool;
-                        } else {
-                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0027 }, "'{s}' requires an 'Ord' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.preludeProtocols().ord) });
-                        }
-                    },
-                    .eq_eq, .bang_eq => {
-                        // `==`/`!=` desugar to `Eq::eq`. HOMOGENEOUS: require the same
-                        // type FIRST (so a cross-type compare stays "same type" even if both
-                        // sides individually conform), then type to bool iff the operand
-                        // conforms to `Eq` — a concrete int/bool/str/unit prelude conformance
-                        // or user struct/enum impl, or a `[T has Eq]` bound in a generic body.
-                        if (!Type.eql(lt, rt)) {
-                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must have the same type", .{op_text});
-                        } else if (lt.isFunc()) {
-                            // Function values compare by identity (code and env), not `Eq`.
-                            break :blk Type.bool;
-                        } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().eq, node_idx)) {
-                            break :blk Type.bool;
-                        } else if (try bc.deriveBlocker(lt, bc.model.preludeProtocols().eq)) |blocker| {
-                            // A struct that would derive `Eq` but for one non-conforming
-                            // field names that field (T0029). A payload enum / other type
-                            // keeps the "no Eq impl" T0026 below.
-                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0029 }, "cannot derive 'Eq' for '{s}': field '{s}' of type '{s}' does not conform to 'Eq'", .{ bc.typeName(lt), blocker.name, bc.typeName(blocker.ty) });
-                        } else {
-                            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0026 }, "'{s}' requires an 'Eq' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.preludeProtocols().eq) });
-                        }
-                    },
-                    .amp_amp, .pipe_pipe => {
-                        if (lt.kind == .bool and rt.kind == .bool) break :blk Type.bool;
-                        try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must be bool", .{op_text});
-                    },
-                    .amp, .pipe, .caret, .lt_lt, .gt_gt, .percent => {
-                        if (lt.isInteger() and Type.eql(lt, rt)) break :blk lt;
-                        try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must be int", .{op_text});
-                    },
-                    .plus_dot, .minus_dot, .star_dot, .slash_dot => {
-                        // The dotted operators are float-ONLY inline machine ops (no protocol
-                        // desugar): the non-dotted `+`/`<` on a float falls to T0028/T0027.
-                        if (lt.kind == .float and Type.eql(lt, rt)) break :blk lt;
-                        try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must both be float", .{op_text});
-                    },
-                    .lt_dot, .gt_dot, .le_dot, .ge_dot => {
-                        if (lt.kind == .float and Type.eql(lt, rt)) break :blk Type.bool;
-                        try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0044 }, "operands of '{s}' must both be float", .{op_text});
-                    },
-                    else => {},
-                }
-                break :blk Type.invalid;
+                const op_tok = bc.tokens[n.main_token];
+                break :blk try bc.binaryResult(node_idx, .{ .node = node_idx }, op_tok.tag, op_tok.text(bc.source), lt, rt);
             },
             .empty_list => blk: {
                 // An empty list literal `[]` is typed bidirectionally by its expected
@@ -4514,6 +4438,100 @@ pub const BodyChecker = struct {
         if (t.kind != .@"struct") return null;
         const pid = pid_opt orelse return null;
         return Conform.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols);
+    }
+
+    /// Where an operator error underlines, resolved only when one is reported: a
+    /// node's span walks its whole subtree, too costly to pay on every operator.
+    const Blame = union(enum) { node: Ast.Index, token: u32 };
+
+    fn blameSpan(bc: *const BodyChecker, blame: Blame) Span {
+        return switch (blame) {
+            .node => |n| bc.spanOf(n),
+            .token => |t| bc.tokSpan(t),
+        };
+    }
+
+    /// The result type of the binary operator `op` over operands already typed `lt`
+    /// and `rt`, reporting at `blame`. `site` is where a structural derive request is
+    /// recorded. Shared by `a op b` and the compound `place op= v`, so the two forms
+    /// type and diagnose alike.
+    fn binaryResult(bc: *BodyChecker, site: Ast.Index, blame: Blame, op: TokenTag, op_text: []const u8, lt: Type, rt: Type) error{OutOfMemory}!Type {
+        switch (op) {
+            .plus, .minus, .star, .slash => {
+                // `+`/`-`/`*`/`/` desugar to the arithmetic protocols Add/Sub/Mul/Div
+                //. Builtin `int` stays inline (a single machine add/sub/mul/sdiv,
+                // no witness). Otherwise HOMOGENEOUS like `==`/`<`: require the same
+                // type FIRST, then type to the operand type (`Out = Self`) iff it
+                // conforms to the operator's protocol — a user struct/enum `impl T has
+                // Add`, or a `[T has Add]` bound in a generic body. str/bool have NO
+                // arithmetic impl (str concat allocates, deferred), so they fall to T0028.
+                if (lt.isInteger() and Type.eql(lt, rt)) return lt;
+                const ap = bc.arithProtocol(op);
+                if (!Type.eql(lt, rt)) {
+                    try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0044 }, "operands of '{s}' must have the same type", .{op_text});
+                } else if (bc.conformsToArith(lt, ap.pid)) {
+                    return lt;
+                } else {
+                    try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0028 }, "'{s}' requires an '{s}' impl for type '{s}'", .{ op_text, ap.name, bc.typeName(lt) });
+                }
+            },
+            .lt, .lt_eq, .gt, .gt_eq => {
+                // `<`/`>`/`<=`/`>=` desugar to a discriminant test on `Ord::cmp`'s
+                // result. HOMOGENEOUS like `==`: require the same type FIRST,
+                // then type to bool iff the operand conforms to `Ord` — a concrete
+                // int/str/bool prelude conformance or user struct/enum `impl T has Ord`,
+                // or a `[T has Ord]` bound in a generic body.
+                if (!Type.eql(lt, rt)) {
+                    try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0044 }, "operands of '{s}' must have the same type", .{op_text});
+                } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().ord, site)) {
+                    return Type.bool;
+                } else {
+                    try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0027 }, "'{s}' requires an 'Ord' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.preludeProtocols().ord) });
+                }
+            },
+            .eq_eq, .bang_eq => {
+                // `==`/`!=` desugar to `Eq::eq`. HOMOGENEOUS: require the same
+                // type FIRST (so a cross-type compare stays "same type" even if both
+                // sides individually conform), then type to bool iff the operand
+                // conforms to `Eq` — a concrete int/bool/str/unit prelude conformance
+                // or user struct/enum impl, or a `[T has Eq]` bound in a generic body.
+                if (!Type.eql(lt, rt)) {
+                    try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0044 }, "operands of '{s}' must have the same type", .{op_text});
+                } else if (lt.isFunc()) {
+                    // Function values compare by identity (code and env), not `Eq`.
+                    return Type.bool;
+                } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().eq, site)) {
+                    return Type.bool;
+                } else if (try bc.deriveBlocker(lt, bc.model.preludeProtocols().eq)) |blocker| {
+                    // A struct that would derive `Eq` but for one non-conforming
+                    // field names that field (T0029). A payload enum / other type
+                    // keeps the "no Eq impl" T0026 below.
+                    try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0029 }, "cannot derive 'Eq' for '{s}': field '{s}' of type '{s}' does not conform to 'Eq'", .{ bc.typeName(lt), blocker.name, bc.typeName(blocker.ty) });
+                } else {
+                    try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0026 }, "'{s}' requires an 'Eq' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.preludeProtocols().eq) });
+                }
+            },
+            .amp_amp, .pipe_pipe => {
+                if (lt.kind == .bool and rt.kind == .bool) return Type.bool;
+                try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0044 }, "operands of '{s}' must be bool", .{op_text});
+            },
+            .amp, .pipe, .caret, .lt_lt, .gt_gt, .percent => {
+                if (lt.isInteger() and Type.eql(lt, rt)) return lt;
+                try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0044 }, "operands of '{s}' must be int", .{op_text});
+            },
+            .plus_dot, .minus_dot, .star_dot, .slash_dot => {
+                // The dotted operators are float-ONLY inline machine ops (no protocol
+                // desugar): the non-dotted `+`/`<` on a float falls to T0028/T0027.
+                if (lt.kind == .float and Type.eql(lt, rt)) return lt;
+                try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0044 }, "operands of '{s}' must both be float", .{op_text});
+            },
+            .lt_dot, .gt_dot, .le_dot, .ge_dot => {
+                if (lt.kind == .float and Type.eql(lt, rt)) return Type.bool;
+                try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0044 }, "operands of '{s}' must both be float", .{op_text});
+            },
+            else => {},
+        }
+        return Type.invalid;
     }
 
     /// Map an arithmetic operator token to its prelude protocol id (from the frozen Model)
