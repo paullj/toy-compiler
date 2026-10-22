@@ -264,7 +264,7 @@ pub fn main(init: std.process.Init) !void {
     // the config, 2 on a usage error or an unreadable entry. `--exit-zero` forces 0
     // regardless.
     if (st.check_seen) {
-        std.process.exit(try runCheck(gpa, out, level, usage, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.timings, st.sev));
+        std.process.exit(try runCheck(gpa, out, level, usage, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.timings, st.sev, st.allow_core_imports));
     }
 
     // The DEFAULT action is to BUILD a signed executable: a bare `toy <file>` (and any
@@ -284,12 +284,12 @@ pub fn main(init: std.process.Init) !void {
 
     // Build the executable: output → `-o`/`--output`, else the default build dir.
     if (build_exe) {
-        std.process.exit(try emitExecutable(gpa, out, level, usage, st.target, st.paths.items, st.out_path, run_after, st.mode, st.codegen_stats, st.opt, st.specialize, st.opt_stats, st.timings, st.jlimit, threads, st.sev));
+        std.process.exit(try emitExecutable(gpa, out, level, usage, st.target, st.paths.items, st.out_path, run_after, st.mode, st.codegen_stats, st.opt, st.specialize, st.opt_stats, st.timings, st.jlimit, threads, st.sev, st.allow_core_imports));
     }
 
     // `--emit ir`: print the target-independent IR for the whole program.
     if (st.emit == .ir) {
-        std.process.exit(try emitIr(gpa, out, level, usage, st.target, st.paths.items, st.opt, st.specialize, st.jlimit, st.sev));
+        std.process.exit(try emitIr(gpa, out, level, usage, st.target, st.paths.items, st.opt, st.specialize, st.jlimit, st.sev, st.allow_core_imports));
     }
 
     const results = try Driver.run(gpa, io, st.emit, st.target, st.paths.items);
@@ -352,6 +352,7 @@ const State = struct {
     // by default == identity, so no-flag runs render byte-identical. `rules` lives in a
     // fn-scope backing list `applyParsed` fills; resolve reads it LATE at render.
     sev: SevCfg.SeverityConfig = .{},
+    allow_core_imports: bool = false,
     paths: std.ArrayList([]const u8),
 };
 
@@ -392,6 +393,7 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
             };
         }
     }
+    st.allow_core_imports = devCoreImports(p);
     if (p.j) |n| {
         // n >= 1 guaranteed by the Range. -j1 => .limited(0) (serial baseline);
         // -jN>=2 => .limited(N) (cap the pool). job_count feeds the threads line.
@@ -414,6 +416,11 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
     return null;
 }
 
+/// `--dev-core-imports`, which only a dev build registers.
+fn devCoreImports(p: anytype) bool {
+    return if (@hasField(@TypeOf(p), "dev_core_imports")) p.dev_core_imports else false;
+}
+
 /// The `Opt.Pass` a parsed `--opt`/`--no-opt` choice names. The CLI enum is reified
 /// from `Opt.Pass`'s field names, so the name always maps back.
 fn optPass(choice: anytype) Opt.Pass {
@@ -434,6 +441,7 @@ fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, usage: Usage, st: *State
     };
     st.check_ndjson = if (p.format) |f| (f == .ndjson) else false;
     st.check_exit_zero = p.exit_zero;
+    st.allow_core_imports = devCoreImports(p);
     st.timings = p.timings;
     if (try buildSevRules(gpa, p, sev_rules)) |e| return try sevSpecError(usage, e);
     st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
@@ -701,6 +709,7 @@ fn emitExecutable(
     jlimit: Io.Limit,
     threads: usize,
     sev: SevCfg.SeverityConfig,
+    allow_core_imports: bool,
 ) !u8 {
     // A build takes the 1 ROOT (entry) file; the driver discovers the transitive
     // import graph from it and compiles the whole program. `argLine` flushes, because
@@ -827,6 +836,7 @@ fn emitExecutable(
         // resolved jobs count (the `-j N` value, else the host cpu count).
         .ncpu = threads,
         .sev = sev,
+        .allow_core_imports = allow_core_imports,
         .timings = timings,
         .last_ns = &last_ns,
         .ns_discover = &ns_discover,
@@ -986,6 +996,7 @@ fn emitIr(
     specialize: bool,
     jlimit: Io.Limit,
     sev: SevCfg.SeverityConfig,
+    allow_core_imports: bool,
 ) !u8 {
     // `--emit ir` takes the 1 ROOT (entry) file; discover the whole graph. `argLine`
     // flushes, because the code bubbles up through `std.process.exit(try emitIr(...))`
@@ -1047,6 +1058,7 @@ fn emitIr(
         // cpus, `-j1` (`.limited(0)`)->1 (one chunk = the serial inline path).
         .ncpu = @max(@as(usize, 1), jlimit.toInt() orelse Engine.hostCpus()),
         .sev = sev,
+        .allow_core_imports = allow_core_imports,
         .timings = false,
         .last_ns = null,
         .ns_discover = null,
@@ -1125,6 +1137,7 @@ fn runCheck(
     exit_zero: bool,
     timings: bool,
     sev: SevCfg.SeverityConfig,
+    allow_core_imports: bool,
 ) !u8 {
     // `check` takes the 1 ROOT (entry) file, exactly like a `-o`/`--emit ir` build:
     // discover its transitive import graph.
@@ -1184,7 +1197,7 @@ fn runCheck(
     // DISCOVER the whole module graph (following imports), reusing `build`'s discoverer.
     // A true I/O/OOM failure propagates as a Zig error (exit 2); a STRUCTURAL problem
     // (missing import, escape, cycle, tainted parse) is recorded in `graph.err`.
-    graph_slot = Graph.discover(gpa, cio, cache, target, entry, .{ .probe = if (timings) &discover_probe else null }) catch |e| {
+    graph_slot = Graph.discover(gpa, cio, cache, target, entry, .{ .probe = if (timings) &discover_probe else null, .allow_core_imports = allow_core_imports }) catch |e| {
         try argLine(usage, @errorName(e));
         return 2;
     };

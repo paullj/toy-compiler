@@ -1,0 +1,7 @@
+# The core/ and std/ import paths name only standard library modules, so a path the
+# bundle lacks is R0003 without looking on disk.
+import std/nope  #~ ERROR [R0003] imported module 'std/nope' not found (the 'core/' and 'std/' import paths name only standard library modules)
+
+fn main() -> int {
+    return 0
+}

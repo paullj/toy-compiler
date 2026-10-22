@@ -123,11 +123,11 @@ test "heap: store + read-back through a rawptr cell returns 42" {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const code = buildAndRun(gpa, io, ".toy-test-heap-selftest",
+    const code = buildAndRunWith(gpa, io, ".toy-test-heap-selftest",
         \\import core/mem_selftest
         \\fn main() -> int { return mem_selftest.selftest() }
         \\
-    ) catch |e| if (e == error.SkipZigTest) return e else return e;
+    , &.{harness.dev_core_imports}) catch |e| if (e == error.SkipZigTest) return e else return e;
     try std.testing.expectEqual(@as(u8, 42), code);
 }
 
@@ -138,11 +138,11 @@ test "heap: two cells are distinct, non-overlapping, and zeroed" {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const code = try buildAndRun(gpa, io, ".toy-test-heap-distinct",
+    const code = try buildAndRunWith(gpa, io, ".toy-test-heap-distinct",
         \\import core/mem_selftest
         \\fn main() -> int { return mem_selftest.check_distinct_zeroed() }
         \\
-    );
+    , &.{harness.dev_core_imports});
     try std.testing.expectEqual(@as(u8, 1), code);
 }
 
@@ -209,11 +209,11 @@ test "gc: a self-referential cycle is traced without looping and swept without c
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const code = try buildAndRun(gpa, io, ".toy-test-gc-cycle",
+    const code = try buildAndRunWith(gpa, io, ".toy-test-gc-cycle",
         \\import core/mem_selftest
         \\fn main() -> int { return mem_selftest.ref_cycle_reclaimed() }
         \\
-    );
+    , &.{harness.dev_core_imports});
     try std.testing.expectEqual(@as(u8, 1), code);
 }
 
@@ -248,11 +248,11 @@ test "gc: a >4096-wide object forces the mark stack to realloc-grow; all childre
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const code = try buildAndRun(gpa, io, ".toy-test-gc-markstack-grow",
+    const code = try buildAndRunWith(gpa, io, ".toy-test-gc-markstack-grow",
         \\import core/mem_selftest
         \\fn main() -> int { return mem_selftest.mark_stack_grow() }
         \\
-    );
+    , &.{harness.dev_core_imports});
     try std.testing.expectEqual(@as(u8, 42), code);
 }
 
@@ -261,11 +261,11 @@ test "gc: a large object (> 8 KiB direct mmap) survives a forced collection" {
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const code = try buildAndRun(gpa, io, ".toy-test-gc-large-survive",
+    const code = try buildAndRunWith(gpa, io, ".toy-test-gc-large-survive",
         \\import core/mem_selftest
         \\fn main() -> int { return mem_selftest.large_object_survivor() }
         \\
-    );
+    , &.{harness.dev_core_imports});
     try std.testing.expectEqual(@as(u8, 9), code);
 }
 
@@ -278,11 +278,11 @@ test "gc: churning dropped large objects is bounded — dead spans munmapped, ro
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const code = try buildAndRun(gpa, io, ".toy-test-gc-large-churn",
+    const code = try buildAndRunWith(gpa, io, ".toy-test-gc-large-churn",
         \\import core/mem_selftest
         \\fn main() -> int { return mem_selftest.large_churn_survivor() }
         \\
-    );
+    , &.{harness.dev_core_imports});
     try std.testing.expectEqual(@as(u8, 9), code);
 }
 
@@ -294,11 +294,11 @@ test "gc: the collection budget scales with the live heap, not a fixed 256 KiB (
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const code = try buildAndRun(gpa, io, ".toy-test-gc-live-paced",
+    const code = try buildAndRunWith(gpa, io, ".toy-test-gc-live-paced",
         \\import core/mem_selftest
         \\fn main() -> int { return mem_selftest.live_paced_collections() }
         \\
-    );
+    , &.{harness.dev_core_imports});
     try std.testing.expectEqual(@as(u8, 1), code);
 }
 
@@ -307,11 +307,11 @@ test "gc: a large object rooted only through its third page survives (every page
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const code = try buildAndRun(gpa, io, ".toy-test-gc-large-interior",
+    const code = try buildAndRunWith(gpa, io, ".toy-test-gc-large-interior",
         \\import core/mem_selftest
         \\fn main() -> int { return mem_selftest.large_interior_survivor() }
         \\
-    );
+    , &.{harness.dev_core_imports});
     try std.testing.expectEqual(@as(u8, 9), code);
 }
 
@@ -323,11 +323,11 @@ test "heap: repeated span exhaustion keeps mmapping fresh spans (arena count >= 
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const code = try buildAndRun(gpa, io, ".toy-test-heap-growth",
+    const code = try buildAndRunWith(gpa, io, ".toy-test-heap-growth",
         \\import core/mem_selftest
         \\fn main() -> int { return mem_selftest.check_span_growth() }
         \\
-    );
+    , &.{harness.dev_core_imports});
     try std.testing.expect(code >= 3);
 }
 

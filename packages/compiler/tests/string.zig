@@ -537,7 +537,7 @@ test "string: core/text panics on a range outside its str or buffer, at -O0 and 
         defer gpa.free(src);
         const sub = try std.fmt.allocPrint(gpa, "{s}/{d}{s}", .{ dir, k, level[1..] });
         defer gpa.free(sub);
-        const prog = try harness.compile(gpa, io, sub, src, &.{ "--no-cache", level });
+        const prog = try harness.compile(gpa, io, sub, src, &.{ "--no-cache", level, harness.dev_core_imports });
         defer gpa.free(prog);
         const run = try harness.runStderr(gpa, io, prog);
         defer gpa.free(run.err);
@@ -547,7 +547,7 @@ test "string: core/text panics on a range outside its str or buffer, at -O0 and 
         };
     };
     // The same parts in range build the str.
-    try harness.expectStdoutAtBothLevels(gpa, io, dir,
+    try harness.expectStdoutAtBothLevelsWith(gpa, io, dir,
         \\import core/text
         \\import std/io
         \\fn main() -> int {
@@ -560,5 +560,5 @@ test "string: core/text panics on a range outside its str or buffer, at -O0 and 
         \\    return 0
         \\}
         \\
-    , "hello\n0\n0\n");
+    , &.{harness.dev_core_imports}, "hello\n0\n0\n");
 }

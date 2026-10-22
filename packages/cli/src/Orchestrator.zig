@@ -112,6 +112,8 @@ pub const Orchestrator = struct {
     /// gates on EFFECTIVE severity (`hasError`) — a warning-only stage does not bail, and
     /// `--deny-warnings` promotes a surviving warning to a stage-failing error.
     sev: SevCfg.SeverityConfig,
+    /// `--dev-core-imports` (see `Graph.allow_core_imports`).
+    allow_core_imports: bool = false,
 
     // `--timings` per-stage laps (each stage closure charges its own bucket). Null
     // pointers on paths that don't profile (`--emit ir`) => no lap.
@@ -246,7 +248,7 @@ fn fnResolveDigest(gf: ResolveGraph.GlobalFn) u64 {
 const DiscoverCompute = struct {
     o: Orchestrator,
     pub fn run(c: DiscoverCompute) !void {
-        c.o.graph.* = try Graph.discover(c.o.gpa, c.o.io, c.o.cache, c.o.target, c.o.entry, .{ .probe = c.o.discover_probe });
+        c.o.graph.* = try Graph.discover(c.o.gpa, c.o.io, c.o.cache, c.o.target, c.o.entry, .{ .probe = c.o.discover_probe, .allow_core_imports = c.o.allow_core_imports });
         if (c.o.graph.*.?.err != null) {
             c.o.failed_stage.* = .discover;
             return error.StageDiagnostics;

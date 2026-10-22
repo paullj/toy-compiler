@@ -254,7 +254,6 @@ The names `unwrap`, `unwrap_or`, `is_err` and `map_err` may change; see issue #2
 
 Open issues that touch this page. Each has a repro.
 
-- **`core/*` is importable** ([#36](https://github.com/paullj/toy-compiler/issues/36)): a program can import `core/mem` and call its unchecked primitives, which std calls only after a bounds check.
 - **Uncached closure units** ([#39](https://github.com/paullj/toy-compiler/issues/39)): lambda units, specialized copies and adapters are lowered again on every build (see Representation).
 - **Escape analysis limits** ([#40](https://github.com/paullj/toy-compiler/issues/40)): a captured and assigned local over 16 B stays boxed, frame envs share a 256 B budget per function, and a bound method value always gets a heap env (see Escape analysis).
 - **Own type parameters on a non-generic type's method** ([#44](https://github.com/paullj/toy-compiler/issues/44)): T0013 at the call; make the method a generic fn.

@@ -171,6 +171,29 @@ pub fn importHintFor(name: []const u8) ?ImportHint {
     return import_hints.get(name);
 }
 
+/// The std module(s) a user program imports instead of a private `core/` module, named
+/// by R0013. A `core/` module joins this table when it is added, so the R0013 hint never
+/// goes blank (a unit test walks the bundle).
+const core_replacements = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "core/mem", "std/vec, std/map or std/set" },
+    .{ "core/text", "std/str" },
+    .{ "core/sys", "std/io" },
+    .{ "core/ffi", "std/math" },
+});
+
+/// The self-check modules only force or count collections for their tests, which std/gc
+/// does through a supported surface.
+const selftest_suffix = "_selftest";
+const selftest_replacement = "std/gc";
+
+/// The std replacement R0013 names for the `core/` module `path`, or null for a path
+/// that is not a bundled core module.
+pub fn coreReplacement(path: []const u8) ?[]const u8 {
+    if (core_replacements.get(path)) |r| return r;
+    if (std.mem.startsWith(u8, path, "core/") and std.mem.endsWith(u8, path, selftest_suffix)) return selftest_replacement;
+    return null;
+}
+
 test "method names are distinct, non-empty, and the element primitives are qualified" {
     const methods = [_][]const u8{ method_new, method_push, method_iter, method_next };
     for (methods) |m| try std.testing.expect(m.len != 0);
@@ -308,4 +331,27 @@ test "std_methods are the methods each std module declares, and all of them" {
     try std.testing.expectEqualStrings(importHintFor("Ref").?.module, familyModule(.ref));
     try std.testing.expectEqualStrings("option", methodModule(.result, "map_err").?);
     try std.testing.expect(methodModule(.option, "map_err") == null);
+}
+
+test "every bundled core module names a std replacement for R0013" {
+    const BundledStd = @import("bundled_std");
+    for (BundledStd.modules) |m| {
+        if (!std.mem.startsWith(u8, m.path, "core/")) continue;
+        const r = coreReplacement(m.path) orelse {
+            std.debug.print("core module '{s}' has no std replacement in core_replacements\n", .{m.path});
+            return error.TestUnexpectedResult;
+        };
+        try std.testing.expect(std.mem.startsWith(u8, r, "std/"));
+    }
+    for (core_replacements.keys()) |path| {
+        const bundled = for (BundledStd.modules) |m| {
+            if (std.mem.eql(u8, m.path, path)) break true;
+        } else false;
+        if (!bundled) {
+            std.debug.print("core_replacements names '{s}', which the bundle lacks\n", .{path});
+            return error.TestUnexpectedResult;
+        }
+    }
+    try std.testing.expectEqual(@as(?[]const u8, null), coreReplacement("std/vec"));
+    try std.testing.expectEqual(@as(?[]const u8, null), coreReplacement("util_selftest"));
 }

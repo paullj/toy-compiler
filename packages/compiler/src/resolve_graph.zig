@@ -501,6 +501,14 @@ const GraphResolve = struct {
                     continue;
                 };
 
+                // The namespace is still bound below, so the program's uses of it resolve
+                // and the one R0013 is the only diagnostic the import costs.
+                const tm = &g.graph.modules[target];
+                if (!m.bundled and tm.isCore() and !g.graph.allow_core_imports) {
+                    const instead = StdNames.coreReplacement(tm.path) orelse "a std module";
+                    try g.sink.report(.{ .span = g.importPathSpan(mod, decl), .code = .R0013, .scope = mod }, "module '{s}' is private to the standard library; import {s} instead", .{ tm.path, instead });
+                }
+
                 // Namespace name = alias token if present, else the last path segment.
                 const ns_tok: u32 = if (Ast.importAliasTok(decl).unwrap()) |alias| alias.int() else decl.main_token;
                 const ns_name = g.nameOf(mod, ns_tok);
@@ -1825,6 +1833,16 @@ fn withResolvedGraph(
     entry: []const u8,
     check: *const fn (g: *const Graph.Graph, r: *GraphResult) anyerror!void,
 ) !void {
+    return withResolvedGraphOpts(dir_name, files, entry, .{}, check);
+}
+
+fn withResolvedGraphOpts(
+    comptime dir_name: []const u8,
+    files: []const FixtureFile,
+    entry: []const u8,
+    opts: Graph.DiscoverOptions,
+    check: *const fn (g: *const Graph.Graph, r: *GraphResult) anyerror!void,
+) !void {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1849,7 +1867,7 @@ fn withResolvedGraph(
     var entry_buf: [std.fs.max_path_bytes]u8 = undefined;
     const entry_path = try std.fmt.bufPrint(&entry_buf, "{s}/{s}", .{ dir_name, entry });
 
-    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, .{});
+    var graph = try Graph.discover(gpa, io, cache, "native", entry_path, opts);
     defer graph.deinit(gpa);
     try testing.expect(graph.err == null);
 
@@ -3159,7 +3177,7 @@ test "a non-core module naming a pub extern is a visibility error (extern name s
     // `core/ffi` and naming its pub extern `labs`. Discovery serves `core/ffi` from the
     // embedded bundle, so `ffi.labs` finds the pub `.import` member but the referring
     // module is not `core/*` → the quarantine falls through to R0005 (not exported),
-    // pinning "an extern name resolves only inside `core/`".
+    // pinning "an extern name resolves only inside `core/`". The import itself is R0013.
     const files = &[_]FixtureFile{
         .{ .path = "main.toy", .source =
         \\import core/ffi
@@ -3170,12 +3188,93 @@ test "a non-core module naming a pub extern is a visibility error (extern name s
     const Check = struct {
         fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
             _ = g;
-            try testing.expectEqual(@as(usize, 1), r.diags.len);
-            try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "not exported") != null);
-            try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "labs") != null);
+            try testing.expectEqual(@as(usize, 2), r.diags.len);
+            var r0005: ?Diagnostic = null;
+            for (r.diags) |d| switch (d.code) {
+                .R0005 => r0005 = d,
+                .R0013 => {},
+                else => return error.TestUnexpectedResult,
+            };
+            try testing.expect(std.mem.indexOf(u8, r0005.?.message, "not exported") != null);
+            try testing.expect(std.mem.indexOf(u8, r0005.?.message, "labs") != null);
         }
     };
     try withResolvedGraph(".toy-test-res-extern-gate", files, "main.toy", Check.run);
+}
+
+fn expectCoreImportGate(r: *GraphResult, g: *const Graph.Graph, mod_path: []const u8, core_path: []const u8, instead: []const u8) !void {
+    var hits: usize = 0;
+    for (r.diags) |d| {
+        if (d.severity != .err) continue;
+        try testing.expectEqual(codes.Code.R0013, d.code);
+        try testing.expectEqual(modId(g, mod_path), d.scope);
+        try testing.expect(std.mem.indexOf(u8, d.message, core_path) != null);
+        try testing.expect(std.mem.indexOf(u8, d.message, instead) != null);
+        const m = g.modules[d.scope];
+        try testing.expectEqualStrings(core_path, m.source[d.byte_offset..d.end]);
+        hits += 1;
+    }
+    try testing.expectEqual(@as(usize, 1), hits);
+}
+
+test "a user entry importing core/* is R0013 at the import path, and its uses still resolve" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import core/mem
+        \\fn main() -> int {
+        \\    a := mem.ga_new[int]()
+        \\    mem.ga_push[int](a, 7)
+        \\    return mem.ga_get[int](a, 100000)
+        \\}
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            try expectCoreImportGate(r, g, "main", "core/mem", "std/vec, std/map or std/set");
+        }
+    };
+    try withResolvedGraph(".toy-test-res-core-gate-entry", files, "main.toy", Check.run);
+}
+
+test "a user non-entry module importing core/* is R0013 in that module" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source = "import util\nfn main() -> int { return util.n() }\n" },
+        .{ .path = "util.toy", .source = "import core/text\npub fn n() -> int { return 0 }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            try expectCoreImportGate(r, g, "util", "core/text", "std/str");
+        }
+    };
+    try withResolvedGraph(".toy-test-res-core-gate-dep", files, "main.toy", Check.run);
+}
+
+test "std and core modules import core freely, and allow_core_imports lifts the gate" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import core/mem_selftest
+        \\import std/vec
+        \\import std/str
+        \\fn main() -> int {
+        \\    xs: Vec[int] = [1]
+        \\    return xs[0] + mem_selftest.selftest()
+        \\}
+        \\
+        },
+    };
+    const Gated = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            try expectCoreImportGate(r, g, "main", "core/mem_selftest", "std/gc");
+        }
+    };
+    try withResolvedGraph(".toy-test-res-core-gate-std", files, "main.toy", Gated.run);
+    const Allowed = struct {
+        fn run(_: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+        }
+    };
+    try withResolvedGraphOpts(".toy-test-res-core-gate-allow", files, "main.toy", .{ .allow_core_imports = true }, Allowed.run);
 }
 
 test "two non-generic conformances sharing a method name register distinctly (no R0002)" {
