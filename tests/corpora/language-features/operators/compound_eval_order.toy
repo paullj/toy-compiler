@@ -1,0 +1,25 @@
+# Feature: `place op= v` reads the place before it evaluates `v`, as `place = place op v`
+# does, so a write to the place from inside `v` is overwritten by the result built from
+# the old value.
+# expect: stdout "101\n"
+# expect: exit 102
+import std/io
+
+struct P { x: int }
+
+fn main() -> int {
+    x := 1
+    set := fn() -> int {
+        x = 50
+        return 100
+    }
+    x += set()
+    io.println(x)
+    p := P { x: 1 }
+    poke := fn() -> int {
+        p.x = 50
+        return 1
+    }
+    p.x += poke()
+    return x + p.x - 1
+}

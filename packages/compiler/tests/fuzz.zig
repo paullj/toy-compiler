@@ -286,6 +286,7 @@ const max_gen_depth: usize = 4;
 const idents = [_][]const u8{ "a", "b", "c", "x", "y", "foo", "bar", "n", "acc" };
 const types = [_][]const u8{ "int", "bool", "str", "()", "fn(int) -> int", "fn()" };
 const bin_ops = [_][]const u8{ "+", "-", "*", "/", "==", "!=", "<", ">", "<=", ">=", "and", "or", "|>", "\n|>" };
+const assign_ops = [_][]const u8{ " = ", " += ", " -= ", " *= ", " /= ", " %= ", " |= ", " &= ", " ^= ", " <<= ", " >>= " };
 
 /// Emit a random-but-plausible program: 1..4 top-level items (fn/struct/enum/
 /// import). At least one `fn main`-like function so the whole-program check has an
@@ -395,9 +396,9 @@ fn genStmt(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random, de
             try out.appendSlice(gpa, " := ");
             try genExpr(gpa, out, rand, 0);
         },
-        1 => { // assignment
+        1 => { // assignment, plain or compound
             try out.appendSlice(gpa, pick(idents, rand));
-            try out.appendSlice(gpa, " = ");
+            try out.appendSlice(gpa, pick(assign_ops, rand));
             try genExpr(gpa, out, rand, 0);
         },
         2 => { // return

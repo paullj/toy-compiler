@@ -72,7 +72,8 @@ pub const Event = union(enum) {
     /// param/return type (carrying the cross-module-correct global id).
     type_ref: struct { idx: Ast.Index, ordinal: u32, is_ret: bool },
     /// A desugaring binary operator on a `.binary` node `idx`: `==`/`!=` (Eq/Ord), a
-    /// comparison `<`/`>`/`<=`/`>=` (Ord), or arithmetic `+`/`-`/`*`/`/` (Add/Sub/Mul/Div).
+    /// comparison `<`/`>`/`<=`/`>=` (Ord), or arithmetic `+`/`-`/`*`/`/` (Add/Sub/Mul/Div);
+    /// or a compound `.assign` whose base operator is arithmetic (`+=` is Add).
     /// Emitted AFTER both operands, like `.callee` fires after a call's callee subtree, and
     /// only for a token that has a candidate method (see `opMethod`). `CallVisitor` folds the
     /// resolved witness for a struct/enum operand so `p == q`/`a < b`/`v1 + v2` tracks the SAME
@@ -276,8 +277,10 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try walkInner(src, n.lhs, collect, visitor);
         },
         .assign => {
+            try emit(visitor, .{ .leaf = leaf }); // x = 1 != x += 1 != x -= 1
             try walkInner(src, n.lhs, collect, visitor);
             try walkInner(src, n.rhs, collect, visitor);
+            if (opMethods(operatorOf(src.tokens[n.main_token].tag)).len > 0) try emit(visitor, .{ .operator = .{ .idx = idx } });
         },
         .return_stmt => {
             try emit(visitor, .{ .flag = n.lhs != Ast.none }); // bare return != return v
@@ -578,6 +581,12 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
             try walkInner(src, n.rhs, collect, visitor);
         },
     }
+}
+
+/// The binary operator a `.binary` or `.assign` node's main token applies: a compound
+/// assignment applies its base operator, and a plain `=` none.
+pub fn operatorOf(tag: TokenTag) TokenTag {
+    return tag.compoundBase() orelse tag;
 }
 
 /// Candidate desugaring method names for a binary operator token, in resolution order

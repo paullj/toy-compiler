@@ -1829,14 +1829,6 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
                 const init_expr = try p.parseExpr(0);
                 return p.addNode(.{ .tag = .var_decl, .main_token = name_tok, .lhs = init_expr, .rhs = type_ref });
             },
-            .eq => {
-                const name_tok = p.index;
-                const target = try p.leaf(.identifier, name_tok); // advances past name
-                const op_tok = p.index;
-                try p.expect(.eq, "expected '=' in assignment");
-                const value = try p.parseExpr(0);
-                return p.addNode(.{ .tag = .assign, .main_token = op_tok, .lhs = target, .rhs = value });
-            },
             // A `.`- or `[`-rooted place: `p.x = v`, `p.a.b = v`, `ps[0].x = v`. Parse the
             // place (a postfix chain over a name); if `=` follows it is a store, otherwise
             // it is an expression statement (continue the infix climb). An index element
@@ -1844,16 +1836,15 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
             .dot, .l_bracket => {
                 const first = p.index;
                 const place = try p.parsePostfix(try p.parsePrefix());
-                if (p.at(.eq)) {
-                    const op_tok = p.index;
-                    p.bump(.eq);
-                    const value = try p.parseExpr(0);
-                    return p.addNode(.{ .tag = .assign, .main_token = op_tok, .lhs = place, .rhs = value });
-                }
+                if (p.atAssignOp()) return p.parseAssignTail(place);
                 const expr = try p.continueInfix(place, 0);
                 return p.addNode(.{ .tag = .expr_stmt, .main_token = first, .lhs = expr, .rhs = Ast.none });
             },
-            else => return p.parseExprStmt(),
+            else => |next| {
+                if (!isAssignOp(next)) return p.parseExprStmt();
+                const target = try p.leaf(.identifier, p.index); // advances past name
+                return p.parseAssignTail(target);
+            },
         },
         // Recovery only: a statement led by the removed `*r` (`*r = v`). `parsePrefix`
         // reports the one P0015; the rest of the statement still parses (as an assign or
@@ -1861,17 +1852,29 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
         .star => {
             const first = p.index;
             const place = try p.parsePostfix(try p.parsePrefix());
-            if (p.at(.eq)) {
-                const op_tok = p.index;
-                p.bump(.eq);
-                const value = try p.parseExpr(0);
-                return p.addNode(.{ .tag = .assign, .main_token = op_tok, .lhs = place, .rhs = value });
-            }
+            if (p.atAssignOp()) return p.parseAssignTail(place);
             const expr = try p.continueInfix(place, 0);
             return p.addNode(.{ .tag = .expr_stmt, .main_token = first, .lhs = expr, .rhs = Ast.none });
         },
         else => return p.parseExprStmt(),
     }
+}
+
+fn atAssignOp(p: *const Parser) bool {
+    return isAssignOp(p.peek().tag);
+}
+
+fn isAssignOp(tag: token.Tag) bool {
+    return tag == .eq or tag.compoundBase() != null;
+}
+
+/// The `= v` or `op= v` after an assignment target, at an assignment operator.
+fn parseAssignTail(p: *Parser, target: Ast.Index) Error!Ast.Index {
+    std.debug.assert(p.atAssignOp());
+    const op_tok = p.index;
+    p.advance();
+    const value = try p.parseExpr(0);
+    return p.addNode(.{ .tag = .assign, .main_token = op_tok, .lhs = target, .rhs = value });
 }
 
 /// `while cond { body }`. The condition is a full expression (no parens
@@ -3378,6 +3381,13 @@ test "every assign arm takes the '=' token as its main token" {
         try testing.expectEqual(token.Tag.eq, tokens[n.main_token].tag);
     };
     try testing.expectEqual(@as(usize, 4), assigns);
+}
+
+test "every compound operator parses as an assign on each place arm" {
+    try expectProgram(
+        "fn f() {\n x += 1\n p.a.b -= 2\n p.0 *= 3\n xs[0] /= 4\n x %= 5\n x |= 6\n x &= 7\n x ^= 8\n x <<= 9\n x >>= a + 1\n}\n",
+        "(program (fn f () _ (block (+= x 1) (-= (. (. p a) b) 2) (*= (. p 0) 3) (/= (index xs 0) 4) (%= x 5) (|= x 6) (&= x 7) (^= x 8) (<<= x 9) (>>= x (+ a 1)))))",
+    );
 }
 
 test "empty block, no params, void return" {

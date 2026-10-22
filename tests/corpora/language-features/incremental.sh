@@ -194,6 +194,52 @@ fn add(a: int, b: int) -> int { return a + b }
 fn main() -> int { return add(40, 2) }
 ' 0
 
+# 4b) COMPOUND OPERATOR — `+=` edited to `-=`: the fn holding it MUST re-lower (its key
+#     folds the assignment's operator), the unrelated fn cuts off.
+run_scenario compound_op \
+'fn step(mut n: int) { n += 3 }
+fn unrelated(n: int) -> int { return n + n }
+fn main() -> int {
+    x := 10
+    step(x)
+    return x + unrelated(1)
+}
+' \
+'fn step(mut n: int) { n -= 3 }
+fn unrelated(n: int) -> int { return n + n }
+fn main() -> int {
+    x := 10
+    step(x)
+    return x + unrelated(1)
+}
+' 1
+
+# 4c) COMPOUND WITNESS — `v += w` on a struct calls its Add impl. The key of the fn
+#     holding the `+=` folds the witness's signature, not its body (the AstWalk unit test
+#     guards that fold), so a body edit stays sound and cuts `grow` off: only the impl
+#     re-lowers.
+run_scenario compound_witness \
+'struct V { a: int }
+impl V has Add { fn add(self, o: V) -> V { V { a: self.a + o.a } } }
+fn grow(mut v: V, w: V) { v += w }
+fn unrelated(n: int) -> int { return n + n }
+fn main() -> int {
+    v := V { a: 1 }
+    grow(v, V { a: 2 })
+    return v.a + unrelated(1)
+}
+' \
+'struct V { a: int }
+impl V has Add { fn add(self, o: V) -> V { V { a: self.a * 10 + o.a } } }
+fn grow(mut v: V, w: V) { v += w }
+fn unrelated(n: int) -> int { return n + n }
+fn main() -> int {
+    v := V { a: 1 }
+    grow(v, V { a: 2 })
+    return v.a + unrelated(1)
+}
+' 1
+
 # 5) CROSS-MODULE — a body edit to an imported module PRIVATE helper. The importer
 #    depends on the imported fn SIGNATURE, never its body, so the entry cuts off.
 run_cross_module() {

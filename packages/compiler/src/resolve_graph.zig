@@ -939,7 +939,12 @@ const GraphResolve = struct {
                         .module => try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, target.main_token), .code = .R0007, .scope = g.cur_mod }, "cannot assign to module '{s}'", .{g.nameText(target.main_token)}),
                         .local => |slot| if (g.locals.items[slot].is_fn) {
                             try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, target.main_token), .code = .R0007, .scope = g.cur_mod }, "cannot assign to function '{s}'", .{g.nameText(target.main_token)});
-                        } else try g.noteCapture(slot, stmt.lhs),
+                        } else {
+                            // `x op= v` reads `x` before it writes it, so the write it
+                            // follows is live.
+                            if (g.tokens()[stmt.main_token].tag.compoundBase() != null) g.readTap(slot);
+                            try g.noteCapture(slot, stmt.lhs);
+                        },
                         .label => {},
                     }
                 }
@@ -1008,6 +1013,13 @@ const GraphResolve = struct {
         }
     }
 
+    /// Dead-store read-tap: a read of `slot` keeps any pending straight-line write to it
+    /// live. Cleared at every active block level so a read nested arbitrarily deep still
+    /// keeps an outer write live.
+    fn readTap(g: *GraphResolve, slot: u32) void {
+        for (g.dead_pending.items) |*m| _ = m.remove(slot);
+    }
+
     fn resolveExpr(g: *GraphResolve, node_idx: Ast.Index) error{OutOfMemory}!void {
         if (node_idx == Ast.none) return;
         const n = g.nodes()[node_idx.int()];
@@ -1015,14 +1027,12 @@ const GraphResolve = struct {
             .identifier => {
                 const resn: Resolution = if (g.holeSlot(node_idx)) |s| .{ .local = s } else g.lookupName(n.main_token);
                 g.res(node_idx, resn);
-                // Dead-store read-tap. A value-read of a local keeps any pending straight-line
-                // write to that slot live. This is the ONE point every local READ resolves, so
-                // tapping here cannot miss a read — and a bare-assign target (resolved via
-                // `lookupName` in `resolveStmt`) and a `var_decl` name (via `declare`) never
-                // reach this arm, so a WRITE is never mistaken for a read. Clear at EVERY active
-                // block level so a read nested arbitrarily deep still keeps an outer write live.
+                // Every local read in an expression resolves here, so tapping here cannot miss
+                // one. An assign target (resolved via `lookupName` in `resolveStmt`) and a
+                // `var_decl` name (via `declare`) never reach this arm, so a write is never
+                // mistaken for a read; `resolveStmt` taps a compound target itself.
                 if (resn == .local) {
-                    for (g.dead_pending.items) |*m| _ = m.remove(resn.local);
+                    g.readTap(resn.local);
                     try g.noteCapture(resn.local, node_idx);
                 }
                 if (resn == .unresolved) {
@@ -2586,6 +2596,32 @@ test "a nested control-flow expression reading the slot in the RHS is not a fals
         }
     };
     try withResolvedGraph(".toy-test-deadstore-nested-cf-rhs", files, "main.toy", Check.run);
+}
+
+test "a compound assignment reads its target, then is a write of its own" {
+    const files = &[_]FixtureFile{.{ .path = "main.toy", .source =
+        \\fn live() -> int {
+        \\ x := 1
+        \\ x += 2
+        \\ return x
+        \\}
+        \\fn dead() -> int {
+        \\ y := 1
+        \\ y -= 2
+        \\ y = 3
+        \\ return y
+        \\}
+        \\fn main() -> int { return live() + dead() }
+        \\
+    }};
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            // Only `y -= 2`, overwritten before any read.
+            try testing.expectEqual(@as(usize, 1), countCode(r, .W0010));
+        }
+    };
+    try withResolvedGraph(".toy-test-deadstore-compound", files, "main.toy", Check.run);
 }
 
 test "two dead stores in a straight-line chain both flag W0010" {

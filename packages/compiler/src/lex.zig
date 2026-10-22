@@ -259,19 +259,19 @@ fn lexSymbol(l: *Lexer, start: u32) Token {
 
     l.index += 1;
     const tag: Tag = switch (c) {
-        '+' => if (l.eat('.')) .plus_dot else .plus,
-        '-' => if (l.eat('>')) .arrow else if (l.eat('.')) .minus_dot else .minus,
-        '*' => if (l.eat('.')) .star_dot else .star,
-        '/' => if (l.eat('.')) .slash_dot else .slash,
-        '%' => .percent,
+        '+' => if (l.eat('.')) .plus_dot else if (l.eat('=')) .plus_eq else .plus,
+        '-' => if (l.eat('>')) .arrow else if (l.eat('.')) .minus_dot else if (l.eat('=')) .minus_eq else .minus,
+        '*' => if (l.eat('.')) .star_dot else if (l.eat('=')) .star_eq else .star,
+        '/' => if (l.eat('.')) .slash_dot else if (l.eat('=')) .slash_eq else .slash,
+        '%' => if (l.eat('=')) .percent_eq else .percent,
         '=' => if (l.eat('=')) .eq_eq else .eq,
         '!' => if (l.eat('=')) .bang_eq else .bang,
-        '<' => if (l.eat('<')) .lt_lt else if (l.eat('=')) (if (l.eat('.')) .le_dot else .lt_eq) else if (l.eat('.')) .lt_dot else .lt,
-        '>' => if (l.eat('>')) .gt_gt else if (l.eat('=')) (if (l.eat('.')) .ge_dot else .gt_eq) else if (l.eat('.')) .gt_dot else .gt,
-        '&' => if (l.eat('&')) .amp_amp else .amp,
-        '^' => .caret,
+        '<' => if (l.eat('<')) (if (l.eat('=')) .lt_lt_eq else .lt_lt) else if (l.eat('=')) (if (l.eat('.')) .le_dot else .lt_eq) else if (l.eat('.')) .lt_dot else .lt,
+        '>' => if (l.eat('>')) (if (l.eat('=')) .gt_gt_eq else .gt_gt) else if (l.eat('=')) (if (l.eat('.')) .ge_dot else .gt_eq) else if (l.eat('.')) .gt_dot else .gt,
+        '&' => if (l.eat('&')) .amp_amp else if (l.eat('=')) .amp_eq else .amp,
+        '^' => if (l.eat('=')) .caret_eq else .caret,
         '~' => .tilde,
-        '|' => if (l.eat('|')) .pipe_pipe else if (l.eat('>')) .pipe_gt else .pipe,
+        '|' => if (l.eat('|')) .pipe_pipe else if (l.eat('>')) .pipe_gt else if (l.eat('=')) .pipe_eq else .pipe,
         '(' => .l_paren,
         ')' => .r_paren,
         '{' => .l_brace,
@@ -379,8 +379,20 @@ test "pipe |> is one token, distinct from | and ||" {
 test "bitwise and shift operators lex to their tags" {
     try expectTags("& ^ ~ << >>", &.{ .amp, .caret, .tilde, .lt_lt, .gt_gt, .eof });
     try expectTags("a << b >> c", &.{ .identifier, .lt_lt, .identifier, .gt_gt, .identifier, .eof });
-    // `<<`/`>>` do not swallow a following `=`; `<=`/`>=` still lex.
     try expectTags("< <= << > >= >>", &.{ .lt, .lt_eq, .lt_lt, .gt, .gt_eq, .gt_gt, .eof });
+}
+
+test "compound assignment operators lex to one token each" {
+    try expectTags("+= -= *= /= %= |= &= ^= <<= >>=", &.{ .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq, .pipe_eq, .amp_eq, .caret_eq, .lt_lt_eq, .gt_gt_eq, .eof });
+    for ([_]Tag{ .plus_eq, .minus_eq, .star_eq, .slash_eq, .percent_eq, .pipe_eq, .amp_eq, .caret_eq, .lt_lt_eq, .gt_gt_eq }, [_]Tag{ .plus, .minus, .star, .slash, .percent, .pipe, .amp, .caret, .lt_lt, .gt_gt }) |c, base|
+        try std.testing.expectEqual(@as(?Tag, base), c.compoundBase());
+    try std.testing.expectEqual(@as(?Tag, null), Tag.eq.compoundBase());
+    try expectTags("x+=1", &.{ .identifier, .plus_eq, .number, .eof });
+    // The operator comes first, so `=-` stays an assignment of a negative value.
+    try expectTags("x=-1", &.{ .identifier, .eq, .minus, .number, .eof });
+    try expectTags("a <= b >= c -> d +. e", &.{ .identifier, .lt_eq, .identifier, .gt_eq, .identifier, .arrow, .identifier, .plus_dot, .identifier, .eof });
+    // An operator before a newline cannot end a statement, so the value continues.
+    try expectTags("x +=\n1\n", &.{ .identifier, .plus_eq, .number, .newline, .eof });
 }
 
 test "unterminated string at EOF is one string_unterminated token spanning to EOF" {

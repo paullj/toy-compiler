@@ -1,0 +1,24 @@
+# Feature: an aggregate store whose value runs a compound `+=` on a user Add is built aside
+# first, as its long form is: the witness may read the destination through a closure, and
+# must see it whole.
+# expect: stdout "1\n"
+# expect: exit 1
+import std/io
+
+struct P { a: int, b: int }
+struct S { n: int, f: fn() -> int }
+
+impl S has Add {
+    fn add(self, o: S) -> S { S { n: self.n + o.n + self.f(), f: self.f } }
+}
+
+fn main() -> int {
+    v := P { a: 1, b: 2 }
+    reader := fn() -> int { v.a }
+    s := S { n: 0, f: reader }
+    t := s
+    v = P { a: 5, b: { t = t + s
+        t.n } }
+    io.println(v.b)
+    return v.b
+}

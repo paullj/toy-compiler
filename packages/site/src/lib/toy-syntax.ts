@@ -44,7 +44,7 @@ export const toyLanguage = StreamLanguage.define<{ afterFn: boolean; depth: numb
 			return 'variableName';
 		}
 
-		const punct = stream.match(/[{}()[\],;:.]|[-+*/%<>=!&|?]+/) as RegExpMatchArray | null;
+		const punct = stream.match(/[{}()[\],;:.]|[-+*/%<>=!&|^?]+/) as RegExpMatchArray | null;
 		if (punct) {
 			if (/^[{([]$/.test(punct[0])) state.depth++;
 			else if (/^[})\]]$/.test(punct[0])) state.depth = Math.max(0, state.depth - 1);

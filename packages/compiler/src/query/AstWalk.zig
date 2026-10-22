@@ -123,7 +123,7 @@ pub const CallVisitor = struct {
                 if (!self.frozen.nodes.has(bn.lhs)) return;
                 const recv = self.frozen.nodes.typeOf(bn.lhs);
                 if (recv.kind != .@"struct" and recv.kind != .@"enum") return;
-                for (Walk.opMethods(self.frozen.tokens[bn.main_token].tag)) |method| {
+                for (Walk.opMethods(Walk.operatorOf(self.frozen.tokens[bn.main_token].tag))) |method| {
                     const pid = Typecheck.witnessProtocolId(self.frozen.prelude_ids, method);
                     switch (Typecheck.resolveConformanceMethod(self.frozen.methods, recv, method, pid, null)) {
                         .one => |m| return self.foldWitness(m),
@@ -630,6 +630,7 @@ test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch
         \\fn f(p: P, e: E) -> P {
         \\  q := g(g(p))
         \\  d := q.x - p.x
+        \\  d += 1
         \\  s := P { x: d }
         \\  eqp := q == s
         \\  m := match e { .A | .C(0) -> 1, .C(r) -> r }
@@ -726,7 +727,7 @@ test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch
         .touch => saw_touch = true,
         .callee => saw_callee = true,
         .type_ref => saw_type_ref = true,
-        .operator => switch (b.tokens[b.tree.nodes[st.idx.int()].main_token].tag) {
+        .operator => switch (Walk.operatorOf(b.tokens[b.tree.nodes[st.idx.int()].main_token].tag)) {
             .eq_eq, .bang_eq => saw_eq_op = true,
             .lt, .lt_eq, .gt, .gt_eq => saw_ord_op = true,
             .plus, .minus, .star, .slash => saw_arith_op = true,
@@ -795,15 +796,18 @@ test "[DRIFT GUARD] all three consumers observe the SAME event stream + dispatch
         try testing.expect(is_proto_type);
     }
 
-    // (5) `.operator` PLACEMENT: every `.operator` idx is an entered `.binary` node whose
-    // operator token has a candidate desugaring method. A signal at the wrong node — or
+    // (5) `.operator` PLACEMENT: every `.operator` idx is an entered `.binary` or compound
+    // `.assign` node whose operator has a candidate desugaring method. A signal at the wrong node — or
     // fired for a non-desugaring binary — fails here.
+    var saw_compound_op = false;
     for (stream) |st| {
         if (st.kind != .operator) continue;
         const bnode = b.tree.nodes[st.idx.int()];
-        try testing.expect(bnode.tag == .binary);
-        try testing.expect(Walk.opMethods(b.tokens[bnode.main_token].tag).len > 0);
+        try testing.expect(bnode.tag == .binary or bnode.tag == .assign);
+        if (bnode.tag == .assign) saw_compound_op = true;
+        try testing.expect(Walk.opMethods(Walk.operatorOf(b.tokens[bnode.main_token].tag)).len > 0);
     }
+    try testing.expect(saw_compound_op);
 }
 
 /// True for the pattern-subtree tags the touched walk descends with `collect=false`
@@ -963,6 +967,28 @@ test "a param's own mut changes the fn's body hash" {
         }
         try testing.expect(fps[0] != fps[1]);
     }
+}
+
+test "an assignment's operator changes the fn's body hash" {
+    const gpa = testing.allocator;
+    const srcs = [_][]const u8{
+        "fn f(mut x: int) { x = 1 }\n",
+        "fn f(mut x: int) { x += 1 }\n",
+        "fn f(mut x: int) { x -= 1 }\n",
+    };
+    var fps: [srcs.len]u64 = undefined;
+    for (srcs, &fps) |src, *out| {
+        var b = try build(gpa, src);
+        defer b.deinit(gpa);
+        const decl = for (b.tree.nodes, 0..) |n, i| {
+            if (n.tag == .fn_decl) break Ast.Index.from(@intCast(i));
+        } else return error.TestExpectedFn;
+        var h = std.hash.Wyhash.init(0);
+        var hv = HashVisitor{ .h = &h };
+        try Walk.walk(b.src(), decl, &hv);
+        out.* = h.final();
+    }
+    try testing.expect(fps[0] != fps[1] and fps[1] != fps[2] and fps[0] != fps[2]);
 }
 
 test "a lambda folds param-type and ret presence" {
@@ -1378,6 +1404,78 @@ test "`p + q` folds the SAME Add witness Sig as `p.add(q)` (incremental soundnes
     try testing.expectEqual(@as(usize, 1), meth_sigs.items.len);
     const a = op_sigs.items[0];
     const m = meth_sigs.items[0];
+    try testing.expectEqual(a.kind, m.kind);
+    try testing.expectEqualStrings(a.name, m.name);
+    try testing.expectEqual(a.ret.kind, m.ret.kind);
+    try testing.expectEqual(a.params.len, m.params.len);
+}
+
+test "`p += q` folds the SAME Add witness Sig as `p + q` (incremental soundness)" {
+    const gpa = testing.allocator;
+    const Graph = @import("../driver/Graph.zig");
+    const ResolveGraph = @import("../resolve_graph.zig");
+    const TypecheckGraph = @import("../types_graph.zig");
+    const Link = @import("../link/Link.zig");
+
+    const src =
+        \\struct V2 { x: int, y: int }
+        \\impl V2 has Add { fn add(self, o: V2) -> V2 { V2{ x: self.x + o.x, y: self.y + o.y } } }
+        \\fn use_op(p: V2, q: V2) -> V2 { p + q }
+        \\fn use_compound(mut p: V2, q: V2) { p += q }
+        \\
+    ;
+    const tokens = try Lexer.tokenize(gpa, src);
+    defer gpa.free(tokens);
+    const tree = try Parser.expectTree(gpa, tokens, src);
+    defer {
+        gpa.free(tree.nodes);
+        gpa.free(tree.extra);
+    }
+
+    var g = try Graph.single(gpa, "main", "", src, tokens, tree.nodes, tree.extra, tree.pub_bits);
+    defer g.deinit(gpa);
+    var res = try ResolveGraph.resolveGraph(gpa, &g);
+    defer res.deinit(gpa);
+    var tc = try TypecheckGraph.checkGraph(gpa, &g, &res, null, 0);
+    defer tc.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), tc.diags.len);
+
+    const names = try gpa.alloc(Link.SymName, res.fns.len);
+    defer {
+        for (names) |nm| gpa.free(nm.name);
+        gpa.free(names);
+    }
+    for (res.fns, 0..) |gf, i| {
+        const kind: Link.SymKind = if (gf.decl_node == Ast.none) .builtin else .user_fn;
+        names[i] = .{ .kind = kind, .name = try gpa.dupe(u8, gf.name) };
+    }
+
+    const frozen = fakeInputs(tree, tokens, src, .{ .resolutions = res.resolutions[0], .node_types = tc.node_types[0], .callees = tc.callees[0], .layouts = tc.layouts, .enum_layouts = tc.enum_layouts, .names = names, .sigs = tc.sigs, .instances = tc.instances, .methods = tc.methods, .prelude_ids = tc.prelude_ids });
+
+    const prog = tree.nodes[Ast.root(tree.nodes).int()];
+    var op_decl: Ast.Index = Ast.none;
+    var compound_decl: Ast.Index = Ast.none;
+    for (Ast.rangeSlice(.{ .nodes = tree.nodes, .extra = tree.extra }, prog.lhs.int())) |idx| {
+        if (tree.nodes[idx.int()].tag != .fn_decl) continue;
+        if (op_decl == Ast.none) op_decl = idx else compound_decl = idx;
+    }
+    try testing.expect(op_decl != Ast.none and compound_decl != Ast.none);
+
+    var op_sigs: std.ArrayList(Sig) = .empty;
+    defer op_sigs.deinit(gpa);
+    var vop = CallVisitor{ .gpa = gpa, .frozen = &frozen, .out = &op_sigs };
+    try Walk.walk(.{ .tree = tree, .tokens = tokens, .source = src }, op_decl, &vop);
+
+    var compound_sigs: std.ArrayList(Sig) = .empty;
+    defer compound_sigs.deinit(gpa);
+    var vm = CallVisitor{ .gpa = gpa, .frozen = &frozen, .out = &compound_sigs };
+    try Walk.walk(.{ .tree = tree, .tokens = tokens, .source = src }, compound_decl, &vm);
+
+    // `p += q` folds the SAME witness as `p + q`, so editing `add` invalidates it too.
+    try testing.expectEqual(@as(usize, 1), op_sigs.items.len);
+    try testing.expectEqual(@as(usize, 1), compound_sigs.items.len);
+    const a = op_sigs.items[0];
+    const m = compound_sigs.items[0];
     try testing.expectEqual(a.kind, m.kind);
     try testing.expectEqualStrings(a.name, m.name);
     try testing.expectEqual(a.ret.kind, m.ret.kind);

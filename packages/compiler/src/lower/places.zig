@@ -159,12 +159,17 @@ pub fn readsCopyOnReadRoot(b: *const Builder, node_idx: Ast.Index) bool {
 /// reads the root: by name, or, for a root a closure or a caller may hold by reference,
 /// through code it runs. Staging every aggregate store would change the code of programs
 /// none of this reaches.
-pub fn stagesStore(b: *Builder, place: Ast.Index, value: Ast.Index) bool {
+pub fn stagesStore(b: *Builder, place: Ast.Index, store: L.StoreValue) bool {
     const li = symbols_res.placeRoot(b.in.tree, b.in.resolutions, place) orelse return false;
     const home = b.homes.get(li) orelse return false;
     const hold = b.in.closure.storage.hold(li);
     // A store to a local kept in the owner's frame is unstaged here, as through its box at -O0.
     if (b.staged_places and home == .addr and hold != .frame_addr) return true;
+    // A compound value is an operator's result, finished before it is copied in.
+    const value = switch (store) {
+        .expr => |e| e,
+        .compound => return false,
+    };
     if (!L.producesInPlace(b, value)) return false;
     const shared = home != .slot or hold == .frame_addr;
     const reads = readsOf(b, value, li);
@@ -174,8 +179,8 @@ pub fn stagesStore(b: *Builder, place: Ast.Index, value: Ast.Index) bool {
 const Reads = struct { names_root: bool = false, runs_code: bool = false };
 
 /// Whether `expr` names local `li` (in a lambda inside it too), and whether it may run code
-/// other than its own: a call, an index, a `for` (`iter`/`next`), or an operator a protocol
-/// witness implements.
+/// other than its own: a call, an index, a `for` (`iter`/`next`), or an operator (compound
+/// assignment included) a protocol witness implements.
 fn readsOf(b: *const Builder, expr: Ast.Index, li: u32) Reads {
     const Visitor = struct {
         b: *const Builder,
@@ -195,9 +200,13 @@ fn readsOf(b: *const Builder, expr: Ast.Index, li: u32) Reads {
                     else => {},
                 },
                 .call, .index, .type_app, .for_in_stmt, .for_in2_stmt => v.r.runs_code = true,
-                .binary => switch (in.nodes.typeOf(in.tree.nodes[e.idx.int()].lhs).kind) {
-                    .@"struct", .@"enum" => v.r.runs_code = true,
-                    else => {},
+                .binary, .assign => {
+                    const n = in.tree.nodes[e.idx.int()];
+                    if (e.tag == .assign and in.tokens[n.main_token].tag.compoundBase() == null) return;
+                    switch (in.nodes.typeOf(n.lhs).kind) {
+                        .@"struct", .@"enum" => v.r.runs_code = true,
+                        else => {},
+                    }
                 },
                 else => {},
             }
@@ -210,10 +219,11 @@ fn readsOf(b: *const Builder, expr: Ast.Index, li: u32) Reads {
 
 /// Produce the aggregate `value` into a fresh temp, then copy it to `dst`, so `value`
 /// never reads that storage half-written.
-pub fn storeStaged(b: *Builder, value: Ast.Index, dst: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
-    const tmp = try L.aggregateValue(b, value, ty);
+pub fn storeStaged(b: *Builder, value: L.StoreValue, dst: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
+    const tmp = try b.addSlot(ty);
+    try L.lowerStoreValueInto(b, value, try b.emit(.{ .slot_addr = tmp }, Typecheck.Type.int), ty);
     if (b.termSet()) return;
-    const src = try b.emit(.{ .slot_addr = tmp.slot }, Typecheck.Type.int);
+    const src = try b.emit(.{ .slot_addr = tmp }, Typecheck.Type.int);
     _ = try b.emit(.{ .copy = .{ .dst = dst, .src = src, .ty = ty } }, null);
 }
 

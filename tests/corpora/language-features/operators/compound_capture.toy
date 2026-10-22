@@ -1,0 +1,23 @@
+# Feature: a closure that writes a captured local with `op=` boxes it like `=` does, so
+# the owner and every closure see each write.
+# expect: stdout "1\n3\n13\n"
+# expect: exit 13
+import std/io
+
+fn twice(f: fn()) {
+    f()
+    f()
+}
+
+fn main() -> int {
+    c := 0
+    inc := fn() { c += 1 }
+    inc()
+    io.println(c)
+    twice(inc)
+    io.println(c)
+    c *= 4
+    show := fn() { io.println(c + 1) }
+    show()
+    return c + 1
+}

@@ -1,0 +1,33 @@
+# Feature: `+=` `-=` `*=` `/=` on a user type go through the same protocol as the binary
+# operator (Add, Sub, Mul, Div), in a generic body bound by it too.
+# expect: stdout "6\n4\n8\n2\n"
+# expect: exit 20
+import std/io
+
+struct V { a: int }
+
+impl V has Add { fn add(self, o: V) -> V { V { a: self.a + o.a } } }
+impl V has Sub { fn sub(self, o: V) -> V { V { a: self.a - o.a } } }
+impl V has Mul { fn mul(self, o: V) -> V { V { a: self.a * o.a } } }
+impl V has Div { fn div(self, o: V) -> V { V { a: self.a / o.a } } }
+
+fn sum[T has Add](a: T, b: T, c: T) -> T {
+    r := a
+    r += b
+    r += c
+    return r
+}
+
+fn main() -> int {
+    v := V { a: 1 }
+    v += V { a: 5 }
+    io.println(v.a)
+    v -= V { a: 2 }
+    io.println(v.a)
+    v *= V { a: 2 }
+    io.println(v.a)
+    v /= V { a: 4 }
+    io.println(v.a)
+    w := sum(v, v, V { a: 4 })
+    return w.a + sum(1, 2, 3) + v.a + 4
+}
