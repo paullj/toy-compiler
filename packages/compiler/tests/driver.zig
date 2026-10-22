@@ -425,6 +425,25 @@ test "explain: a parse code (P0001) prints its doc (exit 0)" {
     try testing.expect(std.mem.indexOf(u8, got, "P0001") != null);
 }
 
+test "explain: the retired T0074 prints its retired page (exit 0)" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    try harness.requireToy(io);
+    const bin_abs = harness.toy_exe;
+
+    var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "explain", "T0074" }, .stdout = .pipe });
+    var rdr = child.stdout.?.readerStreaming(io, &.{});
+    const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+    defer gpa.free(got);
+    const term = try child.wait(io);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+    try testing.expect(std.mem.indexOf(u8, got, "(retired)") != null);
+    try testing.expect(std.mem.indexOf(u8, got, "xs[i] op= v") != null);
+}
+
 test "coded render: a parse error renders `error[P0002]:` and stays report-once (one -->)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

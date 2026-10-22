@@ -1,0 +1,10 @@
+# expect: exit 1
+# Feature: an out-of-bounds `xs[i] op= v` panics with "index out of bounds" and exits 1,
+# at the read, before the rhs runs.
+import std/vec
+
+fn main() -> int {
+    xs := [10]
+    xs[1] += 5
+    return 0
+}

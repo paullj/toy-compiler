@@ -39,6 +39,13 @@ pub const ElemPrim = enum {
             .set_at => "core/mem.ga_set_at",
         };
     }
+
+    /// The primitives an `.index` node calls, in the order lower emits them: a read calls
+    /// `at`, a plain store `set_at`, and a compound store both.
+    pub fn of(store: ?Ast.IndexStore) []const ElemPrim {
+        const s = store orelse return &.{.at};
+        return if (s.reads) &.{ .at, .set_at } else &.{.set_at};
+    }
 };
 
 /// Where a receiver-method desugar reads the receiver type it selects the method on.
@@ -192,6 +199,13 @@ test "desugarMethods enumerates each sugar's receiver methods in expansion order
 
     // A sugar with no receiver-method desugar (indexing goes through `ElemPrim`).
     try std.testing.expectEqual(@as(usize, 0), desugarMethods(.index).len);
+}
+
+test "an index reads, a store writes, and a compound store reads then writes" {
+    const at = Ast.Index.from(0);
+    try std.testing.expectEqualSlices(ElemPrim, &.{.at}, ElemPrim.of(null));
+    try std.testing.expectEqualSlices(ElemPrim, &.{.set_at}, ElemPrim.of(.{ .index = at, .reads = false }));
+    try std.testing.expectEqualSlices(ElemPrim, &.{ .at, .set_at }, ElemPrim.of(.{ .index = at, .reads = true }));
 }
 
 test "core/mem declares every element primitive" {

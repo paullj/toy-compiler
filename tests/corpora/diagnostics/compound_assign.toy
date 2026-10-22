@@ -20,7 +20,7 @@ fn main() -> int {
     y: int8 = 1
     y += 300  #~ ERROR [T0034] literal out of range for type 'int8'
     xs: Vec[int] = [1, 2]
-    xs[0] += 1  #~ ERROR [T0074] cannot assign to an index element `xs[i]`
+    xs[0] += true  #~ ERROR [T0044] operands of '+=' must have the same type
     ps: Vec[P] = []
     ps[0].x -= 1  #~ ERROR [T0070] cannot assign to a field of an index element
     w := W { p: P { x: 1 } }

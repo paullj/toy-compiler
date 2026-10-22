@@ -3194,10 +3194,15 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
     // store targets before the walk that picks each index's element primitive.
     var stores = try std.DynamicBitSetUnmanaged.initEmpty(t.gpa, nodes.len);
     defer stores.deinit(t.gpa);
+    var compound = try std.DynamicBitSetUnmanaged.initEmpty(t.gpa, nodes.len);
+    defer compound.deinit(t.gpa);
     for (nodes, range.start..) |n, i| {
         if (n.tag != .assign) continue;
-        const lhs = Ast.indexStoreTarget(tree, mc.tokens, Ast.Index.from(@intCast(i))) orelse continue;
-        if (lhs.int() >= range.start and lhs.int() < range.end) stores.set(lhs.int() - range.start);
+        const st = Ast.indexStoreTarget(tree, mc.tokens, Ast.Index.from(@intCast(i))) orelse continue;
+        const lhs = st.index.int();
+        if (lhs < range.start or lhs >= range.end) continue;
+        stores.set(lhs - range.start);
+        if (st.reads) compound.set(lhs - range.start);
     }
     // A non-empty list literal `[e0, ..]` desugars to `new()` + one `push` per element
     // over its typed `Vec[V]` receiver, and a `for x in xs` desugars to `it := xs.iter()`
@@ -3217,12 +3222,13 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
                 }
             },
             .index => {
-                // `xs[i]` desugars to `mem.ga_at[V]` and the store `xs[i] = v` to
-                // `mem.ga_set_at[V]`; discover that instance keyed on the index node's
-                // element type V so lower can resolve its mangled symbol.
+                // `xs[i]` desugars to `mem.ga_at[V]`, the store `xs[i] = v` to
+                // `mem.ga_set_at[V]` and `xs[i] op= v` to both; discover those instances
+                // keyed on the index node's element type V so lower can resolve their
+                // mangled symbols.
                 const elem = node_types[i];
-                const prim: StdNames.ElemPrim = if (stores.isSet(i - range.start)) .set_at else .at;
-                if (isConcreteValue(elem)) if (elemPrimGid(model, prim)) |gid| {
+                const store: ?Ast.IndexStore = if (stores.isSet(i - range.start)) .{ .index = Ast.Index.from(@intCast(i)), .reads = compound.isSet(i - range.start) } else null;
+                if (isConcreteValue(elem)) for (StdNames.ElemPrim.of(store)) |prim| if (elemPrimGid(model, prim)) |gid| {
                     const args = [_]Type{elem};
                     try t.enqueueInstance(model, gid, &args, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)) }, mod);
                 };

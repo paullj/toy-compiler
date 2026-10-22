@@ -141,8 +141,9 @@ from two angles — assignability is directional (want ← got), join is symmetr
   stored, so an out-of-bounds `i` panics after `e` has run. `e` is checked against `T`
   (**T0041** names "an element of type T"). The handle is read before `e`, so an `e`
   that rebinds `xs` still writes into the `Vec` that `xs` named. A compound
-  `xs[i] op= e` is **T0074**. A `Map` store `m[k] = v` is **T0057** with a hint to
-  `m.set(k, v)`.
+  `xs[i] op= e` evaluates `xs` and `i` once, reads the element (an out-of-bounds `i`
+  panics here, before `e` runs), then runs `e`, applies `op` and stores. A `Map`
+  store `m[k] = v` is **T0057** with a hint to `m.set(k, v)`.
 * `place op= e` — compound assignment, for `op` in `+ - * / % | & ^ << >>` and the
   float forms `+. -. *. /.`. It means `place = place op e`: the place is read
   before `e` runs, `e` is typed like a binary operand (a bare integer literal takes the
