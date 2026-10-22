@@ -1,0 +1,17 @@
+# expect: exit 1
+# Feature: an out-of-bounds `ps[i].x op= v` panics with "index out of bounds" and exits 1
+# at the field read, once and before the rhs runs, so the rhs prints nothing.
+import std/io
+import std/vec
+
+struct P { x: int }
+
+fn main() -> int {
+    ps := [P { x: 1 }]
+    rhs := fn() -> int {
+        io.println("rhs ran")
+        5
+    }
+    ps[1].x += rhs()
+    return 0
+}

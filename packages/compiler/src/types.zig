@@ -5820,7 +5820,7 @@ test "an associated fn of a bare generic struct infers its type params from its 
     }
 }
 
-test "a compound element field store and a field of a call result are no store targets, and a user Vec has no index" {
+test "a field of a call result is no store target, and a user Vec has no index" {
     const gpa = testing.allocator;
     const decls =
         \\struct P { x: int }
@@ -5830,8 +5830,6 @@ test "a compound element field store and a field of a call result are no store t
         \\
     ;
     const cases = [_]struct { stmt: []const u8, code: codes.Code, message: []const u8 }{
-        // A compound store to an element field has no lowering yet.
-        .{ .stmt = "ps[i].x += 5", .code = .T0070, .message = "cannot assign to a field of an index element `xs[i].field` with a compound operator; write `xs[i].field = xs[i].field op v`" },
         // The `Vec` here is the user's, which has no element primitives to lower to.
         .{ .stmt = "ps[0].x = 5", .code = .T0057, .message = "cannot index a value of type 'Vec'" },
         .{ .stmt = "xs[1] = 7", .code = .T0057, .message = "cannot index a value of type 'Vec'" },

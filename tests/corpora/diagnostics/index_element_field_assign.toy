@@ -1,6 +1,6 @@
-# `xs[i].f = v` writes the field of the element in the Vec, but a compound store to an
-# element field (`xs[i].f op= v`) has no lowering yet (T0070), on a local `Vec` as on a
-# field's.
+# `xs[i].f = v` and `xs[i].f op= v` write the field of the element in the Vec, on a local
+# `Vec` as on a field's, and type as a store to the field: the value is checked against
+# the field's type, and a compound one as `xs[i].f = xs[i].f op v`.
 import std/vec
 
 struct P { x: int }
@@ -9,11 +9,12 @@ struct H { ps: Vec[P] }
 fn main() -> int {
     h := H { ps: [P { x: 1 }] }
     h.ps[0].x = 5
-    h.ps[0].x += 5  #~ ERROR [T0070] cannot assign to a field of an index element `xs[i].field` with a compound operator
+    h.ps[0].x += 5
+    h.ps[0].x = "a"  #~ ERROR [T0041] cannot assign str to variable of type int
     ps: Vec[P] = [P { x: 2 }]
     i := 0
     ps[i].x = 7
-    ps[0].x *= 6  #~ ERROR [T0070] cannot assign to a field of an index element `xs[i].field` with a compound operator
-    ps[i].x -= 7  #~ ERROR [T0070] cannot assign to a field of an index element `xs[i].field` with a compound operator
+    ps[0].x *= 6
+    ps[i].x -= true  #~ ERROR [T0044] operands of '-=' must have the same type
     return 0
 }

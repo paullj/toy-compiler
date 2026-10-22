@@ -22,7 +22,7 @@ fn main() -> int {
     xs: Vec[int] = [1, 2]
     xs[0] += true  #~ ERROR [T0044] operands of '+=' must have the same type
     ps: Vec[P] = []
-    ps[0].x -= 1  #~ ERROR [T0070] cannot assign to a field of an index element
+    ps[0].x -= true  #~ ERROR [T0044] operands of '-=' must have the same type
     w := W { p: P { x: 1 } }
     w.p.moved(1).x *= 5  #~ ERROR [T0075] cannot assign to a field of a temporary value
     return x + w.p.x

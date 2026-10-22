@@ -425,7 +425,7 @@ test "explain: a parse code (P0001) prints its doc (exit 0)" {
     try testing.expect(std.mem.indexOf(u8, got, "P0001") != null);
 }
 
-test "explain: the retired T0074 prints its retired page (exit 0)" {
+test "explain: the retired T0074 and T0070 print their retired pages (exit 0)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -434,14 +434,20 @@ test "explain: the retired T0074 prints its retired page (exit 0)" {
     try harness.requireToy(io);
     const bin_abs = harness.toy_exe;
 
-    var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "explain", "T0074" }, .stdout = .pipe });
-    var rdr = child.stdout.?.readerStreaming(io, &.{});
-    const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
-    defer gpa.free(got);
-    const term = try child.wait(io);
-    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
-    try testing.expect(std.mem.indexOf(u8, got, "(retired)") != null);
-    try testing.expect(std.mem.indexOf(u8, got, "xs[i] op= v") != null);
+    const cases = [_]struct { code: []const u8, form: []const u8 }{
+        .{ .code = "T0074", .form = "xs[i] op= v" },
+        .{ .code = "T0070", .form = "xs[i].f op= v" },
+    };
+    for (cases) |case| {
+        var child = try std.process.spawn(io, .{ .argv = &.{ bin_abs, "explain", case.code }, .stdout = .pipe });
+        var rdr = child.stdout.?.readerStreaming(io, &.{});
+        const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
+        defer gpa.free(got);
+        const term = try child.wait(io);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, term);
+        try testing.expect(std.mem.indexOf(u8, got, "(retired)") != null);
+        try testing.expect(std.mem.indexOf(u8, got, case.form) != null);
+    }
 }
 
 test "coded render: a parse error renders `error[P0002]:` and stays report-once (one -->)" {
