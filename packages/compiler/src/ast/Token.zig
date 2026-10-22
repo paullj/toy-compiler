@@ -233,6 +233,10 @@ pub const Tag = enum(u8) {
     caret_eq, // ^=
     lt_lt_eq, // <<=
     gt_gt_eq, // >>=
+    plus_dot_eq, // +.=
+    minus_dot_eq, // -.=
+    star_dot_eq, // *.=
+    slash_dot_eq, // /.=
 
     /// The binary operator a compound assignment applies, or null for any other tag.
     pub fn compoundBase(tag: Tag) ?Tag {
@@ -247,6 +251,10 @@ pub const Tag = enum(u8) {
             .caret_eq => .caret,
             .lt_lt_eq => .lt_lt,
             .gt_gt_eq => .gt_gt,
+            .plus_dot_eq => .plus_dot,
+            .minus_dot_eq => .minus_dot,
+            .star_dot_eq => .star_dot,
+            .slash_dot_eq => .slash_dot,
             else => null,
         };
     }

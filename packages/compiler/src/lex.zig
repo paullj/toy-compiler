@@ -259,10 +259,10 @@ fn lexSymbol(l: *Lexer, start: u32) Token {
 
     l.index += 1;
     const tag: Tag = switch (c) {
-        '+' => if (l.eat('.')) .plus_dot else if (l.eat('=')) .plus_eq else .plus,
-        '-' => if (l.eat('>')) .arrow else if (l.eat('.')) .minus_dot else if (l.eat('=')) .minus_eq else .minus,
-        '*' => if (l.eat('.')) .star_dot else if (l.eat('=')) .star_eq else .star,
-        '/' => if (l.eat('.')) .slash_dot else if (l.eat('=')) .slash_eq else .slash,
+        '+' => if (l.eat('.')) (if (l.eat('=')) .plus_dot_eq else .plus_dot) else if (l.eat('=')) .plus_eq else .plus,
+        '-' => if (l.eat('>')) .arrow else if (l.eat('.')) (if (l.eat('=')) .minus_dot_eq else .minus_dot) else if (l.eat('=')) .minus_eq else .minus,
+        '*' => if (l.eat('.')) (if (l.eat('=')) .star_dot_eq else .star_dot) else if (l.eat('=')) .star_eq else .star,
+        '/' => if (l.eat('.')) (if (l.eat('=')) .slash_dot_eq else .slash_dot) else if (l.eat('=')) .slash_eq else .slash,
         '%' => if (l.eat('=')) .percent_eq else .percent,
         '=' => if (l.eat('=')) .eq_eq else .eq,
         '!' => if (l.eat('=')) .bang_eq else .bang,
@@ -393,6 +393,15 @@ test "compound assignment operators lex to one token each" {
     try expectTags("a <= b >= c -> d +. e", &.{ .identifier, .lt_eq, .identifier, .gt_eq, .identifier, .arrow, .identifier, .plus_dot, .identifier, .eof });
     // An operator before a newline cannot end a statement, so the value continues.
     try expectTags("x +=\n1\n", &.{ .identifier, .plus_eq, .number, .newline, .eof });
+}
+
+test "float compound assignment operators lex to one token each" {
+    try expectTags("+.= -.= *.= /.=", &.{ .plus_dot_eq, .minus_dot_eq, .star_dot_eq, .slash_dot_eq, .eof });
+    for ([_]Tag{ .plus_dot_eq, .minus_dot_eq, .star_dot_eq, .slash_dot_eq }, [_]Tag{ .plus_dot, .minus_dot, .star_dot, .slash_dot }) |c, base|
+        try std.testing.expectEqual(@as(?Tag, base), c.compoundBase());
+    try expectTags("x+.=1.0", &.{ .identifier, .plus_dot_eq, .float, .eof });
+    try expectTags("a +. b -. c <=. d", &.{ .identifier, .plus_dot, .identifier, .minus_dot, .identifier, .le_dot, .identifier, .eof });
+    try expectTags("x +. = 1", &.{ .identifier, .plus_dot, .eq, .number, .eof });
 }
 
 test "unterminated string at EOF is one string_unterminated token spanning to EOF" {
