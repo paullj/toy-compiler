@@ -18,7 +18,7 @@ test "option: Option.map over a str payload survives forced collections" {
     // 10 * 3 + 10 * 4 = 70.
     const codes = try harness.exitAtBothLevels(gpa, io, ".toy-test-option-gc",
         \\import std/option
-        \\import core/mem_selftest
+        \\import std/gc
         \\fn fresh(i: int) -> str { "k".concat(i.to_string()) }
         \\fn main() -> int {
         \\    total := 0
@@ -26,30 +26,30 @@ test "option: Option.map over a str payload survives forced collections" {
         \\    while i < 20 {
         \\        o := Option[str].some(fresh(i))
         \\        m := o.map(fn(s) {
-        \\            _c := mem_selftest.forced_collect_count()
+        \\            gc.collect()
         \\            s.concat("!")
         \\        })
-        \\        _c := mem_selftest.forced_collect_count()
+        \\        gc.collect()
         \\        want := fresh(i).concat("!")
         \\        if m.unwrap() != want { return 1 }
         \\        t := m.then(fn(s) {
-        \\            _c := mem_selftest.forced_collect_count()
+        \\            gc.collect()
         \\            Option.some(s.concat("?"))
         \\        })
         \\        if t.unwrap() != want.concat("?") { return 2 }
         \\        n: Option[str] = Option.none
         \\        k := i + 100
         \\        d := n.or_else(fn() {
-        \\            _c := mem_selftest.forced_collect_count()
+        \\            gc.collect()
         \\            fresh(k)
         \\        })
         \\        if d != fresh(k) { return 3 }
         \\        r: Result[int, str] = Result.err(fresh(i))
         \\        e := r.map_err(fn(s) {
-        \\            _c := mem_selftest.forced_collect_count()
+        \\            gc.collect()
         \\            s.concat("#")
         \\        })
-        \\        _d := mem_selftest.forced_collect_count()
+        \\        gc.collect()
         \\        if e.or_else(fn(s) { s.len() }) != fresh(i).len() + 1 { return 4 }
         \\        total = total + m.unwrap().len()
         \\        i = i + 1

@@ -16,8 +16,23 @@ const compile = harness.compile;
 const runExit = harness.runExit;
 
 const collision_src =
-    \\import core/map_selftest
-    \\fn main() -> int { return map_selftest.collision_survives() }
+    \\import std/gc
+    \\import std/map
+    \\fn main() -> int {
+    \\    m := Map[int, int].new()
+    \\    for i in 0..8 {
+    \\        k := 1 + i * 8
+    \\        m.set(k, k * 100)
+    \\    }
+    \\    gc.collect()
+    \\    for i in 0..8 {
+    \\        k := 1 + i * 8
+    \\        v := match m.get(k) { .some(v) -> v, .none -> -1 }
+    \\        if v != k * 100 { return 1 }
+    \\    }
+    \\    if m.len() != 8 { return 2 }
+    \\    return 0
+    \\}
     \\
 ;
 
@@ -335,7 +350,7 @@ test "map: filter and map results keep str keys across a forced collection" {
     const codes = try harness.exitAtBothLevels(gpa, io, ".toy-test-map-methods-gc",
         \\import std/map
         \\import std/vec
-        \\import core/mem_selftest
+        \\import std/gc
         \\fn fresh(i: int) -> str { "k".concat(i.to_string()) }
         \\fn main() -> int {
         \\    m := Map[str, int].new()
@@ -345,15 +360,15 @@ test "map: filter and map results keep str keys across a forced collection" {
         \\        i = i + 1
         \\    }
         \\    odd := m.filter(fn(_k, v) {
-        \\        _c := mem_selftest.forced_collect_count()
+        \\        gc.collect()
         \\        v % 2 == 1
         \\    })
         \\    tags := m.map(fn(v) {
-        \\        _c := mem_selftest.forced_collect_count()
+        \\        gc.collect()
         \\        "v".concat(v.to_string())
         \\    })
         \\    ks := odd.keys()
-        \\    _c := mem_selftest.forced_collect_count()
+        \\    gc.collect()
         \\    if odd.len() != 15 || tags.len() != 30 || ks.len() != 15 { return 1 }
         \\    ok := 0
         \\    i = 0

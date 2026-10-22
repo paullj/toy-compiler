@@ -84,30 +84,29 @@ test "ref: a program building Ref[int] AND Ref[bool] is byte-identical at -j1 an
     try harness.expectDeterministicBuild(gpa, io, ".toy-test-ref-determinism", src, &.{}, null);
 }
 
-test "ref: a growable holding Ref[int] elements pushes then reads-back the boxed values" {
+test "ref: a Vec[Ref[int]] pushes then reads back the boxed values" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     try skipUnlessBackend(io);
-    // A box element is an 8-byte handle: `ga_push` stores it and `ga_get` reads it back as a
-    // `Ref[int]` (not a truncated int). `Ref.new(x)` boxes the value; the push round-trips
-    // through the same element slot. 3 + 4 == 7.
+    // A box element is an 8-byte handle: `push` stores it and `xs[i]` reads it back as a
+    // `Ref[int]` (not a truncated int). 3 + 4 == 7.
     const code = try buildAndRun(gpa, io, ".toy-test-ref-box-element",
-        \\import core/mem
         \\import std/ref
+        \\import std/vec
         \\fn main() -> int {
-        \\    a := mem.ga_new[Ref[int]]()
-        \\    mem.ga_push[Ref[int]](a, Ref.new(3))
-        \\    mem.ga_push[Ref[int]](a, Ref.new(4))
-        \\    return mem.ga_get[Ref[int]](a, 0).get() + mem.ga_get[Ref[int]](a, 1).get()
+        \\    xs: Vec[Ref[int]] = []
+        \\    xs.push(Ref.new(3))
+        \\    xs.push(Ref.new(4))
+        \\    return xs[0].get() + xs[1].get()
         \\}
         \\
     );
     try std.testing.expectEqual(@as(u8, 7), code);
 }
 
-test "ref: a growable of Ref[int] elements is byte-identical at -j1 and -j8" {
+test "ref: a Vec[Ref[int]] program is byte-identical at -j1 and -j8" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -115,13 +114,13 @@ test "ref: a growable of Ref[int] elements is byte-identical at -j1 and -j8" {
     try skipUnlessBackend(io);
 
     const src =
-        \\import core/mem
         \\import std/ref
+        \\import std/vec
         \\fn main() -> int {
-        \\    a := mem.ga_new[Ref[int]]()
-        \\    mem.ga_push[Ref[int]](a, Ref.new(3))
-        \\    mem.ga_push[Ref[int]](a, Ref.new(4))
-        \\    return mem.ga_get[Ref[int]](a, 0).get() + mem.ga_get[Ref[int]](a, 1).get()
+        \\    xs: Vec[Ref[int]] = []
+        \\    xs.push(Ref.new(3))
+        \\    xs.push(Ref.new(4))
+        \\    return xs[0].get() + xs[1].get()
         \\}
         \\
     ;

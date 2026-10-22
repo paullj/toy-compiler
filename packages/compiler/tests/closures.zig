@@ -391,17 +391,19 @@ test "a capturing lambda passed to Vec.each in a loop triggers no collection at 
     const tmp = ".toy-test-closures-alloc";
     Io.Dir.cwd().deleteTree(io, tmp) catch {};
     defer Io.Dir.cwd().deleteTree(io, tmp) catch {};
-    // `forced_collect_count` runs one collection and returns the count, so the difference
-    // is 1 exactly when nothing in the loop allocated enough to trigger one.
+    // Each `gc.collect()` adds one to the count, so the difference is 1 exactly when
+    // nothing in the loop allocated enough to trigger a collection.
     const src =
         \\import std/vec
-        \\import core/mem_selftest
+        \\import std/gc
         \\fn main() -> int {
         \\    xs: Vec[int] = [1, 2, 3]
-        \\    a := mem_selftest.forced_collect_count()
+        \\    gc.collect()
+        \\    a := gc.collections()
         \\    total := 0
         \\    for _ in 0..100000 { xs.each(fn(v: int) { total = total + v }) }
-        \\    b := mem_selftest.forced_collect_count()
+        \\    gc.collect()
+        \\    b := gc.collections()
         \\    if total != 600000 { return 255 }
         \\    return b - a
         \\}
