@@ -1,0 +1,48 @@
+# Feature: `xs[i] op= v` evaluates the handle and the index once, reads the element, runs
+# the rhs, then stores. `xs[f()] += 1` calls `f` once; an rhs that grows the Vec keeps the
+# write; an rhs that rebinds `xs` or writes the element loses to the old value it read.
+# expect: stdout "1\n2\n102\n5\n10\n0\n4\n"
+# expect: exit 0
+import std/io
+import std/vec
+
+fn main() -> int {
+    xs: Vec[int] = [1, 1]
+    calls := 0
+    at := fn() -> int {
+        calls += 1
+        1
+    }
+    xs[at()] += 1
+    io.println(calls)
+    io.println(xs[1])
+
+    grow := fn() -> int {
+        i := 0
+        while i < 100 {
+            xs.push(i)
+            i += 1
+        }
+        4
+    }
+    xs[0] += grow()
+    io.println(xs.len())
+    io.println(xs[0])
+
+    clobber := fn() -> int {
+        xs[0] = 100
+        5
+    }
+    xs[0] += clobber()
+    io.println(xs[0])
+
+    old := xs
+    rebind := fn() -> int {
+        xs = [0]
+        -6
+    }
+    xs[0] += rebind()
+    io.println(xs[0])
+    io.println(old[0])
+    return 0
+}

@@ -1,0 +1,44 @@
+# Feature: the handle and the old element `xs[i] op= v` reads stay GC roots across the rhs.
+# The first rhs rebinds `xs`, the second overwrites the element it read, leaving the read
+# value the only reference to its Vec; each then forces a collection and allocates from
+# the freed cells. The old Vec must take the write, and the old element must still hold
+# its own Vec, or the cells `other` reused would show through.
+# expect: exit 111
+import std/gc
+import std/vec
+
+struct B { v: Vec[int] }
+
+impl B has Add {
+    fn add(self, o: B) -> B { B { v: [self.v[0] + o.v[0]] } }
+}
+
+fn main() -> int {
+    xs: Vec[int] = []
+    other: Vec[int] = []
+    fill := fn() {
+        xs = [1, 2, 3]
+    }
+    fill()
+    rhs := fn() -> int {
+        xs = [0]
+        gc.collect()
+        other = [100, 100, 100]
+        7
+    }
+    xs[2] += rhs()
+
+    bs: Vec[B] = []
+    fill_bs := fn() {
+        bs = [B { v: [4] }]
+    }
+    fill_bs()
+    clobber := fn() -> B {
+        bs[0] = B { v: [0] }
+        gc.collect()
+        other = [100, 100, 100]
+        B { v: [1] }
+    }
+    bs[0] += clobber()
+    return other[2] + xs.len() + bs[0].v[0] + 5
+}

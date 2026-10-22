@@ -127,7 +127,7 @@ pub const Code = enum(u16) {
     T0071, // too-many-fields (a tuple struct past the positional field limit)
     T0072, // bound-receiver-not-local (a `mut self` method bound on a field, not a local)
     T0073, // main-params (the entry `main` declares parameters)
-    T0074, // index-element-assign (`xs[i] op= v`: a compound store to an element is unsupported)
+    T0074, // index-element-assign (removed: `xs[i] = v` and `xs[i] op= v` store through `Vec.set`)
     T0075, // temporary-field-assign (`f(..).x = v` writes a field of a temporary copy)
     T0076, // receiver-mode-mismatch (a conformance method's `self`/`mut self` differs from its protocol's)
     T0077, // type-too-large (a struct or enum larger than the largest value codegen can address)

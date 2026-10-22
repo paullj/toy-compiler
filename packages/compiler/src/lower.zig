@@ -192,6 +192,10 @@ pub const Builder = struct {
 
     /// The enclosing loop/labeled-block contexts (innermost last).
     loops: std.ArrayList(LoopCtx) = .empty,
+    /// A node already evaluated, which `lowerExpr` yields instead of lowering it again: the
+    /// element `xs[i] op= v` read once, so the operator arms reused for it see a place
+    /// whose handle and index ran once.
+    prelowered: ?struct { node: Ast.Index, op: Ir.Operand } = null,
 
     diags: *std.ArrayList(Diagnostic),
     had_error: bool = false,
@@ -559,7 +563,7 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
                 return;
             }
             if (Ast.indexStoreTarget(b.in.tree, b.in.tokens, stmt_idx) != null) {
-                try lowerIndexStore(b, stmt.lhs, stmt.rhs, place_ty);
+                try lowerIndexStore(b, stmt.lhs, value, place_ty);
                 return;
             }
             const home = try places.bindingHome(b, stmt.lhs, place_ty);
@@ -688,6 +692,7 @@ fn storeInto(b: *Builder, home: places.LocalHome, value: StoreValue, ty: Typeche
 /// (16-byte aggregate) yields `Operand.slot`; unit yields `.none`.
 pub fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand {
     if (node_idx == Ast.none) return .none;
+    if (b.prelowered) |p| if (p.node == node_idx) return p.op;
     const n = b.in.tree.nodes[(node_idx).int()];
     const ty = b.in.nodes.typeOf(node_idx);
     // A check-time `type_var` / composite `App` / fn type is substituted/reified to a
@@ -3080,8 +3085,10 @@ fn elemPrimCallee(b: *Builder, prim: StdNames.ElemPrim, elem_ty: Typecheck.Type)
 }
 
 /// Lower `recv[i] = v` as `mem.ga_set_at[V](recv.h, i, v)`: the handle, the index and the
-/// value in source order, then the checked store, as `recv.set(i, v)` evaluates.
-fn lowerIndexStore(b: *Builder, place: Ast.Index, rhs: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!void {
+/// value in source order, then the checked store, as `recv.set(i, v)` evaluates. A compound
+/// `recv[i] op= v` reads the element through `mem.ga_at[V]` after the index and before `v`,
+/// so the handle and index are evaluated once and an out-of-bounds index panics before `v`.
+fn lowerIndexStore(b: *Builder, place: Ast.Index, value: StoreValue, ty: Typecheck.Type) error{OutOfMemory}!void {
     const n = b.in.tree.nodes[place.int()];
     const base = try operandPtr(b, try lowerExpr(b, n.lhs));
     if (base == Ir.none_value) return;
@@ -3089,7 +3096,16 @@ fn lowerIndexStore(b: *Builder, place: Ast.Index, rhs: Ast.Index, ty: Typecheck.
     // the handle is typed as a managed box: the root map then keeps the Vec alive.
     const handle = try b.emit(.{ .load = .{ .addr = base, .ty = Typecheck.Type.int } }, box_repr_ty);
     const idx_val = operandValue(try lowerExpr(b, n.rhs));
-    const val = try lowerExpr(b, rhs);
+    const val = switch (value) {
+        .expr => |e| try lowerExpr(b, e),
+        .compound => blk: {
+            const old = try emitElemRead(b, handle, idx_val, n.main_token, ty);
+            std.debug.assert(b.prelowered == null);
+            b.prelowered = .{ .node = place, .op = old };
+            defer b.prelowered = null;
+            break :blk try lowerStoreValue(b, value);
+        },
+    };
     const callee = elemPrimCallee(b, .set_at, ty) orelse {
         try b.note(n.main_token, "unresolved 'ga_set_at' index primitive in lower");
         return;
@@ -3128,6 +3144,12 @@ fn lowerIndexCore(b: *Builder, recv: Ast.Index, idx: Ast.Index, main_token: u32,
     if (base == Ir.none_value) return .none;
     const handle = try b.emit(.{ .load = .{ .addr = base, .ty = int_ty } }, int_ty);
     const idx_val = operandValue(try lowerExpr(b, idx));
+    return emitElemRead(b, handle, idx_val, main_token, ty);
+}
+
+/// Call `mem.ga_at[V](handle, idx)`, placing the element by how V travels: an aggregate
+/// into a fresh slot, a scalar/box in a register.
+fn emitElemRead(b: *Builder, handle: Ir.ValueId, idx_val: Ir.ValueId, main_token: u32, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
     const callee = elemPrimCallee(b, .at, ty) orelse {
         try b.note(main_token, "unresolved 'ga_at' index primitive in lower");
         return .none;

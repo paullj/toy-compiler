@@ -1,5 +1,5 @@
 # `xs[i] = v` stores a whole element, so the element's type is the rhs's expectation and a
-# wrong value names the element. A compound `xs[i] += v` is not supported yet (T0074). A
+# wrong value names the element. A compound `xs[i] += v` types as `xs[i] = xs[i] + v`. A
 # `Map` has no index operator at all, so its store gets that error with a hint to `.set`.
 import std/vec
 import std/map
@@ -10,7 +10,8 @@ fn main() -> int {
     xs: Vec[int] = [1, 2, 3]
     xs[1] = 7
     xs[1] = true  #~ ERROR [T0041] cannot assign bool to an element of type int
-    xs[1] += 7  #~ ERROR [T0074] cannot assign to an index element
+    xs[1] += 7
+    xs[1] += "a"  #~ ERROR [T0044] operands of '+=' must have the same type
     h := H { xs: xs }
     h.xs[0] = 5
     vs: Vec[Vec[int]] = [[1]]

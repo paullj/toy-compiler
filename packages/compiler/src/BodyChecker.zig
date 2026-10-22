@@ -641,12 +641,7 @@ pub const BodyChecker = struct {
                     const what = if (target.tag == .index) "an element" else "variable";
                     try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0041 }, "cannot assign {s} to {s} of type {s}", .{ bc.typeName(rhs), what, bc.typeName(lhs) });
                 }
-                // A plain `xs[i] = v` is the element store `xs.set(i, v)`; a compound one
-                // also reads the element, which has no lowering yet.
-                if (target.tag == .index and bc.tokens[stmt.main_token].tag != .eq) {
-                    if (lhs.kind != .invalid)
-                        try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0074 }, "cannot assign to an index element `xs[i]` with a compound operator; write `xs[i] = xs[i] op v`", .{});
-                } else if (target.tag == .field_access or target.tag == .tuple_field) switch (bc.storeRoot(stmt.lhs)) {
+                if (target.tag == .field_access or target.tag == .tuple_field) switch (bc.storeRoot(stmt.lhs)) {
                     .name => {},
                     .index_element => try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0070 }, "cannot assign to a field of an index element `xs[i].field`; the element is a temporary copy, so the write would be lost", .{}),
                     .temporary => if (lhs.kind != .invalid)

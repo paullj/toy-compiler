@@ -88,8 +88,9 @@ pub const CallVisitor = struct {
     /// CallVisitor constructions that don't fold a `?` widen stay unchanged; a `.try_operator`
     /// with no threaded sig folds nothing (`orelse return`).
     fn_sig: ?Sig = null,
-    /// The index of the plain store `xs[i] = v` being walked, which folds `ga_set_at`.
-    store_target: Ast.Index = Ast.none,
+    /// The element store `xs[i] = v` or `xs[i] op= v` being walked, whose index folds
+    /// `ga_set_at`.
+    store_target: ?Ast.IndexStore = null,
 
     pub fn on(self: *Self, ev: Walk.Event) error{OutOfMemory}!void {
         switch (ev) {
@@ -172,7 +173,7 @@ pub const CallVisitor = struct {
         const fr = self.frozen;
         // The walk enters a store's `.assign` before its index, so the index learns here
         // that it writes.
-        if (tag == .assign) self.store_target = Ast.indexStoreTarget(fr.tree, fr.tokens, idx) orelse Ast.none;
+        if (tag == .assign) self.store_target = Ast.indexStoreTarget(fr.tree, fr.tokens, idx);
         if (!fr.nodes.has(idx)) return;
         const n = fr.tree.nodes[idx.int()];
         switch (tag) {
@@ -184,7 +185,10 @@ pub const CallVisitor = struct {
             .empty_list, .list_literal => for (StdNames.desugarMethods(tag)) |dm| {
                 if (Typecheck.findMethod(fr.methods, fr.nodes.typeOf(idx), dm.name)) |m| try self.foldWitness(m);
             },
-            .index => try self.foldElemPrim(idx, if (idx == self.store_target) .set_at else .at),
+            .index => {
+                const store = if (self.store_target) |st| (if (st.index == idx) st else null) else null;
+                for (StdNames.ElemPrim.of(store)) |prim| try self.foldElemPrim(idx, prim);
+            },
             .type_app => if (fr.resolutions.len == fr.tree.nodes.len and symbols_res.leftmostHeadIsValue(fr.tree, fr.resolutions, n.lhs)) try self.foldElemPrim(idx, .at),
             else => {},
         }
