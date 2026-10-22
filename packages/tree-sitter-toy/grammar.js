@@ -253,7 +253,7 @@ module.exports = grammar({
     assignment: ($) =>
       seq(
         field("left", $._expression),
-        field("operator", choice("=", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "<<=", ">>=")),
+        field("operator", choice("=", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "<<=", ">>=", "+.=", "-.=", "*.=", "/.=")),
         field("right", $._expression),
       ),
 

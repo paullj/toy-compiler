@@ -1,0 +1,44 @@
+# Feature: the float compound forms `+.= -.= *.= /.=` store `place op. v` on a local, a
+# struct field, a tuple-struct field, a `mut` parameter and a field of `mut self`.
+# expect: stdout "1\n1\n1\n1\n1\n"
+# expect: exit 5
+import std/io
+
+struct P { x: float }
+struct Pair(float, float)
+
+impl P {
+    fn halve(mut self) { self.x /.= 2.0 }
+}
+
+fn scale(mut f: float, by: float) { f *.= by }
+
+fn hit(ok: bool) -> int { if ok { 1 } else { 0 } }
+
+fn main() -> int {
+    x := 1.5
+    x +.= 2.5
+    x -.= 1.0
+    x *.= 4.0
+    x /.= 3.0
+    a := hit(x == 4.0)
+    io.println(a)
+    p := P { x: 10.0 }
+    p.x -.= 3.0
+    p.halve()
+    b := hit(p.x == 3.5)
+    io.println(b)
+    t := Pair(1.0, 2.0)
+    t.1 *.= 2.5
+    t.0 +.= t.1
+    c := hit(t.0 == 6.0)
+    io.println(c)
+    k := 1.5
+    scale(k, 4.0)
+    d := hit(k == 6.0)
+    io.println(d)
+    scale(p.x, 2.0)
+    e := hit(p.x == 7.0)
+    io.println(e)
+    return a + b + c + d + e
+}

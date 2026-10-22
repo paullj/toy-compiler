@@ -286,7 +286,7 @@ const max_gen_depth: usize = 4;
 const idents = [_][]const u8{ "a", "b", "c", "x", "y", "foo", "bar", "n", "acc" };
 const types = [_][]const u8{ "int", "bool", "str", "()", "fn(int) -> int", "fn()" };
 const bin_ops = [_][]const u8{ "+", "-", "*", "/", "==", "!=", "<", ">", "<=", ">=", "and", "or", "|>", "\n|>" };
-const assign_ops = [_][]const u8{ " = ", " += ", " -= ", " *= ", " /= ", " %= ", " |= ", " &= ", " ^= ", " <<= ", " >>= " };
+const assign_ops = [_][]const u8{ " = ", " += ", " -= ", " *= ", " /= ", " %= ", " |= ", " &= ", " ^= ", " <<= ", " >>= ", " +.= ", " -.= ", " *.= ", " /.= " };
 
 /// Emit a random-but-plausible program: 1..4 top-level items (fn/struct/enum/
 /// import). At least one `fn main`-like function so the whole-program check has an

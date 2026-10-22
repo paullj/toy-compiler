@@ -1,0 +1,12 @@
+# A float has no Add, so `+=` on one is T0028, with a hint naming the dotted form `+.=`
+# (as `+` names `+.`). The dotted forms take floats only (T0044).
+fn main() -> int {
+    x := 1.0
+    x += 1.0  #~ ERROR [T0028] '+=' requires an 'Add' impl for type 'float'; use '+.=' for float arithmetic
+    x /= 2.0  #~ ERROR [T0028] '/=' requires an 'Div' impl for type 'float'; use '/.=' for float arithmetic
+    _y := x * 2.0  #~ ERROR [T0028] '*' requires an 'Mul' impl for type 'float'; use '*.' for float arithmetic
+    n := 1
+    n +.= 1  #~ ERROR [T0044] operands of '+.=' must both be float
+    x -.= 1  #~ ERROR [T0044] operands of '-.=' must both be float
+    return n
+}

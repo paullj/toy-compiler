@@ -3390,6 +3390,13 @@ test "every compound operator parses as an assign on each place arm" {
     );
 }
 
+test "every float compound operator parses as an assign" {
+    try expectProgram(
+        "fn f() {\n x +.= 1.0\n p.a -.= 2.0\n p.0 *.= 3.0\n x /.= y\n}\n",
+        "(program (fn f () _ (block (+.= x 1.0) (-.= (. p a) 2.0) (*.= (. p 0) 3.0) (/.= x y))))",
+    );
+}
+
 test "empty block, no params, void return" {
     try expectProgram("fn f() {}\n", "(program (fn f () _ (block)))");
 }

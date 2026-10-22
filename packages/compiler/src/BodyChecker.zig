@@ -4474,6 +4474,10 @@ pub const BodyChecker = struct {
                     try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0044 }, "operands of '{s}' must have the same type", .{op_text});
                 } else if (bc.conformsToArith(lt, ap.pid)) {
                     return lt;
+                } else if (lt.kind == .float) {
+                    // Every arithmetic operator is one character, and its float twin puts
+                    // a `.` after it: `+` is `+.`, `+=` is `+.=`.
+                    try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0028 }, "'{s}' requires an '{s}' impl for type '{s}'; use '{s}.{s}' for float arithmetic", .{ op_text, ap.name, bc.typeName(lt), op_text[0..1], op_text[1..] });
                 } else {
                     try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0028 }, "'{s}' requires an '{s}' impl for type '{s}'", .{ op_text, ap.name, bc.typeName(lt) });
                 }
