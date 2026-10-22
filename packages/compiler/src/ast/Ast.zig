@@ -115,8 +115,10 @@ pub const Node = extern struct {
         /// `name := expr`. `main_token` is the name identifier. `lhs` is the
         /// initializer expression. `rhs` is `none`.
         var_decl,
-        /// `name = expr`. `main_token` is the name identifier. `lhs` is the
-        /// target (an `identifier` node). `rhs` is the value expression.
+        /// `place = expr`. `main_token` is the assignment operator token, so a
+        /// compound form can name its operator. `lhs` is the target: an `identifier`
+        /// or a place (`field_access`, `tuple_field`, `index`). `rhs` is the value
+        /// expression.
         assign,
         /// `return expr?`. `main_token` is `return`. `lhs` is the expression or
         /// `none` (bare return). `rhs` is `none`.
@@ -802,7 +804,7 @@ pub const parse_magic: u32 = 0x544f5950;
 
 /// The packed-encoding version `ParseHeader` writes and `unpack` requires. One constant,
 /// so the writer and the reader can never disagree.
-pub const parse_version: u32 = 23;
+pub const parse_version: u32 = 24;
 
 /// Header prefixing a packed `Tree` blob. `extern` so it serializes by memcpy.
 pub const ParseHeader = extern struct {
@@ -1028,7 +1030,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             try out.writeByte(')');
         },
         .assign => {
-            try out.writeAll("(= ");
+            try out.print("({s} ", .{tok_text});
             try renderNode(out, tree, tokens, source, n.lhs);
             try out.writeByte(' ');
             try renderNode(out, tree, tokens, source, n.rhs);

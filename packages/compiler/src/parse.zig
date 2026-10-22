@@ -1832,9 +1832,10 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
             .eq => {
                 const name_tok = p.index;
                 const target = try p.leaf(.identifier, name_tok); // advances past name
+                const op_tok = p.index;
                 try p.expect(.eq, "expected '=' in assignment");
                 const value = try p.parseExpr(0);
-                return p.addNode(.{ .tag = .assign, .main_token = name_tok, .lhs = target, .rhs = value });
+                return p.addNode(.{ .tag = .assign, .main_token = op_tok, .lhs = target, .rhs = value });
             },
             // A `.`- or `[`-rooted place: `p.x = v`, `p.a.b = v`, `ps[0].x = v`. Parse the
             // place (a postfix chain over a name); if `=` follows it is a store, otherwise
@@ -1843,9 +1844,11 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
             .dot, .l_bracket => {
                 const first = p.index;
                 const place = try p.parsePostfix(try p.parsePrefix());
-                if (p.eat(.eq)) {
+                if (p.at(.eq)) {
+                    const op_tok = p.index;
+                    p.bump(.eq);
                     const value = try p.parseExpr(0);
-                    return p.addNode(.{ .tag = .assign, .main_token = first, .lhs = place, .rhs = value });
+                    return p.addNode(.{ .tag = .assign, .main_token = op_tok, .lhs = place, .rhs = value });
                 }
                 const expr = try p.continueInfix(place, 0);
                 return p.addNode(.{ .tag = .expr_stmt, .main_token = first, .lhs = expr, .rhs = Ast.none });
@@ -1858,9 +1861,11 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
         .star => {
             const first = p.index;
             const place = try p.parsePostfix(try p.parsePrefix());
-            if (p.eat(.eq)) {
+            if (p.at(.eq)) {
+                const op_tok = p.index;
+                p.bump(.eq);
                 const value = try p.parseExpr(0);
-                return p.addNode(.{ .tag = .assign, .main_token = first, .lhs = place, .rhs = value });
+                return p.addNode(.{ .tag = .assign, .main_token = op_tok, .lhs = place, .rhs = value });
             }
             const expr = try p.continueInfix(place, 0);
             return p.addNode(.{ .tag = .expr_stmt, .main_token = first, .lhs = expr, .rhs = Ast.none });
@@ -3356,6 +3361,23 @@ test "var_decl, call, assign, bare return" {
         "fn main() {\n x := 1\n x = add(x, 2)\n return\n}\n",
         "(program (fn main () _ (block (:= x 1) (= x (call add x 2)) (return))))",
     );
+}
+
+test "every assign arm takes the '=' token as its main token" {
+    const gpa = testing.allocator;
+    const source = "fn f() {\n x = 1\n p.x = 2\n ps[0].y = 3\n *r = 4\n}\n";
+    const tokens = try Lexer.tokenize(gpa, source);
+    defer gpa.free(tokens);
+    const res = try parse(gpa, tokens, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    const tree = res.tree;
+    var assigns: usize = 0;
+    for (tree.nodes) |n| if (n.tag == .assign) {
+        assigns += 1;
+        try testing.expectEqual(token.Tag.eq, tokens[n.main_token].tag);
+    };
+    try testing.expectEqual(@as(usize, 4), assigns);
 }
 
 test "empty block, no params, void return" {

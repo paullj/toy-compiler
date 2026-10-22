@@ -27,6 +27,7 @@
 
 const std = @import("std");
 const Ast = @import("ast/Ast.zig");
+const Walk = @import("ast/Walk.zig");
 const Token = @import("ast/Token.zig").Token;
 const TokenTag = @import("ast/Token.zig").Tag;
 const Resolve = @import("resolve.zig");
@@ -653,7 +654,7 @@ pub fn lowerExpr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Operand
         .literal_char => return try aggregateValue(b, node_idx, ty),
         .identifier => return try lowerIdentifier(b, node_idx, ty),
         .unary => return try lowerUnary(b, node_idx, n),
-        .binary => return try lowerBinary(b, node_idx, n),
+        .binary => return try lowerBinary(b, n),
         .call => {
             if (isQualifiedVariantCtorCall(b, n, ty)) {
                 return try aggregateValue(b, node_idx, ty);
@@ -844,18 +845,22 @@ fn emitZeroGuard(b: *Builder, rhs: Ir.ValueId, ty: Typecheck.Type, reason: Ir.Te
     b.switchTo(cont);
 }
 
-fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
-    _ = node_idx;
-    const op = b.in.tokens[n.main_token].tag;
+fn lowerBinary(b: *Builder, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
+    return lowerBinOp(b, n.main_token, b.in.tokens[n.main_token].tag, n.lhs, n.rhs);
+}
+
+/// `lhs op rhs` as a value. `op` is passed apart from `op_tok` (the token a lowering
+/// note blames) so a compound `place op= v` can lower through the same arms.
+fn lowerBinOp(b: *Builder, op_tok: u32, op: TokenTag, lhs_node: Ast.Index, rhs_node: Ast.Index) error{OutOfMemory}!Ir.Operand {
     switch (op) {
         .plus, .minus, .star, .slash => {
             // int stays an inline machine add/sub/mul/sdiv (bytes unchanged); a struct/enum
             // operand desugars to the resolved Add/Sub/Mul/Div witness via `lowerArithValue`
             //. The checker (T0028) has already proven a same-type conforming operand.
-            const lt = b.in.nodes.typeOf(n.lhs);
+            const lt = b.in.nodes.typeOf(lhs_node);
             if (isInlineArith(lt.kind)) {
-                const lhs = operandValue(try lowerExpr(b, n.lhs));
-                const rhs = operandValue(try lowerExpr(b, n.rhs));
+                const lhs = operandValue(try lowerExpr(b, lhs_node));
+                const rhs = operandValue(try lowerExpr(b, rhs_node));
                 const bin: Ir.Bin = .{ .lhs = lhs, .rhs = rhs };
                 // `/` gains a runtime zero-divisor guard; `+`/`-`/`*` stay byte-identical.
                 if (op == .slash) {
@@ -873,37 +878,37 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
                 // returns it as the result type, so it is also the result width.
                 return .{ .value = try b.emit(ir_op, lt) };
             }
-            return try lowerArithValue(b, lt, n.lhs, n.rhs, op);
+            return try lowerArithValue(b, lt, lhs_node, rhs_node, op);
         },
         .lt, .lt_eq, .gt, .gt_eq => {
             // int/bool stay an inline `icmp` (bytes unchanged); str/struct/enum desugar to a
             // discriminant test on `Ord::cmp` via `lowerOrdValue`.
-            const lt = b.in.nodes.typeOf(n.lhs);
+            const lt = b.in.nodes.typeOf(lhs_node);
             if (isInlineOrd(lt.kind)) {
-                const lhs = operandValue(try lowerExpr(b, n.lhs));
-                const rhs = operandValue(try lowerExpr(b, n.rhs));
+                const lhs = operandValue(try lowerExpr(b, lhs_node));
+                const rhs = operandValue(try lowerExpr(b, rhs_node));
                 const cc = condFromToken(op, lt.isUnsignedInt());
                 return .{ .value = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.bool) };
             }
-            return try lowerOrdValue(b, lt, n.lhs, n.rhs, op);
+            return try lowerOrdValue(b, lt, lhs_node, rhs_node, op);
         },
         .eq_eq, .bang_eq => {
             // int/bool stay an inline `icmp` (bytes unchanged); str/unit/struct/enum
             // desugar to `Eq::eq` via `lowerEqValue`.
-            const lt = b.in.nodes.typeOf(n.lhs);
+            const lt = b.in.nodes.typeOf(lhs_node);
             if (isInlineEq(lt.kind)) {
-                const lhs = operandValue(try lowerExpr(b, n.lhs));
-                const rhs = operandValue(try lowerExpr(b, n.rhs));
+                const lhs = operandValue(try lowerExpr(b, lhs_node));
+                const rhs = operandValue(try lowerExpr(b, rhs_node));
                 const cc = condFromToken(op, lt.isUnsignedInt());
                 return .{ .value = try b.emit(.{ .icmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.bool) };
             }
-            return try lowerEqValue(b, lt, n.lhs, n.rhs, op == .bang_eq);
+            return try lowerEqValue(b, lt, lhs_node, rhs_node, op == .bang_eq);
         },
-        .amp_amp, .pipe_pipe => return try lowerAndOrValue(b, n, op),
+        .amp_amp, .pipe_pipe => return try lowerAndOrValue(b, lhs_node, rhs_node, op),
         .amp, .pipe, .caret, .lt_lt, .gt_gt => {
-            const lt = b.in.nodes.typeOf(n.lhs);
-            const lhs = operandValue(try lowerExpr(b, n.lhs));
-            const rhs = operandValue(try lowerExpr(b, n.rhs));
+            const lt = b.in.nodes.typeOf(lhs_node);
+            const lhs = operandValue(try lowerExpr(b, lhs_node));
+            const rhs = operandValue(try lowerExpr(b, rhs_node));
             const bin: Ir.Bin = .{ .lhs = lhs, .rhs = rhs };
             const ir_op: Ir.Op = switch (op) {
                 .amp => .{ .band = bin },
@@ -919,17 +924,17 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
             // Integer-only builtin like the bitwise arm above (no Div-style witness path),
             // so it trusts the checker (T "operands of '%' must be int") rather than
             // re-guarding the operand kind.
-            const lt = b.in.nodes.typeOf(n.lhs);
-            const lhs = operandValue(try lowerExpr(b, n.lhs));
-            const rhs = operandValue(try lowerExpr(b, n.rhs));
+            const lt = b.in.nodes.typeOf(lhs_node);
+            const lhs = operandValue(try lowerExpr(b, lhs_node));
+            const rhs = operandValue(try lowerExpr(b, rhs_node));
             try emitZeroGuard(b, rhs, lt, .rem_by_zero);
             const bin: Ir.Bin = .{ .lhs = lhs, .rhs = rhs };
             const ir_op: Ir.Op = if (lt.isUnsignedInt()) Ir.Op{ .umod = bin } else Ir.Op{ .smod = bin };
             return .{ .value = try b.emit(ir_op, lt) };
         },
         .plus_dot, .minus_dot, .star_dot, .slash_dot => {
-            const lhs = operandValue(try lowerExpr(b, n.lhs));
-            const rhs = operandValue(try lowerExpr(b, n.rhs));
+            const lhs = operandValue(try lowerExpr(b, lhs_node));
+            const rhs = operandValue(try lowerExpr(b, rhs_node));
             const bin: Ir.Bin = .{ .lhs = lhs, .rhs = rhs };
             // No zero-guard for `/.`: IEEE-754 division yields ±inf/NaN, never traps.
             const ir_op: Ir.Op = switch (op) {
@@ -942,8 +947,8 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
             return .{ .value = try b.emit(ir_op, Typecheck.Type.float) };
         },
         .lt_dot, .gt_dot, .le_dot, .ge_dot => {
-            const lhs = operandValue(try lowerExpr(b, n.lhs));
-            const rhs = operandValue(try lowerExpr(b, n.rhs));
+            const lhs = operandValue(try lowerExpr(b, lhs_node));
+            const rhs = operandValue(try lowerExpr(b, rhs_node));
             const cc: Ir.FCond = switch (op) {
                 .lt_dot => .lt,
                 .gt_dot => .gt,
@@ -954,7 +959,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
             return .{ .value = try b.emit(.{ .fcmp = .{ .cc = cc, .lhs = lhs, .rhs = rhs } }, Typecheck.Type.bool) };
         },
         else => {
-            try b.note(n.main_token, "binary operator unsupported in lower");
+            try b.note(op_tok, "binary operator unsupported in lower");
             return .none;
         },
     }
@@ -964,7 +969,7 @@ fn lowerBinary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}
 /// block param on the join. For `&&`: a-false stores `false` and branches to join;
 /// a-true falls through to evaluate b, which branches to join with its own value.
 /// For `||`: a-true stores `true`; a-false evaluates b.
-fn lowerAndOrValue(b: *Builder, n: Ast.Node, op: TokenTag) error{OutOfMemory}!Ir.Operand {
+fn lowerAndOrValue(b: *Builder, lhs_node: Ast.Index, rhs_node: Ast.Index, op: TokenTag) error{OutOfMemory}!Ir.Operand {
     const eval_b = try b.addBlock();
     const short = try b.addBlock(); // the short-circuit constant block
     const join = try b.addBlock();
@@ -972,9 +977,9 @@ fn lowerAndOrValue(b: *Builder, n: Ast.Node, op: TokenTag) error{OutOfMemory}!Ir
 
     // Condition on `a`: for &&, a-true → eval_b, a-false → short. For ||, swap.
     if (op == .amp_amp) {
-        try genCond(b, n.lhs, eval_b, short);
+        try genCond(b, lhs_node, eval_b, short);
     } else {
-        try genCond(b, n.lhs, short, eval_b);
+        try genCond(b, lhs_node, short, eval_b);
     }
 
     // short block: the short-circuit constant (&&→false, ||→true) → join(const).
@@ -984,7 +989,7 @@ fn lowerAndOrValue(b: *Builder, n: Ast.Node, op: TokenTag) error{OutOfMemory}!Ir
 
     // eval_b block: evaluate b, branch to join with its value.
     b.switchTo(eval_b);
-    const bv = try lowerExpr(b, n.rhs);
+    const bv = try lowerExpr(b, rhs_node);
     if (!b.termSet()) try brTo(b, join, bv);
 
     b.switchTo(join);
@@ -1214,13 +1219,7 @@ fn lowerCmpDiscriminant(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.I
 /// its own Sig/instance (matching `lowerCmpDiscriminant`); T0024 forces `Out = Self`, so today it
 /// equals `operand_ty`, but reading the sig keeps it correct for a future generic-impl instance.
 fn lowerArithValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, rhs_node: Ast.Index, op: TokenTag) error{OutOfMemory}!Ir.Operand {
-    const method: []const u8 = switch (op) {
-        .plus => "add",
-        .minus => "sub",
-        .star => "mul",
-        .slash => "div",
-        else => unreachable,
-    };
+    const method = Walk.opMethods(op)[0];
     switch (Typecheck.resolveConformanceMethod(b.in.methods, operand_ty, method, Typecheck.witnessProtocolId(b.in.prelude_ids, method), null)) {
         .one => |m| {
             const ret_ty = if (m.instance) |ii| b.in.instances[ii].ret else b.in.sigs[m.fn_id].ret;
