@@ -1,0 +1,40 @@
+# Feature: each compound operator `x op= v` on an int local stores `x op v`. A bare
+# literal takes the place's width, and a narrow place wraps as `x = x op v` does.
+# expect: stdout "4\n3\n30\n10\n3\n11\n8\n9\n36\n18\n-2\n"
+# expect: exit 22
+import std/io
+
+fn main() -> int {
+    x := 1
+    x = x + 3
+    io.println(x)
+    x = x - 1
+    io.println(x)
+    x = x * 10
+    io.println(x)
+    x = x / 3
+    io.println(x)
+    x = x % 7
+    io.println(x)
+    x = x | 8
+    io.println(x)
+    x = x & 12
+    io.println(x)
+    x = x ^ 1
+    io.println(x)
+    x = x << 2
+    io.println(x)
+    x = x >> 1
+    io.println(x)
+    k := 2
+    x = x - k * 10
+    io.println(x)
+    b: int8 = 127
+    b = b + 1
+    lo: int8 = 0
+    u: uint8 = 250
+    u = u + 10
+    small: uint8 = 5
+    if b < lo && u < small { x = x + 24 }
+    return x
+}

@@ -544,21 +544,26 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
         .var_decl => {
             const ty = b.in.nodes.typeOf(stmt_idx);
             const home = if (places.boxedBinding(b, stmt_idx)) |li| try places.bindBox(b, li, ty) else try places.localHome(b, stmt_idx, ty);
-            try storeInto(b, home, stmt.lhs, ty);
+            try storeInto(b, home, .{ .expr = stmt.lhs }, ty);
         },
         .assign => {
             const target = b.in.tree.nodes[(stmt.lhs).int()];
             const place_ty = b.in.nodes.typeOf(stmt.lhs);
+            const op = b.in.tokens[stmt.main_token].tag;
+            const value: StoreValue = if (op.compoundBase()) |base|
+                .{ .compound = .{ .op_tok = stmt.main_token, .op = base, .place = stmt.lhs, .rhs = stmt.rhs } }
+            else
+                .{ .expr = stmt.rhs };
             if (target.tag == .field_access or target.tag == .tuple_field) {
-                try lowerFieldStore(b, stmt.lhs, stmt.rhs, place_ty);
+                try lowerFieldStore(b, stmt.lhs, value, place_ty);
                 return;
             }
             const home = try places.bindingHome(b, stmt.lhs, place_ty);
-            if (isAggregatePass(b, place_ty) and places.stagesStore(b, stmt.lhs, stmt.rhs)) {
-                try places.storeStaged(b, stmt.rhs, try places.homeAddr(b, home), place_ty);
+            if (isAggregatePass(b, place_ty) and places.stagesStore(b, stmt.lhs, value)) {
+                try places.storeStaged(b, value, try places.homeAddr(b, home), place_ty);
                 return;
             }
-            try storeInto(b, home, stmt.rhs, place_ty);
+            try storeInto(b, home, value, place_ty);
         },
         .return_stmt => {
             const arg: Ir.Operand = if (stmt.lhs == Ast.none)
@@ -588,33 +593,90 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
     }
 }
 
-/// Store the value of `expr` into the local at `home`. A scalar emits a store; an aggregate
+/// The value a store writes: an expression, or the `place op v` of a compound assignment,
+/// which has no node of its own. Both go through the same store paths, so `x op= v` lowers
+/// exactly as `x = x op v` does.
+pub const StoreValue = union(enum) {
+    expr: Ast.Index,
+    compound: struct { op_tok: u32, op: TokenTag, place: Ast.Index, rhs: Ast.Index },
+
+    fn token(v: StoreValue, b: *const Builder) u32 {
+        return switch (v) {
+            .expr => |e| b.in.tree.nodes[e.int()].main_token,
+            .compound => |c| c.op_tok,
+        };
+    }
+};
+
+fn lowerStoreValue(b: *Builder, v: StoreValue) error{OutOfMemory}!Ir.Operand {
+    return switch (v) {
+        .expr => |e| try lowerExpr(b, e),
+        // The place is read as an rvalue before `rhs` runs, as `place op rhs` reads it.
+        .compound => |c| try lowerBinOp(b, c.op_tok, c.op, c.place, c.rhs),
+    };
+}
+
+/// `lowerExprInto` for a `StoreValue`. A compound value is a binary operator's result, so
+/// it takes `lowerExprInto`'s `.binary` path.
+pub fn lowerStoreValueInto(b: *Builder, v: StoreValue, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
+    const c = switch (v) {
+        .expr => |e| return lowerExprInto(b, e, dst_ptr, ty),
+        .compound => |c| c,
+    };
+    try storeOperandInto(b, try lowerBinOp(b, c.op_tok, c.op, c.place, c.rhs), dst_ptr, ty, c.op_tok);
+}
+
+/// Store an already-lowered `op` of type `ty` into `dst_ptr`: a scalar is stored, an
+/// aggregate byte-copied from its slot.
+fn storeOperandInto(b: *Builder, op: Ir.Operand, dst_ptr: Ir.ValueId, ty: Typecheck.Type, tok: u32) error{OutOfMemory}!void {
+    switch (passKind(b, ty)) {
+        // A diverging producer (e.g. a match arm body that `return`s) already set the
+        // block terminator; a store into that dead tail is malformed IR.
+        .box => if (!b.termSet()) {
+            _ = try b.emit(.{ .store = .{ .addr = dst_ptr, .val = operandValue(op), .ty = Typecheck.Type.int } }, null);
+        },
+        .int, .bool, .float => if (!b.termSet()) {
+            _ = try b.emit(.{ .store = .{ .addr = dst_ptr, .val = operandValue(op), .ty = ty } }, null);
+        },
+        .str, .@"struct", .@"enum" => {
+            const src_ptr = try operandPtr(b, op);
+            if (src_ptr == Ir.none_value) return; // a diagnostic was already emitted
+            _ = try b.emit(.{ .copy = .{ .dst = dst_ptr, .src = src_ptr, .ty = ty } }, null);
+        },
+        // `never` means the producer diverged and set its own terminator, so there is no
+        // value to store.
+        .unit, .never => {},
+        .rawptr, .invalid => try b.note(tok, "produce-into-slot type unsupported in lower"),
+    }
+}
+
+/// Store `value` into the local at `home`. A scalar emits a store; an aggregate
 /// (str/struct/enum) is PRODUCED INTO the storage directly via `lowerExprInto` (the
 /// produce-into-slot path: construct/copy/match write straight to the destination,
 /// never value-then-copy).
-fn storeInto(b: *Builder, home: places.LocalHome, expr: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!void {
+fn storeInto(b: *Builder, home: places.LocalHome, value: StoreValue, ty: Typecheck.Type) error{OutOfMemory}!void {
     // A managed box is a struct type but travels as an 8-byte scalar cell pointer, not an
     // aggregate slot, so store it like a scalar rather than routing to `lowerExprInto`.
     switch (passKind(b, ty)) {
         .box => {
-            const v = try lowerExpr(b, expr);
+            const v = try lowerStoreValue(b, value);
             const addr = try places.homeAddr(b, home);
             _ = try b.emit(.{ .store = .{ .addr = addr, .val = operandValue(v), .ty = Typecheck.Type.int } }, null);
         },
         .int, .bool, .float, .rawptr => {
-            const v = try lowerExpr(b, expr);
+            const v = try lowerStoreValue(b, value);
             const addr = try places.homeAddr(b, home);
             _ = try b.emit(.{ .store = .{ .addr = addr, .val = operandValue(v), .ty = ty } }, null);
         },
         .str, .@"struct", .@"enum" => {
             const dst = try places.homeAddr(b, home);
-            try lowerExprInto(b, expr, dst, ty);
+            try lowerStoreValueInto(b, value, dst, ty);
         },
         .unit => {
-            _ = try lowerExpr(b, expr); // for effect
+            _ = try lowerStoreValue(b, value); // for effect
         },
-        .never => _ = try lowerExpr(b, expr),
-        .invalid => try b.note(b.in.tree.nodes[(expr).int()].main_token, "aggregate var/assign unsupported in lower"),
+        .never => _ = try lowerStoreValue(b, value),
+        .invalid => try b.note(value.token(b), "aggregate var/assign unsupported in lower"),
     }
 }
 
@@ -2246,7 +2308,7 @@ fn lowerIntrinsicCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node, ik: Intrins
             const vty = b.in.nodes.typeOf(a[1]);
             if (vty.kind == .never) {
                 _ = try lowerExpr(b, a[1]);
-            } else try storeThrough(b, addr, a[1], vty, n.main_token);
+            } else try storeThrough(b, addr, .{ .expr = a[1] }, vty, n.main_token);
             return .none;
         },
         else => return null,
@@ -2797,25 +2859,7 @@ pub fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Type
     const n = b.in.tree.nodes[(expr).int()];
     // A managed box produces an 8-byte scalar cell pointer straight into the destination.
     switch (passKind(b, ty)) {
-        .box => {
-            const op = try lowerExpr(b, expr);
-            if (!b.termSet()) _ = try b.emit(.{ .store = .{ .addr = dst_ptr, .val = operandValue(op), .ty = Typecheck.Type.int } }, null);
-            return;
-        },
-        .int, .bool, .float => {
-            const op = try lowerExpr(b, expr);
-            // A diverging producer (e.g. a match arm body that `return`s) already set
-            // the block terminator; a store into that dead tail is malformed IR.
-            if (!b.termSet()) _ = try b.emit(.{ .store = .{ .addr = dst_ptr, .val = operandValue(op), .ty = ty } }, null);
-            return;
-        },
-        .unit, .never => {
-            // `never` means the expression diverges (e.g. a match arm whose body
-            // `return`s). Lower it for its control-flow effect: it sets its own
-            // terminator, so there is no value to produce into `dst_ptr`.
-            _ = try lowerExpr(b, expr);
-            return;
-        },
+        .box, .int, .bool, .float, .unit, .never => return storeOperandInto(b, try lowerExpr(b, expr), dst_ptr, ty, n.main_token),
         .str, .@"struct", .@"enum" => {},
         .rawptr, .invalid => {
             try b.note(n.main_token, "produce-into-slot type unsupported in lower");
@@ -2902,10 +2946,7 @@ pub fn producesInPlace(b: *Builder, expr: Ast.Index) bool {
 /// An aggregate value yielded by an identifier / field-access / call: lower it to
 /// an Operand.slot, then byte-copy that slot into `dst_ptr`.
 fn copyAggInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
-    const op = try lowerExpr(b, expr);
-    const src_ptr = try operandPtr(b, op);
-    if (src_ptr == Ir.none_value) return; // a diagnostic was already emitted
-    _ = try b.emit(.{ .copy = .{ .dst = dst_ptr, .src = src_ptr, .ty = ty } }, null);
+    try storeOperandInto(b, try lowerExpr(b, expr), dst_ptr, ty, b.in.tree.nodes[expr.int()].main_token);
 }
 
 /// The ptr VALUE backing an aggregate Operand (its slot address). For a scalar/
@@ -3141,7 +3182,7 @@ fn lowerFieldAccess(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{
 /// Store into a `field_access` place (`p.x = v`, `p.a.b = v`). The place address is
 /// a field_addr chain rooted at a local slot; scalar → store, aggregate → produce
 /// into the place address.
-fn lowerFieldStore(b: *Builder, place: Ast.Index, value: Ast.Index, ty: Typecheck.Type) error{OutOfMemory}!void {
+fn lowerFieldStore(b: *Builder, place: Ast.Index, value: StoreValue, ty: Typecheck.Type) error{OutOfMemory}!void {
     const addr = try places.lowerPlaceAddr(b, place);
     if (addr == Ir.none_value) {
         try b.note(b.in.tree.nodes[(place).int()].main_token, "field store target unsupported in lower");
@@ -3152,15 +3193,15 @@ fn lowerFieldStore(b: *Builder, place: Ast.Index, value: Ast.Index, ty: Typechec
 }
 
 /// Store `value` (of type `ty`) into the storage at `addr`.
-fn storeThrough(b: *Builder, addr: Ir.ValueId, value: Ast.Index, ty: Typecheck.Type, tok: u32) error{OutOfMemory}!void {
+fn storeThrough(b: *Builder, addr: Ir.ValueId, value: StoreValue, ty: Typecheck.Type, tok: u32) error{OutOfMemory}!void {
     switch (ty.kind) {
         .int, .bool, .float => {
-            const v = operandValue(try lowerExpr(b, value));
+            const v = operandValue(try lowerStoreValue(b, value));
             _ = try b.emit(.{ .store = .{ .addr = addr, .val = v, .ty = ty } }, null);
         },
-        .str, .@"struct", .@"enum" => try lowerExprInto(b, value, addr, ty),
+        .str, .@"struct", .@"enum" => try lowerStoreValueInto(b, value, addr, ty),
         // A zero-sized place (`()`): evaluate the RHS for effect, store nothing.
-        .unit => _ = try lowerExpr(b, value),
+        .unit => _ = try lowerStoreValue(b, value),
         else => try b.note(tok, "field store type unsupported in lower"),
     }
 }

@@ -165,6 +165,87 @@ pub fn expectStdoutAtBothLevels(gpa: std.mem.Allocator, io: Io, dir: []const u8,
     }
 }
 
+/// A syntax feature proven to be pure sugar: each case in `cases_dir` whose name starts
+/// with `prefix` must build, at every level in `levels`, to the same binary as its
+/// hand-desugared twin at the same path under `twins_dir`, and every twin must have a case.
+pub const Twins = struct {
+    cases_dir: []const u8,
+    twins_dir: []const u8,
+    prefix: []const u8 = "",
+    tmp: []const u8,
+    /// Optimization flags to build each pair at; empty builds once at the default level.
+    levels: []const []const u8 = &.{},
+};
+
+pub fn expectTwins(gpa: std.mem.Allocator, io: Io, t: Twins) !void {
+    Io.Dir.cwd().deleteTree(io, t.tmp) catch {};
+    defer Io.Dir.cwd().deleteTree(io, t.tmp) catch {};
+
+    var root = try Io.Dir.cwd().openDir(io, t.cases_dir, .{ .iterate = true });
+    defer root.close(io);
+    var walker = try root.walk(gpa);
+    defer walker.deinit();
+
+    var compared: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".toy")) continue;
+        if (!std.mem.startsWith(u8, entry.basename, t.prefix)) continue;
+        const case_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ t.cases_dir, entry.path });
+        defer gpa.free(case_path);
+        const twin_path = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ t.twins_dir, entry.path });
+        defer gpa.free(twin_path);
+        const case_src = try Io.Dir.cwd().readFileAlloc(io, case_path, gpa, .unlimited);
+        defer gpa.free(case_src);
+        const twin_src = Io.Dir.cwd().readFileAlloc(io, twin_path, gpa, .unlimited) catch {
+            std.debug.print("case {s} has no twin at {s}\n", .{ case_path, twin_path });
+            return error.MissingTwin;
+        };
+        defer gpa.free(twin_src);
+
+        const levels: []const []const u8 = if (t.levels.len == 0) &.{""} else t.levels;
+        for (levels) |level| {
+            // `--no-cache`: a warm cache could hand the twin the case's cached code, and
+            // the comparison would pass without testing anything.
+            const a = try buildBytes(gpa, io, t.tmp, entry.path, "case", level, case_src, case_path);
+            defer gpa.free(a);
+            const b = try buildBytes(gpa, io, t.tmp, entry.path, "twin", level, twin_src, twin_path);
+            defer gpa.free(b);
+            if (!std.mem.eql(u8, a, b)) {
+                std.debug.print("case {s} differs from its twin at {s} ({d} vs {d} bytes)\n", .{ case_path, level, a.len, b.len });
+                return error.TestExpectedEqual;
+            }
+        }
+        compared += 1;
+    }
+    // Every twin must have a case, so a renamed or deleted case cannot leave a stale twin.
+    try std.testing.expect(compared > 0);
+    try std.testing.expectEqual(try countToy(gpa, io, t.twins_dir), compared);
+}
+
+fn buildBytes(gpa: std.mem.Allocator, io: Io, tmp: []const u8, rel: []const u8, side: []const u8, level: []const u8, src: []const u8, src_path: []const u8) ![]u8 {
+    const dir = try std.fmt.allocPrint(gpa, "{s}/{s}/{s}{s}", .{ tmp, rel, side, level });
+    defer gpa.free(dir);
+    const flags: []const []const u8 = if (level.len == 0) &.{"--no-cache"} else &.{ "--no-cache", level };
+    const prog = compile(gpa, io, dir, src, flags) catch |e| {
+        std.debug.print("failed to build {s} at {s}\n", .{ src_path, level });
+        return e;
+    };
+    defer gpa.free(prog);
+    return Io.Dir.cwd().readFileAlloc(io, prog, gpa, .unlimited);
+}
+
+fn countToy(gpa: std.mem.Allocator, io: Io, path: []const u8) !usize {
+    var dir = try Io.Dir.cwd().openDir(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(gpa);
+    defer walker.deinit();
+    var n: usize = 0;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.path, ".toy")) n += 1;
+    }
+    return n;
+}
+
 /// `compile` + `runExit` in a fresh `dir`, removed afterwards.
 pub fn buildAndRun(gpa: std.mem.Allocator, io: Io, dir: []const u8, src: []const u8) !u8 {
     Io.Dir.cwd().deleteTree(io, dir) catch {};

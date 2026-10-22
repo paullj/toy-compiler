@@ -634,7 +634,10 @@ pub const BodyChecker = struct {
                 };
                 bc.node_types[(stmt.lhs).int()] = lhs;
                 try LambdaChecker.noteAssignedRoot(bc, stmt.lhs);
-                const rhs = try bc.typeOfExpected(stmt.rhs, if (lhs.kind == .invalid) null else lhs);
+                const rhs = if (bc.tokens[stmt.main_token].tag.compoundBase()) |base|
+                    try bc.compoundValue(stmt_idx, base, lhs)
+                else
+                    try bc.typeOfExpected(stmt.rhs, if (lhs.kind == .invalid) null else lhs);
                 if (!Type.assignable(lhs, rhs)) {
                     try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0041 }, "cannot assign {s} to variable of type {s}", .{ bc.typeName(rhs), bc.typeName(lhs) });
                 }
@@ -1232,8 +1235,8 @@ pub const BodyChecker = struct {
                 if (lt.kind == .invalid or rt.kind == .invalid) break :blk Type.invalid; // poison propagation: no emit (exempt)
                 const l_lit = bc.tree.nodes[n.lhs.int()].tag == .literal_number;
                 const r_lit = bc.tree.nodes[n.rhs.int()].tag == .literal_number;
-                if (r_lit and !l_lit and lt.isInteger()) rt = try bc.typeOfExpected(n.rhs, lt);
-                if (l_lit and !r_lit and rt.isInteger()) lt = try bc.typeOfExpected(n.lhs, rt);
+                if (!l_lit) rt = try bc.adoptLiteralWidth(n.rhs, rt, lt);
+                if (!r_lit) lt = try bc.adoptLiteralWidth(n.lhs, lt, rt);
                 // Both operands bare literals (`c: int8 = 1 + 2`): no typed sibling to
                 // adopt from, so re-type each under the OUTER expected width (running the
                 // per-literal range check) — else both stay platform `int`, the homogeneous
@@ -4532,6 +4535,25 @@ pub const BodyChecker = struct {
             else => {},
         }
         return Type.invalid;
+    }
+
+    /// The type of binary operand `operand` (typed `t` with no expected type): a bare
+    /// integer literal beside an operand of integer type `sibling` takes that width.
+    fn adoptLiteralWidth(bc: *BodyChecker, operand: Ast.Index, t: Type, sibling: Type) error{OutOfMemory}!Type {
+        if (bc.tree.nodes[operand.int()].tag != .literal_number or !sibling.isInteger()) return t;
+        return bc.typeOfExpected(operand, sibling);
+    }
+
+    /// The type `place op= v` stores, `place op v`, given the place type `lt`. `v` is typed
+    /// as a binary operand is, with no expected type, so a bare literal adopts the place's
+    /// width and anything else must already match it; errors name the compound operator.
+    fn compoundValue(bc: *BodyChecker, stmt_idx: Ast.Index, base: TokenTag, lt: Type) error{OutOfMemory}!Type {
+        const stmt = bc.tree.nodes[stmt_idx.int()];
+        var rt = try bc.typeOfExpected(stmt.rhs, null);
+        if (lt.kind == .invalid or rt.kind == .invalid) return Type.invalid;
+        rt = try bc.adoptLiteralWidth(stmt.rhs, rt, lt);
+        const op_tok = bc.tokens[stmt.main_token];
+        return bc.binaryResult(stmt_idx, .{ .token = stmt.main_token }, base, op_tok.text(bc.source), lt, rt);
     }
 
     /// Map an arithmetic operator token to its prelude protocol id (from the frozen Model)

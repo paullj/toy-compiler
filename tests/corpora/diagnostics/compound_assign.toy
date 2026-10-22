@@ -1,0 +1,29 @@
+# `place op= v` types and diagnoses as `place = place op v`, with errors at the
+# operator: the operands must match (T0044), a type with no operator impl is T0028 (no
+# str `+=`), and a literal takes the place's width (T0034). The place checks of `=` stay.
+import std/vec
+
+struct P { x: int }
+struct W { p: P }
+
+impl P {
+    fn moved(self, d: int) -> P { P { x: self.x + d } }
+}
+
+fn main() -> int {
+    x := 1
+    flag := true
+    x += flag  #~ ERROR [T0044] operands of '+=' must have the same type
+    x <<= flag  #~ ERROR [T0044] operands of '<<=' must be int
+    s := "a"
+    s += "b"  #~ ERROR [T0028] '+=' requires an 'Add' impl for type 'str'
+    y: int8 = 1
+    y += 300  #~ ERROR [T0034] literal out of range for type 'int8'
+    xs: Vec[int] = [1, 2]
+    xs[0] += 1  #~ ERROR [T0074] cannot assign to an index element `xs[i]`
+    ps: Vec[P] = []
+    ps[0].x -= 1  #~ ERROR [T0070] cannot assign to a field of an index element
+    w := W { p: P { x: 1 } }
+    w.p.moved(1).x *= 5  #~ ERROR [T0075] cannot assign to a field of a temporary value
+    return x + w.p.x
+}

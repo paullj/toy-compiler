@@ -219,6 +219,37 @@ pub const Tag = enum(u8) {
     // Pipe. Appended at the END (frozen ordinal; `[]Token` is memcpy'd to/from the
     // content cache). NOT a keyword. See packages/docs/pipe.md.
     pipe_gt, // |>
+
+    // Compound assignment. Appended at the END (frozen ordinals; `[]Token` is memcpy'd
+    // to/from the content cache). NOT keywords. `place op= v` stores `place op v`;
+    // `compoundBase` maps each to the binary operator it applies.
+    plus_eq, // +=
+    minus_eq, // -=
+    star_eq, // *=
+    slash_eq, // /=
+    percent_eq, // %=
+    pipe_eq, // |=
+    amp_eq, // &=
+    caret_eq, // ^=
+    lt_lt_eq, // <<=
+    gt_gt_eq, // >>=
+
+    /// The binary operator a compound assignment applies, or null for any other tag.
+    pub fn compoundBase(tag: Tag) ?Tag {
+        return switch (tag) {
+            .plus_eq => .plus,
+            .minus_eq => .minus,
+            .star_eq => .star,
+            .slash_eq => .slash,
+            .percent_eq => .percent,
+            .pipe_eq => .pipe,
+            .amp_eq => .amp,
+            .caret_eq => .caret,
+            .lt_lt_eq => .lt_lt,
+            .gt_gt_eq => .gt_gt,
+            else => null,
+        };
+    }
 };
 
 /// Maps identifier text to its keyword tag, if any.

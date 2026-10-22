@@ -639,6 +639,41 @@ test "hover on a captured name says how its closure holds it" {
     }
 }
 
+test "hover on a compound assignment's target and value types them as with '='" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\struct P { x: int }
+        \\fn main() -> int {
+        \\    count := 3
+        \\    step := 2
+        \\    count += step
+        \\    p := P { x: 1 }
+        \\    p.x <<= count
+        \\    bump := fn() { count -= 1 }
+        \\    bump()
+        \\    return count + p.x
+        \\}
+        \\
+    ;
+    const test_util = @import("test_util.zig");
+    const cases = [_]struct { at: @import("protocol.zig").Position, want: []const u8 }{
+        .{ .at = test_util.posOf(src, "count += step"), .want = "count: int\n```" },
+        .{ .at = test_util.posOf(src, "step\n    p :="), .want = "step: int\n```" },
+        .{ .at = test_util.posOf(src, "x <<="), .want = "int\n```" },
+        .{ .at = test_util.posOf(src, "count -= 1"), .want = "count: int\n```\n\ncaptured: shared" },
+    };
+    for (cases) |c| {
+        var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///c/main.toy")) orelse return error.NoHover;
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}
+
 test "hover on a mut argument or a mut self receiver names the call that mutates it" {
     const gpa = testing.allocator;
     var docs: @import("Documents.zig") = .{};

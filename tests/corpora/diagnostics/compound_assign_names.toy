@@ -1,0 +1,16 @@
+# A compound assignment needs an assignable name, as `=` does (R0007).
+struct P { x: int }
+
+impl P {
+    fn get(self) -> P { self }
+}
+
+fn one() -> int { 1 }
+
+fn main() -> int {
+    p := P { x: 1 }
+    nope += 1  #~ ERROR [R0007] assignment to undeclared name 'nope'
+    one -= 1  #~ ERROR [R0007] cannot assign to function 'one'
+    p.get() += p  #~ ERROR [R0007] cannot assign to a temporary value
+    return p.x
+}

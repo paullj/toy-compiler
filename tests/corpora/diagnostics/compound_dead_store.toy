@@ -1,0 +1,10 @@
+# A compound assignment reads its target before it writes it: it keeps the write before
+# it live, and is itself a store that a later plain write can make dead (W0010).
+fn main() -> int {
+    a := 1
+    a += 2
+    b := 1
+    b -= 1  #~ WARN [W0010] dead store to 'b'
+    b = 5
+    return a + b
+}

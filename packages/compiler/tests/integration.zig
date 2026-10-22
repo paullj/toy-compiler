@@ -27,6 +27,7 @@ test {
     _ = @import("option.zig");
     _ = @import("desc.zig");
     _ = @import("pipe.zig");
+    _ = @import("compound.zig");
     _ = @import("map.zig");
     _ = @import("set.zig");
     _ = @import("string.zig");

@@ -250,7 +250,12 @@ module.exports = grammar({
         ),
       ),
 
-    assignment: ($) => seq(field("left", $._expression), "=", field("right", $._expression)),
+    assignment: ($) =>
+      seq(
+        field("left", $._expression),
+        field("operator", choice("=", "+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "<<=", ">>=")),
+        field("right", $._expression),
+      ),
 
     // `prec.right` makes a bare `return`/`break` greedily absorb a following expression
     // rather than treating it as the next statement. Newlines are trivia here, so the two
