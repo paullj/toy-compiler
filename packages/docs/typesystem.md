@@ -149,7 +149,9 @@ from two angles — assignability is directional (want ← got), join is symmetr
   field is stored into the copy and the copy is written back with `xs.set(i, ..)`. No
   code runs between the copy-in and the write-back, so a write `e` makes to another
   field of the element is kept, and an `e` that grows `xs` still lands. A compound
-  `xs[i].f op= e` is **T0070**.
+  `xs[i].f op= e` evaluates `xs` and `i` once and reads the field (an out-of-bounds `i`
+  panics here, before `e` runs), then runs `e`, applies `op` and stores the result as
+  `xs[i].f = ..` does, copying the element in only after `e`.
 * `place op= e` — compound assignment, for `op` in `+ - * / % | & ^ << >>` and the
   float forms `+. -. *. /.`. It means `place = place op e`: the place is read
   before `e` runs, `e` is typed like a binary operand (a bare integer literal takes the

@@ -646,10 +646,6 @@ pub const BodyChecker = struct {
                     .field_access, .tuple_field => if (bc.rootIsTemporary(stmt.lhs)) {
                         if (lhs.kind != .invalid)
                             try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0075 }, "cannot assign to a field of a temporary value, such as a call result; it is a copy, so the write would be lost", .{});
-                    } else if (bc.elementRoot(stmt.lhs) != null and bc.tokens[stmt.main_token].tag != .eq) {
-                        // `ps[i].f = v` writes the element back; a compound one would also read
-                        // the field, which has no lowering yet.
-                        try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0070 }, "cannot assign to a field of an index element `xs[i].field` with a compound operator; write `xs[i].field = xs[i].field op v`", .{});
                     } else bc.noteElementWrite(stmt.lhs, true),
                     else => {},
                 }

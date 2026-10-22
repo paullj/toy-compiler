@@ -1,0 +1,86 @@
+# Feature: `ps[i].f op= v` reads the field of the element, applies `op` and writes the
+# element back: every integer operator, a float field, a struct field with an `Add` impl,
+# a nested field, a tuple-struct field, a Vec held in a field and in `self`, an element of
+# an element and a generic element.
+# expect: stdout "14\n12\n24\n12\n0\n4\n4\n7\n28\n3\n2\ntrue\n4\n6\n9\n7\n8\n9\n10\n11\n"
+# expect: exit 0
+import std/io
+import std/vec
+
+struct V { x: int, y: int }
+struct Q { a: int, b: int }
+struct P { x: int, f: float, v: V, q: Q }
+struct Pair(int, int)
+struct H { ps: Vec[P] }
+struct Box[T] { v: T }
+
+impl V has Add {
+    fn add(self, o: V) -> V { V { x: self.x + o.x, y: self.y + o.y } }
+}
+
+impl H {
+    fn bump(self, i: int) { self.ps[i].x += 1 }
+}
+
+fn add[T has Add](xs: Vec[Box[T]], i: int, v: T) { xs[i].v += v }
+
+fn mk() -> P {
+    return P { x: 0, f: 1.0, v: V { x: 1, y: 2 }, q: Q { a: 0, b: 0 } }
+}
+
+fn main() -> int {
+    ps: Vec[P] = [mk(), mk()]
+    i := 1
+    ps[i].x = 7
+    ps[i].x *= 2
+    io.println(ps[i].x)
+    ps[i].x -= 2
+    io.println(ps[i].x)
+    ps[i].x += 12
+    io.println(ps[i].x)
+    ps[i].x /= 2
+    io.println(ps[i].x)
+    ps[i].x %= 4
+    io.println(ps[i].x)
+    ps[i].x |= 4
+    io.println(ps[i].x)
+    ps[i].x &= 13
+    io.println(ps[i].x)
+    ps[i].x ^= 3
+    io.println(ps[i].x)
+    ps[i].x <<= 2
+    io.println(ps[i].x)
+    ps[i].x >>= 3
+    io.println(ps[i].x)
+    ps[i].q.a += 2
+    io.println(ps[1].q.a)
+
+    ps[0].f +.= 1.5
+    io.println(ps[0].f == 2.5)
+
+    ps[0].v += V { x: 3, y: 4 }
+    io.println(ps[0].v.x)
+    io.println(ps[0].v.y)
+
+    ts: Vec[Pair] = [Pair(1, 2), Pair(3, 4)]
+    ts[i].0 += 6
+    io.println(ts[1].0)
+
+    h := H { ps: [mk()] }
+    h.ps[0].x += 6
+    h.bump(0)
+    io.println(h.ps[0].x)
+
+    gs: Vec[Vec[Pair]] = [[Pair(0, 0)], [Pair(0, 0), Pair(0, 8)]]
+    gs[i][1].1 += 0
+    io.println(gs[1][1].1)
+    gs[i][1].1 += 1
+    io.println(gs[1][1].1)
+
+    bs: Vec[Box[int]] = [Box[int] { v: 4 }]
+    add(bs, 0, 6)
+    io.println(bs[0].v)
+    bs[0].v += 1
+    io.println(bs[0].v)
+    return 0
+}

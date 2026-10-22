@@ -1,0 +1,27 @@
+# Feature: `ps[i].x op= v` evaluates the handle and the index once, reads the field, runs
+# the value, then copies the element in, stores the field and writes it back. No code
+# runs between the copy-in and the write-back, so a write the value makes to another field
+# of the same element is kept; the old field value is the one read before the value ran.
+# expect: stdout "1\n"
+# expect: exit 47
+import std/io
+import std/vec
+
+struct P { x: int, y: int }
+
+fn main() -> int {
+    ps: Vec[P] = [P { x: 0, y: 0 }, P { x: 5, y: 0 }]
+    calls := 0
+    at := fn() -> int {
+        calls += 1
+        1
+    }
+    rhs := fn() -> int {
+        ps[1].y = 40
+        ps[1].x = 100
+        2
+    }
+    ps[0 + at()].x += rhs()
+    io.println(calls)
+    return ps[1].x + ps[1].y + ps[0].x + ps[0].y
+}

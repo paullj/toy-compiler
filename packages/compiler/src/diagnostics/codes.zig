@@ -123,7 +123,7 @@ pub const Code = enum(u16) {
     T0067, // pattern-type-mismatch (a match scrutinee or pattern whose type the match cannot test)
     T0068, // pattern-arity-mismatch (a variant pattern binds a different number of values than the variant holds)
     T0069, // or-pattern-mismatch (the alternatives of an or-pattern bind different names or types)
-    T0070, // index-element-field-assign (`xs[i].f op= v`: a compound store to an element field is unsupported)
+    T0070, // index-element-field-assign (removed: `xs[i].f = v` and `xs[i].f op= v` write the element back)
     T0071, // too-many-fields (a tuple struct past the positional field limit)
     T0072, // bound-receiver-not-local (a `mut self` method bound on a field, not a local)
     T0073, // main-params (the entry `main` declares parameters)

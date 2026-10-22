@@ -10,8 +10,10 @@ const cases_dir = "tests/corpora/language-features/closures";
 
 const Ran = struct { exit: u8, stdout: []u8 };
 
+// Stderr is dropped: an expected panic (the *_oob fixtures) would otherwise reach the build
+// runner, which then reports the passing step as a failed command.
 fn run(gpa: std.mem.Allocator, io: Io, prog: []const u8) !Ran {
-    var child = try std.process.spawn(io, .{ .argv = &.{prog}, .stdout = .pipe });
+    var child = try std.process.spawn(io, .{ .argv = &.{prog}, .stdout = .pipe, .stderr = .ignore });
     var rdr = child.stdout.?.readerStreaming(io, &.{});
     const out = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
     errdefer gpa.free(out);

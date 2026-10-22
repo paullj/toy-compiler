@@ -468,6 +468,7 @@ test "panic: div/mod/unwrap traps + user panic() write msg + a symbolized-backtr
         .{ .dir = ".toy-test-panic-oob-store", .src = "import std/vec\nfn main() -> int {\n  xs := [10]\n  xs[-1] = 5\n  return 0\n}\n", .want = @as(?u8, 1), .err = "index out of bounds" },
         .{ .dir = ".toy-test-panic-oob-compound", .src = "import std/vec\nfn main() -> int {\n  xs := [10]\n  xs[1] += 5\n  return 0\n}\n", .want = @as(?u8, 1), .err = "index out of bounds" },
         .{ .dir = ".toy-test-panic-oob-field", .src = "import std/vec\nstruct P { x: int }\nfn main() -> int {\n  ps := [P { x: 1 }]\n  ps[1].x = 5\n  return 0\n}\n", .want = @as(?u8, 1), .err = "index out of bounds" },
+        .{ .dir = ".toy-test-panic-oob-field-compound", .src = "import std/vec\nstruct P { x: int }\nfn main() -> int {\n  ps := [P { x: 1 }]\n  ps[1].x += 5\n  return 0\n}\n", .want = @as(?u8, 1), .err = "index out of bounds" },
         .{ .dir = ".toy-test-panic-ctldiv", .src = "fn main() -> int { return 10 / 3 }\n", .want = @as(?u8, 3), .err = "" },
         .{ .dir = ".toy-test-panic-ctlmod", .src = "fn main() -> int { return 17 % 5 }\n", .want = @as(?u8, 2), .err = "" },
     };

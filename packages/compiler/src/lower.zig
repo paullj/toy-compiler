@@ -3287,15 +3287,25 @@ fn lowerFieldStore(b: *Builder, place: Ast.Index, value: StoreValue, ty: Typeche
     try storeThrough(b, addr, value, ty, b.in.tree.nodes[(place).int()].main_token);
 }
 
-/// Store into a field of a `Vec` element (`ps[i].f = v`, `ps[i].q.a = v`) by
-/// read-modify-write: the handle and the index, then the value, then copy the element in,
+/// Store into a field of a `Vec` element (`ps[i].f = v`, `ps[i].q.a op= v`) by
+/// read-modify-write: the handle and the index, then (for a compound store) the old field
+/// through a read of the element, then the value, then copy the element in,
 /// store the field into the copy and write the copy back. No user code runs between the
 /// copy-in and the write-back, so a write the value makes to the element is kept, and a
 /// value that grows the Vec is copied in from the new backing.
 fn lowerElementFieldStore(b: *Builder, place: Ast.Index, root: Ast.Index, value: StoreValue, ty: Typecheck.Type) error{OutOfMemory}!void {
     const tok = b.in.tree.nodes[place.int()].main_token;
     var ep = try places.lowerElementPlace(b, root) orelse return;
-    const v = try lowerStoreValue(b, value);
+    const v = switch (value) {
+        .expr => |e| try lowerExpr(b, e),
+        // The old field is read from its own copy of the element, before the value runs,
+        // so `copyIn` below still sees every write the value makes (D54).
+        .compound => blk: {
+            const outer = b.pushPrelowered(root, try emitElemRefRead(b, ep.ref));
+            defer b.prelowered = outer;
+            break :blk try lowerStoreValue(b, value);
+        },
+    };
     if (b.termSet()) return;
     const addr = try places.copyIn(b, &ep, place);
     if (addr == Ir.none_value) {
