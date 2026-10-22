@@ -45,7 +45,7 @@ impl Map[K has Hashable, V] {
         i := 0
         while i < n {
             f(mem.mp_key_at[K, V](self.h, i), mem.mp_val_at[K, V](self.h, i))
-            i = i + 1
+            i += 1
         }
     }
 
@@ -57,7 +57,7 @@ impl Map[K has Hashable, V] {
             k := mem.mp_key_at[K, V](self.h, i)
             v := mem.mp_val_at[K, V](self.h, i)
             if f(k, v) { out.set(k, v) }
-            i = i + 1
+            i += 1
         }
         return out
     }
@@ -68,7 +68,7 @@ impl Map[K has Hashable, V] {
         i := 0
         while i < n {
             out.set(mem.mp_key_at[K, V](self.h, i), f(mem.mp_val_at[K, V](self.h, i)))
-            i = i + 1
+            i += 1
         }
         return out
     }
@@ -79,7 +79,7 @@ impl Map[K has Hashable, V] {
         i := 0
         while i < n {
             out.push(mem.mp_key_at[K, V](self.h, i))
-            i = i + 1
+            i += 1
         }
         return out
     }
@@ -90,7 +90,7 @@ impl Map[K has Hashable, V] {
         i := 0
         while i < n {
             out.push(mem.mp_val_at[K, V](self.h, i))
-            i = i + 1
+            i += 1
         }
         return out
     }
@@ -109,7 +109,7 @@ pub struct MapIter[K, V] { m: Map[K, V], i: int }
 
 impl MapIter[K, V] has iter.Iterator[Entry[K, V]] {
     fn next(mut self) -> Option[Entry[K, V]] {
-        self.i = self.i + 1
+        self.i += 1
         if self.i >= mem.mp_len[K, V](self.m.h) {
             return Option[Entry[K, V]].none
         }

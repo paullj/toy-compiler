@@ -39,7 +39,7 @@ impl Set[T has Hashable] {
         i := 0
         while i < n {
             f(mem.mp_key_at[T, ()](self.m.h, i))
-            i = i + 1
+            i += 1
         }
     }
 
@@ -50,7 +50,7 @@ impl Set[T has Hashable] {
         while i < n {
             x := mem.mp_key_at[T, ()](self.m.h, i)
             if f(x) { out.add(x) }
-            i = i + 1
+            i += 1
         }
         return out
     }
@@ -62,7 +62,7 @@ impl Set[T has Hashable] {
         i := 0
         while i < n {
             out.add(f(mem.mp_key_at[T, ()](self.m.h, i)))
-            i = i + 1
+            i += 1
         }
         return out
     }
@@ -79,7 +79,7 @@ pub struct SetIter[T] { m: Map[T, ()], i: int }
 
 impl SetIter[T] has iter.Iterator[T] {
     fn next(mut self) -> Option[T] {
-        self.i = self.i + 1
+        self.i += 1
         if self.i >= mem.mp_len[T, ()](self.m.h) {
             return Option[T].none
         }

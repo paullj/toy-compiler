@@ -135,7 +135,7 @@ test('hover tells how a closure holds a name, what a _ makes, and who mutates an
 	const b = await live(page, 'closures.toy');
 	const tip = page.locator('.cm-lsp-hover-tooltip');
 	const cases = [
-		{ line: 'count = count + 1', word: 'count', note: 'captured: shared' },
+		{ line: 'count += 1', word: 'count', note: 'captured: shared' },
 		{ line: '.map(add(10, _))', word: '_', note: 'capture: fn(int) -> int' },
 		{ line: '# count is now 4', word: 'count', note: 'mutated by bump' }
 	];
@@ -154,7 +154,7 @@ test('inlay hints show what a closure captures and which argument a call mutates
 	// `like` is a line without hints.
 	const cases = [
 		{ line: '.fold(0,', like: '.filter(', label: 'captures count (shared)', tooltip: 'count: shared', before: 'fn(sum, x) ', after: '{' },
-		{ line: /^\s*bump\(/, like: 'count = count + 1', label: 'mut', tooltip: 'mutated by bump', before: '    bump(', after: 'count)' }
+		{ line: /^\s*bump\(/, like: 'count += 1', label: 'mut', tooltip: 'mutated by bump', before: '    bump(', after: 'count)' }
 	];
 	const height = (text: string | RegExp) =>
 		b.locator('.cm-line', { hasText: text }).evaluate((l) => l.getBoundingClientRect().height);

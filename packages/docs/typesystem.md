@@ -136,6 +136,12 @@ from two angles — assignability is directional (want ← got), join is symmetr
   `xs[i]` reads a copy and `Vec` has no index assignment, so `xs[i] = v` is **T0074**
   and `xs[i].f = v` is **T0070**. Nor is any other temporary: a field of a call result
   (`p.get().x = v`) is **T0075**, and a call result itself (`p.get() = v`) **R0007**.
+* `place op= e` — compound assignment, for `op` in `+ - * / % | & ^ << >>` and the
+  float forms `+. -. *. /.`. It means `place = place op e`: the place is read
+  before `e` runs, `e` is typed like a binary operand (a bare integer literal takes the
+  place's width), and the codes are the same as for that long form — **T0044** and
+  **T0028** at the operator, the place codes of `=` at the place. A user type gets
+  `+=` from its `Add` impl; there is no separate `AddAssign`.
 * `return e` / bare `return` — `assignable(declared_ret, T)` where `T` is the
   value type (or `()` for a bare return).
 * Every `return e` **and** the body's trailing expression are checked against the

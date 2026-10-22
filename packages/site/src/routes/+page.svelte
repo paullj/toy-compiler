@@ -92,7 +92,7 @@ fn main() -> int {
 			code: `import std/vec
 
 fn add(a: int, b: int) -> int { a + b }
-fn bump(mut n: int) { n = n + 1 }
+fn bump(mut n: int) { n += 1 }
 
 fn main() -> int {
     count := 0
@@ -100,7 +100,7 @@ fn main() -> int {
         |> .filter(fn(x) { x > 2 })
         |> .map(add(10, _))    # fn(x) { add(10, x) }
         |> .fold(0, fn(sum, x) {
-            count = count + 1  # shared with main, not a copy
+            count += 1         # shared with main, not a copy
             sum + x
         })
     bump(count)                # count is now 4

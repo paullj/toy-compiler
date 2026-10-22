@@ -43,7 +43,7 @@ impl Vec[T] {
         i := 0
         while i < n {
             f(mem.ga_get[T](self.h, i))
-            i = i + 1
+            i += 1
         }
     }
 
@@ -53,7 +53,7 @@ impl Vec[T] {
         i := 0
         while i < n {
             out.push(f(mem.ga_get[T](self.h, i)))
-            i = i + 1
+            i += 1
         }
         return out
     }
@@ -65,7 +65,7 @@ impl Vec[T] {
         while i < n {
             x := mem.ga_get[T](self.h, i)
             if f(x) { out.push(x) }
-            i = i + 1
+            i += 1
         }
         return out
     }
@@ -76,7 +76,7 @@ impl Vec[T] {
         i := 0
         while i < n {
             acc = f(acc, mem.ga_get[T](self.h, i))
-            i = i + 1
+            i += 1
         }
         return acc
     }
@@ -86,7 +86,7 @@ impl Vec[T] {
         i := 0
         while i < n {
             if f(mem.ga_get[T](self.h, i)) { return true }
-            i = i + 1
+            i += 1
         }
         return false
     }
@@ -96,7 +96,7 @@ impl Vec[T] {
         i := 0
         while i < n {
             if !f(mem.ga_get[T](self.h, i)) { return false }
-            i = i + 1
+            i += 1
         }
         return true
     }
@@ -107,7 +107,7 @@ impl Vec[T] {
         while i < n {
             x := mem.ga_get[T](self.h, i)
             if f(x) { return Option.some(x) }
-            i = i + 1
+            i += 1
         }
         return Option[T].none
     }
@@ -120,7 +120,7 @@ impl Vec[T] {
         i := 0
         while i < n {
             mem.ga_push[T](dst, mem.ga_get[T](src, i))
-            i = i + 1
+            i += 1
         }
         width := 1
         flipped := false
@@ -135,12 +135,12 @@ impl Vec[T] {
                 while k < hi {
                     if r < hi && (l >= mid || less(mem.ga_get[T](src, r), mem.ga_get[T](src, l))) {
                         mem.ga_set[T](dst, k, mem.ga_get[T](src, r))
-                        r = r + 1
+                        r += 1
                     } else {
                         mem.ga_set[T](dst, k, mem.ga_get[T](src, l))
-                        l = l + 1
+                        l += 1
                     }
-                    k = k + 1
+                    k += 1
                 }
                 lo = hi
             }
@@ -148,13 +148,13 @@ impl Vec[T] {
             src = dst
             dst = t
             flipped = !flipped
-            width = width * 2
+            width *= 2
         }
         if flipped {
             i = 0
             while i < n {
                 mem.ga_set[T](self.h, i, mem.ga_get[T](src, i))
-                i = i + 1
+                i += 1
             }
         }
     }
@@ -174,7 +174,7 @@ pub struct VecIter[T] { v: Vec[T], i: int }
 
 impl VecIter[T] has iter.Iterator[T] {
     fn next(mut self) -> Option[T] {
-        self.i = self.i + 1
+        self.i += 1
         return self.v.get(self.i)
     }
 }
