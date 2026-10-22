@@ -41,52 +41,6 @@ pub fn check_span_growth() -> int {
     return gc_span_count()
 }
 
-pub fn gc_arena_count() -> int {
-    return gc_span_count()
-}
-
-# One explicit collection must bump the collection count from 0 to exactly 1. This is
-# the decisive falsifier of the bump-only/never-collect fallback: a non-collecting
-# allocator leaves `gc_stats()` at 0 here.
-pub fn forced_collect_count() -> int {
-    c := gc_alloc(16)
-    unsafe { store(c, 5) }
-    gc_collect()
-    return gc_stats()
-}
-
-# Churn unreachable cells past the growth watermark. A real collector fires at least one
-# synchronous collection along the way (each iteration's cell is dead the moment the local
-# is overwritten), so `gc_stats()` returns >= 1; a bump-only allocator returns 0.
-pub fn churn_collects() -> int {
-    i := 0
-    loop {
-        if i >= 20000 { break }
-        p := gc_alloc(64)
-        unsafe { store(p, i) }
-        i = i + 1
-    }
-    return gc_stats()
-}
-
-# A reference embedded BY VALUE inside an aggregate frame cell must be found by the
-# conservative whole-frame scan. `h` holds a `Ref[int]` boxing 7; churning forces a
-# collection while `h` is live in the frame, and the boxed 7 must survive it. Reads 7.
-struct Holder { r: Ref[int] }
-
-pub fn aggregate_survivor() -> int {
-    h := Holder { r: ref_new(7) }
-    i := 0
-    loop {
-        if i >= 20000 { break }
-        junk := gc_alloc(64)
-        unsafe { store(junk, i) }
-        i = i + 1
-    }
-    box := h.r
-    return ref_get(box)
-}
-
 # A self-referential cycle must be traced without the marker looping (the mark bit stops
 # re-push) and later swept without crashing. `cyc` builds two mutually-pointing cells and
 # collects while they are rooted (exercising the cycle trace); back here they are dead, and

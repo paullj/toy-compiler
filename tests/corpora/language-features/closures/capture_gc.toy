@@ -1,7 +1,7 @@
 # Feature: closures and their envs survive collections forced between making and calling them
 # expect: exit 42
 import std/vec
-import core/mem_selftest
+import std/gc
 
 struct Pt { x: int, y: int }
 
@@ -10,21 +10,25 @@ fn make(n: int, p: Pt, tag: str) -> fn() -> int {
 }
 
 fn churn() -> int {
+    before := gc.collections()
     i := 0
     loop {
         if i >= 20000 { break }
         j := i + 1000
         _g := fn() -> int { j }
+        junk: Vec[int] = []
+        junk.push(i)
         i = i + 1
     }
-    return mem_selftest.churn_collects()
+    return gc.collections() - before
 }
 
 fn main() -> int {
     f := make(10, Pt { x: 3, y: 4 }, "abc")
     fs: Vec[fn() -> int] = []
     for k in 0..3 { fs.push(make(k, Pt { x: 1, y: 1 }, "")) }
-    n := mem_selftest.forced_collect_count()
+    gc.collect()
+    n := gc.collections()
     c := churn()
     if n < 1 || c < 1 { return 1 }
     s := 0

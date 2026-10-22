@@ -2,11 +2,18 @@
 # expect: exit 41
 import std/vec
 import std/ref
-import core/mem_selftest
+import std/gc
+
+fn churn() {
+    for i in 0..20000 {
+        junk: Vec[int] = []
+        junk.push(i)
+    }
+}
 
 fn each_gc(xs: Vec[int], f: fn(int)) {
     for x in xs {
-        _c := mem_selftest.churn_collects()
+        churn()
         f(x)
     }
 }
@@ -22,6 +29,6 @@ fn main() -> int {
     g := adder(1)
     total := 0
     each_gc([1, 2], fn(x: int) { total = total + x + v[0] + s.len() + r.get() + g(0) })
-    _n := mem_selftest.forced_collect_count()
+    gc.collect()
     return total
 }

@@ -195,8 +195,23 @@ test "string: int/bool to_string render into a str comparable by content" {
 }
 
 const map_owned_key_src =
-    \\import core/map_selftest
-    \\fn main() -> int { return map_selftest.concat_str_key_survives() }
+    \\import std/gc
+    \\import std/map
+    \\fn main() -> int {
+    \\    m := Map[str, int].new()
+    \\    m.set("a".concat("aa"), 1)
+    \\    m.set("b".concat("bb"), 2)
+    \\    m.set("c".concat("cc"), 3)
+    \\    gc.collect()
+    \\    m.set("a".concat("aa"), 10)
+    \\    gc.collect()
+    \\    if m.len() != 3 { return 1 }
+    \\    a := match m.get("aaa") { .some(v) -> v, .none -> -1 }
+    \\    if a != 10 { return 2 }
+    \\    b := match m.get("bbb") { .some(v) -> v, .none -> -1 }
+    \\    if b != 2 { return 3 }
+    \\    return 0
+    \\}
     \\
 ;
 
@@ -258,7 +273,7 @@ test "string: split, trim and join results survive forced collections" {
     const codes = try harness.exitAtBothLevels(gpa, io, ".toy-test-string-split-gc",
         \\import std/str
         \\import std/vec
-        \\import core/mem_selftest
+        \\import std/gc
         \\fn main() -> int {
         \\    src := "x".concat("alpha, beta ,gamma,delta  ")
         \\    parts := src.split(",") |> .map(fn(p) { p.trim() })
@@ -268,9 +283,9 @@ test "string: split, trim and join results survive forced collections" {
         \\        _j := junk.len()
         \\        i = i + 1
         \\    }
-        \\    _c := mem_selftest.forced_collect_count()
+        \\    gc.collect()
         \\    keep := parts.filter(fn(p) { p.ends_with("a") })
-        \\    _d := mem_selftest.forced_collect_count()
+        \\    gc.collect()
         \\    joined := "|".join(keep)
         \\    if joined != "xalpha|beta|gamma|delta" { return 1 }
         \\    if "a-b".replace("-", "x".concat("y")) != "axyb" { return 2 }
@@ -296,7 +311,7 @@ test "string: a join's buffer survives collections around it, over thousands of 
     const codes = try harness.exitAtBothLevels(gpa, io, ".toy-test-string-join-gc",
         \\import std/str
         \\import std/vec
-        \\import core/mem_selftest
+        \\import std/gc
         \\fn main() -> int {
         \\    parts: Vec[str] = []
         \\    i := 0
@@ -308,7 +323,7 @@ test "string: a join's buffer survives collections around it, over thousands of 
         \\    k := 0
         \\    while k < 40 {
         \\        s := ",".join(parts)
-        \\        _c := mem_selftest.forced_collect_count()
+        \\        gc.collect()
         \\        junk: Vec[str] = ["a".concat("b"), "c".concat("d")]
         \\        _j := junk.len()
         \\        if !s.starts_with("p0,p1,p2,") || !s.ends_with(",p2998,p2999") { return 1 }
@@ -377,7 +392,7 @@ test "string: a chars iterator keeps its string alive" {
     const live = try harness.exitAtBothLevels(gpa, io, ".toy-test-string-chars-live",
         \\import std/str
         \\import std/vec
-        \\import core/mem_selftest
+        \\import std/gc
         \\fn churn() {
         \\    i := 0
         \\    while i < 500 {
@@ -390,7 +405,7 @@ test "string: a chars iterator keeps its string alive" {
         \\    total := 0
         \\    for c in "h".concat("é€😀").chars() {
         \\        churn()
-        \\        _x := mem_selftest.forced_collect_count()
+        \\        gc.collect()
         \\        k: int = c.into()
         \\        total = total + k
         \\    }
@@ -402,20 +417,20 @@ test "string: a chars iterator keeps its string alive" {
     const held = try harness.exitAtBothLevels(gpa, io, ".toy-test-string-chars-held",
         \\import std/str
         \\import std/vec
-        \\import core/mem_selftest
+        \\import std/gc
         \\fn mk() -> Chars[char] {
         \\    return "h".concat("é€").chars()
         \\}
         \\fn main() -> int {
         \\    it := mk()
-        \\    _x := mem_selftest.forced_collect_count()
+        \\    gc.collect()
         \\    g := Vec[int].new()
         \\    i := 0
         \\    while i < 2000 {
         \\        g.push(i)
         \\        i = i + 1
         \\    }
-        \\    _y := mem_selftest.forced_collect_count()
+        \\    gc.collect()
         \\    total := 0
         \\    for c in it {
         \\        k: int = c.into()

@@ -1,11 +1,11 @@
 //! End-to-end coverage for the leaking span bump allocator.
 //!
-//! The allocator has no user-facing surface, so it is exercised through a bundled,
-//! allowlisted `core/mem_selftest` module whose `pub` self-checks prove each invariant
-//! in toy and surface the result as the program's EXIT CODE — the only thing this
-//! harness can observe of the compiled child (it cannot inspect the child's heap
-//! in-process). Each case writes a tiny entry program that `import core/mem_selftest`,
-//! compiles it with the installed `toy` binary, runs the result, and asserts the exit.
+//! Each case surfaces its result as the program's EXIT CODE, the only thing this harness
+//! can observe of the compiled child (it cannot inspect the child's heap in-process).
+//! Collections are forced and counted through `std/gc`; the raw heap invariants that no
+//! std API reaches are proven by the bundled `core/mem_selftest` self-checks. Each case
+//! writes a tiny entry program, compiles it with the installed `toy` binary, runs the
+//! result, and asserts the exit.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -152,36 +152,53 @@ test "gc: an explicit collection bumps the collection count to 1" {
     defer threaded.deinit();
     const io = threaded.io();
     const code = try buildAndRun(gpa, io, ".toy-test-gc-forced",
-        \\import core/mem_selftest
-        \\fn main() -> int { return mem_selftest.forced_collect_count() }
+        \\import std/gc
+        \\fn main() -> int {
+        \\    gc.collect()
+        \\    return gc.collections()
+        \\}
         \\
     );
     try std.testing.expectEqual(@as(u8, 1), code);
 }
 
-test "gc: churning unreachable arrays forces at least one collection (falsifies never-collect)" {
-    // The decisive proof that a collection ACTUALLY runs — a bump-only allocator would
-    // leave gc_stats().collections at 0 here even though collect.toy still exits 15.
+test "gc: churning unreachable Vecs triggers at least one collection (falsifies never-collect)" {
+    // The decisive proof that allocation alone triggers a collection: nothing here forces
+    // one, so a bump-only allocator leaves the count at 0.
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const code = try buildAndRun(gpa, io, ".toy-test-gc-churn",
-        \\import core/mem_selftest
-        \\fn main() -> int { return mem_selftest.churn_collects() }
+        \\import std/gc
+        \\import std/vec
+        \\fn main() -> int {
+        \\    for i in 0..20000 {
+        \\        junk: Vec[int] = []
+        \\        junk.push(i)
+        \\    }
+        \\    return gc.collections()
+        \\}
         \\
     );
     try std.testing.expect(code >= 1);
 }
 
-test "gc: a struct-embedded growable survives a forced collection (conservative whole-frame scan)" {
+test "gc: a Ref embedded in a struct local survives a forced collection (whole-frame scan)" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     const code = try buildAndRun(gpa, io, ".toy-test-gc-aggregate",
-        \\import core/mem_selftest
-        \\fn main() -> int { return mem_selftest.aggregate_survivor() }
+        \\import std/gc
+        \\import std/ref
+        \\struct Holder { r: Ref[int] }
+        \\fn main() -> int {
+        \\    h := Holder { r: Ref.new(7) }
+        \\    gc.collect()
+        \\    for i in 0..20000 { _junk := Ref.new(i) }
+        \\    return h.r.get()
+        \\}
         \\
     );
     try std.testing.expectEqual(@as(u8, 7), code);
@@ -414,13 +431,19 @@ test "gc: forced collection count is deterministic across identical runs (waterm
     defer threaded.deinit();
     const io = threaded.io();
     const a = try buildAndRun(gpa, io, ".toy-test-gc-detcount-a",
-        \\import core/mem_selftest
-        \\fn main() -> int { return mem_selftest.forced_collect_count() }
+        \\import std/gc
+        \\fn main() -> int {
+        \\    gc.collect()
+        \\    return gc.collections()
+        \\}
         \\
     );
     const b = try buildAndRun(gpa, io, ".toy-test-gc-detcount-b",
-        \\import core/mem_selftest
-        \\fn main() -> int { return mem_selftest.forced_collect_count() }
+        \\import std/gc
+        \\fn main() -> int {
+        \\    gc.collect()
+        \\    return gc.collections()
+        \\}
         \\
     );
     try std.testing.expectEqual(a, b);
@@ -567,6 +590,17 @@ test "gc: a container slot is cleared before a collection can scan it" {
     try std.testing.expectEqual(@as(u8, 10), code);
 }
 
+const churn_src =
+    \\fn churn() -> int {
+    \\    for i in 0..20000 {
+    \\        junk: Vec[int] = []
+    \\        junk.push(i)
+    \\    }
+    \\    return gc.collections()
+    \\}
+    \\
+;
+
 test "gc: an enum word that is a container in one variant only is word-scanned" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -577,52 +611,61 @@ test "gc: an enum word that is a container in one variant only is word-scanned" 
     const cases = [_]struct { src: []const u8, want: u8 }{
         .{ .src =
         \\import std/vec
-        \\import core/mem_selftest
+        \\import std/gc
         \\enum E { b(int, int, Vec[int]), a(int, fn() -> int) }
         \\struct Pt { x: int, y: int }
         \\fn mk(k: int) -> fn() -> int {
         \\    p := Pt { x: k, y: k }
         \\    fn() -> int { p.x + p.y }
         \\}
-        \\fn main() -> int {
-        \\    e := E.a(1, mk(5))
-        \\    n := mem_selftest.churn_collects()
-        \\    m := mem_selftest.forced_collect_count()
-        \\    r := match e { .a(k, f) -> k + f(), .b(_, _, v) -> v.len() }
-        \\    if n < 1 || m < 1 { return 1 }
-        \\    return r
-        \\}
         \\
+        ++ churn_src ++
+            \\fn main() -> int {
+            \\    e := E.a(1, mk(5))
+            \\    n := churn()
+            \\    gc.collect()
+            \\    m := gc.collections()
+            \\    r := match e { .a(k, f) -> k + f(), .b(_, _, v) -> v.len() }
+            \\    if n < 1 || m < 1 { return 1 }
+            \\    return r
+            \\}
+            \\
         , .want = 11 },
         .{ .src =
         \\import std/ref
         \\import std/vec
-        \\import core/mem_selftest
+        \\import std/gc
         \\enum E { b(int, int, Vec[int]), a(int, int, Ref[int]) }
-        \\fn main() -> int {
-        \\    e := E.a(1, 2, Ref.new(5))
-        \\    n := mem_selftest.churn_collects()
-        \\    m := mem_selftest.forced_collect_count()
-        \\    r := match e { .a(k, _, rr) -> k + rr.get(), .b(_, _, v) -> v.len() }
-        \\    if n < 1 || m < 1 { return 1 }
-        \\    return r
-        \\}
         \\
+        ++ churn_src ++
+            \\fn main() -> int {
+            \\    e := E.a(1, 2, Ref.new(5))
+            \\    n := churn()
+            \\    gc.collect()
+            \\    m := gc.collections()
+            \\    r := match e { .a(k, _, rr) -> k + rr.get(), .b(_, _, v) -> v.len() }
+            \\    if n < 1 || m < 1 { return 1 }
+            \\    return r
+            \\}
+            \\
         , .want = 6 },
         .{ .src =
         \\import std/vec
-        \\import core/mem_selftest
+        \\import std/gc
         \\enum E { b(int, Vec[int]), a(int, str) }
-        \\fn main() -> int {
-        \\    x := 12345
-        \\    e := E.a(1, x.to_string())
-        \\    n := mem_selftest.churn_collects()
-        \\    m := mem_selftest.forced_collect_count()
-        \\    r := match e { .a(k, s) -> k + s.len(), .b(_, v) -> v.len() }
-        \\    if n < 1 || m < 1 { return 1 }
-        \\    return r
-        \\}
         \\
+        ++ churn_src ++
+            \\fn main() -> int {
+            \\    x := 12345
+            \\    e := E.a(1, x.to_string())
+            \\    n := churn()
+            \\    gc.collect()
+            \\    m := gc.collections()
+            \\    r := match e { .a(k, s) -> k + s.len(), .b(_, v) -> v.len() }
+            \\    if n < 1 || m < 1 { return 1 }
+            \\    return r
+            \\}
+            \\
         , .want = 6 },
     };
     for (cases, 0..) |cs, i| {

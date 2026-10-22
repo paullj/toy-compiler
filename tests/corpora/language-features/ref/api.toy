@@ -6,9 +6,18 @@
 # `Ref[Ref[int]]` reaches the inner cell through `rr.get()`.
 import std/ref
 import std/vec
-import core/mem_selftest
+import std/gc
 
 struct P { x: int, y: int }
+
+# A reference embedded by value in an aggregate local is found by the frame scan.
+struct Holder { r: Ref[int] }
+
+fn aggregate_survivor() -> int {
+    h := Holder { r: Ref.new(7) }
+    gc.collect()
+    return h.r.get()
+}
 
 fn main() -> int {
     r := Ref.new(41)
@@ -23,15 +32,19 @@ fn main() -> int {
         xs.push(Ref.new(i))
         i = i + 1
     }
-    n := mem_selftest.churn_collects()
-    if n < 1 { return 3 }
+    before := gc.collections()
+    for k in 0..20000 {
+        junk: Vec[int] = []
+        junk.push(k)
+    }
+    if gc.collections() == before { return 3 }
     t := 0
     for c in xs { t = t + c.get() }
     if t != 1225 { return 4 }
     p := Ref.new(P { x: 1, y: 2 })
     q := p
     q.set(P { x: 5, y: 6 })
-    if mem_selftest.aggregate_survivor() != 7 { return 5 }
+    if aggregate_survivor() != 7 { return 5 }
     rr := Ref.new(Ref.new(3))
     inner := rr.get()
     rr.get().set(10)

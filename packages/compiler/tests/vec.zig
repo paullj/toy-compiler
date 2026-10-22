@@ -858,7 +858,7 @@ test "vec: Vec closure methods keep their results across forced collections" {
     // insertion order. 10 * 3 + 30 * 4 = 150.
     const codes = try harness.exitAtBothLevels(gpa, io, ".toy-test-vec-closure-gc",
         \\import std/vec
-        \\import core/mem_selftest
+        \\import std/gc
         \\fn main() -> int {
         \\    xs: Vec[str] = []
         \\    i := 0
@@ -867,28 +867,28 @@ test "vec: Vec closure methods keep their results across forced collections" {
         \\        i = i + 1
         \\    }
         \\    ys := xs.map(fn(s) {
-        \\        _c := mem_selftest.forced_collect_count()
+        \\        gc.collect()
         \\        s.concat("!")
         \\    })
         \\    i = 0
         \\    while i < 40 {
-        \\        if ys.get(i).unwrap() != xs.get(i).unwrap().concat("!") { return 1 }
+        \\        if ys[i] != xs[i].concat("!") { return 1 }
         \\        i = i + 1
         \\    }
         \\    ys.sort_by(fn(a, b) {
-        \\        _c := mem_selftest.forced_collect_count()
+        \\        gc.collect()
         \\        a.len() < b.len()
         \\    })
         \\    short := ys.filter(fn(s) {
-        \\        _c := mem_selftest.forced_collect_count()
+        \\        gc.collect()
         \\        s.len() == 3
         \\    })
         \\    joined := short.fold("", fn(acc, s) {
-        \\        _c := mem_selftest.forced_collect_count()
+        \\        gc.collect()
         \\        acc.concat(s)
         \\    })
         \\    if joined != "k0!k5!k4!k9!k3!k8!k2!k7!k1!k6!" { return 2 }
-        \\    if ys.get(10).unwrap() != "k17!" { return 3 }
+        \\    if ys[10] != "k17!" { return 3 }
         \\    return ys.fold(0, fn(acc, s) { acc + s.len() })
         \\}
         \\

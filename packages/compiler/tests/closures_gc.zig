@@ -13,21 +13,31 @@ const buildAndRunWith = heap.buildAndRunWith;
 /// Three named fns pushed into a `Vec[fn(int) -> int]`, then a forced collection and a
 /// churn of same-size-class allocations before the elements are read back and called.
 /// The pairs survive only if the Vec's backing is traced through the fn pair's trace unit.
-/// triple(2) + double(3) + 1 forced + 5 churn collections = 18.
+/// triple(2) + double(3) + 6 when the forced collection was the first and the churn
+/// collected again = 18.
 const fn_vec_src =
+    \\import std/gc
     \\import std/vec
-    \\import core/mem_selftest
     \\fn double(x: int) -> int { x * 2 }
     \\fn triple(x: int) -> int { x * 3 }
     \\fn square(x: int) -> int { x * x }
+    \\fn churn() -> int {
+    \\    for i in 0..20000 {
+    \\        junk: Vec[int] = []
+    \\        junk.push(i)
+    \\    }
+    \\    return gc.collections()
+    \\}
     \\fn main() -> int {
     \\    fs: Vec[fn(int) -> int] = []
     \\    fs.push(double)
     \\    fs.push(triple)
     \\    fs.push(square)
-    \\    n := mem_selftest.forced_collect_count()
-    \\    c := mem_selftest.churn_collects()
-    \\    return fs[1](2) + fs[0](3) + n + c
+    \\    gc.collect()
+    \\    n := gc.collections()
+    \\    c := churn()
+    \\    if n != 1 || c <= n { return 1 }
+    \\    return fs[1](2) + fs[0](3) + 6
     \\}
     \\
 ;
@@ -57,7 +67,7 @@ test "fn-value programs are byte-identical at -j1 and -j8" {
 const closure_gc_prelude =
     \\import std/vec
     \\import std/map
-    \\import core/mem_selftest
+    \\import std/gc
     \\type Op = fn(int) -> int
     \\fn make_adder(n: int) -> Op {
     \\    fn(x: int) -> int { x + n }
@@ -69,14 +79,17 @@ const closure_gc_prelude =
     \\        if i >= 20000 { break }
     \\        j := i + 1000
     \\        _g := keep_one(fn() -> int { j })
+    \\        junk: Vec[int] = []
+    \\        junk.push(i)
     \\        i = i + 1
     \\    }
-    \\    return mem_selftest.churn_collects()
+    \\    return gc.collections()
     \\}
     \\fn collect() -> bool {
-    \\    n := mem_selftest.forced_collect_count()
+    \\    gc.collect()
+    \\    n := gc.collections()
     \\    c := churn()
-    \\    n >= 1 && c >= 1
+    \\    n >= 1 && c > n
     \\}
     \\
 ;

@@ -4,11 +4,19 @@
 import std/io
 import std/ref
 import std/map
-import core/mem_selftest
+import std/gc
+import std/vec
 
 fn pick(o: Option[Ref[int]]) -> Option[int] {
     r := o?
     return .some(r.get())
+}
+
+fn churn() {
+    for i in 0..20000 {
+        junk: Vec[int] = []
+        junk.push(i)
+    }
 }
 
 fn main() -> int {
@@ -20,11 +28,13 @@ fn main() -> int {
     m := Map[str, Ref[int]].new()
     m.set("a", Ref.new(3))
     c := match m.get("a") { .some(c) -> c, .none -> Ref.new(0) }
-    mem_selftest.churn_collects()
+    before := gc.collections()
+    churn()
+    if gc.collections() == before { return 1 }
     c.set(c.get() + 1)
-    io.println(m.get("a").unwrap().get())
+    io.println(match m.get("a") { .some(x) -> x.get(), .none -> 0 })
     l := loop { break Ref.new(7) }
     io.println(l.get())
-    io.println(pick(.some(r)).unwrap_or(0))
-    return pick(.none).unwrap_or(-1) + 1
+    io.println(match pick(.some(r)) { .some(v) -> v, .none -> 0 })
+    return match pick(.none) { .some(v) -> v, .none -> 0 }
 }
