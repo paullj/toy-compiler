@@ -1,0 +1,9 @@
+# Only a bundled module may import core/*: its primitives skip the bounds checks std
+# makes, so this read past the end would crash (#36). R0013 sits on the import path.
+import core/mem  #~ ERROR [R0013] module 'core/mem' is private to the standard library; import std/vec, std/map or std/set instead
+
+fn main() -> int {
+    a := mem.ga_new[int]()
+    mem.ga_push[int](a, 7)
+    return mem.ga_get[int](a, 100000)
+}

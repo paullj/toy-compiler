@@ -34,7 +34,7 @@ test "desc: descriptor_of + call_indirect on struct/str/int keys matches the inl
     Io.Dir.cwd().deleteTree(io, dir) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
 
-    const prog = try compile(gpa, io, dir, selftest_src, &.{});
+    const prog = try compile(gpa, io, dir, selftest_src, &.{harness.dev_core_imports});
     defer gpa.free(prog);
     var run = try std.process.spawn(io, .{ .argv = &.{prog} });
     const term = try run.wait(io);
@@ -54,5 +54,5 @@ test "desc: the descriptor-table program is byte-identical at -j1 and -j8" {
 
     // The descriptor table + erased units are pure functions of source (canonical order), so
     // codegen is `-jN` byte-identical.
-    try harness.expectDeterministicBuild(gpa, io, ".toy-test-desc-determinism", selftest_src, &.{}, null);
+    try harness.expectDeterministicBuild(gpa, io, ".toy-test-desc-determinism", selftest_src, &.{harness.dev_core_imports}, null);
 }

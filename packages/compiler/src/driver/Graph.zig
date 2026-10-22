@@ -84,8 +84,9 @@ pub const Module = struct {
     }
 
     /// The bundled `core/` layer — the sole place `extern` decls and heap
-    /// intrinsics may be declared/named. `std/` is bundled but NOT core, so it
-    /// calls core's safe members without itself naming an intrinsic.
+    /// intrinsics may be declared/named, and private to the bundle: only a bundled
+    /// module may import it (R0013). `std/` is bundled but NOT core, so it calls
+    /// core's members without itself naming an intrinsic.
     pub fn isCore(m: Module) bool {
         return m.bundled and std.mem.startsWith(u8, m.path, "core/");
     }
@@ -165,6 +166,9 @@ pub const Graph = struct {
     modules: []Module = &.{},
     entry_index: u32 = 0,
     err: ?Error = null,
+    /// Lets a user module import `core/*` (`--dev-core-imports`): the raw heap and
+    /// descriptor self-checks have no std surface until the testing epic.
+    allow_core_imports: bool = false,
 
     pub const Ownership = enum { owned, borrowed };
 
@@ -207,6 +211,8 @@ pub const DiscoverOptions = struct {
     /// Bundled modules already lexed and parsed by an earlier discover (see
     /// `BundledCache`). BORROWED; null => every bundled module is lexed and parsed.
     bundled_cache: ?*BundledCache = null,
+    /// Sets `Graph.allow_core_imports`.
+    allow_core_imports: bool = false,
 };
 
 /// The bundled modules a long-lived caller (an editor session) keeps parsed between
@@ -331,7 +337,9 @@ pub fn discover(
         else => |err| return err,
     };
 
-    return d.toGraph(root_id);
+    var g = try d.toGraph(root_id);
+    g.allow_core_imports = opts.allow_core_imports;
+    return g;
 }
 
 /// Build the trivial one-module graph from an ALREADY lexed+parsed single source.
@@ -906,6 +914,17 @@ const Discoverer = struct {
                 continue;
             }
 
+            // A user file must not stand in for a bundled module the bundle lacks, so
+            // these prefixes never reach the disk.
+            if (std.mem.startsWith(u8, path, "core/") or std.mem.startsWith(u8, path, "std/")) {
+                return d.fail(.{
+                    .kind = .missing,
+                    .message = try std.fmt.allocPrint(d.gpa, "imported module '{s}' not found (the 'core/' and 'std/' import paths name only standard library modules)", .{path}),
+                    .module = id,
+                    .span = import_span,
+                });
+            }
+
             // Validate + resolve to an on-disk file under the root.
             const file = resolveFile(d.gpa, d.root, path) catch |e| switch (e) {
                 error.PathEscape => return d.fail(.{
@@ -1287,6 +1306,27 @@ test "discover: missing import errors cleanly with location" {
         }
     };
     try withFixture(".toy-test-graph-missing", files, "main.toy", Check.run);
+}
+
+test "discover: a core/ or std/ path the bundle lacks is missing, even with that file on disk" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import std/nope
+        \\fn main() -> int { return 0 }
+        \\
+        },
+        .{ .path = "std/nope.toy", .source = "pub fn f() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            try testing.expect(g.err != null);
+            try testing.expectEqual(Error.Kind.missing, g.err.?.kind);
+            try testing.expectEqual(codes.Code.R0003, g.err.?.code());
+            try testing.expect(std.mem.indexOf(u8, g.err.?.message, "std/nope") != null);
+            try testing.expectEqual(@as(usize, 1), g.modules.len);
+        }
+    };
+    try withFixture(".toy-test-graph-reserved", files, "main.toy", Check.run);
 }
 
 test "discover: self-import is a cycle" {

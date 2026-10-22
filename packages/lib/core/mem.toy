@@ -144,9 +144,10 @@ pub fn mp_val_at[K, V](m: gc_array[int], i: int) -> V {
 # The erased probe: the ONE place the key's hash/eq are consumed, via the key descriptor's
 # function offsets resolved off text_base and call_indirect'd on raw key bytes (the exact
 # desc_selftest pattern). Returns the entry index of `k`, or -1 when absent. The face's `has
-# Hashable` bound rejects a non-Hashable key at compile time, but a raw `import core/mem`
-# reaches these unbounded functions directly; a key with no hash/eq (offset 24/32 zero) would
-# `call_indirect` into text_base and jump wild, so the guard turns that into a clean panic.
+# Hashable` bound rejects a non-Hashable key at compile time, but a bundled module (or a dev
+# build's --dev-core-imports self-check) reaches these unbounded functions directly; a key with
+# no hash/eq (offset 24/32 zero) would `call_indirect` into text_base and jump wild, so the
+# guard turns that into a clean panic.
 # The bound cannot move here: the raw `load`-into-`K` idiom needs a monomorphized (concrete)
 # K, which a bound's abstract-template checking forbids. Guarding inside these generic bodies
 # (not a shared non-generic helper) keeps the emit demand-driven, so no non-Map program shifts.

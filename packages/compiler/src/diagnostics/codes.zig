@@ -52,6 +52,7 @@ pub const Code = enum(u16) {
     R0010, // extern-not-in-core (an `extern fn` declared outside a `core/` module)
     R0011, // duplicate-binding (a name declared twice in one parameter list, pattern or block)
     R0012, // import-cycle (imports that lead back to a module that is still being imported)
+    R0013, // core-import-private (a user module imports a bundled `core/` module)
 
     // Type band (T####).
     T0001, // unknown-type
@@ -196,6 +197,7 @@ pub const table = [_]Entry{
     .{ .code = .R0010, .str = "R0010", .slug = "extern-not-in-core" },
     .{ .code = .R0011, .str = "R0011", .slug = "duplicate-binding", .related = "first declared here" },
     .{ .code = .R0012, .str = "R0012", .slug = "import-cycle" },
+    .{ .code = .R0013, .str = "R0013", .slug = "core-import-private" },
     .{ .code = .T0001, .str = "T0001", .slug = "unknown-type" },
     .{ .code = .T0002, .str = "T0002", .slug = "unknown-module" },
     .{ .code = .T0003, .str = "T0003", .slug = "module-has-no-type" },
@@ -621,6 +623,8 @@ test "str/defaultSeverity/slug for none and a real code" {
     // The codes that gave every former uncoded diagnostic one.
     try testing.expectEqualStrings("duplicate-binding", slug(.R0011).?);
     try testing.expectEqual(Code.R0012, fromStr("R0012").?);
+    try testing.expectEqualStrings("core-import-private", slug(.R0013).?);
+    try testing.expectEqual(Severity.err, defaultSeverity(.R0013));
     try testing.expectEqualStrings("type-arg-count", slug(.T0054).?);
     try testing.expectEqualStrings("main-params", slug(.T0073).?);
     try testing.expectEqual(Code.T0073, fromStr("T0073").?);

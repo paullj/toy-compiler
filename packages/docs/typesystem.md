@@ -356,7 +356,8 @@ method, so the pick never depends on the import order and a program keeps its ow
 method when std gains one of that name. Between two of the program's own modules, the
 first in import order wins. A call written in a bundled module (`std/*`, `core/*`)
 reaches the bundled method; std's bodies are immune to the program's methods, because
-their bounds and results come from their own methods and the builtins.
+their bounds and results come from their own methods and the builtins. Only a bundled
+module may import `core/*` (**R0013**).
 
 A program's method may also take the name of a builtin on a builtin type (`str`'s
 `len`, `byte_at`, `concat` and `to_string`, a scalar's `eq`, `hash` and `to_string`,

@@ -149,12 +149,19 @@ pub fn runStderr(gpa: std.mem.Allocator, io: Io, prog: []const u8) !struct { err
 /// Build `src` at -O0 and at -O1 into separate dirs under `dir`, run each, and expect
 /// `want` on stdout from both.
 pub fn expectStdoutAtBothLevels(gpa: std.mem.Allocator, io: Io, dir: []const u8, src: []const u8, want: []const u8) !void {
+    return expectStdoutAtBothLevelsWith(gpa, io, dir, src, &.{}, want);
+}
+
+/// `expectStdoutAtBothLevels` with extra build `flags`.
+pub fn expectStdoutAtBothLevelsWith(gpa: std.mem.Allocator, io: Io, dir: []const u8, src: []const u8, flags: []const []const u8, want: []const u8) !void {
     Io.Dir.cwd().deleteTree(io, dir) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
     for ([_][]const u8{ "-O0", "-O1" }) |level| {
         const sub = try std.fmt.allocPrint(gpa, "{s}/{s}", .{ dir, level[1..] });
         defer gpa.free(sub);
-        const prog = try compile(gpa, io, sub, src, &.{ "--no-cache", level });
+        const args = try std.mem.concat(gpa, []const u8, &.{ &.{ "--no-cache", level }, flags });
+        defer gpa.free(args);
+        const prog = try compile(gpa, io, sub, src, args);
         defer gpa.free(prog);
         const out = try runStdout(gpa, io, prog);
         defer gpa.free(out);
@@ -245,6 +252,10 @@ fn countToy(gpa: std.mem.Allocator, io: Io, path: []const u8) !usize {
     }
     return n;
 }
+
+/// Lets a test program import `core/*`: the raw heap, descriptor and text self-checks
+/// have no std surface until the testing epic.
+pub const dev_core_imports = "--dev-core-imports";
 
 /// `compile` + `runExit` in a fresh `dir`, removed afterwards.
 pub fn buildAndRun(gpa: std.mem.Allocator, io: Io, dir: []const u8, src: []const u8) !u8 {

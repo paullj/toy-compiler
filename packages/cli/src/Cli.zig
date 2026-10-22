@@ -27,13 +27,20 @@ const emit_opt: []const Spec.Option = if (dev_inspect) &.{
     .{ .long = "emit", .value = .{ .@"enum" = &.{ "lex", "parse", "ir" } }, .value_name = "STAGE", .help = "Inspect the pipeline instead of building (no binary; dev builds only)" },
 } else &.{};
 
+/// Lets a user module import `core/*` (R0013 off), for the raw heap and descriptor
+/// self-checks that have no std surface until the testing epic. Dev builds only, so a
+/// release binary keeps `core/` private.
+const dev_core_opt: []const Spec.Option = if (dev_inspect) &.{
+    .{ .long = "dev-core-imports", .action = .set_true, .help = "Let user modules import core/* (dev builds only)" },
+} else &.{};
+
 /// `--target`, shared by every command that takes it, so `check` validates it too.
 const target_opt: Spec.Option = .{ .long = "target", .value = .{ .@"enum" = &toyc.Driver.targets }, .value_name = "TARGET", .help = "Compilation target (default: " ++ toyc.Driver.default_target ++ ")" };
 
 const pass_names = std.meta.fieldNames(toyc.Opt.Pass);
 
-// The build/inspect options MINUS `--emit` (spliced in via `emit_opt` so it can be
-// gated behind `dev_inspect`). `shared_opts` below is `pre_emit ++ emit_opt ++ post_emit`.
+// The build/inspect options MINUS the dev-only ones (`emit_opt`, `dev_core_opt`, spliced
+// in so they can be gated behind `dev_inspect`). `shared_opts` below is `pre_emit ++ emit_opt ++ dev_core_opt ++ post_emit`.
 const pre_emit: []const Spec.Option = &.{
     .{ .long = "output", .short = 'o', .value = .string, .value_name = "PATH", .help = "Output path for the built binary (default: .toy/<stamp>/build/<name>)" },
     target_opt,
@@ -71,7 +78,7 @@ const sev_opts: []const Spec.Option = &.{
 /// only when `dev_inspect` is true (Debug builds + test binaries); a release build
 /// drops it entirely. `--target` is not defaulted in-spec; the driver applies
 /// `Driver.default_target` when it is absent.
-const shared_opts: []const Spec.Option = pre_emit ++ emit_opt ++ post_emit;
+const shared_opts: []const Spec.Option = pre_emit ++ emit_opt ++ dev_core_opt ++ post_emit;
 
 /// The variadic input-file positional, shared by root/build/run.
 const files_pos: []const Spec.Positional = &.{
@@ -94,7 +101,7 @@ const check_opts: []const Spec.Option = &[_]Spec.Option{
     .{ .long = "color", .value = .{ .@"enum" = &.{ "auto", "always", "never" } }, .value_name = "WHEN", .help = "Colorize output (default auto: on when stdout is a tty)" },
     target_opt,
     .{ .long = "timings", .action = .set_true, .help = "Print the per-stage wall-clock profile" },
-};
+} ++ dev_core_opt;
 
 /// The build options `check` does not take, so that using one names it as a build option.
 const check_declined: []const Spec.Option = blk: {
@@ -171,6 +178,8 @@ const std = @import("std");
 comptime {
     if (hasLong(shared_opts, "emit") != dev_inspect)
         @compileError("`--emit` presence on shared_opts must equal build_options.dev_inspect");
+    if (hasLong(shared_opts, "dev-core-imports") != dev_inspect or hasLong(check_opts, "dev-core-imports") != dev_inspect)
+        @compileError("`--dev-core-imports` presence must equal build_options.dev_inspect");
     if (hasLong(check_opts, "emit"))
         @compileError("`check` must never register `--emit`");
     // check_opts must carry ONLY the restricted, non-codegen knobs.
