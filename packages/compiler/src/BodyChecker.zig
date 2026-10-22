@@ -643,7 +643,10 @@ pub const BodyChecker = struct {
                 }
                 if (target.tag == .field_access or target.tag == .tuple_field) switch (bc.storeRoot(stmt.lhs)) {
                     .name => {},
-                    .index_element => try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0070 }, "cannot assign to a field of an index element `xs[i].field`; the element is a temporary copy, so the write would be lost", .{}),
+                    // `ps[i].f = v` writes the element back; a compound one would also read
+                    // the field, which has no lowering yet.
+                    .index_element => if (bc.tokens[stmt.main_token].tag != .eq)
+                        try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0070 }, "cannot assign to a field of an index element `xs[i].field` with a compound operator; write `xs[i].field = xs[i].field op v`", .{}),
                     .temporary => if (lhs.kind != .invalid)
                         try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0075 }, "cannot assign to a field of a temporary value, such as a call result; it is a copy, so the write would be lost", .{}),
                 };
@@ -4706,11 +4709,11 @@ pub const BodyChecker = struct {
         };
     }
 
-    /// What a `.field`/`.tuple_field` store chain bottoms out at. Only a name can be a
-    /// place: an index element (`ps[i]` — an `.index` node, or a value-headed `type_app`
-    /// the parser could not tell from a turbofish) or any other temporary (`p.get()`,
-    /// `o?`) has no addressable home, and `lower`'s place-addr materializes it into a
-    /// temp, so a store through it would write the copy and silently drop the write.
+    /// What a `.field`/`.tuple_field` store chain bottoms out at. A name is a place. An
+    /// index element (`ps[i]` — an `.index` node, or a value-headed `type_app` the parser
+    /// could not tell from a turbofish) is copied in and written back by `lower`. Any other
+    /// temporary (`p.get()`, `o?`) has no home to write back to, so a store through it
+    /// would write the copy and silently drop the write.
     const StoreRoot = enum { name, index_element, temporary };
 
     fn storeRoot(bc: *BodyChecker, node_idx: Ast.Index) StoreRoot {

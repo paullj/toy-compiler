@@ -88,8 +88,8 @@ pub const CallVisitor = struct {
     /// CallVisitor constructions that don't fold a `?` widen stay unchanged; a `.try_operator`
     /// with no threaded sig folds nothing (`orelse return`).
     fn_sig: ?Sig = null,
-    /// The element store `xs[i] = v` or `xs[i] op= v` being walked, whose index folds
-    /// `ga_set_at`.
+    /// The element store `xs[i] = v`, `xs[i] op= v` or `xs[i].f = v` being walked, whose
+    /// element folds `ga_set_at`.
     store_target: ?Ast.IndexStore = null,
 
     pub fn on(self: *Self, ev: Walk.Event) error{OutOfMemory}!void {
@@ -185,11 +185,10 @@ pub const CallVisitor = struct {
             .empty_list, .list_literal => for (StdNames.desugarMethods(tag)) |dm| {
                 if (Typecheck.findMethod(fr.methods, fr.nodes.typeOf(idx), dm.name)) |m| try self.foldWitness(m);
             },
-            .index => {
+            .index, .type_app => if (tag == .index or (fr.resolutions.len == fr.tree.nodes.len and symbols_res.leftmostHeadIsValue(fr.tree, fr.resolutions, n.lhs))) {
                 const store = if (self.store_target) |st| (if (st.index == idx) st else null) else null;
                 for (StdNames.ElemPrim.of(store)) |prim| try self.foldElemPrim(idx, prim);
             },
-            .type_app => if (fr.resolutions.len == fr.tree.nodes.len and symbols_res.leftmostHeadIsValue(fr.tree, fr.resolutions, n.lhs)) try self.foldElemPrim(idx, .at),
             else => {},
         }
     }

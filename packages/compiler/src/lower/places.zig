@@ -77,9 +77,8 @@ pub fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Va
         // A `.field` off an index element (`ps[i].x`, `b.items[i].x`): the element is
         // an rvalue with no named place, so materialize it into a temp and return that
         // temp's ptr — the `.field_access` recursion above then computes `field_addr`
-        // off it. A store through this ptr would write the copy, not the vector, so the
-        // checker's `storeRoot` gate rejects assigning through it (T0070); only
-        // the read base (`= b.items[i].x`, `b.items[i].m()`) reaches here.
+        // off it. A store through this ptr writes the copy, not the vector, so a field
+        // store reaches here only from `copyIn`, which writes the copy back.
         .index => {
             const op = try L.lowerExpr(b, node_idx);
             return try L.operandPtr(b, op);
@@ -104,6 +103,53 @@ pub fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Va
             else => return Ir.none_value,
         },
     }
+}
+
+/// A `Vec` element a field store writes through (`ps[i]` in `ps[i].f = v`): the handle and
+/// the index, evaluated once, and the element node, whose copy the field store changes.
+pub const ElementPlace = struct {
+    ref: L.ElemRef,
+    node: Ast.Index,
+    /// The element copied in by `copyIn`, which `writeBack` stores.
+    elem: Ir.Operand = .none,
+};
+
+/// The element a field store chain (`ps[i].q.a`) bottoms out at: an `.index`, or a
+/// value-headed `type_app` the parser could not tell from a turbofish. Null for a
+/// local-rooted place.
+pub fn elementRoot(b: *Builder, place: Ast.Index) ?Ast.Index {
+    var cur = place;
+    while (true) {
+        const n = b.in.tree.nodes[cur.int()];
+        switch (n.tag) {
+            .field_access, .tuple_field => cur = n.lhs,
+            .index => return cur,
+            .type_app => return if (L.appHeadIsValue(b, cur)) cur else null,
+            else => return null,
+        }
+    }
+}
+
+/// Evaluate the handle and the index of the element `node` names.
+pub fn lowerElementPlace(b: *Builder, node: Ast.Index) error{OutOfMemory}!?ElementPlace {
+    const r = try L.lowerElemRef(b, node) orelse return null;
+    return .{ .ref = r, .node = node };
+}
+
+/// Copy the element in and return the address of `place` (a field chain rooted at the
+/// element) in the copy. The chain's element node yields the copy instead of reading the
+/// element again.
+pub fn copyIn(b: *Builder, ep: *ElementPlace, place: Ast.Index) error{OutOfMemory}!Ir.ValueId {
+    ep.elem = try L.emitElemRefRead(b, ep.ref);
+    std.debug.assert(b.prelowered == null);
+    b.prelowered = .{ .node = ep.node, .op = ep.elem };
+    defer b.prelowered = null;
+    return lowerPlaceAddr(b, place);
+}
+
+/// Store the changed copy back to the element.
+pub fn writeBack(b: *Builder, ep: ElementPlace) error{OutOfMemory}!void {
+    try L.emitElemRefStore(b, ep.ref, ep.elem);
 }
 
 /// Put each local a call in `body` passes as a `mut` argument or a `mut self` receiver into

@@ -41,7 +41,7 @@ pub const ElemPrim = enum {
     }
 
     /// The primitives an `.index` node calls, in the order lower emits them: a read calls
-    /// `at`, a plain store `set_at`, and a compound store both.
+    /// `at`, a plain store `set_at`, and a compound store or a field store both.
     pub fn of(store: ?Ast.IndexStore) []const ElemPrim {
         const s = store orelse return &.{.at};
         return if (s.reads) &.{ .at, .set_at } else &.{.set_at};
@@ -201,7 +201,7 @@ test "desugarMethods enumerates each sugar's receiver methods in expansion order
     try std.testing.expectEqual(@as(usize, 0), desugarMethods(.index).len);
 }
 
-test "an index reads, a store writes, and a compound store reads then writes" {
+test "an index reads, a store writes, and a compound or field store reads then writes" {
     const at = Ast.Index.from(0);
     try std.testing.expectEqualSlices(ElemPrim, &.{.at}, ElemPrim.of(null));
     try std.testing.expectEqualSlices(ElemPrim, &.{.set_at}, ElemPrim.of(.{ .index = at, .reads = false }));

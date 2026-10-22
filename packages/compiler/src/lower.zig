@@ -194,7 +194,8 @@ pub const Builder = struct {
     loops: std.ArrayList(LoopCtx) = .empty,
     /// A node already evaluated, which `lowerExpr` yields instead of lowering it again: the
     /// element `xs[i] op= v` read once, so the operator arms reused for it see a place
-    /// whose handle and index ran once.
+    /// whose handle and index ran once, and the element copy a field store `xs[i].f = v`
+    /// changes, so the place chain addresses that copy.
     prelowered: ?struct { node: Ast.Index, op: Ir.Operand } = null,
 
     diags: *std.ArrayList(Diagnostic),
@@ -563,7 +564,7 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
                 return;
             }
             if (Ast.indexStoreTarget(b.in.tree, b.in.tokens, stmt_idx) != null) {
-                try lowerIndexStore(b, stmt.lhs, value, place_ty);
+                try lowerIndexStore(b, stmt.lhs, value);
                 return;
             }
             const home = try places.bindingHome(b, stmt.lhs, place_ty);
@@ -3084,38 +3085,66 @@ fn elemPrimCallee(b: *Builder, prim: StdNames.ElemPrim, elem_ty: Typecheck.Type)
     return .{ .kind = .user_fn, .name = b.in.instances[ii].name.? };
 }
 
+/// A `Vec[V]` element named for a store: its handle and its index, each evaluated once.
+pub const ElemRef = struct {
+    handle: Ir.ValueId,
+    idx: Ir.ValueId,
+    tok: u32,
+    ty: Typecheck.Type,
+};
+
+/// Evaluate the handle and then the index of the element `place` (an `.index`, or a
+/// value-headed `type_app`) that a store writes, or null when the receiver has no address.
+pub fn lowerElemRef(b: *Builder, place: Ast.Index) error{OutOfMemory}!?ElemRef {
+    const n = b.in.tree.nodes[place.int()];
+    const idx = if (n.tag == .type_app) Ast.rangeSlice(b.in.tree, n.rhs.int())[0] else n.rhs;
+    const base = try operandPtr(b, try lowerExpr(b, n.lhs));
+    if (base == Ir.none_value) return null;
+    // The code that runs before the write may drop the Vec's last other reference (it can
+    // rebind `xs`) and collect, so the handle is typed as a managed box: the root map then
+    // keeps the Vec alive.
+    const handle = try b.emit(.{ .load = .{ .addr = base, .ty = Typecheck.Type.int } }, box_repr_ty);
+    const idx_val = operandValue(try lowerExpr(b, idx));
+    return .{ .handle = handle, .idx = idx_val, .tok = n.main_token, .ty = b.in.nodes.typeOf(place) };
+}
+
+/// Read the element `r` names through `mem.ga_at[V]`.
+pub fn emitElemRefRead(b: *Builder, r: ElemRef) error{OutOfMemory}!Ir.Operand {
+    return emitElemRead(b, r.handle, r.idx, r.tok, r.ty);
+}
+
+/// Store `val` to the element `r` names through `mem.ga_set_at[V]`, which checks the
+/// bounds again.
+pub fn emitElemRefStore(b: *Builder, r: ElemRef, val: Ir.Operand) error{OutOfMemory}!void {
+    const callee = elemPrimCallee(b, .set_at, r.ty) orelse {
+        try b.note(r.tok, "unresolved 'ga_set_at' index primitive in lower");
+        return;
+    };
+    const args = try b.gpa.alloc(Ir.Operand, 3);
+    errdefer b.gpa.free(args);
+    args[0] = .{ .value = r.handle };
+    args[1] = .{ .value = r.idx };
+    args[2] = val;
+    _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, null);
+}
+
 /// Lower `recv[i] = v` as `mem.ga_set_at[V](recv.h, i, v)`: the handle, the index and the
 /// value in source order, then the checked store, as `recv.set(i, v)` evaluates. A compound
 /// `recv[i] op= v` reads the element through `mem.ga_at[V]` after the index and before `v`,
 /// so the handle and index are evaluated once and an out-of-bounds index panics before `v`.
-fn lowerIndexStore(b: *Builder, place: Ast.Index, value: StoreValue, ty: Typecheck.Type) error{OutOfMemory}!void {
-    const n = b.in.tree.nodes[place.int()];
-    const base = try operandPtr(b, try lowerExpr(b, n.lhs));
-    if (base == Ir.none_value) return;
-    // The rhs may drop the Vec's last other reference (it can rebind `xs`) and collect, so
-    // the handle is typed as a managed box: the root map then keeps the Vec alive.
-    const handle = try b.emit(.{ .load = .{ .addr = base, .ty = Typecheck.Type.int } }, box_repr_ty);
-    const idx_val = operandValue(try lowerExpr(b, n.rhs));
+fn lowerIndexStore(b: *Builder, place: Ast.Index, value: StoreValue) error{OutOfMemory}!void {
+    const r = try lowerElemRef(b, place) orelse return;
     const val = switch (value) {
         .expr => |e| try lowerExpr(b, e),
         .compound => blk: {
-            const old = try emitElemRead(b, handle, idx_val, n.main_token, ty);
+            const old = try emitElemRefRead(b, r);
             std.debug.assert(b.prelowered == null);
             b.prelowered = .{ .node = place, .op = old };
             defer b.prelowered = null;
             break :blk try lowerStoreValue(b, value);
         },
     };
-    const callee = elemPrimCallee(b, .set_at, ty) orelse {
-        try b.note(n.main_token, "unresolved 'ga_set_at' index primitive in lower");
-        return;
-    };
-    const args = try b.gpa.alloc(Ir.Operand, 3);
-    errdefer b.gpa.free(args);
-    args[0] = .{ .value = handle };
-    args[1] = .{ .value = idx_val };
-    args[2] = val;
-    _ = try b.emit(.{ .call = .{ .callee = callee, .args = args, .ret_slot = Ir.none_slot } }, null);
+    try emitElemRefStore(b, r, val);
 }
 
 /// Lower a value index `recv[i]` reading a `Vec[V]` element. The receiver's single field
@@ -3233,6 +3262,7 @@ fn lowerFieldAccess(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{
 /// a field_addr chain rooted at a local slot; scalar → store, aggregate → produce
 /// into the place address.
 fn lowerFieldStore(b: *Builder, place: Ast.Index, value: StoreValue, ty: Typecheck.Type) error{OutOfMemory}!void {
+    if (places.elementRoot(b, place)) |root| return lowerElementFieldStore(b, place, root, value, ty);
     const addr = try places.lowerPlaceAddr(b, place);
     if (addr == Ir.none_value) {
         try b.note(b.in.tree.nodes[(place).int()].main_token, "field store target unsupported in lower");
@@ -3240,6 +3270,25 @@ fn lowerFieldStore(b: *Builder, place: Ast.Index, value: StoreValue, ty: Typeche
     }
     if (isAggregatePass(b, ty) and places.stagesStore(b, place, value)) return places.storeStaged(b, value, addr, ty);
     try storeThrough(b, addr, value, ty, b.in.tree.nodes[(place).int()].main_token);
+}
+
+/// Store into a field of a `Vec` element (`ps[i].f = v`, `ps[i].q.a = v`) by
+/// read-modify-write: the handle and the index, then the value, then copy the element in,
+/// store the field into the copy and write the copy back. No user code runs between the
+/// copy-in and the write-back, so a write the value makes to the element is kept, and a
+/// value that grows the Vec is copied in from the new backing.
+fn lowerElementFieldStore(b: *Builder, place: Ast.Index, root: Ast.Index, value: StoreValue, ty: Typecheck.Type) error{OutOfMemory}!void {
+    const tok = b.in.tree.nodes[place.int()].main_token;
+    var ep = try places.lowerElementPlace(b, root) orelse return;
+    const v = try lowerStoreValue(b, value);
+    if (b.termSet()) return;
+    const addr = try places.copyIn(b, &ep, place);
+    if (addr == Ir.none_value) {
+        try b.note(tok, "field store target unsupported in lower");
+        return;
+    }
+    try storeOperandInto(b, v, addr, ty, tok);
+    try places.writeBack(b, ep);
 }
 
 /// Store `value` (of type `ty`) into the storage at `addr`.

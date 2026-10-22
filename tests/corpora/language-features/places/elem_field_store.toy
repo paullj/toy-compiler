@@ -1,0 +1,57 @@
+# Feature: `ps[i].f = v` stores a field of the element in the Vec: it copies the element
+# in, stores the field and writes the element back. A nested field, a tuple-struct field,
+# an enum-typed field, a whole struct field, an element of an element, a Vec held in a
+# field and in `self`, and a generic element all keep the write.
+# expect: stdout "7\n9\n30\n11\n12\n13\n21\n31\n"
+# expect: exit 0
+import std/io
+import std/vec
+
+enum Shape { dot, circle(int) }
+struct Q { a: int, b: int }
+struct P { x: int, q: Q, s: Shape }
+struct Pair(int, int)
+struct H { ps: Vec[P] }
+struct Box[T] { v: T }
+
+impl H {
+    fn poke(mut self, i: int, v: int) { self.ps[i].q.b = v }
+}
+
+fn area(s: Shape) -> int {
+    return match s { .dot -> 0, .circle(r) -> r * 10 }
+}
+
+fn put[T](xs: Vec[Box[T]], i: int, v: T) { xs[i].v = v }
+
+fn main() -> int {
+    ps: Vec[P] = [P { x: 1, q: Q { a: 2, b: 3 }, s: Shape.dot }, P { x: 4, q: Q { a: 5, b: 6 }, s: Shape.dot }]
+    i := 1
+    ps[0].x = 7
+    ps[i].q.a = 9
+    ps[i].s = Shape.circle(3)
+    io.println(ps[0].x)
+    io.println(ps[1].q.a)
+    q := ps[1]
+    io.println(area(q.s))
+    ps[0].q = Q { a: 11, b: 0 }
+    io.println(ps[0].q.a)
+
+    ts: Vec[Pair] = [Pair(1, 2), Pair(3, 4)]
+    ts[i].0 = 12
+    io.println(ts[1].0)
+
+    gs: Vec[Vec[Pair]] = [[Pair(0, 0)], [Pair(0, 0), Pair(0, 0)]]
+    gs[i][1].1 = 13
+    io.println(gs[1][1].1)
+
+    h := H { ps: [P { x: 0, q: Q { a: 0, b: 0 }, s: Shape.dot }] }
+    h.ps[0].q.b = 20
+    h.poke(0, h.ps[0].q.b + 1)
+    io.println(h.ps[0].q.b)
+
+    bs: Vec[Box[int]] = [Box[int] { v: 0 }]
+    put(bs, 0, 31)
+    io.println(bs[0].v)
+    return ps[0].q.b + ps[1].q.b - 6
+}

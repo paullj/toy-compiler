@@ -1,0 +1,21 @@
+# Feature: the rhs of `ps[i].x = v` may grow the Vec: the handle and the index are read
+# first, the value next, and only then is the element copied in from the grown backing,
+# its field stored and the element written back, so the write lands.
+# expect: exit 42
+import std/vec
+
+struct P { x: int, y: int }
+
+fn main() -> int {
+    ps: Vec[P] = [P { x: 1, y: 2 }]
+    grow := fn() -> int {
+        i := 0
+        while i < 100 {
+            ps.push(P { x: i, y: i })
+            i = i + 1
+        }
+        40
+    }
+    ps[0].x = grow()
+    return if ps.len() == 101 { ps[0].x + ps[0].y } else { 1 }
+}

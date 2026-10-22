@@ -540,18 +540,18 @@ test "vec: indexing a non-indexable struct FIELD is a clean type error (not 'unk
     , &.{}));
 }
 
-test "vec: assigning to a field of an index element is rejected (never a silent write-drop)" {
+test "vec: assigning to a field of an index element writes the element back (never a silent write-drop)" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     try skipUnlessBackend(io);
-    // `b.items[i].x = 99` reads its element into a temp copy, so a store would write the
-    // copy and be lost. The checker must reject it rather than accept-and-drop.
+    // `b.items[i].x = 99` reads its element into a temp copy; the store must reach the
+    // Vec through the write-back, not stop at the copy.
     const dir = ".toy-test-vec-index-assign";
     Io.Dir.cwd().deleteTree(io, dir) catch {};
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
-    try std.testing.expectError(error.CompileFailed, compile(gpa, io, dir,
+    const prog = try compile(gpa, io, dir,
         \\import std/vec
         \\struct P { x: int, y: int }
         \\struct Bag { items: Vec[P] }
@@ -559,10 +559,12 @@ test "vec: assigning to a field of an index element is rejected (never a silent 
         \\    b := Bag { items: [P{ x: 1, y: 2 }, P{ x: 3, y: 4 }] }
         \\    i := 1
         \\    b.items[i].x = 99
-        \\    return b.items[i].x
+        \\    return b.items[i].x + b.items[i].y + b.items[0].x
         \\}
         \\
-    , &.{}));
+    , &.{});
+    defer gpa.free(prog);
+    try std.testing.expectEqual(@as(u8, 104), try harness.runExit(gpa, io, prog));
 }
 
 test "vec: indexing a non-indexable value is a clean compile error" {

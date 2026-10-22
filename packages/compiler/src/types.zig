@@ -3194,15 +3194,15 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
     // store targets before the walk that picks each index's element primitive.
     var stores = try std.DynamicBitSetUnmanaged.initEmpty(t.gpa, nodes.len);
     defer stores.deinit(t.gpa);
-    var compound = try std.DynamicBitSetUnmanaged.initEmpty(t.gpa, nodes.len);
-    defer compound.deinit(t.gpa);
+    var reads = try std.DynamicBitSetUnmanaged.initEmpty(t.gpa, nodes.len);
+    defer reads.deinit(t.gpa);
     for (nodes, range.start..) |n, i| {
         if (n.tag != .assign) continue;
         const st = Ast.indexStoreTarget(tree, mc.tokens, Ast.Index.from(@intCast(i))) orelse continue;
         const lhs = st.index.int();
         if (lhs < range.start or lhs >= range.end) continue;
         stores.set(lhs - range.start);
-        if (st.reads) compound.set(lhs - range.start);
+        if (st.reads) reads.set(lhs - range.start);
     }
     // A non-empty list literal `[e0, ..]` desugars to `new()` + one `push` per element
     // over its typed `Vec[V]` receiver, and a `for x in xs` desugars to `it := xs.iter()`
@@ -3221,25 +3221,16 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
                     try t.discoverRecvMethod(model, recv, dm.name, .program, worklist, seen, at, mod);
                 }
             },
-            .index => {
-                // `xs[i]` desugars to `mem.ga_at[V]`, the store `xs[i] = v` to
-                // `mem.ga_set_at[V]` and `xs[i] op= v` to both; discover those instances
-                // keyed on the index node's element type V so lower can resolve their
-                // mangled symbols.
+            // `xs[i]` desugars to `mem.ga_at[V]`, the store `xs[i] = v` to `mem.ga_set_at[V]`,
+            // and `xs[i] op= v` and the field store `xs[i].f = v` to both; discover those
+            // instances keyed on the index node's element type V so lower can resolve their
+            // mangled symbols. A value-headed `type_app` is a value index the parser could
+            // not tell from a turbofish (`b.items[i].f`) and lowers the same way. A real
+            // type-app's leftmost identifier is not `.local`, so this never fires for one.
+            .index, .type_app => if (n.tag == .index or symbols_res.leftmostHeadIsValue(tree, resolutions, n.lhs)) {
                 const elem = node_types[i];
-                const store: ?Ast.IndexStore = if (stores.isSet(i - range.start)) .{ .index = Ast.Index.from(@intCast(i)), .reads = compound.isSet(i - range.start) } else null;
+                const store: ?Ast.IndexStore = if (stores.isSet(i - range.start)) .{ .index = Ast.Index.from(@intCast(i)), .reads = reads.isSet(i - range.start) } else null;
                 if (isConcreteValue(elem)) for (StdNames.ElemPrim.of(store)) |prim| if (elemPrimGid(model, prim)) |gid| {
-                    const args = [_]Type{elem};
-                    try t.enqueueInstance(model, gid, &args, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)) }, mod);
-                };
-            },
-            // A value-headed `type_app` is a value index the parser could not tell from a
-            // turbofish (`b.items[i].f`); it lowers through the same `mem.ga_at[V]`
-            // primitive as `.index`, so discover that instance too. A real type-app's
-            // leftmost identifier is not `.local`, so this never fires for one.
-            .type_app => if (symbols_res.leftmostHeadIsValue(tree, resolutions, n.lhs)) {
-                const elem = node_types[i];
-                if (isConcreteValue(elem)) if (elemPrimGid(model, .at)) |gid| {
                     const args = [_]Type{elem};
                     try t.enqueueInstance(model, gid, &args, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)) }, mod);
                 };
@@ -5839,7 +5830,7 @@ test "an associated fn of a bare generic struct infers its type params from its 
     }
 }
 
-test "a field of an index element or of a call result is no store target, and a user Vec has no index" {
+test "a compound element field store and a field of a call result are no store targets, and a user Vec has no index" {
     const gpa = testing.allocator;
     const decls =
         \\struct P { x: int }
@@ -5849,9 +5840,10 @@ test "a field of an index element or of a call result is no store target, and a 
         \\
     ;
     const cases = [_]struct { stmt: []const u8, code: codes.Code, message: []const u8 }{
-        .{ .stmt = "ps[0].x = 5", .code = .T0070, .message = "cannot assign to a field of an index element `xs[i].field`; the element is a temporary copy, so the write would be lost" },
-        .{ .stmt = "ps[i].x = 5", .code = .T0070, .message = "cannot assign to a field of an index element `xs[i].field`; the element is a temporary copy, so the write would be lost" },
+        // A compound store to an element field has no lowering yet.
+        .{ .stmt = "ps[i].x += 5", .code = .T0070, .message = "cannot assign to a field of an index element `xs[i].field` with a compound operator; write `xs[i].field = xs[i].field op v`" },
         // The `Vec` here is the user's, which has no element primitives to lower to.
+        .{ .stmt = "ps[0].x = 5", .code = .T0057, .message = "cannot index a value of type 'Vec'" },
         .{ .stmt = "xs[1] = 7", .code = .T0057, .message = "cannot index a value of type 'Vec'" },
         .{ .stmt = "h.xs[0] = 7", .code = .T0057, .message = "cannot index a value of type 'Vec'" },
         .{ .stmt = "i = xs[0]", .code = .T0057, .message = "cannot index a value of type 'Vec'" },
