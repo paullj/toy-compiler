@@ -7,6 +7,7 @@
 
 const std = @import("std");
 const Ast = @import("../ast/Ast.zig");
+const Callee = @import("Callee.zig").Callee;
 
 /// The list/vector struct (`std/vec.toy`) list-literal and index sugar target.
 pub const vec_struct = "Vec";
@@ -40,11 +41,15 @@ pub const ElemPrim = enum {
         };
     }
 
-    /// The primitives an `.index` node calls, in the order lower emits them: a read calls
-    /// `at`, a plain store `set_at`, and a compound store or a field store both.
-    pub fn of(store: ?Ast.IndexStore) []const ElemPrim {
-        const s = store orelse return &.{.at};
-        return if (s.reads) &.{ .at, .set_at } else &.{.set_at};
+    /// The primitives an `.index` node calls, in the order lower emits them, from the
+    /// mark the checker left in its callee slot: a read calls `at`, a plain store `set_at`,
+    /// and an element read and written back both.
+    pub fn of(mark: Callee) []const ElemPrim {
+        return switch (mark.tag) {
+            .elem_store => &.{.set_at},
+            .elem_write => &.{ .at, .set_at },
+            else => &.{.at},
+        };
     }
 };
 
@@ -201,11 +206,10 @@ test "desugarMethods enumerates each sugar's receiver methods in expansion order
     try std.testing.expectEqual(@as(usize, 0), desugarMethods(.index).len);
 }
 
-test "an index reads, a store writes, and a compound or field store reads then writes" {
-    const at = Ast.Index.from(0);
-    try std.testing.expectEqualSlices(ElemPrim, &.{.at}, ElemPrim.of(null));
-    try std.testing.expectEqualSlices(ElemPrim, &.{.set_at}, ElemPrim.of(.{ .index = at, .reads = false }));
-    try std.testing.expectEqualSlices(ElemPrim, &.{ .at, .set_at }, ElemPrim.of(.{ .index = at, .reads = true }));
+test "an index reads, a store writes, and a written-back element reads then writes" {
+    try std.testing.expectEqualSlices(ElemPrim, &.{.at}, ElemPrim.of(.{}));
+    try std.testing.expectEqualSlices(ElemPrim, &.{.set_at}, ElemPrim.of(Callee.elem_store));
+    try std.testing.expectEqualSlices(ElemPrim, &.{ .at, .set_at }, ElemPrim.of(Callee.elem_write));
 }
 
 test "core/mem declares every element primitive" {

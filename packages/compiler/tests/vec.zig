@@ -567,6 +567,37 @@ test "vec: assigning to a field of an index element writes the element back (nev
     try std.testing.expectEqual(@as(u8, 104), try harness.runExit(gpa, io, prog));
 }
 
+test "vec: a managed-box element passed to a mut param or a mut self receiver is written back" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try skipUnlessBackend(io);
+    // A `Vec[int]` element is a one-word handle: its copy lives in a slot the callee writes
+    // through, and the write-back stores the new handle into the outer Vec.
+    const dir = ".toy-test-vec-elem-mut-box";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const prog = try compile(gpa, io, dir,
+        \\import std/vec
+        \\struct W { v: Vec[int] }
+        \\impl W {
+        \\    fn swap_in(mut self) { self.v = [40, 2] }
+        \\}
+        \\fn reset(mut v: Vec[int]) { v = [7, 8, 9] }
+        \\fn main() -> int {
+        \\    vs: Vec[Vec[int]] = [[1], [2]]
+        \\    reset(vs[1])
+        \\    ws: Vec[W] = [W { v: [] }]
+        \\    ws[0].swap_in()
+        \\    return vs[1][2] + vs[1].len() + vs[0][0] + ws[0].v[0] + ws[0].v[1]
+        \\}
+        \\
+    , &.{});
+    defer gpa.free(prog);
+    try std.testing.expectEqual(@as(u8, 55), try harness.runExit(gpa, io, prog));
+}
+
 test "vec: indexing a non-indexable value is a clean compile error" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

@@ -196,7 +196,7 @@ pub const Builder = struct {
     /// element `xs[i] op= v` read once, so the operator arms reused for it see a place
     /// whose handle and index ran once, and the element copy a field store `xs[i].f = v`
     /// changes, so the place chain addresses that copy.
-    prelowered: ?struct { node: Ast.Index, op: Ir.Operand } = null,
+    prelowered: ?Prelowered = null,
 
     diags: *std.ArrayList(Diagnostic),
     had_error: bool = false,
@@ -318,6 +318,17 @@ pub const Builder = struct {
         }
         bb.term = term;
         bb.term_set = true;
+    }
+
+    pub const Prelowered = struct { node: Ast.Index, op: Ir.Operand };
+
+    /// Have `lowerExpr` yield `op` for `node`, returning the outer entry for the caller to
+    /// restore. One element store can run inside the value of another (`xs[0] += f(ys[1])`
+    /// with a `mut` param, or an `if` block holding `ps[0].x = 1`), so entries nest.
+    pub fn pushPrelowered(b: *Builder, node: Ast.Index, op: Ir.Operand) ?Prelowered {
+        const outer = b.prelowered;
+        b.prelowered = .{ .node = node, .op = op };
+        return outer;
     }
 
     pub fn termSet(b: *Builder) bool {
@@ -563,7 +574,7 @@ fn lowerStmt(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
                 try lowerFieldStore(b, stmt.lhs, value, place_ty);
                 return;
             }
-            if (Ast.indexStoreTarget(b.in.tree, b.in.tokens, stmt_idx) != null) {
+            if (target.tag == .index) {
                 try lowerIndexStore(b, stmt.lhs, value);
                 return;
             }
@@ -2153,12 +2164,16 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     const self_n: usize = if (self_recv != Ast.none) 1 else 0;
     const args = try b.gpa.alloc(Ir.Operand, arg_nodes.len + self_n);
     errdefer b.gpa.free(args);
+    // A `mut` place rooted at a Vec element passes the address of a copy, written back
+    // once the call returns.
+    var wbs: std.ArrayList(places.ElementPlace) = .empty;
+    defer wbs.deinit(b.gpa);
     if (self_recv != Ast.none) {
         if (self_mut) {
             // Pass the receiver's place ADDRESS (an int value) as `self`. The receiver
             // was proven a mutable place by the body checker (T0019); a non-place here
             // is an internal invariant break — note-and-drop rather than miscompile.
-            const addr = try places.lowerPlaceAddr(b, self_recv);
+            const addr = try places.lowerMutPlaceAddr(b, self_recv, &wbs);
             if (addr == Ir.none_value) {
                 try b.note(callee_node.main_token, "mut-self receiver is not a place in lower");
                 b.gpa.free(args);
@@ -2173,7 +2188,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
     for (arg_nodes, 0..) |arg, i| {
         if (Modes.isMut(arg_mut, i)) {
             // A `mut` param takes the argument's place ADDRESS, like a `mut self` receiver.
-            const addr = try places.lowerPlaceAddr(b, arg);
+            const addr = try places.lowerMutPlaceAddr(b, arg, &wbs);
             if (addr == Ir.none_value) {
                 try b.note(callee_node.main_token, "mut argument is not a place in lower");
                 b.gpa.free(args);
@@ -2183,7 +2198,9 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         } else args[self_n + i] = try lowerExpr(b, arg);
     }
 
-    return try emitCall(b, .{ .direct = callee }, args, result_ty, n.main_token);
+    const result = try emitCall(b, .{ .direct = callee }, args, result_ty, n.main_token);
+    try places.writeBacks(b, wbs.items);
+    return result;
 }
 
 /// A call the checker selected no callee for: one of the compile-time intrinsics spelled
@@ -3137,10 +3154,8 @@ fn lowerIndexStore(b: *Builder, place: Ast.Index, value: StoreValue) error{OutOf
     const val = switch (value) {
         .expr => |e| try lowerExpr(b, e),
         .compound => blk: {
-            const old = try emitElemRefRead(b, r);
-            std.debug.assert(b.prelowered == null);
-            b.prelowered = .{ .node = place, .op = old };
-            defer b.prelowered = null;
+            const outer = b.pushPrelowered(place, try emitElemRefRead(b, r));
+            defer b.prelowered = outer;
             break :blk try lowerStoreValue(b, value);
         },
     };
@@ -4003,8 +4018,10 @@ fn lowerFor(b: *Builder, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMem
 /// `iter` declares it: by value, or for `mut self` the place's address (the checker made it
 /// a place, T0019). False when that fails to lower (a note is out).
 fn emitForIter(b: *Builder, recv: Ast.Index, iter_m: Typecheck.Method, it_slot: Ir.SlotId) error{OutOfMemory}!bool {
+    var wbs: std.ArrayList(places.ElementPlace) = .empty;
+    defer wbs.deinit(b.gpa);
     const self0: Ir.Operand = if (iter_m.mut_self) blk: {
-        const addr = try places.lowerPlaceAddr(b, recv);
+        const addr = try places.lowerMutPlaceAddr(b, recv, &wbs);
         if (addr == Ir.none_value) {
             try b.note(b.in.tree.nodes[recv.int()].main_token, "for-in: mut-self 'iter' receiver is not a place in lower");
             return false;
@@ -4015,6 +4032,7 @@ fn emitForIter(b: *Builder, recv: Ast.Index, iter_m: Typecheck.Method, it_slot: 
     errdefer b.gpa.free(args);
     args[0] = self0;
     _ = try b.emit(.{ .call = .{ .callee = witnessCallee(b, iter_m), .args = args, .ret_slot = it_slot } }, null);
+    try places.writeBacks(b, wbs.items);
     return true;
 }
 
@@ -4519,7 +4537,7 @@ fn paramOperand(b: *Builder, ty: Typecheck.Type, merge: Ir.ValueId) Ir.Operand {
 /// Extract the `value` of an Operand for an op that needs a scalar value id. A
 /// `.none`/`.slot` here is a lowering bug for scalar context; default to
 /// `none_value` so we never index garbage (a diagnostic was already emitted).
-fn operandValue(op: Ir.Operand) Ir.ValueId {
+pub fn operandValue(op: Ir.Operand) Ir.ValueId {
     return switch (op) {
         .value => |v| v,
         else => Ir.none_value,

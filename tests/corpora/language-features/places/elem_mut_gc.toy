@@ -1,0 +1,25 @@
+# Feature: the Vec a `mut` element argument is written back to stays alive across the
+# call. The callee drops the caller's only reference to it through another `mut` param,
+# forces a collection through std/gc and allocates `other` from the freed cells. The old
+# Vec must survive and take the write-back; were it collected, `other` could reuse its
+# cells and the write-back would land in `other`.
+# expect: exit 105
+import std/gc
+import std/vec
+
+fn fill() -> Vec[int] { [1, 2, 3] }
+
+fn rebind(mut n: int, mut v: Vec[int], mut other: Vec[int]) {
+    v = [50]
+    gc.collect()
+    other = [100, 100, 100]
+    n = 4
+}
+
+fn main() -> int {
+    xs := fill()
+    other: Vec[int] = []
+    rebind(xs[2], xs, other)
+    ok := other[2] == 100 && xs[0] == 50
+    return if ok { 100 + other.len() + xs.len() + 1 } else { 1 }
+}

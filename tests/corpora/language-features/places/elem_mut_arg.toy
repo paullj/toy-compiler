@@ -1,0 +1,86 @@
+# Feature: a Vec element, or a field chain rooted at one, passed to a `mut` param is copied
+# in where the argument is evaluated and written back after the call, in argument order.
+# The handle and the index run once. A callee that grows the Vec still lands its write,
+# and a write the callee makes to the element through another handle is overwritten by
+# the write-back. Aliased elements are two copies, and the last write-back wins.
+# expect: stdout "313\n4\n11\n22\n1\n7\n8\n103\n4\n1\n2\n6\n9\n"
+# expect: exit 0
+import std/io
+import std/vec
+
+struct P { x: int, y: int }
+struct H { ps: Vec[P] }
+
+fn bump(mut n: int) { n += 1 }
+
+fn swap(mut a: int, mut b: int) {
+    t := a
+    a = b
+    b = t
+}
+
+fn shift(mut p: P) {
+    p.x += 10
+    p.y += 20
+}
+
+fn grow_bump(mut n: int, xs: Vec[int]) {
+    for k in 0..100 { xs.push(k) }
+    n += 5
+}
+
+fn clobber(mut n: int, xs: Vec[int]) {
+    xs[0] = 99
+    n += 1
+}
+
+fn set2(mut a: int, mut b: int) {
+    a = 5
+    b = 6
+}
+
+fn put[T](mut a: T, v: T) { a = v }
+
+fn main() -> int {
+    xs: Vec[int] = [1, 2, 3]
+    bump(xs[1])
+    swap(xs[0], xs[1])
+    io.println(xs[0] * 100 + xs[1] * 10 + xs[2])
+
+    ps: Vec[P] = [P { x: 1, y: 2 }, P { x: 3, y: 4 }]
+    bump(ps[1].x)
+    shift(ps[0])
+    h := H { ps: [P { x: 0, y: 0 }] }
+    bump(h.ps[0].y)
+    vs: Vec[Vec[int]] = [[5, 6]]
+    bump(vs[0][1])
+    io.println(ps[1].x)
+    io.println(ps[0].x)
+    io.println(ps[0].y)
+    io.println(h.ps[0].y)
+    io.println(vs[0][1])
+
+    grow_bump(xs[2], xs)
+    io.println(xs[2])
+    io.println(xs.len())
+    clobber(xs[0], xs)
+    io.println(xs[0])
+
+    calls := 0
+    at := fn() -> int {
+        calls += 1
+        1
+    }
+    bump(xs[at()])
+    io.println(calls)
+
+    ys: Vec[int] = [1, 2]
+    set2(ys[0], ys[0])
+    swap(ys[1], ys[0])
+    io.println(ys[0])
+    io.println(ys[1])
+
+    put(ys[1], 9)
+    io.println(ys[1])
+    return 0
+}

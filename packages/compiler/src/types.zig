@@ -3190,20 +3190,8 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
             try t.discoverRecvMethod(model, recv, dm.name, .program, worklist, seen, .{ .token_of = Ast.Index.from(@intCast(i)) }, mod);
         }
     }
-    // A store's index node precedes its `.assign` (children are built first), so mark the
-    // store targets before the walk that picks each index's element primitive.
-    var stores = try std.DynamicBitSetUnmanaged.initEmpty(t.gpa, nodes.len);
-    defer stores.deinit(t.gpa);
-    var reads = try std.DynamicBitSetUnmanaged.initEmpty(t.gpa, nodes.len);
-    defer reads.deinit(t.gpa);
-    for (nodes, range.start..) |n, i| {
-        if (n.tag != .assign) continue;
-        const st = Ast.indexStoreTarget(tree, mc.tokens, Ast.Index.from(@intCast(i))) orelse continue;
-        const lhs = st.index.int();
-        if (lhs < range.start or lhs >= range.end) continue;
-        stores.set(lhs - range.start);
-        if (st.reads) reads.set(lhs - range.start);
-    }
+    var prim_gids: [std.enums.values(StdNames.ElemPrim).len]?u32 = undefined;
+    for (std.enums.values(StdNames.ElemPrim), &prim_gids) |prim, *g| g.* = elemPrimGid(model, prim);
     // A non-empty list literal `[e0, ..]` desugars to `new()` + one `push` per element
     // over its typed `Vec[V]` receiver, and a `for x in xs` desugars to `it := xs.iter()`
     // then a loop over `it.next()`: discover the template instances lower will call (the
@@ -3222,17 +3210,19 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
                 }
             },
             // `xs[i]` desugars to `mem.ga_at[V]`, the store `xs[i] = v` to `mem.ga_set_at[V]`,
-            // and `xs[i] op= v` and the field store `xs[i].f = v` to both; discover those
-            // instances keyed on the index node's element type V so lower can resolve their
-            // mangled symbols. A value-headed `type_app` is a value index the parser could
-            // not tell from a turbofish (`b.items[i].f`) and lowers the same way. A real
-            // type-app's leftmost identifier is not `.local`, so this never fires for one.
+            // and an element read and written back to both, as the checker marked it;
+            // discover those instances keyed on the index node's element type V so lower
+            // can resolve their mangled symbols. A value-headed
+            // `type_app` is a value index the parser could not tell from a turbofish
+            // (`b.items[i].f`) and lowers the same way. A real type-app's leftmost
+            // identifier is not `.local`, so this never fires for one.
             .index, .type_app => if (n.tag == .index or symbols_res.leftmostHeadIsValue(tree, resolutions, n.lhs)) {
                 const elem = node_types[i];
-                const store: ?Ast.IndexStore = if (stores.isSet(i - range.start)) .{ .index = Ast.Index.from(@intCast(i)), .reads = reads.isSet(i - range.start) } else null;
-                if (isConcreteValue(elem)) for (StdNames.ElemPrim.of(store)) |prim| if (elemPrimGid(model, prim)) |gid| {
+                const at = Ast.Index.from(@intCast(i));
+                const mark: Callee = if (i < callees.len) callees[i] else .{};
+                if (isConcreteValue(elem)) for (StdNames.ElemPrim.of(mark)) |prim| if (prim_gids[@intFromEnum(prim)]) |gid| {
                     const args = [_]Type{elem};
-                    try t.enqueueInstance(model, gid, &args, worklist, seen, .{ .node = Ast.Index.from(@intCast(i)) }, mod);
+                    try t.enqueueInstance(model, gid, &args, worklist, seen, .{ .node = at }, mod);
                 };
             },
             // A bound method on a generic-type receiver (`get := b.get`) calls the method's
@@ -9034,7 +9024,7 @@ test "a mut self method pipe needs a place and marks it mutated" {
     ;
     const temp = pre ++ "fn main() -> int {\n mk() |> .bump()\n return 0\n}\n";
     try expectOnlyDiag(temp, .T0019);
-    try expectOneDiag(temp, .T0019, "cannot call mutating method 'bump' on a temporary; the receiver must be a mutable variable (a local or a field of one)");
+    try expectOneDiag(temp, .T0019, "cannot call mutating method 'bump' on a temporary; the receiver must be a mutable place (a local, a Vec element, or a field of either)");
     var c = try checkSource(pre ++ "fn main() -> int {\n c := C { n: 0 }\n f := fn() { c |> .bump() }\n f()\n return c.n\n}\n");
     defer c.deinit(gpa);
     try testing.expectEqualSlices(u32, &.{0}, try expectBoxedOnce(&c, 1));

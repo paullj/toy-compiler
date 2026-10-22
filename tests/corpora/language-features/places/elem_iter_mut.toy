@@ -1,0 +1,41 @@
+# Feature: `for x in xs[i]` over an element whose `iter` takes `mut self` copies the element
+# in, passes the copy to `iter` and writes it back before the loop runs, so the change
+# `iter` makes lands in the Vec.
+# expect: stdout "10\n2\n13\n"
+# expect: exit 0
+import std/io
+import std/iter
+import std/vec
+
+struct Up[T] { i: int, n: int, loops: int }
+
+impl Up[T] has iter.Iterator[int] {
+    fn next(mut self) -> Option[int] {
+        self.i += 1
+        if self.i > self.n { return Option[int].none }
+        return Option.some(self.i)
+    }
+}
+
+impl Up[T] {
+    fn iter(mut self) -> Up[T] {
+        self.loops += 1
+        self
+    }
+}
+
+struct H { up: Up[int] }
+
+fn main() -> int {
+    ups: Vec[Up[int]] = [Up[int] { i: 0, n: 4, loops: 0 }]
+    t := 0
+    for x in ups[0] { t += x }
+    io.println(t)
+    for x in ups[0] { t += x }
+    io.println(ups[0].loops)
+    hs: Vec[H] = [H { up: Up[int] { i: 0, n: 2, loops: 0 } }]
+    s := 0
+    for x in hs[0].up { s += x }
+    io.println(s + hs[0].up.loops * 10)
+    return 0
+}

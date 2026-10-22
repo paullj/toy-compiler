@@ -158,6 +158,35 @@ test "hintsIn: capture lists before closure bodies and mut before mut arguments,
     }
 }
 
+test "hintsIn: a Vec element passed to a mut param gets mut, naming the callee" {
+    const gpa = testing.allocator;
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\import std/vec
+        \\struct P { x: int }
+        \\fn bump(mut n: int) { n += 1 }
+        \\fn main() -> int {
+        \\    xs: Vec[int] = [1, 2]
+        \\    ps: Vec[P] = [P { x: 0 }]
+        \\    i := 1
+        \\    bump(xs[i])
+        \\    bump(ps[0].x)
+        \\    return xs[1] + ps[0].x
+        \\}
+        \\
+    ;
+    var r = try hintsIn(gpa, ws, src, whole(src), "file:///p/main.toy");
+    defer r.deinit();
+    try testing.expectEqual(@as(usize, 2), r.hints.len);
+    for (r.hints, [_][]const u8{ "xs[i])", "ps[0].x)" }) |h, at| {
+        try testing.expectEqual(test_util.posOf(src, at), h.position);
+        try testing.expectEqualStrings("mut", h.label);
+        try testing.expectEqualStrings("mutated by bump", h.tooltip.?);
+    }
+}
+
 test "hintsIn keeps only the requested range, counted in the client's encoding" {
     const gpa = testing.allocator;
     var docs: Documents = .{};

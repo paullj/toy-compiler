@@ -12,15 +12,15 @@ fn one() -> int { 1 }
 fn inc(v: int) -> int { v + 1 }
 
 fn main() -> int {
-    bump(1)  #~ ERROR [T0019] argument 1 must be a mutable variable (a local or a field of one); 'bump' takes it as 'mut'
-    bump(one())  #~ ERROR [T0019] argument 1 must be a mutable variable
+    bump(1)  #~ ERROR [T0019] argument 1 must be a mutable place (a local, a Vec element, or a field of either); 'bump' takes it as 'mut'
+    bump(one())  #~ ERROR [T0019] argument 1 must be a mutable place
     xs: Vec[int] = [1]
-    bump(xs[0])  #~ ERROR [T0019] argument 1 must be a mutable variable
-    bump(P { x: 1 }.x)  #~ ERROR [T0019] argument 1 must be a mutable variable
-    reset(inc)  #~ ERROR [T0019] argument 1 must be a mutable variable (a local or a field of one); 'reset' takes it as 'mut'
+    bump(xs[0])
+    bump(P { x: 1 }.x)  #~ ERROR [T0019] argument 1 must be a mutable place
+    reset(inc)  #~ ERROR [T0019] argument 1 must be a mutable place (a local, a Vec element, or a field of either); 'reset' takes it as 'mut'
     fn twice(v: int) -> int { v * 2 }
     reset(twice)  #~ ERROR [T0019] argument 1 names the local function 'twice', which a 'mut' parameter could reassign
-    5 |> bump()  #~ ERROR [T0019] argument 1 (the piped value) must be a mutable variable
+    5 |> bump()  #~ ERROR [T0019] argument 1 (the piped value) must be a mutable place
     p := P { x: 1 }
     reset(p.add)  #~ ERROR [T0019] argument 1 is a method value, not a place; 'reset' takes it as 'mut'
     c := 0

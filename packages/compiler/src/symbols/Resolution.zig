@@ -51,6 +51,23 @@ pub fn leftmostHeadIsValue(tree: Ast.Tree, resolutions: []const Resolution, head
     return false;
 }
 
+/// The Vec element a place chain (`xs[i]`, `ps[i].q.a`, or a value-headed `b.ps[i].x`)
+/// is rooted at: an `.index`, or a `type_app` whose head is a value, which the parser could
+/// not tell from a turbofish. Null for a place rooted anywhere else. The one walker the
+/// checker and lower share, so a written element is marked exactly where it is lowered.
+pub fn elementRoot(tree: Ast.Tree, resolutions: []const Resolution, place: Ast.Index) ?Ast.Index {
+    var cur = place;
+    while (true) {
+        const n = tree.nodes[cur.int()];
+        switch (n.tag) {
+            .field_access, .tuple_field => cur = n.lhs,
+            .index => return cur,
+            .type_app => return if (leftmostHeadIsValue(tree, resolutions, n.lhs)) cur else null,
+            else => return null,
+        }
+    }
+}
+
 /// The local a place (`x`, `x.f`, `x.0`, or a chain of them) is rooted at: its resolver
 /// slot, or null for a place rooted anywhere else (an index, a call), whose store writes
 /// no local. The one walker the checker, lower and the LSP share.

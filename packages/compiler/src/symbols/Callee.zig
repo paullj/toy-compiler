@@ -38,7 +38,12 @@ pub const Callee = extern struct {
     /// runs. `.generic`: a call of a generic fn whose instance is not known here: one in a
     /// template's own body, or one whose args did not check. The seal records these
     /// once mono has finished, so every reader shares one selection.
-    pub const Tag = enum(u8) { none, method, protocol, builtin, pending_method, pending_bound, pending_call, value, fn_ref, bound_method, template, direct, instance, generic, pending_template };
+    /// `.elem_store` and `.elem_write`: a Vec element (`xs[i]`, on its own node) that is
+    /// written: stored whole by `xs[i] = v` (`ga_set_at` alone), or read, changed and
+    /// written back by a compound store, a field store, a `mut` argument or a `mut self`
+    /// receiver rooted at it (`ga_at`, then `ga_set_at`). Both view as `.none`; only
+    /// `StdNames.ElemPrim.of` reads them.
+    pub const Tag = enum(u8) { none, method, protocol, builtin, pending_method, pending_bound, pending_call, value, fn_ref, bound_method, template, direct, instance, generic, pending_template, elem_write, elem_store };
 
     /// The compiler-provided methods that have no `methods` row. The four `opt_*`
     /// ops mirror `Typecheck.OptResultMethod` (`opt_is_tag0` is `is_some`/`is_ok`);
@@ -99,6 +104,9 @@ pub const Callee = extern struct {
 
     pub const value_call: Callee = .{ .tag = .value };
 
+    pub const elem_write: Callee = .{ .tag = .elem_write };
+    pub const elem_store: Callee = .{ .tag = .elem_store };
+
     pub fn fnRef(gid: u32) Callee {
         return .{ .tag = .fn_ref, .id = gid };
     }
@@ -144,7 +152,7 @@ pub const Callee = extern struct {
     /// The only way a consumer reads a slot.
     pub fn view(c: Callee) View {
         return switch (c.tag) {
-            .none, .pending_method, .pending_bound, .pending_call, .pending_template, .template => .none,
+            .none, .pending_method, .pending_bound, .pending_call, .pending_template, .template, .elem_write, .elem_store => .none,
             .method => .{ .method = c.id },
             .protocol => .{ .protocol = .{ .protocol = c.id, .method = c.aux } },
             .builtin => .{ .builtin = @enumFromInt(c.sub) },
@@ -295,4 +303,11 @@ test "callSlot: member callee, bare, index, call and lambda-shaped callees" {
     try std.testing.expectEqual(@as(?Ast.Index, idx(4)), Callee.callSlot(tree, nodes[7]));
     try std.testing.expectEqual(@as(?Ast.Index, idx(8)), Callee.callSlot(tree, nodes[9]));
     try std.testing.expectEqual(@as(?Ast.Index, null), Callee.callSlot(tree, nodes[1]));
+}
+
+test "an element write views as none" {
+    for ([_]Callee{ Callee.elem_write, Callee.elem_store }) |c| {
+        try std.testing.expectEqual(Callee.View.none, c.view());
+        try std.testing.expect(!c.isPending());
+    }
 }
