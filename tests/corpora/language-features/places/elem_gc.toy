@@ -1,0 +1,49 @@
+# Feature: the Vec a field store `ps[i].x = v` writes stays alive until the write-back. Each
+# `fill` builds the Vecs in its own frame, so no stale copy lingers in `main`'s. Each rhs
+# drops the only other reference to the Vec being written (it rebinds `ps`, overwrites the
+# element `vs[0]`, or rebinds `h`), forces a collection and allocates `other` from the
+# freed cells. The old Vec must survive and take the write; were it collected, `other`
+# could reuse its cells and the write-back would land in `other`.
+# expect: exit 101
+import std/gc
+import std/vec
+
+struct P { x: int, y: int }
+struct H { ps: Vec[P] }
+
+fn main() -> int {
+    ps: Vec[P] = []
+    vs: Vec[Vec[P]] = []
+    h := H { ps: [] }
+    other: Vec[P] = []
+    fill := fn() {
+        ps = [P { x: 1, y: 1 }, P { x: 2, y: 2 }, P { x: 3, y: 3 }]
+        vs = [[P { x: 1, y: 1 }, P { x: 2, y: 2 }, P { x: 3, y: 3 }]]
+        h = H { ps: [P { x: 1, y: 1 }, P { x: 2, y: 2 }, P { x: 3, y: 3 }] }
+    }
+    fill()
+    churn := fn() -> int {
+        gc.collect()
+        other = [P { x: 100, y: 100 }, P { x: 100, y: 100 }, P { x: 100, y: 100 }]
+        7
+    }
+    drop_ps := fn() -> int {
+        ps = [P { x: 0, y: 0 }]
+        churn()
+    }
+    drop_vs := fn() -> int {
+        vs[0] = [P { x: 0, y: 0 }]
+        churn()
+    }
+    drop_h := fn() -> int {
+        h = H { ps: [] }
+        churn()
+    }
+    ps[2].x = drop_ps()
+    a := other[2].x
+    vs[0][2].x = drop_vs()
+    b := other[2].x
+    h.ps[2].x = drop_h()
+    ok := a == 100 && b == 100 && other[2].x == 100
+    return if ok { 100 + ps.len() } else { 1 }
+}

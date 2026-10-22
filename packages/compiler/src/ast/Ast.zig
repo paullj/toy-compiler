@@ -578,20 +578,33 @@ pub fn isMutParam(tree: Tree, tokens: []const Token, param_idx: Index) bool {
     return n.tag == .param and n.main_token > 0 and tokens[n.main_token - 1].tag == .kw_mut;
 }
 
-/// The `.index` place an element store `xs[i] = v` or `xs[i] op= v` writes.
+/// The element an element store writes: the `.index` of `xs[i] = v` or `xs[i] op= v`, or
+/// the element root of a field store `xs[i].f = v`.
 pub const IndexStore = struct {
+    /// An `.index`, or for a field store a `.type_app` the parser could not tell from a
+    /// turbofish (`ps[i].f`), which is an element only when its head is a value.
     index: Index,
-    /// A compound store reads the element before it writes it back.
+    /// A compound store reads the element before it writes it back, and a field store
+    /// copies it in before it stores the field and writes it back.
     reads: bool,
 };
 
 /// The element store `assign` makes, or null. Its index writes through `ga_set_at`, and
-/// reads through `ga_at` only when compound, unlike an `.index` node anywhere else, which
-/// only reads.
+/// reads through `ga_at` only when compound or a field store, unlike an `.index` node
+/// anywhere else, which only reads.
 pub fn indexStoreTarget(tree: Tree, tokens: []const Token, assign: Index) ?IndexStore {
     const n = tree.nodes[assign.int()];
-    if (n.tag != .assign or tree.nodes[n.lhs.int()].tag != .index) return null;
-    return .{ .index = n.lhs, .reads = tokens[n.main_token].tag != .eq };
+    if (n.tag != .assign) return null;
+    if (tree.nodes[n.lhs.int()].tag == .index) return .{ .index = n.lhs, .reads = tokens[n.main_token].tag != .eq };
+    var cur = n.lhs;
+    while (true) {
+        const c = tree.nodes[cur.int()];
+        switch (c.tag) {
+            .field_access, .tuple_field => cur = c.lhs,
+            .index, .type_app => return if (cur == n.lhs) null else .{ .index = cur, .reads = true },
+            else => return null,
+        }
+    }
 }
 
 /// True when token `i` is the identifier `self`: a method's receiver, recognized by its
@@ -1466,7 +1479,7 @@ test "isMutParam detects a kw_mut token immediately before the param name" {
     try testing.expect(!isMutParam(tree, &toks, Index.from(1)));
 }
 
-test "indexStoreTarget names the index of a store, and whether it also reads" {
+test "indexStoreTarget names the element a store writes, and whether it also reads" {
     // tokens: [0]=xs [1]=`=` [2]=`+=` [3]=x
     const toks = [_]Token{
         .{ .tag = .identifier, .start = 0, .end = 2 },
@@ -1482,8 +1495,15 @@ test "indexStoreTarget names the index of a store, and whether it also reads" {
         .{ .tag = .assign, .main_token = 2, .lhs = Index.from(2), .rhs = Index.from(1) }, // xs[0] += 0
         .{ .tag = .identifier, .main_token = 3, .lhs = none, .rhs = none },
         .{ .tag = .assign, .main_token = 1, .lhs = Index.from(5), .rhs = Index.from(1) }, // x = 0
+        .{ .tag = .field_access, .main_token = 3, .lhs = Index.from(2), .rhs = none }, // xs[0].x
+        .{ .tag = .tuple_field, .main_token = 3, .lhs = Index.from(7), .rhs = none }, // xs[0].x.0
+        .{ .tag = .assign, .main_token = 1, .lhs = Index.from(8), .rhs = Index.from(1) }, // xs[0].x.0 = 0
+        .{ .tag = .field_access, .main_token = 3, .lhs = Index.from(0), .rhs = none }, // xs.x
+        .{ .tag = .assign, .main_token = 1, .lhs = Index.from(10), .rhs = Index.from(1) }, // xs.x = 0
     };
     const tree = Tree{ .nodes = &nodes, .extra = &.{} };
+    try testing.expectEqual(@as(?IndexStore, .{ .index = Index.from(2), .reads = true }), indexStoreTarget(tree, &toks, Index.from(9)));
+    try testing.expectEqual(@as(?IndexStore, null), indexStoreTarget(tree, &toks, Index.from(11)));
     try testing.expectEqual(@as(?IndexStore, .{ .index = Index.from(2), .reads = false }), indexStoreTarget(tree, &toks, Index.from(3)));
     try testing.expectEqual(@as(?IndexStore, .{ .index = Index.from(2), .reads = true }), indexStoreTarget(tree, &toks, Index.from(4)));
     try testing.expectEqual(@as(?IndexStore, null), indexStoreTarget(tree, &toks, Index.from(6)));

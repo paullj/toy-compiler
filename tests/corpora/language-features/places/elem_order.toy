@@ -1,0 +1,25 @@
+# Feature: `ps[i].x = v` copies the element in after the value runs, so a write the value
+# makes to another field of the same element is kept, and the index is evaluated once,
+# before the value.
+# expect: stdout "1\n"
+# expect: exit 47
+import std/io
+import std/vec
+
+struct P { x: int, y: int }
+
+fn main() -> int {
+    ps: Vec[P] = [P { x: 0, y: 0 }, P { x: 0, y: 0 }]
+    calls := 0
+    at := fn() -> int {
+        calls += 1
+        1
+    }
+    rhs := fn() -> int {
+        ps[1].y = 40
+        7
+    }
+    ps[0 + at()].x = rhs()
+    io.println(calls)
+    return ps[1].x + ps[1].y + ps[0].x + ps[0].y
+}

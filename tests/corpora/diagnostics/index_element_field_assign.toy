@@ -1,5 +1,6 @@
-# `xs[i]` reads a copy of the element, so assigning one of its fields would write the
-# copy and lose the write (T0070), on a local `Vec` as on a field's.
+# `xs[i].f = v` writes the field of the element in the Vec, but a compound store to an
+# element field (`xs[i].f op= v`) has no lowering yet (T0070), on a local `Vec` as on a
+# field's.
 import std/vec
 
 struct P { x: int }
@@ -7,10 +8,12 @@ struct H { ps: Vec[P] }
 
 fn main() -> int {
     h := H { ps: [P { x: 1 }] }
-    h.ps[0].x = 5  #~ ERROR [T0070] cannot assign to a field of an index element
+    h.ps[0].x = 5
+    h.ps[0].x += 5  #~ ERROR [T0070] cannot assign to a field of an index element `xs[i].field` with a compound operator
     ps: Vec[P] = [P { x: 2 }]
     i := 0
-    ps[0].x = 6  #~ ERROR [T0070] cannot assign to a field of an index element
-    ps[i].x = 7  #~ ERROR [T0070] cannot assign to a field of an index element
+    ps[i].x = 7
+    ps[0].x *= 6  #~ ERROR [T0070] cannot assign to a field of an index element `xs[i].field` with a compound operator
+    ps[i].x -= 7  #~ ERROR [T0070] cannot assign to a field of an index element `xs[i].field` with a compound operator
     return 0
 }

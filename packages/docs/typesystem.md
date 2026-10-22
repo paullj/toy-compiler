@@ -132,10 +132,9 @@ from two angles — assignability is directional (want ← got), join is symmetr
   error (nothing to bind).
 * `name: T = e` — explicit typed local. Parse `T`, `check(e, T)`, bind `name : T`.
 * `name = e` — assignment. `assignable(typeof(name), synth(e))`. The target is a
-  local or a field / tuple-field chain rooted at one. An index element is no place,
-  since `xs[i]` reads a copy, so `xs[i].f = v` is **T0070**. Nor is any other temporary:
-  a field of a call result (`p.get().x = v`) is **T0075**, and a call result itself
-  (`p.get() = v`) **R0007**.
+  local or a field / tuple-field chain rooted at one, or at an index element (see
+  `xs[i].f = e` below). No other temporary is a place: a field of a call result
+  (`p.get().x = v`) is **T0075**, and a call result itself (`p.get() = v`) **R0007**.
 * `xs[i] = e` — element store on a `Vec[T]`. It means `xs.set(i, e)`: `xs`, then `i`,
   then `e` are evaluated, left to right, then the index is checked and the element
   stored, so an out-of-bounds `i` panics after `e` has run. `e` is checked against `T`
@@ -144,6 +143,13 @@ from two angles — assignability is directional (want ← got), join is symmetr
   `xs[i] op= e` evaluates `xs` and `i` once, reads the element (an out-of-bounds `i`
   panics here, before `e` runs), then runs `e`, applies `op` and stores. A `Map`
   store `m[k] = v` is **T0057** with a hint to `m.set(k, v)`.
+* `xs[i].f = e` — field store on an element, through any field / tuple-field chain
+  (`ps[i].q.a = e`, `ps[i].0 = e`). It is read-modify-write: `xs`, then `i`, then `e`
+  are evaluated, then the element is copied in (an out-of-bounds `i` panics here), the
+  field is stored into the copy and the copy is written back with `xs.set(i, ..)`. No
+  code runs between the copy-in and the write-back, so a write `e` makes to another
+  field of the element is kept, and an `e` that grows `xs` still lands. A compound
+  `xs[i].f op= e` is **T0070**.
 * `place op= e` — compound assignment, for `op` in `+ - * / % | & ^ << >>` and the
   float forms `+. -. *. /.`. It means `place = place op e`: the place is read
   before `e` runs, `e` is typed like a binary operand (a bare integer literal takes the
