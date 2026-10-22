@@ -23,8 +23,8 @@ impl str {
     fn trim(self) -> str {
         lo := 0
         hi := self.len()
-        while lo < hi && is_space(self.byte_at(lo)) { lo = lo + 1 }
-        while hi > lo && is_space(self.byte_at(hi - 1)) { hi = hi - 1 }
+        while lo < hi && is_space(self.byte_at(lo)) { lo += 1 }
+        while hi > lo && is_space(self.byte_at(hi - 1)) { hi -= 1 }
         return text.slice(self, lo, hi)
     }
 
@@ -55,8 +55,8 @@ impl str {
         total := self.len() * (n - 1)
         i := 0
         while i < n {
-            total = total + parts.get(i).unwrap_or("").len()
-            i = i + 1
+            total += parts.get(i).unwrap_or("").len()
+            i += 1
         }
         buf := text.alloc(total)
         at := 0
@@ -64,12 +64,12 @@ impl str {
         while i < n {
             if i > 0 {
                 text.put(buf, at, self)
-                at = at + self.len()
+                at += self.len()
             }
             p := parts.get(i).unwrap_or("")
             text.put(buf, at, p)
-            at = at + p.len()
-            i = i + 1
+            at += p.len()
+            i += 1
         }
         return text.take(buf, total)
     }
@@ -102,7 +102,7 @@ impl Chars[T] has iter.Iterator[char] {
         if self.i >= n { return Option[char].none }
         b0 := self.s.byte_at(self.i)
         if b0 < 128 {
-            self.i = self.i + 1
+            self.i += 1
             return Option.some(scalar(b0))
         }
         need := 0
@@ -121,22 +121,22 @@ impl Chars[T] has iter.Iterator[char] {
             cp = b0 - 240
             min = 65536
         } else {
-            self.i = self.i + 1
+            self.i += 1
             return Option.some('\u{FFFD}')
         }
         k := 1
         while k <= need {
             if self.i + k >= n {
-                self.i = self.i + k
+                self.i += k
                 return Option.some('\u{FFFD}')
             }
             b := self.s.byte_at(self.i + k)
             if b < 128 || b > 191 {
-                self.i = self.i + k
+                self.i += k
                 return Option.some('\u{FFFD}')
             }
             cp = cp * 64 + (b - 128)
-            k = k + 1
+            k += 1
         }
         self.i = self.i + need + 1
         if cp < min { return Option.some('\u{FFFD}') }
@@ -147,7 +147,7 @@ impl Chars[T] has iter.Iterator[char] {
 fn matches_at(s: str, sub: str, i: int) -> bool {
     if i < 0 || i + sub.len() > s.len() { return false }
     j := 0
-    while j < sub.len() && s.byte_at(i + j) == sub.byte_at(j) { j = j + 1 }
+    while j < sub.len() && s.byte_at(i + j) == sub.byte_at(j) { j += 1 }
     return j == sub.len()
 }
 
@@ -155,7 +155,7 @@ fn find_from(s: str, sub: str, from: int) -> int {
     i := from
     while i + sub.len() <= s.len() {
         if matches_at(s, sub, i) { return i }
-        i = i + 1
+        i += 1
     }
     return -1
 }

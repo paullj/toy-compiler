@@ -12,18 +12,18 @@ import std/vec
 fn counter() -> fn() -> int {
     n := 0
     fn() {                         # captures n by reference: n moves to a GC box
-        n = n + 1
+        n += 1
         n
     }
 }
 
-fn bump(mut x: int) { x = x + 1 }  # changes the caller's variable, no heap
+fn bump(mut x: int) { x += 1 }      # changes the caller's variable, no heap
 
 fn main() -> int {
     next := counter()
     next()
     total := 0
-    [1, 2, 3].each(fn(v) { total = total + v })
+    [1, 2, 3].each(fn(v) { total += v })
     bump(total)                    # total is now 7
     return next() + total          # 2 + 7 = 9
 }
@@ -118,7 +118,7 @@ fn main() -> int {
 ## `mut` parameters
 
 ```toy
-fn bump(mut n: int) { n = n + 1 }
+fn bump(mut n: int) { n += 1 }
 bump(count)                          # count changes
 ```
 
