@@ -177,10 +177,18 @@ from two angles — assignability is directional (want ← got), join is symmetr
   like a `mut self` receiver, and its writes reach the caller's variable. The
   parameter's type stays by-value for checking (`n: int`); the mode is the fn's own
   `mut_mask` (bit *i* for param *i*, a method's `self` is bit 0), computed in Pass A.
-  The argument must be a mutable place — a local or a field / tuple-field chain
-  rooted at one — or it is **T0019**; the local it is rooted at counts as assigned
-  for the box rule. Allowed on top-level fns and inherent-impl methods (associated
-  fns included); a lambda's, local fn's, extern's or non-self protocol / conformance
+  The argument must be a mutable place — a local, a `Vec` element, or a field /
+  tuple-field chain rooted at either — or it is **T0019**; the local it is rooted at
+  counts as assigned for the box rule. An element (`bump(xs[i])`, `bump(ps[i].x)`, a
+  `mut self` call `ps[i].bump()`, `for x in ps[i]` over an `iter(mut self)`) is
+  read-modify-write: its handle and index are evaluated where the argument is, the
+  element is copied in there, the callee writes the copy, and after the call each copy
+  is written back with `xs.set(i, ..)`, in argument order (the receiver first). Two
+  arguments rooted at one element are two copies, and the last write-back wins, even
+  when they name different fields of it: `swap(ps[0].x, ps[0].y)` sets only `y`,
+  since the copy written back last still holds the old `x`. A write the callee makes
+  to the element through another handle is overwritten. Allowed on top-level fns and
+  inherent-impl methods (associated fns included); a lambda's, local fn's, extern's or non-self protocol / conformance
   param, or a param past the 64th, is **P0006**. A fn with a `mut` param, or a method
   with one after `self`, is not a value (**T0049**).
 * **`main` must return `int` or `()`** — any other return type (bool/str/struct/
@@ -544,9 +552,10 @@ value holds its cell, so the value and the function see each other's writes; one
 nothing assigns is copied into the value. Any other receiver (a field `p.inner.m`, a
 call result) is evaluated once, when the value is made, and copied. A `mut self`
 method writes its receiver through the value, so binding one boxes its receiver, which
-must be a local variable: a temporary is **T0019**, a field **T0072**. A method bound
-on a `mut` parameter (`mut self` included) holds the caller's variable by address; the
-bound value must not escape (**T0052**). A method with a `mut` parameter after `self` cannot be bound (**T0049**). An
+must be a local variable: a temporary or a `Vec` element is **T0019**, a field
+**T0072**. A method bound on a `mut` parameter (`mut self` included) holds the
+caller's variable by address; the bound value must not escape (**T0052**). A
+method with a `mut` parameter after `self` cannot be bound (**T0049**). An
 associated function has no receiver to bind (**T0018**), a generic method has no single
 instance (**T0049**), and a method the compiler expands at each call (a scalar or
 `str` builtin such as `s.len`, a conversion, the derivable `hash`/`to_string`, a native

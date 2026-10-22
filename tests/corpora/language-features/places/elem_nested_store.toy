@@ -1,0 +1,27 @@
+# Feature: an element store or an element `mut` argument nested in the value of an element
+# store (in an `if` block, or a call) runs inside the outer one: the outer element is read
+# before the value, the nested writes land, and the outer write lands last.
+# expect: exit 74
+import std/vec
+
+struct P { x: int }
+
+fn take(mut n: int) -> int {
+    n += 1
+    n
+}
+
+fn main() -> int {
+    xs: Vec[int] = [1, 2]
+    ps: Vec[P] = [P { x: 1 }]
+    c := true
+    xs[0] += if c {
+        xs[1] += 5
+        ps[0].x = 4
+        2
+    } else { 3 }
+    ys: Vec[int] = [0, 10]
+    xs[1] += take(ys[1])
+    # xs = [3, 18], ys[1] = 11, ps[0].x = 4
+    return xs[0] + xs[1] + ys[1] + ps[0].x * 10 + 2
+}

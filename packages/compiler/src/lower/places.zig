@@ -105,29 +105,18 @@ pub fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Va
     }
 }
 
-/// A `Vec` element a field store writes through (`ps[i]` in `ps[i].f = v`): the handle and
-/// the index, evaluated once, and the element node, whose copy the field store changes.
+/// A `Vec` element a store writes through (`ps[i]` in `ps[i].f = v`, or in a `mut`
+/// argument `bump(ps[i].x)`): the handle and the index, evaluated once, and the element
+/// node, whose copy the store changes.
 pub const ElementPlace = struct {
     ref: L.ElemRef,
     node: Ast.Index,
-    /// The element copied in by `copyIn`, which `writeBack` stores.
-    elem: Ir.Operand = .none,
+    /// The slot `copyIn` copies the element into, which `writeBack` stores.
+    copy: Ir.SlotId = Ir.none_slot,
 };
 
-/// The element a field store chain (`ps[i].q.a`) bottoms out at: an `.index`, or a
-/// value-headed `type_app` the parser could not tell from a turbofish. Null for a
-/// local-rooted place.
 pub fn elementRoot(b: *Builder, place: Ast.Index) ?Ast.Index {
-    var cur = place;
-    while (true) {
-        const n = b.in.tree.nodes[cur.int()];
-        switch (n.tag) {
-            .field_access, .tuple_field => cur = n.lhs,
-            .index => return cur,
-            .type_app => return if (L.appHeadIsValue(b, cur)) cur else null,
-            else => return null,
-        }
-    }
+    return symbols_res.elementRoot(b.in.tree, b.in.resolutions, place);
 }
 
 /// Evaluate the handle and the index of the element `node` names.
@@ -137,19 +126,47 @@ pub fn lowerElementPlace(b: *Builder, node: Ast.Index) error{OutOfMemory}!?Eleme
 }
 
 /// Copy the element in and return the address of `place` (a field chain rooted at the
-/// element) in the copy. The chain's element node yields the copy instead of reading the
-/// element again.
+/// element, or the element itself) in the copy. The chain's element node yields the copy
+/// instead of reading the element again. A scalar element is put in a slot, so a `mut`
+/// param has an address to write.
 pub fn copyIn(b: *Builder, ep: *ElementPlace, place: Ast.Index) error{OutOfMemory}!Ir.ValueId {
-    ep.elem = try L.emitElemRefRead(b, ep.ref);
-    std.debug.assert(b.prelowered == null);
-    b.prelowered = .{ .node = ep.node, .op = ep.elem };
-    defer b.prelowered = null;
+    const ty = ep.ref.ty;
+    ep.copy = switch (try L.emitElemRefRead(b, ep.ref)) {
+        .slot => |s| s,
+        else => |op| blk: {
+            const s = try b.addSlot(ty);
+            const at = try b.emit(.{ .slot_addr = s }, Typecheck.Type.int);
+            const word = if (L.passKind(b, ty) == .box) Typecheck.Type.int else ty;
+            _ = try b.emit(.{ .store = .{ .addr = at, .val = L.operandValue(op), .ty = word } }, null);
+            break :blk s;
+        },
+    };
+    const outer = b.pushPrelowered(ep.node, .{ .slot = ep.copy });
+    defer b.prelowered = outer;
     return lowerPlaceAddr(b, place);
 }
 
 /// Store the changed copy back to the element.
 pub fn writeBack(b: *Builder, ep: ElementPlace) error{OutOfMemory}!void {
-    try L.emitElemRefStore(b, ep.ref, ep.elem);
+    if (b.termSet()) return;
+    try L.emitElemRefStore(b, ep.ref, try L.slotOperand(b, ep.copy, ep.ref.ty));
+}
+
+/// The address a `mut` argument or a `mut self` receiver passes: a local-rooted place's
+/// own, or for a place rooted at a `Vec` element its address in a copy of the element,
+/// whose write-back joins `wbs` for the caller to run after the call.
+pub fn lowerMutPlaceAddr(b: *Builder, place: Ast.Index, wbs: *std.ArrayList(ElementPlace)) error{OutOfMemory}!Ir.ValueId {
+    const root = elementRoot(b, place) orelse return lowerPlaceAddr(b, place);
+    var ep = try lowerElementPlace(b, root) orelse return Ir.none_value;
+    const addr = try copyIn(b, &ep, place);
+    try wbs.append(b.gpa, ep);
+    return addr;
+}
+
+/// Run the write-backs a call's `mut` places queued, in argument order, so when two name
+/// one element the last one wins.
+pub fn writeBacks(b: *Builder, wbs: []const ElementPlace) error{OutOfMemory}!void {
+    for (wbs) |ep| try writeBack(b, ep);
 }
 
 /// Put each local a call in `body` passes as a `mut` argument or a `mut self` receiver into

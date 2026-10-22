@@ -1,0 +1,20 @@
+import std/vec
+
+# A bound `mut self` method keeps its receiver past the binding, but a Vec element is only
+# copied in and written back around a call, so binding one is still T0019 (D52).
+struct C { n: int }
+
+impl C {
+    fn bump(mut self) { self.n += 1 }
+}
+
+struct H { c: C }
+
+fn main() -> int {
+    cs: Vec[C] = [C { n: 0 }]
+    _f := cs[0].bump  #~ ERROR [T0019] cannot bind mutating method 'bump' to a Vec element; the receiver must be a local variable
+    hs: Vec[H] = [H { c: C { n: 0 } }]
+    _g := hs[0].c.bump  #~ ERROR [T0019] cannot bind mutating method 'bump' to a Vec element
+    cs[0].bump()
+    return cs[0].n
+}

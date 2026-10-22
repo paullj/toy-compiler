@@ -641,15 +641,18 @@ pub const BodyChecker = struct {
                     const what = if (target.tag == .index) "an element" else "variable";
                     try bc.sink.report(.{ .span = bc.spanOf(stmt.rhs), .code = .T0041 }, "cannot assign {s} to {s} of type {s}", .{ bc.typeName(rhs), what, bc.typeName(lhs) });
                 }
-                if (target.tag == .field_access or target.tag == .tuple_field) switch (bc.storeRoot(stmt.lhs)) {
-                    .name => {},
-                    // `ps[i].f = v` writes the element back; a compound one would also read
-                    // the field, which has no lowering yet.
-                    .index_element => if (bc.tokens[stmt.main_token].tag != .eq)
-                        try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0070 }, "cannot assign to a field of an index element `xs[i].field` with a compound operator; write `xs[i].field = xs[i].field op v`", .{}),
-                    .temporary => if (lhs.kind != .invalid)
-                        try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0075 }, "cannot assign to a field of a temporary value, such as a call result; it is a copy, so the write would be lost", .{}),
-                };
+                switch (target.tag) {
+                    .index => bc.noteElementWrite(stmt.lhs, bc.tokens[stmt.main_token].tag.compoundBase() != null),
+                    .field_access, .tuple_field => if (bc.rootIsTemporary(stmt.lhs)) {
+                        if (lhs.kind != .invalid)
+                            try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0075 }, "cannot assign to a field of a temporary value, such as a call result; it is a copy, so the write would be lost", .{});
+                    } else if (bc.elementRoot(stmt.lhs) != null and bc.tokens[stmt.main_token].tag != .eq) {
+                        // `ps[i].f = v` writes the element back; a compound one would also read
+                        // the field, which has no lowering yet.
+                        try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0070 }, "cannot assign to a field of an index element `xs[i].field` with a compound operator; write `xs[i].field = xs[i].field op v`", .{});
+                    } else bc.noteElementWrite(stmt.lhs, true),
+                    else => {},
+                }
             },
             .return_stmt => {
                 if (bc.body.ret_infer) {
@@ -1025,7 +1028,7 @@ pub const BodyChecker = struct {
     /// leftmost is a struct/enum name, generic fn, or module — never `.local` — so
     /// this reinterpretation never touches one. `b.items[i]` (leftmost `b` -> .local)
     /// is an index; `mod.Box[int]` (leftmost `mod` -> .module) stays a turbofish.
-    fn appHeadIsValue(bc: *BodyChecker, node_idx: Ast.Index) bool {
+    fn appHeadIsValue(bc: *const BodyChecker, node_idx: Ast.Index) bool {
         const n = bc.tree.nodes[(node_idx).int()];
         return n.tag == .type_app and symbols_res.leftmostHeadIsValue(bc.tree, bc.resolutions, n.lhs);
     }
@@ -1724,8 +1727,9 @@ pub const BodyChecker = struct {
                 try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0022 }, "mutating method '{s}' is not supported on the builtin type '{s}'; `mut self` is only allowed on struct and enum receivers", .{ member, bc.typeName(recv_ty) });
                 return false;
             }
-            if (!bc.isMutablePlace(recv)) {
-                try bc.sink.report(.{ .span = bc.spanOf(recv), .code = .T0019 }, "cannot bind mutating method '{s}' to a temporary; the receiver must be a local variable", .{member});
+            if (!bc.isVariablePlace(recv)) {
+                const what = if (bc.elementRoot(recv) != null) "a Vec element" else "a temporary";
+                try bc.sink.report(.{ .span = bc.spanOf(recv), .code = .T0019 }, "cannot bind mutating method '{s}' to {s}; the receiver must be a local variable", .{ member, what });
                 return false;
             }
             const slot = local orelse {
@@ -2375,8 +2379,9 @@ pub const BodyChecker = struct {
     /// A `mut self` call writes through its receiver, which must be a mutable place.
     fn checkMutReceiver(bc: *BodyChecker, recv: Ast.Index, member: []const u8) error{OutOfMemory}!void {
         try LambdaChecker.noteMutatedRoot(bc, recv);
-        if (!bc.isMutablePlace(recv))
-            try bc.sink.report(.{ .span = bc.spanOf(recv), .code = .T0019 }, "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable variable (a local or a field of one)", .{member});
+        if (!bc.isMutablePlace(recv)) {
+            try bc.sink.report(.{ .span = bc.spanOf(recv), .code = .T0019 }, "cannot call mutating method '{s}' on a temporary; the receiver must be a mutable place (a local, a Vec element, or a field of either)", .{member});
+        } else bc.noteElementWrite(recv, true);
     }
 
     /// Check `args` against `sig`: arity (typing every arg for effect first on a
@@ -2425,13 +2430,14 @@ pub const BodyChecker = struct {
         if (bc.body.hole != Ast.none and arg == bc.body.hole) {
             try bc.sink.report(.{ .span = bc.spanOf(arg), .code = .T0019, .related = sig.decl }, "argument {d} is a capture's '_', a copy of the value it is called with; '{s}' takes it as 'mut', so its change would be lost", .{ i + 1, callee });
         } else if (!bc.isMutablePlace(arg)) {
-            try bc.sink.report(.{ .span = bc.spanOf(arg), .code = .T0019, .related = sig.decl }, "argument {d}{s} must be a mutable variable (a local or a field of one); '{s}' takes it as 'mut'", .{ i + 1, bc.pipedArgHint(call, i + 1), callee });
+            try bc.sink.report(.{ .span = bc.spanOf(arg), .code = .T0019, .related = sig.decl }, "argument {d}{s} must be a mutable place (a local, a Vec element, or a field of either); '{s}' takes it as 'mut'", .{ i + 1, bc.pipedArgHint(call, i + 1), callee });
         } else if (bc.placeHopsThroughMethod(arg)) {
             try bc.sink.report(.{ .span = bc.spanOf(arg), .code = .T0019, .related = sig.decl }, "argument {d}{s} is a method value, not a place; '{s}' takes it as 'mut'", .{ i + 1, bc.pipedArgHint(call, i + 1), callee });
         } else if (bc.namesLocalFn(arg)) {
             try bc.sink.report(.{ .span = bc.spanOf(arg), .code = .T0019, .related = sig.decl }, "argument {d} names the local function '{s}', which a 'mut' parameter could reassign", .{ i + 1, bc.nameText(bc.tree.nodes[arg.int()].main_token) });
         } else {
             try LambdaChecker.noteMutatedRoot(bc, arg);
+            bc.noteElementWrite(arg, true);
         }
     }
 
@@ -4695,38 +4701,51 @@ pub const BodyChecker = struct {
         return refs.byteOf(bc, tok);
     }
 
-    /// Whether `node_idx` names a mutable, addressable place: an identifier bound to
-    /// a `.local` (all locals — incl. the `self` receiver — are mutable), or a
-    /// `field_access` chain rooted at one. A temporary/rvalue (a construction, a call
-    /// result, a literal) is NOT a place. Gates a `mut self` receiver and a `mut` argument
-    /// (T0019).
+    /// Whether `node_idx` names a mutable place a `mut self` receiver or a `mut` argument
+    /// can write (T0019): a variable place, or a field chain rooted at a Vec element, which
+    /// `lower` copies in before the call and writes back after it.
     fn isMutablePlace(bc: *const BodyChecker, node_idx: Ast.Index) bool {
+        return bc.isVariablePlace(node_idx) or bc.elementRoot(node_idx) != null;
+    }
+
+    /// Whether `node_idx` names a variable: an identifier bound to a `.local` (all locals —
+    /// incl. the `self` receiver — are mutable), or a field chain rooted at one. A bound
+    /// `mut self` method keeps its receiver by reference past the binding, which a Vec
+    /// element's copy-in and write-back cannot span, so it needs one (D52).
+    fn isVariablePlace(bc: *const BodyChecker, node_idx: Ast.Index) bool {
         const n = bc.tree.nodes[(node_idx).int()];
         return switch (n.tag) {
             .identifier => bc.resolutions[(node_idx).int()] == .local,
-            .field_access, .tuple_field => bc.isMutablePlace(n.lhs),
+            .field_access, .tuple_field => bc.isVariablePlace(n.lhs),
             else => false,
         };
     }
 
-    /// What a `.field`/`.tuple_field` store chain bottoms out at. A name is a place. An
-    /// index element (`ps[i]` — an `.index` node, or a value-headed `type_app` the parser
-    /// could not tell from a turbofish) is copied in and written back by `lower`. Any other
-    /// temporary (`p.get()`, `o?`) has no home to write back to, so a store through it
-    /// would write the copy and silently drop the write.
-    const StoreRoot = enum { name, index_element, temporary };
+    fn elementRoot(bc: *const BodyChecker, node_idx: Ast.Index) ?Ast.Index {
+        return symbols_res.elementRoot(bc.tree, bc.resolutions, node_idx);
+    }
 
-    fn storeRoot(bc: *BodyChecker, node_idx: Ast.Index) StoreRoot {
+    /// Mark the element a written place is rooted at, so discovery and the fingerprint
+    /// enqueue the element primitives `lower` calls: `ga_set_at` for a store, and `ga_at`
+    /// as well when `reads` (the element is read, changed and written back).
+    fn noteElementWrite(bc: *BodyChecker, place: Ast.Index, reads: bool) void {
+        if (bc.abstract_template) return;
+        if (bc.elementRoot(place)) |root| bc.setCalleeAt(root, if (reads) Callee.elem_write else Callee.elem_store);
+    }
+
+    /// Whether a `.field`/`.tuple_field` store chain bottoms out at a temporary (`p.get()`,
+    /// `o?`), which has no home to write back to, so a store through it would write the
+    /// copy and silently drop the write. A name is a place, and `lower` copies a Vec
+    /// element in and writes it back. A type-named head (`Vec[int].x`) is not a value
+    /// either, but its own error stands.
+    fn rootIsTemporary(bc: *const BodyChecker, node_idx: Ast.Index) bool {
         var cur = node_idx;
         while (true) {
             const n = bc.tree.nodes[cur.int()];
             switch (n.tag) {
                 .field_access, .tuple_field => cur = n.lhs,
-                .identifier => return .name,
-                .index => return .index_element,
-                // A type-named head (`Vec[int].x`) is not a value; its own error stands.
-                .type_app => return if (bc.appHeadIsValue(cur)) .index_element else .name,
-                else => return .temporary,
+                .identifier, .index, .type_app => return false,
+                else => return true,
             }
         }
     }
