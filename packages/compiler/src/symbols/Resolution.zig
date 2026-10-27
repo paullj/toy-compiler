@@ -87,6 +87,53 @@ pub fn placeRoot(tree: Ast.Tree, resolutions: []const Resolution, place: Ast.Ind
     return null;
 }
 
+/// Whether the `field_access` `access` is a qualified unit-variant construction (`N.V`,
+/// `mod.N.V`, `Opt[int].V`) rather than a field read: its receiver names a type, not a
+/// value. Being rooted at no local is not enough, as `ps[0].s` and `f().s` read fields
+/// off receivers that are no place.
+pub fn isQualifiedVariant(tree: Ast.Tree, resolutions: []const Resolution, access: Ast.Index) bool {
+    const recv_idx = tree.nodes[access.int()].lhs;
+    const recv = tree.nodes[recv_idx.int()];
+    return switch (recv.tag) {
+        .identifier => resolutions[recv_idx.int()] == .unresolved,
+        .field_access => tree.nodes[recv.lhs.int()].tag == .identifier and resolutions[recv.lhs.int()] == .module,
+        .type_app => !leftmostHeadIsValue(tree, resolutions, recv.lhs),
+        else => false,
+    };
+}
+
+test isQualifiedVariant {
+    const std = @import("std");
+    const Node = Ast.Node;
+    const idx = Ast.Index.from;
+
+    // 0: identifier N (unresolved)  1: field_access(0) `N.V`
+    // 2: identifier mod (module)  3: field_access(2) `mod.N`  4: field_access(3) `mod.N.V`
+    // 5: identifier ps (local)  6: index(5)  7: field_access(6) `ps[0].s`
+    // 8: field_access(5) `ps.s`  9: call  10: field_access(9) `f().s`
+    var nodes = [_]Node{
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .field_access, .main_token = 1, .lhs = idx(0), .rhs = Ast.none },
+        .{ .tag = .identifier, .main_token = 2, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .field_access, .main_token = 3, .lhs = idx(2), .rhs = Ast.none },
+        .{ .tag = .field_access, .main_token = 4, .lhs = idx(3), .rhs = Ast.none },
+        .{ .tag = .identifier, .main_token = 5, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .index, .main_token = 6, .lhs = idx(5), .rhs = Ast.none },
+        .{ .tag = .field_access, .main_token = 7, .lhs = idx(6), .rhs = Ast.none },
+        .{ .tag = .field_access, .main_token = 8, .lhs = idx(5), .rhs = Ast.none },
+        .{ .tag = .call, .main_token = 9, .lhs = idx(0), .rhs = Ast.none },
+        .{ .tag = .field_access, .main_token = 10, .lhs = idx(9), .rhs = Ast.none },
+    };
+    const tree: Ast.Tree = .{ .nodes = &nodes, .extra = &.{} };
+    const res = [_]Resolution{ .unresolved, .unresolved, .{ .module = 1 }, .unresolved, .unresolved, .{ .local = 0 }, .unresolved, .unresolved, .unresolved, .unresolved, .unresolved };
+
+    try std.testing.expect(isQualifiedVariant(tree, &res, idx(1)));
+    try std.testing.expect(isQualifiedVariant(tree, &res, idx(4)));
+    try std.testing.expect(!isQualifiedVariant(tree, &res, idx(7)));
+    try std.testing.expect(!isQualifiedVariant(tree, &res, idx(8)));
+    try std.testing.expect(!isQualifiedVariant(tree, &res, idx(10)));
+}
+
 test placeRoot {
     const std = @import("std");
     const Node = Ast.Node;
