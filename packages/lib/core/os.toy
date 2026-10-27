@@ -1,6 +1,6 @@
-# The quarantined libSystem process clients: argv, the environment, errno and exit. C
-# strings are copied into gc strs on the way in (D66), so no toy str ever points into C
-# memory that a later setenv or exit could free.
+# The quarantined libSystem process clients: argv, the environment, errno, exit and the
+# clocks. C strings are copied into gc strs on the way in (D66), so no toy str ever points
+# into C memory that a later setenv or exit could free.
 import core/text
 
 pub extern fn _NSGetArgc() -> rawptr
@@ -11,6 +11,9 @@ pub extern fn getenv(name: rawptr) -> int
 pub extern fn strlen(s: rawptr) -> int
 pub extern fn exit(code: int) -> never
 pub extern fn __error() -> rawptr
+# Returns a uint64, which stays positive in an int for the next 292 years.
+pub extern fn clock_gettime_nsec_np(clock: int) -> int
+pub extern fn nanosleep(req: rawptr, rem: rawptr) -> int
 
 # A C `int` is 4 bytes and `load` reads 8, so the next 4 would be whatever follows it.
 fn load_i32(p: rawptr) -> int {
@@ -68,4 +71,33 @@ pub fn env(name: str) -> Option[str] {
     p := getenv(to_cstr(name))
     if p == 0 { return Option[str].none }
     return Option.some(from_cstr(offset(p, 0)))
+}
+
+# Darwin's CLOCK_MONOTONIC (6). It keeps counting while the machine sleeps, so an elapsed
+# time includes the sleep, as a wall-clock duration should.
+pub fn monotonic_ns() -> int {
+    return clock_gettime_nsec_np(6)
+}
+
+# Darwin's CLOCK_REALTIME (0): nanoseconds since 1970.
+pub fn realtime_ns() -> int {
+    return clock_gettime_nsec_np(0)
+}
+
+# Sleeps at least `ns` nanoseconds. A signal cuts nanosleep short and leaves what remains in
+# `rem` (EINTR is 4), so it sleeps again for that remainder.
+pub fn sleep_ns(ns: int) {
+    if ns <= 0 { return }
+    req := gc_alloc(16)
+    rem := gc_alloc(16)
+    unsafe {
+        store(req, ns / 1_000_000_000)
+        store(offset(req, 8), ns % 1_000_000_000)
+    }
+    while nanosleep(req, rem) != 0 && errno() == 4 {
+        unsafe {
+            store(req, load(rem))
+            store(offset(req, 8), load(offset(rem, 8)))
+        }
+    }
 }

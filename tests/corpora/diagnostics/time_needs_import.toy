@@ -1,0 +1,4 @@
+# The clock API (now, sleep, unix) lives in std/time; without the import a use names it.
+fn main() -> int {
+    return time.unix()  #~ ERROR [R0001] add 'import std/time'
+}
