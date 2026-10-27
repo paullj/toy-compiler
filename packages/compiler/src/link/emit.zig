@@ -2,10 +2,11 @@
 //! runnable Mach-O image.
 //!
 //! WHY this is one entry point: the backend tail is a fixed, order-sensitive
-//! pipeline — (1) detect referenced hand-emitted builtin bodies (e.g. `panic`, which
-//! pulls in `write`) and append them, (2) intern the
-//! per-fn content-hashed cstring literals program-wide IN A DETERMINISTIC ORDER
-//! (fn source order, then in-fn literal order), (3) rewrite each `.cstr` reloc's
+//! pipeline — (0) drop every fn and descriptor unreachable from the entry, (1)
+//! detect referenced hand-emitted builtin bodies (e.g. `panic`, which pulls in
+//! `write`) and append them, (2) intern the per-fn content-hashed cstring
+//! literals program-wide IN A DETERMINISTIC ORDER (fn source order, then in-fn
+//! literal order), (3) rewrite each `.cstr` reloc's
 //! hash target to its global `__cstring` offset, (4) `Link.link` (layout +
 //! intra-module `.call26` patch + collect cross-segment data_relocs), (5)
 //! `MachO.assemble` (segments, __cstring, __got import, chained fixups), (6)
@@ -65,18 +66,50 @@ pub const Linked = struct {
     data_relocs: []Link.Reloc = &.{},
 };
 
-/// Append referenced hand-emitted builtin bodies, intern strings deterministically,
-/// rewrite `.cstr` targets, then `Link.link`. CONSUMES `fns` (frees each FnCode
-/// and any appended builtin body). `entry` is the entry function's stable symbol
-/// identity. Returns the linked tail; the caller owns its `text`/`cstrings`/
-/// `data_relocs` (free `.import` data-reloc names individually).
-pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymName, descriptors: []const Link.DescEntry) !Linked {
-    // 1) Scan which hand-emitted builtins (`runtime.hand_builtins`) any fn references;
+/// Drop fns and descriptors unreachable from `entry`, append referenced hand-emitted
+/// builtin bodies, intern strings deterministically, rewrite `.cstr` targets, then
+/// `Link.link`. CONSUMES `fns` (frees each FnCode, dropped or kept, and any appended
+/// builtin body). `entry` is the entry function's stable symbol identity. Returns the
+/// linked tail; the caller owns its `text`/`cstrings`/`data_relocs` (free `.import`
+/// data-reloc names individually).
+pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sym.SymName, planned: []const Link.DescEntry) !Linked {
+    // We OWN `fns`' elements now (the caller relinquished them); on any failure free
+    // the ones not yet moved into `all` (or dropped) plus everything in `all`.
+    var all: std.ArrayList(Link.FnCode) = .empty;
+    var moved: usize = 0;
+    errdefer {
+        for (fns[moved..]) |*f| f.deinit(gpa);
+    }
+    defer {
+        for (all.items) |*f| f.deinit(gpa);
+        all.deinit(gpa);
+    }
+
+    // 0) Drop every fn and descriptor unreachable from the entry before anything reads
+    //    them, so the builtins, imports, cstrings, descriptor table, symtab and stack map
+    //    below all derive from the kept set alone. Kept fns and descriptors stay in their
+    //    canonical order, so the image is still a pure function of the fn set at any -jN.
+    var kept_descs: std.ArrayList(Link.DescEntry) = .empty;
+    defer kept_descs.deinit(gpa);
+    {
+        const r = try Link.reachable(gpa, fns, entry, planned);
+        defer r.deinit(gpa);
+        for (planned, r.descs) |d, k| {
+            if (k) try kept_descs.append(gpa, d);
+        }
+        for (fns, r.fns) |*f, k| {
+            if (k) try all.append(gpa, f.*) else f.deinit(gpa);
+            moved += 1;
+        }
+    }
+    const descriptors = kept_descs.items;
+
+    // 1) Scan which hand-emitted builtins (`runtime.hand_builtins`) any kept fn references;
     //    each referenced body is appended below. Those bodies emit their own `.import`
     //    relocs (e.g. `panic` -> `write`), so the dyld import set is DERIVED from
     //    `data_relocs` like any other import.
     var used = [_]bool{false} ** runtime.hand_builtins.len;
-    for (fns) |f| {
+    for (all.items) |f| {
         for (f.relocs) |rl| switch (rl.target) {
             .func => |s| if (s.kind == .builtin) {
                 for (runtime.hand_builtins, 0..) |hb, i| {
@@ -111,23 +144,8 @@ pub fn linkProgram(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry: sy
     // true for any allocating program and false for a heap-free one (keeping it
     // byte-identical). Local to `linkProgram`: no new param threads through `Codegen`.
     const uses_gc = used[comptime runtime.handBuiltinIndex("gc_collect")];
-    // Build the full fn set: the user fns + (if referenced) the hand-emitted builtin
-    // bodies, appended in `hand_builtins` order so the linked image is a pure function of
-    // the fn set (never thread order). We OWN `fns`' elements now (the caller relinquished
-    // them); on any failure free the ones not yet moved into `all` plus everything in `all`.
-    var all: std.ArrayList(Link.FnCode) = .empty;
-    var moved: usize = 0;
-    errdefer {
-        for (fns[moved..]) |*f| f.deinit(gpa);
-    }
-    defer {
-        for (all.items) |*f| f.deinit(gpa);
-        all.deinit(gpa);
-    }
-    for (fns) |f| {
-        try all.append(gpa, f);
-        moved += 1;
-    }
+    // The referenced hand-emitted builtin bodies follow the kept fns, in `hand_builtins`
+    // order, so the linked image never depends on thread order.
     for (runtime.hand_builtins, 0..) |hb, i| {
         if (used[i]) try all.append(gpa, try hb.lower(gpa));
     }
@@ -545,49 +563,82 @@ const w_ret: u32 = 0xD65F03C0;
 /// call26 to the appended builtin, which drags in `write` + the symbol table). Consumed
 /// (freed) by `linkProgram`.
 fn detFn(gpa: std.mem.Allocator, name: []const u8, lit_hash: u64, lit_bytes: []const u8, call_panic: bool) !Link.FnCode {
-    const nwords: usize = if (call_panic) 4 else 3;
-    const code = try gpa.alloc(u8, nwords * 4);
-    std.mem.writeInt(u32, code[0..4], w_adrp0, .little);
-    std.mem.writeInt(u32, code[4..8], w_add0, .little);
-    if (call_panic) {
-        std.mem.writeInt(u32, code[8..12], w_bl0, .little);
-        std.mem.writeInt(u32, code[12..16], w_ret, .little);
-    } else {
-        std.mem.writeInt(u32, code[8..12], w_ret, .little);
-    }
+    return detFnCalling(gpa, name, lit_hash, lit_bytes, call_panic, &.{});
+}
+
+/// `detFn` that also ends in a `bl` to each of `callees` (before the `ret`), so the link
+/// keeps them.
+fn detFnCalling(gpa: std.mem.Allocator, name: []const u8, lit_hash: u64, lit_bytes: []const u8, call_panic: bool, callees: []const []const u8) !Link.FnCode {
+    var words: std.ArrayList(u32) = .empty;
+    defer words.deinit(gpa);
     var relocs: std.ArrayList(Link.Reloc) = .empty;
+    try words.appendSlice(gpa, &.{ w_adrp0, w_add0 });
     try relocs.append(gpa, .{ .site = 0, .target = .{ .cstr = lit_hash }, .kind = .adrp_page });
     try relocs.append(gpa, .{ .site = 4, .target = .{ .cstr = lit_hash }, .kind = .add_lo12 });
     if (call_panic) {
-        try relocs.append(gpa, .{ .site = 8, .target = .{ .func = .{ .kind = .builtin, .name = try gpa.dupe(u8, "panic") } }, .kind = .call26 });
+        try relocs.append(gpa, .{ .site = @intCast(words.items.len * 4), .target = .{ .func = .{ .kind = .builtin, .name = try gpa.dupe(u8, "panic") } }, .kind = .call26 });
+        try words.append(gpa, w_bl0);
     }
+    for (callees) |c| {
+        try relocs.append(gpa, .{ .site = @intCast(words.items.len * 4), .target = .{ .func = .{ .kind = .user_fn, .name = try gpa.dupe(u8, c) } }, .kind = .call26 });
+        try words.append(gpa, w_bl0);
+    }
+    try words.append(gpa, w_ret);
+    const code = try gpa.alloc(u8, words.items.len * 4);
+    for (words.items, 0..) |w, i| std.mem.writeInt(u32, code[i * 4 ..][0..4], w, .little);
     const lits = try gpa.alloc(Link.Literal, 1);
     lits[0] = .{ .hash = lit_hash, .bytes = try gpa.dupe(u8, lit_bytes) };
     return .{ .sym = .{ .kind = .user_fn, .name = try gpa.dupe(u8, name) }, .code = code, .relocs = try relocs.toOwnedSlice(gpa), .literals = lits };
 }
 
 /// Build one owned `FnCode` that calls an `extern` import `sym` via its GOT slot:
-/// `adrp x16,0 ; ldr x16,[x16] ; blr x16 ; ret`, with the two `.import` relocs the
-/// cross-segment pass rebases to the `__got` slot. Consumed (freed) by `linkProgram`.
-fn importFn(gpa: std.mem.Allocator, name: []const u8, sym_name: []const u8) !Link.FnCode {
-    const code = try gpa.alloc(u8, 16);
+/// `adrp x16,0 ; ldr x16,[x16] ; blr x16 ; [bl callee ;] ret`, with the two `.import`
+/// relocs the cross-segment pass rebases to the `__got` slot. Consumed (freed) by
+/// `linkProgram`.
+fn importFn(gpa: std.mem.Allocator, name: []const u8, sym_name: []const u8, callee: ?[]const u8) !Link.FnCode {
+    const code = try gpa.alloc(u8, if (callee != null) 20 else 16);
     std.mem.writeInt(u32, code[0..4], w_adrp0, .little);
     std.mem.writeInt(u32, code[4..8], 0xF9400210, .little); // ldr x16,[x16]
     std.mem.writeInt(u32, code[8..12], 0xD63F0200, .little); // blr x16
-    std.mem.writeInt(u32, code[12..16], w_ret, .little);
+    if (callee != null) std.mem.writeInt(u32, code[12..16], w_bl0, .little);
+    std.mem.writeInt(u32, code[code.len - 4 ..][0..4], w_ret, .little);
     var relocs: std.ArrayList(Link.Reloc) = .empty;
     try relocs.append(gpa, .{ .site = 0, .target = .{ .import = .{ .kind = .import, .name = try gpa.dupe(u8, sym_name) } }, .kind = .adrp_page });
     try relocs.append(gpa, .{ .site = 4, .target = .{ .import = .{ .kind = .import, .name = try gpa.dupe(u8, sym_name) } }, .kind = .ldr_lo12 });
+    if (callee) |c| try relocs.append(gpa, .{ .site = 12, .target = .{ .func = .{ .kind = .user_fn, .name = try gpa.dupe(u8, c) } }, .kind = .call26 });
     return .{ .sym = .{ .kind = .user_fn, .name = try gpa.dupe(u8, name) }, .code = code, .relocs = try relocs.toOwnedSlice(gpa), .literals = &.{} };
 }
 
-/// Two fns importing distinct dyld symbols (`write`, `labs`) → a 2-slot `__got`.
-/// Fresh (owned) each call so both determinism-test runs get their own to consume.
+/// Two fns importing distinct dyld symbols (`write`, `labs`) → a 2-slot `__got`. `main`
+/// calls `aaa`, so the link keeps both. Fresh (owned) each call so both determinism-test
+/// runs get their own to consume.
 fn twoImportFns(gpa: std.mem.Allocator) ![]Link.FnCode {
     const fns = try gpa.alloc(Link.FnCode, 2);
-    fns[0] = try importFn(gpa, "aaa", "write");
-    fns[1] = try importFn(gpa, "main", "labs");
+    fns[0] = try importFn(gpa, "aaa", "write", null);
+    fns[1] = try importFn(gpa, "main", "labs", "aaa");
     return fns;
+}
+
+test "dfe: linkProgram drops a fn unreachable from the entry, with its import and strings" {
+    const gpa = testing.allocator;
+    const entry = Link.SymName{ .kind = .user_fn, .name = "main" };
+    const fns = try gpa.alloc(Link.FnCode, 3);
+    defer gpa.free(fns);
+    fns[0] = try importFn(gpa, "aaa", "write", null);
+    fns[1] = try detFn(gpa, "bbb", 0x2222, "beta", true);
+    fns[2] = try importFn(gpa, "main", "labs", null);
+
+    var t = std.Io.Threaded.init(gpa, .{ .concurrent_limit = .limited(0) });
+    defer t.deinit();
+    var lk = try linkProgram(t.io(), gpa, fns, entry, &.{});
+    defer freeLinked(gpa, &lk);
+
+    // Only `main` survives: no `aaa`, no `bbb`, so no `panic` body either.
+    try testing.expectEqual(@as(usize, 16), lk.text.len);
+    try testing.expectEqual(@as(u32, 0), lk.entry_off);
+    try testing.expectEqual(@as(usize, 0), lk.cstrings.len);
+    try testing.expectEqual(@as(usize, 2), lk.data_relocs.len);
+    for (lk.data_relocs) |rl| try testing.expectEqualStrings("labs", rl.target.import.name);
 }
 
 test "backend spike: a 2-import (labs+write) image is byte-identical at -j1 and -jN" {
@@ -689,14 +740,14 @@ test "backend determinism: the gc stack-map table (riding __cstring) is byte-ide
     try testing.expect(serial.cstrings.len > 0);
 }
 
-/// Three fns with distinct cstrings; `main` also calls `panic`. Fresh (owned) each call
+/// Three fns with distinct cstrings; `main` calls the other two and `panic`. Fresh (owned) each call
 /// so both determinism-test runs get their own copy to consume. `linkProgram` deinits
 /// the ELEMENTS but not the slice backing, so the caller frees the returned slice.
 fn detFns(gpa: std.mem.Allocator) ![]Link.FnCode {
     const fns = try gpa.alloc(Link.FnCode, 3);
     fns[0] = try detFn(gpa, "aaa", 0x1111, "alpha", false);
     fns[1] = try detFn(gpa, "bbb", 0x2222, "beta", false);
-    fns[2] = try detFn(gpa, "main", 0x3333, "gamma", true);
+    fns[2] = try detFnCalling(gpa, "main", 0x3333, "gamma", true, &.{ "aaa", "bbb" });
     return fns;
 }
 
