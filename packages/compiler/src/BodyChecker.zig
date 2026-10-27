@@ -3830,17 +3830,18 @@ pub const BodyChecker = struct {
             }
             // `panic(msg)`: the message must be a `str` (it lowers to a raw {ptr,len}
             // write; a non-str arg would be marshalled per its own ABI and misread).
-            // Discriminate by the callee token — the Model fn carries no name. The call is
-            // `never` on every path, a bad arity or arg included: it still cannot return,
-            // so the enclosing fn or arm must not also report a missing value.
+            // Discriminate by the callee token — the Model fn carries no name. The call has
+            // its seeded `never` return on every path, a bad arity or arg included: it still
+            // cannot return, so the enclosing fn or arm must not also report a missing value.
             if (callee.tag == .identifier and std.mem.eql(u8, bc.nameText(callee.main_token), "panic")) {
                 if (try bc.checkArity(node_idx, args, 1)) {
                     const at = try bc.typeOf(args[0]);
                     if (at.kind != .str and at.kind != .invalid and at.kind != .never)
                         try bc.sink.report(.{ .span = bc.spanOf(args[0]), .code = .T0040 }, "panic message must be a 'str', got '{s}'", .{bc.typeName(at)});
                 }
-                bc.node_types[(node_idx).int()] = Type.never;
-                return Type.never;
+                std.debug.assert(f.ret.kind == .never);
+                bc.node_types[(node_idx).int()] = f.ret;
+                return f.ret;
             }
             // No other 1-arg builtin exists post the intrinsic switch above; a `.func` here
             // is not a builtin call the checker recognizes. Reject rather than fall into the

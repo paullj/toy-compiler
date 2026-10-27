@@ -190,6 +190,20 @@ pub const refs = struct {
     /// Map a type-reference node (an `identifier`, a `literal_unit` for `()`, or in
     /// graph mode a qualified `mod.Type` `field_access`) to a `Type`.
     pub fn typeFromNode(self: anytype, type_node: Ast.Index) Type {
+        return refs.typeFromNodeAt(self, type_node, .value);
+    }
+
+    /// A declared return type (a fn, method, extern, protocol method, local fn, lambda or
+    /// fn type); an omitted `-> R` is unit.
+    pub fn retTypeFromNode(self: anytype, type_node: Ast.Index) Type {
+        return refs.typeFromNodeAt(self, type_node, .ret);
+    }
+
+    /// `never` is spellable only in `.ret` position: a value of it cannot exist, so a
+    /// param, field or binding of it would be dead weight that layout and codegen would
+    /// have to size. It resolves after every user/imported name so a user type `never`
+    /// still wins, as with every other builtin-ish name.
+    fn typeFromNodeAt(self: anytype, type_node: Ast.Index, pos: enum { value, ret }) Type {
         if (type_node == Ast.none) return Type.unit;
         const tn = self.tree.nodes[type_node.int()];
         if (tn.tag == .literal_unit) return Type.unit; // explicit `-> ()` / `p: ()`
@@ -234,6 +248,11 @@ pub const refs = struct {
         // concrete type (per-instance re-check via the checker's substitution). Empty
         // context => null => the normal unknown-type path, byte-identical otherwise.
         if (self.genericParamType(name)) |ty| return ty;
+        if (std.mem.eql(u8, name, "never")) {
+            if (pos == .ret) return Type.never;
+            self.sink.report(.{ .span = refs.tokSpan(self, tok), .code = .T0001 }, "'never' can only be the return type of a function", .{}) catch {};
+            return .invalid;
+        }
         // An exact stdlib type/namespace named here means the import is missing —
         // name the module. The print family (spelling != null) is never a type, so
         // it falls through to the bare message unchanged.
@@ -266,7 +285,7 @@ pub const refs = struct {
             params[i] = refs.typeFromNode(self, pn);
             if (params[i].kind == .invalid) bad = true;
         }
-        const ret = refs.typeFromNode(self, tn.rhs);
+        const ret = refs.retTypeFromNode(self, tn.rhs);
         if (bad or ret.kind == .invalid) return .invalid;
         return refs.internFn(self, params, ret);
     }
@@ -2500,7 +2519,7 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // index this table directly. The synthetic bodyless `panic` is one of them.
     for (fns) |gf| {
         if (gf.kind == .builtin) {
-            try t.appendBuiltinSig();
+            try t.appendBuiltinSig(if (std.mem.eql(u8, gf.name, "panic")) Type.never else Type.unit);
         } else if (gf.kind == .import) {
             _ = t.gphSelect(gf.module);
             try t.decodeExternSig(gf.decl_node, gf.module);
@@ -4156,7 +4175,7 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
         const param = t.tree.nodes[param_idx.int()];
         params[i] = t.typeFromNode(param.lhs);
     }
-    const ret: Type = if (proto.ret_type == Ast.none) Type.unit else t.typeFromNode(proto.ret_type);
+    const ret = refs.retTypeFromNode(t, proto.ret_type);
     const mut_mask = Modes.ofProto(t.tree, t.tokens, proto);
     try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .user_fn, .params = params, .ret = ret, .mod = mod, .generic_params = gnames, .generic_bounds = gbounds, .generic_bound_args = gbound_args, .self_type = self_ty, .mut_mask = mut_mask });
     // Register the method into the program-wide table (SERIAL, fn-id order). The name
@@ -4282,7 +4301,7 @@ pub fn implRejected(t: *const Typecheck, mod: u32, recv_node: Ast.Index) bool {
 /// Every param type and the return type are gated to the C-ABI types the backend
 /// can marshal — `int` (any width), `rawptr`, `bool`, `float` (f64/C `double`), or `str`
 /// (a `{ptr,len}` reg-pair spreading to two C args); a `void` return, spelled by omitting
-/// `-> R`, is also fine.
+/// `-> R`, and a `never` return are also fine.
 /// A type outside that set is T0037 and poisoned to `.invalid`. No generics, no self,
 /// no method registration.
 fn decodeExternSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
@@ -4300,9 +4319,10 @@ fn decodeExternSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
             params[i] = .invalid;
         }
     }
-    var ret: Type = if (proto.ret_type == Ast.none) Type.unit else t.typeFromNode(proto.ret_type);
-    // A `void` extern omits `-> R` (ret == unit); an EXPLICIT return must be a C-ABI scalar.
-    if (proto.ret_type != Ast.none and !externTypeOk(ret)) {
+    var ret = refs.retTypeFromNode(t, proto.ret_type);
+    // A `void` extern omits `-> R` (ret == unit); an EXPLICIT return must be a C-ABI
+    // scalar, or `never` for a C fn that does not return (`exit`, `abort`).
+    if (proto.ret_type != Ast.none and ret.kind != .never and !externTypeOk(ret)) {
         try t.sink.report(.{ .span = t.spanOf(proto.ret_type), .code = .T0037 }, "extern function parameter/return type must be int, float, str, rawptr, or bool", .{});
         ret = .invalid;
     }
@@ -4321,11 +4341,12 @@ fn externTypeOk(ty: Type) bool {
     return ty.isInteger() or ty.kind == .bool or ty.isRawPtr() or ty.kind == .str or ty.kind == .float or ty.kind == .invalid;
 }
 
-/// Append a placeholder `(str) -> ()` sig for a bodyless builtin (`panic`/the intrinsics).
-/// The real arg-checking is token-based in `BodyChecker`; this sig only holds the id slot.
-fn appendBuiltinSig(t: *Typecheck) !void {
+/// Append a placeholder `(str) -> ret` sig for a bodyless builtin (`panic`/the intrinsics).
+/// The real arg-checking is token-based in `BodyChecker`; the sig holds the id slot and,
+/// for `panic`, the `never` return its call is typed with.
+fn appendBuiltinSig(t: *Typecheck, ret: Type) !void {
     const params = try t.gpa.dupe(Type, &.{.str});
-    try t.fns.append(t.gpa, .{ .decl_node = Ast.none, .kind = .builtin, .params = params, .ret = .unit });
+    try t.fns.append(t.gpa, .{ .decl_node = Ast.none, .kind = .builtin, .params = params, .ret = ret });
 }
 
 pub fn typeFromNode(t: *Typecheck, type_node: Ast.Index) Type {
@@ -4484,6 +4505,11 @@ const Checked = struct {
 /// directly; the node-parallel `result.node_types[0]`/`resolve.resolutions[0]` are
 /// the entry module (module 0 IS the file).
 fn checkSource(source: []const u8) !Checked {
+    return checkSourceAs(source, .user);
+}
+
+/// `.core` checks the source as a bundled `core/` module, where `extern fn` is legal.
+fn checkSourceAs(source: []const u8, as: enum { user, core }) !Checked {
     const gpa = testing.allocator;
     const tokens = try Lexer.tokenize(gpa, source);
     errdefer gpa.free(tokens);
@@ -4493,8 +4519,9 @@ fn checkSource(source: []const u8) !Checked {
         gpa.free(tree.extra);
     }
 
-    var g = try Graph.single(gpa, "main", "", source, tokens, tree.nodes, tree.extra, tree.pub_bits);
+    var g = try Graph.single(gpa, if (as == .core) "core/t" else "main", "", source, tokens, tree.nodes, tree.extra, tree.pub_bits);
     defer g.deinit(gpa);
+    g.modules[0].bundled = as == .core;
     var res = try ResolveGraph.resolveGraph(gpa, &g);
     errdefer res.deinit(gpa);
     const result = try TypecheckGraph.checkGraph(gpa, &g, &res, null, 0);
@@ -9544,6 +9571,65 @@ test "a bad panic call is still never, so it reports only its own error" {
 
 test "code after a panic is still unreachable" {
     try expectOnlyDiag("fn f() -> int {\n panic(\"bad\")\n return 0\n}\nfn main() -> int {\n return f()\n}\n", .W0005);
+}
+
+test "a -> never fn, method, local fn, lambda or fn value diverges in a value arm" {
+    const bodies = [_][]const u8{
+        "fn fail(m: str) -> never { panic(m) }\nfn pick(n: int) -> int {\n x := if n > 0 { n } else { fail(\"neg\") }\n x\n}\n",
+        "fn fail(m: str) -> never { panic(m) }\nfn pick(n: int) -> int {\n match n { 0 -> 10, _ -> fail(\"bad\"), }\n}\n",
+        "fn spin() -> never { loop {} }\nfn wrap() -> never { spin() }\nfn pick(n: int) -> int {\n if n > 0 { return n }\n wrap()\n}\n",
+        "struct S { a: int }\nimpl S { fn boom(self) -> never { panic(\"boom\") } }\nfn pick(n: int) -> int {\n if n > 0 { n } else { S { a: n }.boom() }\n}\n",
+        "fn fail[T](_x: T) -> never { panic(\"generic\") }\nfn pick(n: int) -> int {\n if n > 0 { n } else { fail(true) }\n}\n",
+        "protocol Boom { fn boom(self) -> never }\nstruct S { a: int }\nimpl S has Boom { fn boom(self) -> never { panic(\"b\") } }\nfn pick(n: int) -> int {\n if n > 0 { n } else { S { a: n }.boom() }\n}\n",
+        "fn call(n: int, g: fn(str) -> never) -> int {\n if n > 0 { n } else { g(\"neg\") }\n}\nfn pick(n: int) -> int {\n fn local(m: str) -> never { panic(m) }\n lam := fn(m: str) -> never { panic(m) }\n call(n, local) + call(n, lam)\n}\n",
+    };
+    for (bodies) |body| {
+        const src = try std.fmt.allocPrint(testing.allocator, "{s}fn main() -> int {{\n return pick(3)\n}}\n", .{body});
+        defer testing.allocator.free(src);
+        try expectDiagCodes(src, &.{});
+    }
+}
+
+test "a -> never fn that can return is an error" {
+    try expectDiagCodes("fn bad(x: int) -> never {\n if x > 0 { panic(\"p\") }\n}\nfn main() {\n bad(1)\n}\n", &.{.T0043});
+    try expectDiagCodes("fn bad(x: int) -> never {\n if x > 0 { return }\n panic(\"p\")\n}\nfn main() {\n bad(1)\n}\n", &.{.T0042});
+    try expectDiagCodes("fn bad() -> never { 1 }\nfn main() {\n bad()\n}\n", &.{.T0042});
+    try expectDiagCodes("fn main() {\n fn local(n: int) -> never { if n > 0 { panic(\"x\") } }\n local(1)\n}\n", &.{.T0043});
+    try expectDiagCodes("fn main() {\n lam := fn(n: int) -> never { if n > 0 { panic(\"x\") } }\n lam(1)\n}\n", &.{.T0043});
+}
+
+test "never is spellable only as a return type" {
+    try expectDiagCodes("fn f(_x: never) {}\nfn main() {}\n", &.{.T0001});
+    try expectDiagCodes("struct S { a: never }\nfn main() {}\n", &.{.T0001});
+    try expectDiagCodes("fn main() {\n _x: never = panic(\"p\")\n}\n", &.{.T0001});
+}
+
+test "a user type named never shadows the builtin in every position" {
+    try expectDiagCodes("struct never { a: int }\nfn mk() -> never { never { a: 3 } }\nfn take(x: never) -> int { x.a }\nfn main() -> int {\n return take(mk())\n}\n", &.{});
+    try expectDiagCodes("type never = int\nfn mk() -> never { 3 }\nfn main() -> int {\n return mk()\n}\n", &.{});
+}
+
+test "an extern and the seeded panic both return never" {
+    const gpa = testing.allocator;
+    var c = try checkSourceAs(
+        \\extern fn abort() -> never
+        \\fn pick(n: int) -> int {
+        \\ if n > 0 { n } else { abort() }
+        \\}
+        \\fn main() -> int {
+        \\ return pick(3)
+        \\}
+        \\
+    , .core);
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.resolve.diags.len);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    for ([_][]const u8{ "abort", "panic" }) |name| {
+        const id = for (c.resolve.fns, 0..) |f, i| {
+            if (std.mem.endsWith(u8, f.name, name)) break i;
+        } else return error.TestExpectedFn;
+        try testing.expectEqual(Kind.never, c.result.sigs[id].ret.kind);
+    }
 }
 
 test "a user fn named panic keeps its declared type" {

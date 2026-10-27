@@ -23,22 +23,31 @@ it being trivially comparable and hashable.
 | `@"struct"` | a struct name | carries `struct_id` into the struct table |
 | `@"enum"` | an enum name | carries `enum_id` into the enum table |
 | `func` | `fn(A, B) -> R` | check-time; reified to a `{code, env}` pair struct (see below) |
-| `never` | — (not spellable) | the bottom type; a value that never exists |
+| `never` | `never`, as a return type only | the bottom type; a value that never exists |
 | `invalid` | — (not spellable) | the poison/error type |
 
-Two special types are not user-spellable:
+Two special types are not ordinary value types:
 
 * **`never`** is **bottom**. A `never` expression (a break-less `loop`, a
-  `panic(..)` call) never yields a value, so it fits wherever a value of a
-  known type is wanted: a fn tail, a `return`, an `if` or `match` arm, a
-  binding, an assignment or a call argument. A fn that ends in `panic("bad")`
-  needs no dead `return`, and an arm may panic while the others yield the
-  value. An operator operand or a condition does not yet accept `never`. It
-  is the *identity* of the `merge` join.
-* **`invalid`** is **poison**. The first time an operand is `invalid`, the
-  containing expression silently becomes `invalid` too, so one root mistake
-  produces exactly one diagnostic and never cascades. It *absorbs* in both
-  `assignable` and `merge`.
+  `panic(..)` call, a call to a `-> never` fn) never yields a value, so it
+  fits wherever a value of a known type is wanted: a fn tail, a `return`, an
+  `if` or `match` arm, a binding, an assignment or a call argument. A fn that
+  ends in `panic("bad")` needs no dead `return`, and an arm may panic while
+  the others yield the value. An operator operand or a condition does not yet
+  accept `never`. It is the *identity* of the `merge` join.
+
+  `never` is spelled only as a return type: of a fn, method, protocol method,
+  local fn, lambda, `extern` or fn type (`fn fail(m: str) -> never { panic(m) }`,
+  `g: fn(str) -> never`). `panic` itself is seeded with that signature. The
+  body of a `-> never` fn must diverge: one that may fall off its end is
+  **T0043**, and a bare `return` or a value tail is **T0042**. A param, field,
+  binding or type argument spelled `never` is **T0001**, since no value of it
+  could ever be passed or stored. An `extern fn exit(code: int) -> never`
+  declares a C fn that does not return.
+* **`invalid`** is **poison** and is not spellable. The first time an
+  operand is `invalid`, the containing expression silently becomes `invalid`
+  too, so one root mistake produces exactly one diagnostic and never cascades.
+  It *absorbs* in both `assignable` and `merge`.
 
 A type-level name is never a value: a struct, an enum, a builtin type, an alias, a
 protocol or a type parameter named where a value is wanted (`x := Color`,

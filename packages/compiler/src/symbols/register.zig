@@ -281,7 +281,7 @@ pub fn registerProtocols(t: *Typecheck, decl_nodes: []const Ast.Index, mod: u32)
                 }
             }
             method_params[i] = pars;
-            method_rets[i] = if (mp.ret_type == Ast.none) Type.unit else t.typeFromNode(mp.ret_type);
+            method_rets[i] = Typecheck.refs.retTypeFromNode(t, mp.ret_type);
             mut_self[i] = mp.params.len > 0 and Ast.isSelfParam(t.tree, t.tokens, t.source, mp.params[0]) and Ast.isMutParam(t.tree, t.tokens, mp.params[0]);
         }
         const id: u32 = @intCast(t.protocols.items.len);

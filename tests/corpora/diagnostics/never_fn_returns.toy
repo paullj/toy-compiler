@@ -1,0 +1,19 @@
+fn falls(n: int) -> never {  #~ ERROR [T0043] function 'falls' must return never but may fall off the end
+    if n > 0 {
+        panic("positive")
+    }
+}
+
+fn early(n: int) -> never {
+    if n > 0 {
+        return  #~ ERROR [T0042] return type unit does not match declared never
+    }
+    panic("not positive")
+}
+
+fn take(_x: never) {}  #~ ERROR [T0001] 'never' can only be the return type of a function
+
+fn main() {
+    falls(1)
+    early(1)
+}

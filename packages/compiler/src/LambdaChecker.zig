@@ -174,7 +174,7 @@ pub fn typeOfLambda(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Ou
     const mark = bc.sink.count();
 
     const annotated = proto.ret_type != Ast.none;
-    const declared: ?Type = if (annotated) bc.typeFromNode(proto.ret_type) else exp_ret;
+    const declared: ?Type = if (annotated) refs.retTypeFromNode(bc, proto.ret_type) else exp_ret;
     var ret: Type = undefined;
     if (declared) |r| {
         bc.body.cur_ret = r;
@@ -237,7 +237,7 @@ pub fn checkLocalFn(bc: *BodyChecker, idx: Ast.Index, n: Ast.Node) error{OutOfMe
         bc.node_types[p.int()] = ty;
         if (bc.resolutions[p.int()] == .local) try bc.setSlot(bc.resolutions[p.int()].local, ty);
     }
-    const ret = bc.typeFromNode(proto.ret_type);
+    const ret = refs.retTypeFromNode(bc, proto.ret_type);
     if (ret.kind == .invalid) poisoned = true;
     const ty: Type = if (poisoned) .invalid else refs.internFn(bc, params, ret);
     bc.node_types[idx.int()] = ty;

@@ -1,0 +1,15 @@
+# expect: exit 1
+# expect: stdout ""
+# expect: stderr "negative"
+# Feature: the `-> never` arm runs when taken: its panic prints the message and exits 1.
+fn fail(m: str) -> never {
+    panic(m)
+}
+
+fn pick(n: int) -> int {
+    return if n > 0 { n } else { fail("negative") }
+}
+
+fn main() -> int {
+    return pick(-3)
+}

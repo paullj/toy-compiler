@@ -1,0 +1,21 @@
+# expect: exit 7
+# Feature: a `-> never` fn is a diverging arm of a value-if and a match, like panic.
+fn fail(m: str) -> never {
+    panic(m)
+}
+
+fn spin() -> never {
+    loop {}
+}
+
+fn pick(n: int) -> int {
+    x := if n > 0 { n } else { fail("negative") }
+    match x {
+        0 -> spin(),
+        _ -> x,
+    }
+}
+
+fn main() -> int {
+    return pick(7)
+}
