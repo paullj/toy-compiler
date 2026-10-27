@@ -1,0 +1,15 @@
+# Feature: `os.exit(code)` ends the process with that code, after what was printed, and
+# is typed `never`, so it can stand in a value arm.
+# expect: stdout "before\n"
+# expect: exit 7
+import std/io
+import std/os
+fn main() -> int {
+    io.println("before")
+    n := match os.env("MISSING") {
+        .some(v) -> v.len(),
+        .none -> os.exit(7),
+    }
+    io.println("after")
+    return n
+}

@@ -188,6 +188,57 @@ fn classify(arg: []const u8) Token {
     return .{ .short_cluster = arg[1..] };
 }
 
+/// The index of the `--` in `argv` that ends `cmd`'s own words and starts a trailing
+/// argument list for something else (`toy run f.toy -- args`): the first `--` after a
+/// positional. A `--` before any positional stays the ordinary terminator, so
+/// `run -- -f.toy` still names a file that starts with '-'. Values are skipped by the
+/// same rules `parse` uses, so `-o x -- f.toy` does not count `x` as a positional.
+pub fn trailingSplit(comptime cmd: Spec.Command, argv: []const []const u8) ?usize {
+    var seen_pos = false;
+    var positional_only = false;
+    var i: usize = 0;
+    while (i < argv.len) : (i += 1) {
+        const arg = argv[i];
+        if (std.mem.eql(u8, arg, "--")) {
+            if (seen_pos) return i;
+            positional_only = true;
+            continue;
+        }
+        if (positional_only) {
+            seen_pos = true;
+            continue;
+        }
+        switch (classify(arg)) {
+            .positional, .dash_positional => seen_pos = true,
+            .dashdash => unreachable,
+            .long => |lv| if (lv.inline_val == null and longTakesValue(cmd, lv.name)) {
+                i += 1;
+            },
+            .short_cluster => |bytes| if (shortClusterTakesNext(cmd, bytes)) {
+                i += 1;
+            },
+        }
+    }
+    return null;
+}
+
+fn longTakesValue(comptime cmd: Spec.Command, name: []const u8) bool {
+    inline for (cmd.options ++ cmd.declined.options) |o| {
+        if (o.long) |l| if (std.mem.eql(u8, l, name)) return comptime !isFlag(o);
+    }
+    return false;
+}
+
+/// True when the cluster ends on a value-taking short, so its value is the next word.
+fn shortClusterTakesNext(comptime cmd: Spec.Command, bytes: []const u8) bool {
+    for (bytes, 0..) |c, k| {
+        inline for (cmd.options ++ cmd.declined.options) |o| {
+            if (o.short) |s| if (s == c and comptime !isFlag(o)) return k + 1 == bytes.len;
+        }
+    }
+    return false;
+}
+
 // ---- long options ----------------------------------------------------------
 
 fn handleLong(
@@ -752,6 +803,25 @@ test "classify: long, long=val, short cluster, dash positional, terminator" {
     // A standalone "-5" is a short cluster; negative-number VALUES are handled by
     // the raw value-grab, not classify (see sem5).
     try testing.expectEqualStrings("5", classify("-5").short_cluster);
+}
+
+test "trailingSplit: the first -- after a positional, skipping option values" {
+    const cmd = comptime Spec.Command{
+        .name = "run",
+        .options = &.{
+            .{ .long = "out", .short = 'o', .value = .string },
+            .{ .long = "all", .short = 'a', .value = .boolean },
+        },
+        .positionals = &.{.{ .name = "files", .value = .string, .arity = .variadic }},
+    };
+    try testing.expectEqual(@as(?usize, 1), trailingSplit(cmd, &.{ "f.toy", "--", "x" }));
+    try testing.expectEqual(@as(?usize, 3), trailingSplit(cmd, &.{ "-o", "b", "f.toy", "--", "x" }));
+    try testing.expectEqual(@as(?usize, 3), trailingSplit(cmd, &.{ "-ao", "b", "f.toy", "--" }));
+    try testing.expectEqual(@as(?usize, 2), trailingSplit(cmd, &.{ "--out=b", "f.toy", "--" }));
+    try testing.expectEqual(@as(?usize, null), trailingSplit(cmd, &.{ "--", "f.toy" }));
+    try testing.expectEqual(@as(?usize, null), trailingSplit(cmd, &.{ "-o", "b", "--", "f.toy" }));
+    try testing.expectEqual(@as(?usize, 4), trailingSplit(cmd, &.{ "--out", "b", "--", "-f.toy", "--", "x" }));
+    try testing.expectEqual(@as(?usize, null), trailingSplit(cmd, &.{ "-a", "f.toy" }));
 }
 
 test "Parsed.fieldName derives --dry-run -> dry_run" {

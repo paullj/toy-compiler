@@ -1,0 +1,71 @@
+# The quarantined libSystem process clients: argv, the environment, errno and exit. C
+# strings are copied into gc strs on the way in (D66), so no toy str ever points into C
+# memory that a later setenv or exit could free.
+import core/text
+
+pub extern fn _NSGetArgc() -> rawptr
+pub extern fn _NSGetArgv() -> rawptr
+# getenv returns a nullable char*. Typed int so null is a plain 0 compare; `offset(p, 0)`
+# turns a non-null one back into the rawptr from_cstr reads.
+pub extern fn getenv(name: rawptr) -> int
+pub extern fn strlen(s: rawptr) -> int
+pub extern fn exit(code: int) -> never
+pub extern fn __error() -> rawptr
+
+# A C `int` is 4 bytes and `load` reads 8, so the next 4 would be whatever follows it.
+fn load_i32(p: rawptr) -> int {
+    v := 0
+    for i in 0..4 {
+        v = (v << 8) | unsafe { load_byte(offset(p, 3 - i)) }
+    }
+    return v
+}
+
+# A copy of the NUL-terminated bytes at `p`.
+pub fn from_cstr(p: rawptr) -> str {
+    n := strlen(p)
+    buf := text.alloc(n)
+    w := text.window(buf, 0, n)
+    for i in 0..n {
+        unsafe { store_byte(offset(w, i), load_byte(offset(p, i))) }
+    }
+    return text.take(buf, n)
+}
+
+# `s` with a NUL appended, for a C call. The address points into a gc buffer the caller
+# hands straight to the call, as with `text.window`.
+pub fn to_cstr(s: str) -> rawptr {
+    n := s.len()
+    buf := text.alloc(n + 1)
+    text.put(buf, 0, s)
+    unsafe { store_byte(text.window(buf, n, 1), 0) }
+    return text.window(buf, 0, n + 1)
+}
+
+# The calling thread's errno, as the last failed libSystem call left it.
+pub fn errno() -> int {
+    return load_i32(__error())
+}
+
+# std cannot name an extern, so it ends the process through this wrapper.
+pub fn exit_process(code: int) -> never {
+    exit(code)
+}
+
+pub fn argc() -> int {
+    return load_i32(_NSGetArgc())
+}
+
+# argv[i] as a copied str; the caller keeps `0 <= i < argc()`.
+pub fn argv(i: int) -> str {
+    base: int = unsafe { load(_NSGetArgv()) }
+    p: int = unsafe { load(offset(base, i * 8)) }
+    return from_cstr(offset(p, 0))
+}
+
+# The value of the environment variable `name`, or none when it is unset.
+pub fn env(name: str) -> Option[str] {
+    p := getenv(to_cstr(name))
+    if p == 0 { return Option[str].none }
+    return Option.some(from_cstr(offset(p, 0)))
+}

@@ -172,10 +172,22 @@ pub fn main(init: std.process.Init) !void {
             // must too. `sc.rest` is the argv suffix after the verb, so the verb sits
             // at `argv.len - rest.len - 1`; splice it out.
             const verb_idx = argv.len - sc.rest.len - 1;
+            // `run`'s words after `--` are the program's (D64), so toy never parses them:
+            // a program flag like `-O1` must not set toy's. A `--` before the verb would
+            // have stopped the root parse from seeing a verb, so the split is after it.
+            var toy_end = argv.len;
+            inline for (AppCli.spec.root.subcommands, 0..) |sub, j| {
+                if (comptime sub.trailing != null) if (j == sc.index) {
+                    if (cli.Parser.trailingSplit(sub, argv[verb_idx + 1 ..])) |k| {
+                        st.program_args = argv[verb_idx + 1 + k + 1 ..];
+                        toy_end = verb_idx + 1 + k;
+                    }
+                };
+            }
             var merged: std.ArrayList([]const u8) = .empty;
             defer merged.deinit(gpa);
             try merged.appendSlice(gpa, argv[0..verb_idx]);
-            try merged.appendSlice(gpa, argv[verb_idx + 1 ..]);
+            try merged.appendSlice(gpa, argv[verb_idx + 1 .. toy_end]);
             inline for (AppCli.spec.root.subcommands, 0..) |sub, j| {
                 if (j == sc.index) {
                     // The root pass accumulated any pre-verb option errors into `sink`;
@@ -284,7 +296,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Build the executable: output → `-o`/`--output`, else the default build dir.
     if (build_exe) {
-        std.process.exit(try emitExecutable(gpa, out, level, usage, st.target, st.paths.items, st.out_path, run_after, st.mode, st.codegen_stats, st.opt, st.specialize, st.opt_stats, st.timings, st.jlimit, threads, st.sev, st.allow_core_imports));
+        std.process.exit(try emitExecutable(gpa, out, level, usage, st.target, st.paths.items, st.out_path, run_after, st.program_args, st.mode, st.codegen_stats, st.opt, st.specialize, st.opt_stats, st.timings, st.jlimit, threads, st.sev, st.allow_core_imports));
     }
 
     // `--emit ir`: print the target-independent IR for the whole program.
@@ -353,6 +365,8 @@ const State = struct {
     // fn-scope backing list `applyParsed` fills; resolve reads it LATE at render.
     sev: SevCfg.SeverityConfig = .{},
     allow_core_imports: bool = false,
+    // `run`'s words after `--`, borrowing argv; they follow the binary's path in its argv.
+    program_args: []const []const u8 = &.{},
     paths: std.ArrayList([]const u8),
 };
 
@@ -542,7 +556,7 @@ fn printBuildTime(out: *Io.Writer, level: Style.ColorLevel, threads: usize, ns: 
 /// returns 128+signo (the shell convention); anything else → 1. The status line is
 /// styled: a clean exit-0 green, any non-zero / signal / spawn failure err-red bold;
 /// at `.none` (piped) `styledLine` writes only the text, so the line stays byte-stable.
-fn runBinary(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, level: Style.ColorLevel, path: []const u8) !u8 {
+fn runBinary(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, level: Style.ColorLevel, path: []const u8, program_args: []const []const u8) !u8 {
     // Spawn by ABSOLUTE path: the codesigned binary must be exec'd by a real path, and a
     // bare name without a `/` would be looked up on PATH rather than in the build dir.
     const abs = Io.Dir.cwd().realPathFileAlloc(io, path, gpa) catch |e| {
@@ -552,7 +566,11 @@ fn runBinary(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, level: Style.Color
     };
     defer gpa.free(abs);
 
-    var child = std.process.spawn(io, .{ .argv = &.{abs} }) catch |e| {
+    var child_argv: std.ArrayList([]const u8) = .empty;
+    defer child_argv.deinit(gpa);
+    try child_argv.append(gpa, abs);
+    try child_argv.appendSlice(gpa, program_args);
+    var child = std.process.spawn(io, .{ .argv = child_argv.items }) catch |e| {
         try styledLine(out, level, sty_err, "run: failed to launch {s}: {t}", .{ Decide.basename(path), e });
         try out.flush();
         return 1;
@@ -700,6 +718,7 @@ fn emitExecutable(
     paths: []const []const u8,
     out_path: ?[]const u8,
     run_after: bool,
+    program_args: []const []const u8,
     mode: Engine.Mode,
     codegen_stats: bool,
     opt: Opt.Config,
@@ -716,7 +735,7 @@ fn emitExecutable(
     // the code bubbles up through `std.process.exit(try emitExecutable(...))` in main,
     // which skips defers and never flushes `out` on its own.
     if (paths.len != 1) {
-        try argLine(usage, if (run_after) "run takes exactly one input file (the entry module)" else "build takes exactly one input file (the entry module)");
+        try argLine(usage, if (run_after) "run takes exactly one input file (the entry module); pass program arguments after --" else "build takes exactly one input file (the entry module)");
         return usage_exit;
     }
 
@@ -934,7 +953,7 @@ fn emitExecutable(
         });
     }
     // `run`: execute the freshly built binary and adopt its exit status.
-    if (run_after) return runBinary(gpa, io, out, level, resolved_out);
+    if (run_after) return runBinary(gpa, io, out, level, resolved_out, program_args);
     return 0;
 }
 

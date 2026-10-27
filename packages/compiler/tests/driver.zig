@@ -1334,6 +1334,54 @@ test "unwrap on an aggregate payload compiles and runs (result-slot copy, not a 
     try testing.expectEqual(std.process.Child.Term{ .exited = 2 }, res.term);
 }
 
+const run_args_fixture =
+    \\import std/io
+    \\import std/os
+    \\import std/vec
+    \\fn main() -> int {
+    \\    xs := os.args()
+    \\    for i in 1..xs.len() { io.println(xs[i]) }
+    \\    return xs.len()
+    \\}
+    \\
+;
+
+test "run passes the words after -- to the program, and rejects a second word without it" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.requireToy(io);
+
+    const dir_name = ".toy-test-driver-run-args";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const path = dir_name ++ "/args.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = run_args_fixture });
+
+    // `-O1` after the `--` is the program's, not toy's.
+    const ok = try spawnToyBoth(gpa, io, &.{ "run", path, "-o", dir_name ++ "/a", "--", "x", "y z", "-O1" });
+    defer gpa.free(ok.out);
+    defer gpa.free(ok.err);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 4 }, ok.term);
+    try testing.expect(std.mem.indexOf(u8, ok.out, "x\ny z\n-O1\n") != null);
+
+    const bad = try spawnToyBoth(gpa, io, &.{ "run", path, "-o", dir_name ++ "/b", "x" });
+    defer gpa.free(bad.out);
+    defer gpa.free(bad.err);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 2 }, bad.term);
+    try testing.expect(std.mem.indexOf(u8, bad.err, "pass program arguments after --") != null);
+
+    // A `--` before the entry file is toy's own terminator, not the program-args split.
+    const term = try spawnToyBoth(gpa, io, &.{ "run", "-o", dir_name ++ "/c", "--", path, "--", "w" });
+    defer gpa.free(term.out);
+    defer gpa.free(term.err);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 2 }, term.term);
+    try testing.expect(std.mem.indexOf(u8, term.out, "w\n") != null);
+}
+
 /// Spawn `toy` with `args` over a one-file fixture (the `return nope` R0001 program),
 /// capturing stdout and the exit code. Returns the captured bytes (the caller frees) and
 /// the term. Stderr (usage errors) is dropped: inherited, it reaches the build runner,
@@ -5106,7 +5154,7 @@ test "an unknown command or long flag suggests the near name, and every usage er
         .{ .argv = &.{ a, b }, .err = "error: toy takes exactly one input file (the entry module)\n" },
         .{ .argv = &.{ "rn", a }, .err = "error: toy takes exactly one input file (the entry module)\n" },
         .{ .argv = &.{ "build", a, b }, .err = "error: build takes exactly one input file (the entry module)\n" },
-        .{ .argv = &.{ "run", a, b }, .err = "error: run takes exactly one input file (the entry module)\n" },
+        .{ .argv = &.{ "run", a, b }, .err = "error: run takes exactly one input file (the entry module); pass program arguments after --\n" },
         .{ .argv = &.{ "--emit", "ir", a, b }, .err = "error: --emit ir takes exactly one input file (the entry module)\n" },
         .{ .argv = &.{ "-o", dir_name ++ "/out" }, .err = "error: no input file\n" },
         .{ .argv = &.{"build"}, .err = "error: build: no input file\n" },

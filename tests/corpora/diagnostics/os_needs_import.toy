@@ -1,0 +1,4 @@
+# The process API (args, env, exit) lives in std/os; without the import a use names it.
+fn main() -> int {
+    return os.args().len()  #~ ERROR [R0001] add 'import std/os'
+}

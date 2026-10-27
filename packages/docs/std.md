@@ -48,6 +48,7 @@ core is the private layer between the compiler and std. It is the only place whe
 |--------|-------|
 | `core/sys` | the libSystem `write` and `read` externs: `print(s)` to fd 1, `write_fd`, `read_fd_all` and `read_line_fd` |
 | `core/ffi` | the libm and `labs` externs and their safe wrappers |
+| `core/os` | the `_NSGetArgc`, `_NSGetArgv`, `getenv`, `strlen`, `exit` and `__error` externs: `argc`, `argv(i)`, `env`, `exit_process`, `errno`, and `from_cstr` (copies) / `to_cstr` |
 | `core/mem` | the growable `gc_array` and the hash table behind Vec, Map and Set |
 | `core/text` | raw `str` parts: `slice`, and the `alloc`/`put`/`window`/`take` buffer that builds a str once |
 | `core/mem_selftest`, `core/desc_selftest` | heap and descriptor self-checks |
@@ -67,6 +68,7 @@ and never names a `.core` intrinsic.
 | `std/iter` | the `Iterator` protocol that `for`-in desugars to |
 | `std/math` | integer and float math, over core/ffi |
 | `std/gc` | `collect()` and `collections()` |
+| `std/os` | `args()`, `env(name)` and `exit(code)`, over core/os |
 
 ## std/io: output and input
 
@@ -116,6 +118,39 @@ fn main() -> int {
 It is `none` for an empty string, a lone sign, any other byte (spaces and `_`
 included) and a value outside `int`'s range. Call `trim` first to accept surrounding
 whitespace.
+
+## std/os: arguments, environment and exit
+
+- `os.args() -> Vec[str]` holds every program argument, the program's path (argv[0])
+  first. Each call builds a fresh Vec, so changing one changes no other.
+- `os.env(name) -> Option[str]` is the variable's value, `some("")` for one set to the
+  empty string, and `none` for an unset one.
+- `os.exit(code: int) -> never` ends the process with `code`. Output written before it
+  is not lost, since stdout and stderr are unbuffered. It is typed `never`, so it can end
+  a value arm.
+- Every str these return is a copy of the C string, never a pointer into C memory.
+- `toy run f.toy -- a b` runs the program with `a` and `b` as its arguments. toy reads no
+  word after the `--`, so `toy run f.toy -- -O1` hands `-O1` to the program. A second word
+  without the `--` is a usage error.
+
+```toy
+import std/io
+import std/os
+import std/vec
+
+fn main() {
+    xs := os.args()
+    if xs.len() < 2 {
+        io.eprintln("usage: greet NAME")
+        os.exit(2)
+    }
+    greeting := match os.env("GREETING") {
+        .some(g) -> g,
+        .none -> "hello",
+    }
+    io.println(greeting.concat(", ").concat(xs[1]))
+}
+```
 
 ## Conventions
 
