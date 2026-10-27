@@ -84,6 +84,9 @@ pub const Command = struct {
     positionals: []const Positional = &.{},
     subcommands: []const Command = &.{},
     declined: Declined = .{},
+    /// The value name of an argument list after `--` that the command passes on rather
+    /// than parses (`toy run f.toy -- ARGS`); see `Parser.trailingSplit`.
+    trailing: ?[]const u8 = null,
 };
 
 /// Options that another command takes and this one does not. A use is reported as

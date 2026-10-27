@@ -27,6 +27,7 @@ pub fn renderUsage(comptime cmd: Spec.Command, out: *std.Io.Writer) !void {
         try out.writeByte(' ');
         try out.writeAll(usageArg(p));
     }
+    if (cmd.trailing) |t| try out.print(" [-- {s}...]", .{t});
     try out.writeByte('\n');
 }
 
@@ -206,6 +207,14 @@ const golden_cli = Spec.Cli{
         },
     },
 };
+
+test "renderUsage shows a trailing argument list after --" {
+    const cmd = comptime Spec.Command{ .name = "run", .positionals = &.{.{ .name = "file", .arity = .variadic }}, .trailing = "ARGS" };
+    var buf: [128]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderUsage(cmd, &w);
+    try std.testing.expectEqualStrings("Usage: run [OPTIONS] [file]... [-- ARGS...]\n", w.buffered());
+}
 
 test "renderUsage is a frozen, deterministic string" {
     var buf: [256]u8 = undefined;

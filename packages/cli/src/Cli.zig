@@ -139,7 +139,7 @@ pub const spec: Spec.Cli = .{
         .positionals = files_pos,
         .subcommands = &.{
             .{ .name = "build", .about = "Compile to a signed executable (the default action)", .options = shared_opts, .positionals = files_pos },
-            .{ .name = "run", .about = "Build, then execute the binary and report its exit status", .options = shared_opts, .positionals = files_pos },
+            .{ .name = "run", .about = "Build, then execute the binary with the arguments after -- and report its exit status", .options = shared_opts, .positionals = files_pos, .trailing = "ARGS" },
             .{ .name = "check", .about = "Check syntax and types without building; report all diagnostics", .options = check_opts, .positionals = files_pos, .declined = .{ .owner = "build", .options = check_declined } },
             .{ .name = "explain", .about = "Print the documentation for a diagnostic code, or --list all codes", .options = explain_opts, .positionals = explain_pos },
             // The language server over stdio (JSON-RPC). No options or positionals: it

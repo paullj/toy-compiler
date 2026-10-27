@@ -85,8 +85,13 @@ while IFS= read -r src; do
   # The fixture's `# stdin:` bytes, never the loop's own stdin: a program that reads
   # stdin would otherwise eat the rest of the file list.
   stdin_bytes="$(grep -E '^# stdin:' "$src" | sed -E 's/^# stdin:[[:space:]]*"(.*)"$/\1/' | tr -d '\n')"
-  o0="$(printf '%b' "$stdin_bytes" | limit 30 "$b0")"; r0=$?
-  o1="$(printf '%b' "$stdin_bytes" | limit 30 "$b1")"; r1=$?
+  # `# args:` words and `# env:` pairs as the corpus harness gives them: the environment
+  # holds only the fixture's variables. xargs splits the quoted words without a shell eval.
+  run_args=(); run_env=()
+  while IFS= read -r -d '' w; do run_args+=("$w"); done < <(grep -E '^# args:' "$src" | sed -E 's/^# args:[[:space:]]*//' | xargs printf '%s\0')
+  while IFS= read -r kv; do run_env+=("$kv"); done < <(grep -E '^# env:' "$src" | sed -E 's/^# env:[[:space:]]*//')
+  o0="$(printf '%b' "$stdin_bytes" | limit 30 env -i ${run_env[@]+"${run_env[@]}"} "$b0" ${run_args[@]+"${run_args[@]}"})"; r0=$?
+  o1="$(printf '%b' "$stdin_bytes" | limit 30 env -i ${run_env[@]+"${run_env[@]}"} "$b1" ${run_args[@]+"${run_args[@]}"})"; r1=$?
 
   ok=1
   # #expect under -O0 FIRST (independent oracle).

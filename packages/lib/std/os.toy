@@ -1,0 +1,23 @@
+import core/os
+import std/vec
+
+# Every program argument, argv[0] (the program's path) first. Each call copies them
+# afresh, so a caller that changes its Vec changes no other caller's.
+pub fn args() -> Vec[str] {
+    xs := Vec[str].new()
+    for i in 0..os.argc() {
+        xs.push(os.argv(i))
+    }
+    return xs
+}
+
+# The environment variable `name`, or none when it is unset.
+pub fn env(name: str) -> Option[str] {
+    return os.env(name)
+}
+
+# Ends the process with `code`. stdout and stderr are unbuffered, so nothing written
+# before is lost.
+pub fn exit(code: int) -> never {
+    os.exit_process(code)
+}
