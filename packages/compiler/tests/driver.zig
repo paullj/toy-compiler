@@ -5319,3 +5319,22 @@ test "a word near a command that names an existing file still builds (#70)" {
     try testing.expectEqual(@as(u8, 3), try harness.runExitIn(gpa, io, abs, "f1"));
     try testing.expectEqual(@as(u8, 3), try harness.runExitIn(gpa, io, abs, "f2"));
 }
+
+// The corpus matches a message by substring, so only a spawn can show the hint is absent.
+test "`toy check` leaves the std/ref hint off 'Ref(v)' when std/ref is imported" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-driver-ref-call-imported";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+
+    const res = runToyOnFixture(gpa, io, dir_name, "import std/ref\n\nfn main() -> int {\n    _r := Ref(3)\n    return 0\n}\n", &.{"check"}) catch |e| {
+        if (e == error.SkipZigTest) return error.SkipZigTest;
+        return e;
+    };
+    defer gpa.free(res.out);
+    try testing.expect(std.mem.indexOf(u8, res.out, "error[T0063]: 'Ref' is built with 'Ref.new(v)', not 'Ref(...)'") != null);
+    try testing.expect(std.mem.indexOf(u8, res.out, "add 'import std/ref'") == null);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, res.term);
+}

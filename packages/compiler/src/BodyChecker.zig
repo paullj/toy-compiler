@@ -2033,6 +2033,17 @@ pub const BodyChecker = struct {
         return result;
     }
 
+    /// `Ref` is registered as a one-field tuple struct only to give the cell a layout; its
+    /// field is the runtime cell pointer, so positional construction would let lower build
+    /// a box out of a bare value (it recursed until the stack overflowed).
+    fn rejectRefTupleCall(bc: *BodyChecker, call: Ast.Index, n: Ast.Node, sid: u32) error{OutOfMemory}!Type {
+        if (n.rhs != Ast.none) try bc.drainArgs(Ast.rangeSlice(bc.tree, (n.rhs).int()));
+        const has_new = Typecheck.findGenericMethod(bc.model.templates, sid, false, "new", bc.methodSite()) != null;
+        var hb: [64]u8 = undefined;
+        try bc.sink.report(.{ .span = bc.spanOf(call), .code = .T0063 }, "'Ref' is built with 'Ref.new(v)', not 'Ref(...)'{s}", .{importHint(&hb, if (has_new) null else StdNames.familyModule(.ref))});
+        return .invalid;
+    }
+
     // Not routed through `checkCall` for the same reason as `checkVariantPayloads`: a
     // construction's elements are "values" of the struct, with its own wording.
     fn checkTupleStructInit(bc: *BodyChecker, call: Ast.Index, n: Ast.Node, sid: u32) error{OutOfMemory}!Type {
@@ -3573,6 +3584,7 @@ pub const BodyChecker = struct {
         // field_access callee (never here).
         if (callee.tag == .identifier and bc.resolutions[(n.lhs).int()] == .unresolved) {
             if (bc.activeStructMap().get(bc.nameText(callee.main_token))) |sid| {
+                if (bc.model.structs[sid].native_family == .ref) return try bc.rejectRefTupleCall(node_idx, n, sid);
                 if (bc.model.structs[sid].is_tuple) return try bc.checkTupleStructInit(node_idx, n, sid);
             }
         }
