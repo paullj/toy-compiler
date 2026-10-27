@@ -1,0 +1,47 @@
+# Regression: in a bounded template, a struct field or generic method arg whose slot
+# type holds the template's own T gave its value no expected type, so `Option.none`,
+# `.none` and `[]` there failed to infer (T0016 / T0062).
+# expect: exit 63
+import std/option
+import std/vec
+
+protocol Add {
+    fn add(self, o: Self) -> Self
+}
+
+struct Box[T] { v: Option[T] }
+struct Bag[T] { xs: Vec[T] }
+
+impl Box[T] {
+    fn with[U](self, v: Option[T], _u: U) -> Box[T] { Box[T] { v: v } }
+}
+
+fn go[T has Add](t: T) -> int {
+    b := Box[T] { v: Option.none }
+    c := Box[T] { v: Option.some(t.add(t)) }
+    d := Box[T] { v: .none }
+    e := Bag[T] { xs: [] }
+    f: Bag[T] = Bag[T] { xs: [] }
+    g := c.with(Option.none, 5)
+    x: Option[T] = Option.none
+    ys: Vec[T] = []
+    o: Option[T] = .none
+    r := 0
+    if b.v.is_none() { r = r + 1 }
+    if c.v.is_some() { r = r + 2 }
+    if d.v.is_none() { r = r + 4 }
+    if e.xs.len() == 0 && f.xs.len() == 0 { r = r + 8 }
+    if g.v.is_none() { r = r + 16 }
+    if x.is_none() && ys.len() == 0 && o.is_none() { r = r + 32 }
+    return r
+}
+
+struct N { v: int }
+
+impl N has Add {
+    fn add(self, o: N) -> N { N { v: self.v + o.v } }
+}
+
+fn main() -> int {
+    return go(N { v: 1 })
+}
