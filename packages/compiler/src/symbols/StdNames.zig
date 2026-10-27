@@ -159,6 +159,7 @@ const import_hints = std.StaticStringMap(ImportHint).initComptime(.{
     .{ "os", ImportHint{ .module = "os" } },
     .{ "time", ImportHint{ .module = "time" } },
     .{ "fs", ImportHint{ .module = "fs" } },
+    .{ "float", ImportHint{ .module = "float" } },
     .{ "vec", ImportHint{ .module = "vec" } },
     .{ "map", ImportHint{ .module = "map" } },
     .{ "set", ImportHint{ .module = "set" } },
@@ -184,7 +185,21 @@ const core_replacements = std.StaticStringMap([]const u8).initComptime(.{
     .{ "core/ffi", "std/math" },
     .{ "core/os", "std/os or std/time" },
     .{ "core/fs", "std/fs" },
+    .{ "core/fmt", "std/float" },
 });
+
+/// The std module holding a builtin scalar's `impl` of a protocol, keyed `"<type> has
+/// <protocol>"`. A program that never imports it gets T0023, and the hint names it.
+const scalar_impls = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "float has Display", "float" },
+});
+
+/// The std module whose `impl <ty> has <protocol>` makes the scalar `ty` conform, or null.
+pub fn scalarImplModule(ty: []const u8, protocol: []const u8) ?[]const u8 {
+    var buf: [64]u8 = undefined;
+    const key = std.fmt.bufPrint(&buf, "{s} has {s}", .{ ty, protocol }) catch return null;
+    return scalar_impls.get(key);
+}
 
 /// The self-check modules only force or count collections for their tests, which std/gc
 /// does through a supported surface.
@@ -291,7 +306,7 @@ test "importHintFor: exact stdlib names hint; typos, prelude generics, and unkno
     try std.testing.expectEqualStrings("io.println", importHintFor("println").?.spelling.?);
     try std.testing.expectEqualStrings("io.print", importHintFor("console").?.spelling.?);
 
-    inline for (.{ "Map", "Set", "map", "set", "vec", "math", "iter", "os", "time", "fs" }) |n|
+    inline for (.{ "Map", "Set", "map", "set", "vec", "math", "iter", "os", "time", "fs", "float" }) |n|
         try std.testing.expect(importHintFor(n) != null);
     try std.testing.expectEqualStrings("gc", importHintFor("gc").?.module);
     try std.testing.expectEqualStrings("ref", importHintFor("Ref").?.module);
@@ -336,6 +351,26 @@ test "std_methods are the methods each std module declares, and all of them" {
     try std.testing.expectEqualStrings(importHintFor("Ref").?.module, familyModule(.ref));
     try std.testing.expectEqualStrings("option", methodModule(.result, "map_err").?);
     try std.testing.expect(methodModule(.option, "map_err") == null);
+}
+
+test "scalarImplModule names std/float only for float's Display" {
+    try std.testing.expectEqualStrings("float", scalarImplModule("float", "Display").?);
+    try std.testing.expectEqual(@as(?[]const u8, null), scalarImplModule("float", "Hash"));
+    try std.testing.expectEqual(@as(?[]const u8, null), scalarImplModule("int", "Display"));
+}
+
+test "scalar_impls names a std module that declares each impl" {
+    const BundledStd = @import("bundled_std");
+    var buf: [64]u8 = undefined;
+    var decl: [64]u8 = undefined;
+    for (scalar_impls.keys(), scalar_impls.values()) |key, module| {
+        const path = try std.fmt.bufPrint(&buf, "std/{s}", .{module});
+        const src = for (BundledStd.modules) |m| {
+            if (std.mem.eql(u8, m.path, path)) break m.source;
+        } else return error.NoStdModule;
+        const want = try std.fmt.bufPrint(&decl, "impl {s} {{", .{key});
+        try std.testing.expect(std.mem.indexOf(u8, src, want) != null);
+    }
 }
 
 test "every bundled core module names a std replacement for R0013" {

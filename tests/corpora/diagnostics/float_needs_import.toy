@@ -1,0 +1,7 @@
+# `float` names both the type and std/float, so `float.parse` without the import says which.
+fn main() -> int {
+    return match float.parse("1.0") {  #~ ERROR [T0056] for the module std/float, add 'import std/float'
+        .some(_) -> 1,
+        .none -> 2,
+    }
+}

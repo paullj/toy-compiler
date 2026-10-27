@@ -1116,13 +1116,13 @@ fn lowerErasedEq(
 /// Render field `i` (at byte `off`, type `fty`) of receiver base `self_base` to a fresh
 /// `str` slot through the SHARED `displayToSlot` authority — the SAME renderer `print` /
 /// `to_string` / a top-level value use, so a field never drifts from a standalone value.
-/// int/bool load the field value; str/struct/enum copy the 16-/N-byte field into a temp
+/// int/bool/float load the field value; str/struct/enum copy the 16-/N-byte field into a temp
 /// slot (self by slot); a `()` field is zero-sized (a `.none` operand → the const-data
 /// `"()"`). The caller `appendPiece`s the returned slot. Mirrors `deriveFieldHash`.
 fn deriveFieldDisplay(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.ValueId) error{OutOfMemory}!Ir.SlotId {
     const int_ty = Typecheck.Type.int;
     const op: Ir.Operand = switch (fty.kind) {
-        .int, .bool => blk: {
+        .int, .bool, .float => blk: {
             const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
             break :blk .{ .value = try b.emit(.{ .load = .{ .addr = la, .ty = fty } }, fty) };
         },

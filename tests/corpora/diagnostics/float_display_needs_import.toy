@@ -1,0 +1,7 @@
+# float's Display is an impl in std/float, so without it a float misses a Display bound, and
+# the hint names the module instead of "every field" (a scalar has none).
+fn needs_display[T has Display](x: T) -> str { x.to_string() }
+
+fn main() {
+    _s := needs_display(1.5)  #~ ERROR [T0023] its impl is in std/float: add 'import std/float'
+}

@@ -1,0 +1,52 @@
+# The quarantined libSystem float conversions. `__dtoa` and `__freedtoa` are Darwin-private
+# (D62): only this module names them, so #60 swaps the bodies and nothing else.
+import core/os
+
+pub extern fn __dtoa(d: float, mode: int, ndigits: int, decpt: rawptr, sign: rawptr, rve: rawptr) -> rawptr
+pub extern fn __freedtoa(s: rawptr)
+pub extern fn strtod(s: rawptr, end: rawptr) -> float
+
+# The shortest digits that read back as the value: it is `0.<digits> * 10^point`, negative
+# when `neg`. Infinity and NaN come back as the digits "Infinity" and "NaN" with point 9999.
+pub struct Shortest { digits: str, point: int, neg: bool }
+
+# A C `int` is 4 bytes and `load` reads 8; `point` can be negative, so the sign is extended.
+fn load_i32(p: rawptr) -> int {
+    v := 0
+    for i in 0..4 {
+        v = (v << 8) | unsafe { load_byte(offset(p, 3 - i)) }
+    }
+    if v >= 0x8000_0000 { return v - 0x1_0000_0000 }
+    return v
+}
+
+# Mode 0 asks for the shortest round-trip digits. They live in memory `__dtoa` allocated, so
+# they are copied into a gc str before it is freed.
+pub fn shortest(f: float) -> Shortest {
+    out := gc_alloc(8)
+    sign := gc_alloc(8)
+    p := __dtoa(f, 0, 0, out, sign, offset(0, 0))
+    digits := os.from_cstr(p)
+    __freedtoa(p)
+    return Shortest { digits: digits, point: load_i32(out), neg: load_i32(sign) != 0 }
+}
+
+# The float `s` spells, or none unless strtod reads all of it. strtod skips leading
+# whitespace, which a whole-string parse must not.
+pub fn parse(s: str) -> Option[float] {
+    if s.len() == 0 || s.byte_at(0) <= 32 { return Option[float].none }
+    end := gc_alloc(8)
+    c := os.to_cstr(s)
+    f := strtod(c, end)
+    start := addr(c)
+    stop: int = unsafe { load(end) }
+    if stop - start != s.len() { return Option[float].none }
+    return Option.some(f)
+}
+
+fn addr(p: rawptr) -> int {
+    cell := gc_alloc(8)
+    unsafe { store(cell, p) }
+    a: int = unsafe { load(cell) }
+    return a
+}

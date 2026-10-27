@@ -692,6 +692,9 @@ fn resolveDeriveFields(t: *Typecheck, d: DeriveRecipe) ![]const Derive.FieldWitn
 fn resolveFieldWitness(t: *const Typecheck, comptime kind: Derive.Kind, ft: Type) Derive.FieldWitness {
     switch (ft.kind) {
         .@"struct", .@"enum" => {},
+        // `displayToSlot` renders a float through std/float's impl, so the call is a
+        // witness the derive's key must fold like an aggregate field's.
+        .float => if (kind != .display) return .inline_kind,
         else => return .inline_kind,
     }
     const method, const variant = switch (kind) {

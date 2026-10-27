@@ -1770,9 +1770,9 @@ pub fn appendPiece(b: *Builder, acc: Ir.SlotId, piece: Ir.SlotId) error{OutOfMem
 ///     a 64-bit unsigned int goes to `__uint_to_str` instead.
 ///   * bool   -> `cond_br` selecting the const-data `"true"`/`"false"` literal.
 ///   * unit   -> the const-data `"()"` literal (no alloc).
-///   * struct/enum (incl `char`) -> resolve the `display` witness and call it -> a fresh
-///     str; a custom `impl Display` and a structural derive land here identically, which is
-///     what makes `to_string` universal.
+///   * anything else (a struct/enum incl `char`, a `float`) -> resolve the `display`
+///     witness and call it -> a fresh str; a custom `impl Display` (std's for float) and a
+///     structural derive land here identically, which is what makes `to_string` universal.
 pub fn displayToSlot(b: *Builder, ty: Typecheck.Type, op: Ir.Operand) error{OutOfMemory}!Ir.SlotId {
     // Switch on `ty.kind` (NOT `passKind`): a `Ref`/`gc_array` box is a struct type that
     // renders STRUCTURALLY (`Ref$int{0: <cell>}`) through its derived display witness, so it
@@ -1815,7 +1815,7 @@ pub fn displayToSlot(b: *Builder, ty: Typecheck.Type, op: Ir.Operand) error{OutO
             return res;
         },
         .unit => return try emitStrLiteralSlot(b, "()"),
-        .@"struct", .@"enum" => switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "display", b.in.prelude_ids.display, null)) {
+        else => switch (Typecheck.resolveConformanceMethod(b.in.methods, ty, "display", b.in.prelude_ids.display, null)) {
             .one => |m| {
                 const callee = witnessCallee(b, m);
                 const args = try b.gpa.alloc(Ir.Operand, 1);
@@ -1826,15 +1826,10 @@ pub fn displayToSlot(b: *Builder, ty: Typecheck.Type, op: Ir.Operand) error{OutO
                 return slot;
             },
             .none, .ambiguous => {
-                try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "display: no display witness for an aggregate in lower" });
+                try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "display: no display witness in lower" });
                 b.had_error = true;
                 return try emitStrLiteralSlot(b, "");
             },
-        },
-        else => {
-            try b.diags.append(b.gpa, .{ .byte_offset = 0, .end = 0, .message = "display: unsupported operand kind in lower" });
-            b.had_error = true;
-            return try emitStrLiteralSlot(b, "");
         },
     }
 }

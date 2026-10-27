@@ -1,4 +1,5 @@
 import core/sys
+import std/float
 
 # `print` renders any Display value to a str then writes it. `to_string(str)` is identity
 # (no alloc), so a str arg keeps the alloc-free path; every other kind renders through the

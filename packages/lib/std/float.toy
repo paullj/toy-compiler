@@ -1,0 +1,46 @@
+# Display and parsing for `float` (D14): the shortest digits that read back as the same
+# value, in plain notation for magnitudes in [1e-4, 1e16) and as `<d>.<ddd>e<exp>` outside,
+# always with a digit after the point so the text reads as a float (`1.0`, `1.0e21`).
+import core/fmt
+import core/text
+
+impl float has Display {
+    fn display(self) -> str {
+        s := fmt.shortest(self)
+        # Point 9999 marks inf or NaN (core/fmt); only NaN's digits start with 'N' (78).
+        if s.point == 9999 {
+            if s.digits.byte_at(0) == 78 { return "NaN" }
+            if s.neg { return "-inf" }
+            return "inf"
+        }
+        body := plain_or_sci(s.digits, s.point)
+        if s.neg { return "-".concat(body) }
+        return body
+    }
+}
+
+# The float `s` spells in full, as C strtod reads it (so `inf`, `nan` and `1e999` -> inf
+# parse too), or none when any of `s` is left over.
+pub fn parse(s: str) -> Option[float] {
+    return fmt.parse(s)
+}
+
+fn plain_or_sci(digits: str, point: int) -> str {
+    n := digits.len()
+    if point < -3 || point > 16 {
+        rest := "0"
+        if n > 1 { rest = text.slice(digits, 1, n) }
+        return text.slice(digits, 0, 1).concat(".").concat(rest).concat("e").concat((point - 1).to_string())
+    }
+    if point <= 0 { return "0.".concat(zeros(0 - point)).concat(digits) }
+    if point >= n { return digits.concat(zeros(point - n)).concat(".0") }
+    return text.slice(digits, 0, point).concat(".").concat(text.slice(digits, point, n))
+}
+
+fn zeros(k: int) -> str {
+    z := ""
+    for _ in 0..k {
+        z = z.concat("0")
+    }
+    return z
+}

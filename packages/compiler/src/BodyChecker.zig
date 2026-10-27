@@ -4006,15 +4006,15 @@ pub const BodyChecker = struct {
             }
             // No structural derive and no nameable blocker: fall through to T0018.
         }
-        // A direct `.to_string()` on a struct/enum with NO explicit `to_string` fn: the
-        // structural `Display` derive trigger (`to_string(x) == x.display()`). Mirrors the
-        // `hash` trigger, reusing the shared `conformsTo(display)` gate, so a custom `impl
-        // Display` (a `.direct` conformance) reuses its witness with no structural derive.
-        // A conforming aggregate records the display derive + types the call `str`; a struct
-        // with a non-Display field names it (T0031); a payload enum with a non-conforming
-        // payload has no nameable field and falls through to T0018.
+        // A direct `.to_string()` with NO explicit `to_string` fn on any type the builtin
+        // scalar list leaves out: a struct, an enum, or a scalar such as `float` whose
+        // Display is an `impl` in std. One gate for all of them, the shared
+        // `conformsTo(display)`, so a custom `impl Display` (a `.direct` conformance) reuses
+        // its witness and a structural derive is recorded only for an aggregate. A struct
+        // with a non-Display field names it (T0031); anything else that does not conform
+        // falls through to T0018.
         if (std.mem.eql(u8, member, "to_string") and bc.model.preludeProtocols().display != null and
-            (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum"))
+            Typecheck.builtinStrMethod(recv_ty, member) == null)
         {
             if (!try bc.checkCall(node_idx, args, .{ .params = &.{}, .name = member })) {
                 bc.setCallee(n, Callee.builtinMethod(.display_to_string));
@@ -4027,7 +4027,10 @@ pub const BodyChecker = struct {
                 return Type.str;
             }
             if (try bc.deriveBlocker(recv_ty, bc.model.preludeProtocols().display)) |blocker| {
-                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0031 }, "cannot 'to_string' a '{s}': field '{s}' of type '{s}' does not conform to 'Display'", .{ bc.typeName(recv_ty), blocker.name, bc.typeName(blocker.ty) });
+                var buf: [64]u8 = undefined;
+                const field_ty = bc.typeName(blocker.ty);
+                const hint = importHint(&buf, Typecheck.scalarImplModule(bc.model, field_ty, bc.model.preludeProtocols().display.?));
+                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0031 }, "cannot 'to_string' a '{s}': field '{s}' of type '{s}' does not conform to 'Display'{s}", .{ bc.typeName(recv_ty), blocker.name, field_ty, hint });
                 return .invalid;
             }
             // No structural derive and no nameable blocker: fall through to T0018.
@@ -4191,7 +4194,10 @@ pub const BodyChecker = struct {
                 return Type.str;
             }
             if (try bc.deriveBlocker(recv_ty, bc.model.preludeProtocols().display)) |blocker| {
-                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0031 }, "cannot 'to_string' a '{s}': field '{s}' of type '{s}' does not conform to 'Display'", .{ bc.typeName(recv_ty), blocker.name, bc.typeName(blocker.ty) });
+                var buf: [64]u8 = undefined;
+                const field_ty = bc.typeName(blocker.ty);
+                const hint = importHint(&buf, Typecheck.scalarImplModule(bc.model, field_ty, bc.model.preludeProtocols().display.?));
+                try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0031 }, "cannot 'to_string' a '{s}': field '{s}' of type '{s}' does not conform to 'Display'{s}", .{ bc.typeName(recv_ty), blocker.name, field_ty, hint });
                 return .invalid;
             }
         }
@@ -4808,6 +4814,10 @@ pub const BodyChecker = struct {
         if (bc.rejectedMethod(recv_ty, member)) return;
         if (bc.methodFamily(recv_ty)) |fam| if (bc.stdMethodModule(fam, member)) |module|
             return bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'; " ++ StdNames.add_import, .{ member, bc.typeName(recv_ty), module });
+        if (!recv_ty.isApp() and recv_ty.kind != .@"struct" and recv_ty.kind != .@"enum") {
+            if (Typecheck.scalarMethodModule(bc.model, bc.typeName(recv_ty), member)) |module|
+                return bc.sink.report(.{ .span = at, .code = .T0018 }, "no method '{s}' on type '{s}'; its impl is in std/{s}: " ++ StdNames.add_import, .{ member, bc.typeName(recv_ty), module, module });
+        }
         var iter = MethodNameIter{ .methods = bc.model.methods, .recv = recv_ty };
         if (recv_ty.isApp()) {
             const e = bc.composite.at(recv_ty.appIdx());

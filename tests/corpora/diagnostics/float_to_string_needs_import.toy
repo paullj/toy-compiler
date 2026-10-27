@@ -1,0 +1,10 @@
+# Every way of reaching float's missing Display names std/float, as the bound path does: a
+# direct to_string or display, and a struct whose float field blocks its derived Display.
+struct P { x: float }
+
+fn main() -> int {
+    _a := (1.5).to_string()  #~ ERROR [T0018] its impl is in std/float: add 'import std/float'
+    _b := (2.5).display()  #~ ERROR [T0018] its impl is in std/float: add 'import std/float'
+    _c := P { x: 1.5 }.to_string()  #~ ERROR [T0031] does not conform to 'Display'; add 'import std/float'
+    return 0
+}
