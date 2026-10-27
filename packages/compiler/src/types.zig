@@ -1202,8 +1202,9 @@ pub fn builtinScalarMethod(recv: Type, name: []const u8) ?struct { ret: Type, ar
 /// `Self`: `byte_at` takes an int. A pure, table-free recognizer (no `t.methods`/`t.fns`
 /// row); the checker records its `builtin` as the call's Callee, which lower reads.
 /// `to_string` on int/bool/str/unit produces a str
-/// (it is `self.display()` for every Display-conforming scalar); struct/enum `to_string` is
-/// gated separately (it may record a structural Display derive), so it is NOT recognized here.
+/// (it is `self.display()` for every Display-conforming scalar); struct/enum/float
+/// `to_string` is gated separately (it may record a structural Display derive, and float's
+/// Display is an impl in std/float), so it is NOT recognized here.
 pub fn builtinStrMethod(recv: Type, name: []const u8) ?struct { ret: Type, params: []const Type, builtin: Callee.Builtin } {
     if (recv.kind == .str) {
         if (std.mem.eql(u8, name, "concat")) return .{ .ret = Type.str, .params = &.{Type.str}, .builtin = .str_concat };
@@ -1342,6 +1343,37 @@ pub fn optionResultMethod(family: LayoutEngine.NativeEnumFamily, name: []const u
 /// stays silent on it.
 pub fn optResultFamilyOf(model: *const Model, ctor: u32) LayoutEngine.NativeEnumFamily {
     return if (model.prelude) |p| p.optResultFamily(ctor) else .none;
+}
+
+/// Whether `t` has fields a structural derive could walk: a scalar has none, so "make every
+/// field conform" is no fix for it.
+fn isAggregate(t: Type) bool {
+    return t.kind == .@"struct" or t.kind == .@"enum" or t.isApp();
+}
+
+/// The std module whose `impl` makes the scalar named `tname` conform to protocol `pid`, or
+/// null. Only a prelude protocol qualifies: a program's own protocol may reuse a prelude
+/// name, and no std import satisfies it.
+pub fn scalarImplModule(model: *const Model, tname: []const u8, pid: u32) ?[]const u8 {
+    const ids = model.preludeProtocols();
+    inline for (std.meta.fields(PreludeProtocolIds)) |f| {
+        if (@field(ids, f.name) == pid) return StdNames.scalarImplModule(tname, model.protocols[pid].name);
+    }
+    return null;
+}
+
+/// `scalarImplModule` for a method call `x.member()` on a scalar named `tname`: the
+/// prelude protocol declaring `member` (or Display, for `to_string`) has its impl there.
+pub fn scalarMethodModule(model: *const Model, tname: []const u8, member: []const u8) ?[]const u8 {
+    const ids = model.preludeProtocols();
+    inline for (std.meta.fields(PreludeProtocolIds)) |f| if (@field(ids, f.name)) |pid| {
+        const declares = for (model.protocols[pid].methods) |m| {
+            if (std.mem.eql(u8, m, member)) break true;
+        } else false;
+        const via_display = ids.display == pid and std.mem.eql(u8, member, "to_string");
+        if (declares or via_display) if (StdNames.scalarImplModule(tname, model.protocols[pid].name)) |m| return m;
+    };
+    return null;
 }
 
 /// Whether `pid` is one of the four structurally-derivable prelude protocols
@@ -2538,16 +2570,17 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // every other diagnostic, so it is byte-identical at -j1 and -jN.
     try t.checkMainReturn(entry_mod);
 
-    // Before the derive barrier and the mono tail append method rows no source declares.
-    try t.checkStdShadows();
-    try t.checkFnFieldMethods();
-
     // WHOLE-PROGRAM COHERENCE: walk every `impl .. has ..`, reject a duplicate
     // (protocol, receiver-ctor) conformance (T0020) — including a retroactive one in a
     // sibling module — and an incomplete/undeclared conformance (T0021). SERIAL, in
     // module-then-decl order, BEFORE the parallel Pass-C fan-out — so the emit order is
     // a pure function of source (byte-identical at any `-jN`).
     try coherence.checkCoherence(t, mods);
+
+    // After coherence, which drops an overlapping impl's method rows, and before the
+    // derive barrier and the mono tail append method rows no source declares.
+    try t.checkStdShadows();
+    try t.checkFnFieldMethods();
 
     // Ord-refines-Eq: after coherence, append exactly one `(Eq, recv)` conformance
     // per `Ord` receiver that lacks an existing `(Eq, recv)` entry — so `==`/`!=` on an
@@ -3387,7 +3420,9 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
         if (args[ord].isFunc()) {
             // No impl can be written for a function type, so the usual fixes do not apply.
             try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "function type '{s}' does not conform to protocol '{s}'; function values support only '==' (identity)", .{ tname, pname });
-        } else if (isDerivableProtocol(model, pid)) {
+        } else if (scalarImplModule(model, tname, pid)) |m| {
+            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; its impl is in std/{s}: " ++ StdNames.add_import, .{ tname, pname, m, m });
+        } else if (isDerivableProtocol(model, pid) and isAggregate(args[ord])) {
             try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; make every field of '{s}' conform to '{s}' (it then derives automatically), or add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname, tname, pname });
         } else {
             try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname });
@@ -7291,6 +7326,42 @@ test "a non-conforming type at a DERIVABLE bound suggests structural derivation"
     try testing.expectEqual(codes.Code.T0023, c.result.diags[0].code);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "Display") != null);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "derives automatically") != null);
+}
+
+test "a scalar at a derivable bound gets no 'every field' hint; a float's Display names std/float" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn needs_display[T has Display](x: T) -> str { x.to_string() }
+        \\fn needs_hash[T has Hash](x: T) -> int { x.hash() }
+        \\fn main() -> int {
+        \\  s := needs_display(1.5)
+        \\  h := needs_hash(2.5)
+        \\  return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 2), c.result.diags.len);
+    for (c.result.diags) |d| {
+        try testing.expectEqual(codes.Code.T0023, d.code);
+        try testing.expect(std.mem.indexOf(u8, d.message, "every field") == null);
+    }
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "add 'import std/float'") != null);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[1].message, "impl float has Hash") != null);
+}
+
+test "a program's own protocol named Display gets no std/float hint" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\protocol Display { fn display(self) -> str }
+        \\fn needs[T has Display](_x: T) -> int { 0 }
+        \\fn main() -> int { return needs(1.5) }
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0023, c.result.diags[0].code);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "std/float") == null);
 }
 
 test "a conforming impl whose method signature diverges from the protocol is T0024" {

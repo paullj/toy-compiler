@@ -25,6 +25,7 @@ either runs cleanly or, under `errors/`, fails compilation on purpose.
 | `os/`           | `std/os`: `args()` (with `# args:`), `env(name)` (with `# env:`), and `exit(code)` |
 | `time/`         | `std/time`: `now()` and `Instant.elapsed()`, `Duration` math, `sleep(d)`, and `unix()` / `unix_ns()` |
 | `fs/`           | `std/fs`: `read_file`, `write_file`, `append_file`, `remove` and `exists` in the fixture's cwd, each `IoError`, and `File` handles from `open`, `create` and `append` (chunked reads, writes, use after close) |
+| `float/`        | `std/float`: float `Display` (shortest round-trip digits, exponent outside [1e-4, 1e16), inf/NaN, fields) and `float.parse` round trips |
 | `gc/`           | the mark-sweep collector: roots, tracing, reclaiming churned garbage, and `std/gc`'s `collect()` / `collections()` |
 | `frames/`       | function frames past the 4 KiB a single instruction addresses (about 5 KiB, 40 KiB and 1 MiB), with heap roots at the far end across collections |
 | `errors/`       | programs that are *supposed* to fail to compile           |

@@ -1,0 +1,33 @@
+# Feature: a float prints its shortest round-trip digits, plain in [1e-4, 1e16) and with an
+# exponent outside, always with a digit after the point; std/io alone brings float Display
+# expect: stdout "0.1\n1.0\n1.5e300\n-2.5\n0.3333333333333333\ninf\n-inf\nNaN\n-0.0\n1.0e-5\n0.0001\n5.0e-324\n1.0e16\n9999999999999998.0\n123.456\n100.0\nP{x: 0.5, n: 3}\nhalf(0.5)\nsome(2.25)\n7.75!\n"
+# expect: exit 0
+import std/io
+
+struct P { x: float, n: int }
+enum E { half(float), none }
+
+fn main() -> int {
+    io.println(0.1)
+    io.println(1.0)
+    io.println(1.5e300)
+    io.println(0.0 -. 2.5)
+    io.println(1.0 /. 3.0)
+    io.println(1.0 /. 0.0)
+    io.println((0.0 -. 1.0) /. 0.0)
+    io.println(0.0 /. 0.0)
+    io.println(0.0 *. (0.0 -. 1.0))
+    io.println(1e-5)
+    io.println(0.0001)
+    io.println(5e-324)
+    io.println(1e16)
+    io.println(9999999999999998.0)
+    io.println(123.456)
+    io.println(100.0)
+    io.println(P { x: 0.5, n: 3 })
+    io.println(E.half(0.5))
+    io.println(Option.some(2.25))
+    x := 7.75
+    io.println(x.to_string().concat("!"))
+    return 0
+}

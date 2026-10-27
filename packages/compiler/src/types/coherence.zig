@@ -18,16 +18,18 @@ const testing = std.testing;
 /// Whole-program conformance coherence. Walks every `impl .. has ..` in
 /// module-then-decl order (SERIAL, before Pass C) and enforces:
 ///   * exactly one impl per (protocol, receiver type-ctor) — a duplicate (INCLUDING a
-///     retroactive one in a SIBLING module: no orphan rule) is T0020 at the second impl;
+///     retroactive one in a SIBLING module: no orphan rule) is T0020 at the second impl,
+///     or at the program's impl when the other is in bundled std;
 ///   * `has P` names a declared protocol AND provides every method P requires — an
 ///     undeclared protocol OR a missing method is T0021.
 /// Accepted conformances are recorded onto `t.conformances`. The
 /// `seen` set is `getOrPut`-only (never iterated), so its hash/thread order cannot leak
 /// into the emit stream; emit order is module-id then source order → `-jN`-stable.
 pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
-    // `seen` maps a serialized coherence key (see `writeCoherenceKey`) to presence; it
-    // owns its keys (dup'd on insert), freed on return.
-    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    // `seen` maps a serialized coherence key (see `writeCoherenceKey`) to the impl that
+    // claimed it (null for a prelude conformance or a generic impl); it owns its keys
+    // (dup'd on insert), freed on return.
+    var seen: std.StringHashMapUnmanaged(?ImplAt) = .empty;
     defer {
         var it = seen.keyIterator();
         while (it.next()) |k| t.gpa.free(k.*);
@@ -44,7 +46,10 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
     for (t.conformances.items) |c| {
         try writeCoherenceKey(t.gpa, &keybuf, c.protocol, c.recv, c.protocol_args);
         const gop = try seen.getOrPut(t.gpa, keybuf.items);
-        if (!gop.found_existing) gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items);
+            gop.value_ptr.* = null;
+        }
     }
 
     for (mods, 0..) |_, mi| {
@@ -203,10 +208,12 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
 
             try writeCoherenceKey(t.gpa, &keybuf, pid, recv, pargs);
             const gop = try seen.getOrPut(t.gpa, keybuf.items);
+            const here: ImplAt = .{ .mod = mod, .decl = decl_idx };
             if (gop.found_existing) {
-                try t.sink.report(.{ .span = implHeaderSpan(t, decl, proto_ref), .code = .T0020 }, "overlapping impl of protocol '{s}' for type '{s}'", .{ t.protocols.items[pid].name, t.nameText(decl.main_token) });
+                try reportOverlap(t, pid, gop.value_ptr.*, here);
             } else {
                 gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items);
+                gop.value_ptr.* = here;
                 try t.conformances.append(t.gpa, .{ .protocol = pid, .recv = recv, .protocol_args = try t.gpa.dupe(Type, pargs) });
             }
         }
@@ -221,7 +228,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
 /// receiver CTOR int (the App index is interning-order dependent — would break `-jN`).
 fn recordGenericConformance(
     t: *Typecheck,
-    seen: *std.StringHashMapUnmanaged(void),
+    seen: *std.StringHashMapUnmanaged(?ImplAt),
     keybuf: *std.ArrayList(u8),
     mod: u32,
     decl: Ast.Node,
@@ -329,6 +336,7 @@ fn recordGenericConformance(
         return;
     }
     gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items);
+    gop.value_ptr.* = null;
     const owned_pargs = try t.gpa.dupe(Type, pargs);
     t.template_conformances.append(t.gpa, .{ .protocol_id = pid, .recv_ctor = e.ctor, .recv_is_enum = e.ctor_is_enum, .protocol_args = owned_pargs }) catch |err| {
         t.gpa.free(owned_pargs);
@@ -370,6 +378,52 @@ fn checkReceiverMode(t: *Typecheck, prot: Typecheck.ProtocolSym, j: usize, fn_id
 
 /// `impl T has P`: the header of a conformance block, short of its methods. The decl
 /// node's main token is the receiver's last segment, so walk back to `impl`.
+/// An `impl .. has ..` decl: its module and its node there.
+const ImplAt = struct { mod: u32, decl: Ast.Index };
+
+/// T0020 for the impl `second`, which repeats the conformance `first` claimed. When one of
+/// the two is in bundled std the program's impl is the one to remove, so the error sits on
+/// it and names std's module, whichever came first in module order. The losing impl's
+/// method rows are dropped, so its calls neither shadow std's (W0011) nor look ambiguous
+/// between two witnesses (T0025): this error is the only one the overlap gives.
+fn reportOverlap(t: *Typecheck, pid: u32, first: ?ImplAt, second: ImplAt) !void {
+    const mods = t.graph.mods;
+    var loser = second;
+    var std_mod: ?u32 = null;
+    if (first) |f| {
+        if (mods[f.mod].bundled and !mods[second.mod].bundled) std_mod = f.mod;
+        if (!mods[f.mod].bundled and mods[second.mod].bundled) {
+            loser = f;
+            std_mod = second.mod;
+        }
+    }
+    const prev = t.gphSelect(loser.mod);
+    defer _ = t.gphSelect(prev);
+    const decl = t.tree.nodes[loser.decl.int()];
+    const proto_ref = Ast.implProtocol(t.tree, decl).?;
+    const span = implHeaderSpan(t, decl, proto_ref);
+    const pname = t.protocols.items[pid].name;
+    if (std_mod) |sm|
+        try t.sink.report(.{ .span = span, .code = .T0020 }, "overlapping impl of protocol '{s}' for type '{s}': {s} already provides one; remove this impl", .{ pname, t.nameText(decl.main_token), mods[sm].path })
+    else
+        try t.sink.report(.{ .span = span, .code = .T0020 }, "overlapping impl of protocol '{s}' for type '{s}'", .{ pname, t.nameText(decl.main_token) });
+    for (Ast.implMethods(t.tree, decl)) |pn| {
+        const fid = for (t.fns.items, 0..) |f, fi| {
+            if (f.mod == loser.mod and f.decl_node == pn) break fi;
+        } else continue;
+        var i: usize = 0;
+        while (i < t.methods.items.len) {
+            const m = t.methods.items[i];
+            if (m.fn_id != fid) {
+                i += 1;
+                continue;
+            }
+            if (m.protocol_args.len > 0) t.gpa.free(@constCast(m.protocol_args));
+            _ = t.methods.orderedRemove(i);
+        }
+    }
+}
+
 fn implHeaderSpan(t: *const Typecheck, decl: Ast.Node, proto_ref: Ast.Index) Span {
     var tok = decl.main_token;
     while (tok > 0 and t.tokens[tok].tag != .kw_impl) tok -= 1;

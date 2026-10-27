@@ -1,0 +1,12 @@
+# std/io brings in std/float, whose impl of Display for float a program's own impl now
+# repeats. The one error sits on the program's impl and names std/float, and the call
+# raises no ambiguity or shadowing on top of it.
+import std/io
+
+impl float has Display {  #~ ERROR [T0020] std/float already provides one; remove this impl
+    fn display(self) -> str { return "F" }
+}
+
+fn main() {
+    io.println((1.5).display())
+}

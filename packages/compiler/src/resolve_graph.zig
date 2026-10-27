@@ -1060,7 +1060,12 @@ const GraphResolve = struct {
                     // A declared type-level name is no value, so it is not undeclared either;
                     // the checker reports the same T0056 for a struct or enum name.
                     if (g.typeLevelKind(name)) |kind| {
-                        try g.sink.report(.{ .span = off, .code = .T0056, .scope = g.cur_mod }, "{s} '{s}' is not a value", .{ kind, name });
+                        // `float` names both a type and std/float, so `float.parse` without
+                        // the import lands here, not at the import hint below.
+                        if (if (builtin_type_names.has(name)) StdNames.importHintFor(name) else null) |hint|
+                            try g.sink.report(.{ .span = off, .code = .T0056, .scope = g.cur_mod }, "{s} '{s}' is not a value; for the module std/{s}, " ++ StdNames.add_import, .{ kind, name, hint.module, hint.module })
+                        else
+                            try g.sink.report(.{ .span = off, .code = .T0056, .scope = g.cur_mod }, "{s} '{s}' is not a value", .{ kind, name });
                         return;
                     }
                     // An EXACT stdlib name (checked before the fuzzy suggester) means the

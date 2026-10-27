@@ -51,6 +51,7 @@ core is the private layer between the compiler and std. It is the only place whe
 | `core/os` | the `_NSGetArgc`, `_NSGetArgv`, `getenv`, `strlen`, `exit`, `__error`, `clock_gettime_nsec_np` and `nanosleep` externs: `argc`, `argv(i)`, `env`, `exit_process`, `errno`, `monotonic_ns`, `realtime_ns`, `sleep_ns`, and `from_cstr` (copies) / `to_cstr` |
 | `core/fs` | the `open` (two arguments, never `O_CREAT`), `creat`, `close`, `unlink` and `access` externs: `open_read`, `open_append`, `create`, `close_fd`, `remove`, `exists`, `write_all`, `read_some` and `read_all`, each failure as a negated errno |
 | `core/mem` | the growable `gc_array` and the hash table behind Vec, Map and Set |
+| `core/fmt` | the Darwin-private `__dtoa`/`__freedtoa` and the `strtod` externs: `shortest(f)` (the shortest round-trip digits, their decimal point and sign) and `parse(s)` |
 | `core/text` | raw `str` parts: `slice`, and the `alloc`/`put`/`window`/`take` buffer that builds a str once |
 | `core/mem_selftest`, `core/desc_selftest` | heap and descriptor self-checks |
 
@@ -61,7 +62,8 @@ and never names a `.core` intrinsic.
 
 | module | holds |
 |--------|-------|
-| `std/io` | `print`, `println`, `eprint` and `eprintln` over `T has Display`; `read_line` and `read_all` on stdin |
+| `std/io` | `print`, `println`, `eprint` and `eprintln` over `T has Display`; `read_line` and `read_all` on stdin. It imports std/float, so a printing program can print a float |
+| `std/float` | `impl float has Display` and `parse(s) -> Option[float]`, over core/fmt |
 | `std/vec`, `std/map`, `std/set` | the collections, over core/mem |
 | `std/str` | methods on `str`, including `parse_int`, over core/text |
 | `std/option` | the closure methods of `Option` and `Result` |
@@ -121,6 +123,25 @@ fn main() -> int {
 It is `none` for an empty string, a lone sign, any other byte (spaces and `_`
 included) and a value outside `int`'s range. Call `trim` first to accept surrounding
 whitespace.
+
+## std/float: printing and parsing floats
+
+A float prints the shortest digits that read back as the same value:
+
+- plain for a magnitude in [1e-4, 1e16), and as `<d>.<ddd>e<exp>` outside it;
+- always with a digit after the point, so `1.0`, `100.0`, `1.0e16`, `1.0e-5`;
+- `inf`, `-inf` and `NaN`; a negative zero is `-0.0`.
+
+A float has no unary minus yet, so a printed negative such as `-2.5` is not toy source.
+Struct, enum and `Option` fields of type float print the same way, and `x.to_string()`
+works on a float. std/io imports std/float, so printing needs no extra import; a
+`[T has Display]` fn of your own without either import gets T0023, which names
+std/float.
+
+`float.parse(s) -> Option[float]` reads `s` as C `strtod` does and is `none` unless it
+reads all of `s`: an empty string, leading whitespace or anything left over is `none`.
+`parse(x.to_string()) == x` for every float but NaN. `inf`, `nan` and an overflowing
+`1e999` (inf) parse too.
 
 ## std/os: arguments, environment and exit
 

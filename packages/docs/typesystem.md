@@ -608,7 +608,9 @@ through the erased instance; it changes the code, never the behavior.
 declared `protocol P`. Coherence is checked **whole-program, serially** (before the
 parallel body pass): exactly one impl per `(protocol, type)`, no orphan rules — a
 duplicate (even in a sibling module) is **T0020**, a missing method or undeclared
-protocol is **T0021**. A protocol stores its method NAMES only; the per-impl
+protocol is **T0021**. When one of the two impls is in bundled std (std/float's
+`impl float has Display`, say) the T0020 sits on the program's impl and names std's
+module, and the program's impl methods are dropped so its calls give no further error. A protocol stores its method NAMES only; the per-impl
 signature-compatibility check (params/return vs the protocol) is **deferred**
 (the builtin `Eq` below is signature-correct by construction).
 
@@ -870,6 +872,9 @@ from the same value on its own:
 - `bool` → the literal `true` or `false`; `()` → the literal `()`.
 - `str` → its raw bytes, never quoted.
 - `char` → its UTF-8 encoding (the prelude `char` struct overrides the structural walk).
+- `float` → no builtin rendering: std/float's `impl float has Display` is its witness,
+  called like a struct's, so a float prints only when std/float is in the program
+  (std/io imports it). See `std.md` for the format.
 
 **Structural derive.** `Display` for a struct or enum is synthesized on demand at a
 `to_string` use (which `io.print` makes), through the same source-less
@@ -897,11 +902,11 @@ never a fallback rendering (no addresses):
 
 | type | today |
 |------|-------|
-| `float` | no builtin `Display` (it is `Eq`-only): `io.print(1.5)` is **T0023**, `(1.5).to_string()` is T0018 |
+| `float` without std/float | its `Display` is an impl in std/float: a `[T has Display]` bound is **T0023** naming std/float, `(1.5).to_string()` is T0018 |
 | a function value | conforms to no protocol but `==`: **T0023** |
-| a struct or enum holding a `float` or function field | the derive is blocked: **T0023** at an `io.print`, **T0031** at a `to_string` naming the field |
+| a struct or enum holding a function field (or a `float` one without std/float) | the derive is blocked: **T0023** at an `io.print`, **T0031** at a `to_string` naming the field |
 | `rawptr` | no `Display`; it exists only inside core |
-| a generic `T` without a `Display` bound | checked per instance: `fn f[T has Eq](x: T) { io.print(x) }` accepts `f(2)`, and `f(1.5)` is **T0023** |
+| a generic `T` without a `Display` bound | checked per instance: `fn f[T has Eq](x: T) { io.print(x) }` accepts `f(2)` and `f(1.5)` (std/io brings std/float); an instance whose type does not conform is **T0023** at the call |
 | the boxes `Ref`, `gc_array` (so `Vec`, `Map`, `Set`) | **known gap:** they derive structurally and print their handles (`Ref{0: <cell address>}`), which is not deterministic |
 
 ## Two-phase checking (and parallelism)
