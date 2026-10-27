@@ -1,0 +1,10 @@
+# Feature: a panic writes its message, then a backtrace, to stderr and exits 1.
+# The stderr check is a substring: the backtrace's last frames are unsymbolized
+# addresses that move with ASLR.
+# expect: exit 1
+# expect: stdout ""
+# expect: stderr "out of cheese\n"
+# expect: stderr " main\n"
+fn main() -> int {
+    panic("out of cheese")
+}
