@@ -67,8 +67,8 @@ pub const FieldWitness = union(enum) {
     /// Append-only (ordinal 4).
     hash_call: []const u8,
     /// An aggregate (struct / enum) field of a `Display` derive with a `display` witness:
-    /// call `display(field_self) -> ()`, which writes the field's rendering directly
-    /// to the output fd. Append-only (ordinal 5).
+    /// call `display(field_self) -> str` and append the returned rendering to the
+    /// accumulator str. Append-only (ordinal 5).
     display_call: []const u8,
     /// A MANAGED (reference) field of a `Trace` derive: the trace boundary. The emitter
     /// loads the 8-byte cell pointer and `bl gc_mark`s it — it does NOT recurse into the
