@@ -1,0 +1,18 @@
+# Feature: a struct literal or struct-form variant named through its module
+# (`lib.Pt { .. }`, `shapes.Shape.sq { .. }`) builds the imported type, even when
+# the importer declares a type of the same name.
+# expect: exit 29
+import lib
+import shapes
+
+struct Pt { x: int }
+enum Shape { sq { side: int }, dot }
+
+fn main() -> int {
+    p := lib.Pt { x: 1, y: 2 }
+    q := lib.Pair { a: 3, b: 4 }
+    r: lib.Pair[int, int] = lib.Pair { a: 5, b: 5 }
+    mine := Pt { x: 0 }
+    s := shapes.Shape.sq { side: 3 }
+    return p.x + p.y + q.a + q.b + r.a + r.b + mine.x + shapes.area(s)
+}

@@ -1,0 +1,8 @@
+pub enum Shape { sq { side: int }, circle(int) }
+
+pub fn area(s: Shape) -> int {
+    match s {
+        .sq { side } -> side * side,
+        .circle(r) -> 3 * r * r,
+    }
+}

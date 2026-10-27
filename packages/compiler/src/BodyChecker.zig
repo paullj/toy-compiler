@@ -1422,14 +1422,11 @@ pub const BodyChecker = struct {
 
     fn typeOfStructInit(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
         const lhs = bc.tree.nodes[(n.lhs).int()];
-        // Resolve the constructed type: a plain identifier `P { .. }` names a
-        // non-generic struct; a `type_app` lhs `Box[int] { .. }` names a generic-struct
-        // INSTANCE — a composite `App`. `targs` are the concrete type-args the
-        // template's field PATTERNS are substituted through (empty for a plain struct).
-        var ctor_id: u32 = undefined;
-        var targs: []const Type = &.{};
-        var result: Type = undefined;
-        var disp_name: []const u8 = undefined;
+        // A `type_app` lhs `Box[int] { .. }` names a generic-struct INSTANCE — a
+        // composite `App` whose type-args the template's field PATTERNS are substituted
+        // through. Otherwise the lhs is a plain type-name identifier: a qualified
+        // `N.V { ... }` arrives as enum_init_struct (the parser upgrades a
+        // `field_access {`), not here.
         if (lhs.tag == .type_app and !bc.appHeadIsValue(n.lhs)) {
             const app_ty = bc.typeFromNode(n.lhs); // App or invalid (already diagnosed)
             if (!app_ty.isApp()) {
@@ -1437,98 +1434,95 @@ pub const BodyChecker = struct {
                 return .invalid;
             }
             const e = bc.composite.at(app_ty.appIdx());
-            ctor_id = e.ctor;
-            targs = e.args;
-            result = app_ty;
-            disp_name = bc.model.structs[ctor_id].name;
-        } else {
-            // A qualified struct-variant `N.V { ... }` arrives as enum_init_struct (the
-            // parser upgrades a `field_access {`), not here — so the non-type_app lhs is
-            // always a plain type-name identifier; no enum routing needed.
-            disp_name = bc.nameText(lhs.main_token);
-            const id = bc.activeStructMap().get(disp_name) orelse {
-                for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |fi| _ = try bc.typeUnder(bc.tree.nodes[(fi).int()].lhs, bc.partHint());
-                try bc.sink.report(.{ .span = bc.tokSpan(lhs.main_token), .code = .T0001 }, "unknown struct type '{s}'", .{disp_name});
-                return .invalid;
-            };
-            // A generic struct constructed WITHOUT type args (`Box{ v: 1 }`) infers its
-            // type-params by matching field VALUE types against the declared field
-            // PATTERNS (the matcher over the interned `App`). The inferred `App` is
-            // content-addressed, so it selects the SAME reified struct as an explicit
-            // `Box[int]{..}` and dedups to one codegen unit.
-            if (id < bc.model.structs.len and bc.model.structs[id].is_generic) {
-                const gsym = bc.model.structs[id];
-                const inits = Ast.rangeSlice(bc.tree, (n.rhs).int());
-                // Type each value ONCE (source order); the shared field-check tail reuses
-                // these via `pretyped`, so inner-value diagnostics aren't double-emitted.
-                const pre = try bc.gpa.alloc(Type, inits.len);
-                defer bc.gpa.free(pre);
-                // Align values to decl order + record each field's first supplier (for
-                // conflict spans). A missing field's slot stays `.invalid`/`Ast.none`: the
-                // matcher's never/invalid rule skips it and its span is never dereferenced.
-                const aligned = try bc.gpa.alloc(Type, gsym.field_names.len);
-                defer bc.gpa.free(aligned);
-                @memset(aligned, Type.invalid);
-                const supplier = try bc.gpa.alloc(Ast.Index, gsym.field_names.len);
-                defer bc.gpa.free(supplier);
-                @memset(supplier, Ast.none);
-                const exp_args = bc.expectedAppArgs(id, false);
-                for (inits, 0..) |fi_idx, ii| {
-                    const fi = bc.tree.nodes[(fi_idx).int()];
-                    const j = fieldIndex(gsym.field_names, bc.nameText(fi.main_token));
-                    pre[ii] = try bc.typeUnder(fi.lhs, if (j) |k| bc.partWant(gsym.field_types[k], exp_args) else bc.partHint());
-                    if (j) |k| if (supplier[k] == Ast.none) {
-                        supplier[k] = fi_idx;
-                        aligned[k] = pre[ii];
-                    };
-                }
-                const n_gp: u32 = @intCast(gsym.generic_params.len);
-                const out = try bc.gpa.alloc(Type, n_gp);
-                defer bc.gpa.free(out);
-                const bnd = try bc.gpa.alloc(bool, n_gp);
-                defer bc.gpa.free(bnd);
-                const fp = try bc.gpa.alloc(usize, n_gp);
-                defer bc.gpa.free(fp);
-                switch (Infer.match(n_gp, gsym.field_types, aligned, out, bnd, fp, bc.composite.decomposer())) {
-                    // A field-vs-field conflict is authoritative, reported at the two
-                    // supplier spans — the target type never overrides it.
-                    .conflict => |c| {
-                        // Name the clashing LEAF types (`c.prev`/`c.cur`) — a container
-                        // field clash names `int` vs `bool`, not the container ctor. An
-                        // intra-field clash (`Both[T,T]`) shares one supplier span, so
-                        // collapse to a single caret rather than double-underlining it.
-                        if (c.first_pos == c.second_pos) {
-                            try bc.sink.report(.{ .span = bc.spanOf(supplier[c.second_pos]), .code = .T0015 }, "conflicting types for type parameter '{s}': {s} vs {s}", .{ gsym.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
-                        } else {
-                            const earlier = bc.tree.nodes[(supplier[c.first_pos]).int()].main_token;
-                            try bc.sink.report(.{ .span = bc.spanOf(supplier[c.second_pos]), .code = .T0015, .related = bc.tokSpan(earlier) }, "conflicting types for type parameter '{s}': {s} vs {s}", .{ gsym.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
-                        }
+            const sym = bc.model.structs[e.ctor];
+            return bc.checkStructFieldInits(node_idx, n, sym, e.args, sym.name, app_ty, null);
+        }
+        const id = bc.activeStructMap().get(bc.nameText(lhs.main_token)) orelse {
+            for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |fi| _ = try bc.typeUnder(bc.tree.nodes[(fi).int()].lhs, bc.partHint());
+            try bc.sink.report(.{ .span = bc.tokSpan(lhs.main_token), .code = .T0001 }, "unknown struct type '{s}'", .{bc.nameText(lhs.main_token)});
+            return .invalid;
+        };
+        return bc.typeOfNamedStructInit(node_idx, n, id, lhs.main_token);
+    }
+
+    /// A struct literal with no type args, of struct `id` named at `name_tok`: a bare
+    /// `P { .. }` or a module-qualified `lib.P { .. }`.
+    fn typeOfNamedStructInit(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, id: u32, name_tok: u32) error{OutOfMemory}!Type {
+        const disp_name = bc.nameText(name_tok);
+        // A generic struct constructed WITHOUT type args (`Box{ v: 1 }`) infers its
+        // type-params by matching field VALUE types against the declared field
+        // PATTERNS (the matcher over the interned `App`). The inferred `App` is
+        // content-addressed, so it selects the SAME reified struct as an explicit
+        // `Box[int]{..}` and dedups to one codegen unit.
+        if (id < bc.model.structs.len and bc.model.structs[id].is_generic) {
+            const gsym = bc.model.structs[id];
+            const inits = Ast.rangeSlice(bc.tree, (n.rhs).int());
+            // Type each value ONCE (source order); the shared field-check tail reuses
+            // these via `pretyped`, so inner-value diagnostics aren't double-emitted.
+            const pre = try bc.gpa.alloc(Type, inits.len);
+            defer bc.gpa.free(pre);
+            // Align values to decl order + record each field's first supplier (for
+            // conflict spans). A missing field's slot stays `.invalid`/`Ast.none`: the
+            // matcher's never/invalid rule skips it and its span is never dereferenced.
+            const aligned = try bc.gpa.alloc(Type, gsym.field_names.len);
+            defer bc.gpa.free(aligned);
+            @memset(aligned, Type.invalid);
+            const supplier = try bc.gpa.alloc(Ast.Index, gsym.field_names.len);
+            defer bc.gpa.free(supplier);
+            @memset(supplier, Ast.none);
+            const exp_args = bc.expectedAppArgs(id, false);
+            for (inits, 0..) |fi_idx, ii| {
+                const fi = bc.tree.nodes[(fi_idx).int()];
+                const j = fieldIndex(gsym.field_names, bc.nameText(fi.main_token));
+                pre[ii] = try bc.typeUnder(fi.lhs, if (j) |k| bc.partWant(gsym.field_types[k], exp_args) else bc.partHint());
+                if (j) |k| if (supplier[k] == Ast.none) {
+                    supplier[k] = fi_idx;
+                    aligned[k] = pre[ii];
+                };
+            }
+            const n_gp: u32 = @intCast(gsym.generic_params.len);
+            const out = try bc.gpa.alloc(Type, n_gp);
+            defer bc.gpa.free(out);
+            const bnd = try bc.gpa.alloc(bool, n_gp);
+            defer bc.gpa.free(bnd);
+            const fp = try bc.gpa.alloc(usize, n_gp);
+            defer bc.gpa.free(fp);
+            switch (Infer.match(n_gp, gsym.field_types, aligned, out, bnd, fp, bc.composite.decomposer())) {
+                // A field-vs-field conflict is authoritative, reported at the two
+                // supplier spans — the target type never overrides it.
+                .conflict => |c| {
+                    // Name the clashing LEAF types (`c.prev`/`c.cur`) — a container
+                    // field clash names `int` vs `bool`, not the container ctor. An
+                    // intra-field clash (`Both[T,T]`) shares one supplier span, so
+                    // collapse to a single caret rather than double-underlining it.
+                    if (c.first_pos == c.second_pos) {
+                        try bc.sink.report(.{ .span = bc.spanOf(supplier[c.second_pos]), .code = .T0015 }, "conflicting types for type parameter '{s}': {s} vs {s}", .{ gsym.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
+                    } else {
+                        const earlier = bc.tree.nodes[(supplier[c.first_pos]).int()].main_token;
+                        try bc.sink.report(.{ .span = bc.spanOf(supplier[c.second_pos]), .code = .T0015, .related = bc.tokSpan(earlier) }, "conflicting types for type parameter '{s}': {s} vs {s}", .{ gsym.generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
+                    }
+                    return .invalid;
+                },
+                // Target-fill any still-open param from the expected type
+                // (`p: Phantom[int] = Phantom{..}`); an arg-vs-expected disagreement
+                // surfaces as T0015. Byte-identical when no target exists.
+                .ok, .unbound => switch (try bc.reconcileTargetArgs(out, bnd, exp_args, gsym.generic_params, name_tok)) {
+                    .ok => {
+                        const app = Type.app(try bc.internApp(id, out, false));
+                        return bc.checkStructFieldInits(node_idx, n, gsym, out, disp_name, app, pre);
+                    },
+                    .err => return .invalid,
+                    .unbound => |ord| {
+                        for (out, bnd) |*o, b| if (!b) {
+                            o.* = .invalid;
+                        };
+                        try bc.reportUninferable(bc.tokSpan(name_tok), " '{s}' for '{s}'", .{ gsym.generic_params[ord], disp_name }, disp_name, out, &.{"{ .. }"}, null);
                         return .invalid;
                     },
-                    // Target-fill any still-open param from the expected type
-                    // (`p: Phantom[int] = Phantom{..}`); an arg-vs-expected disagreement
-                    // surfaces as T0015. Byte-identical when no target exists.
-                    .ok, .unbound => switch (try bc.reconcileTargetArgs(out, bnd, exp_args, gsym.generic_params, lhs.main_token)) {
-                        .ok => {
-                            const app = Type.app(try bc.internApp(id, out, false));
-                            return bc.checkStructFieldInits(node_idx, n, gsym, out, disp_name, app, pre);
-                        },
-                        .err => return .invalid,
-                        .unbound => |ord| {
-                            for (out, bnd) |*o, b| if (!b) {
-                                o.* = .invalid;
-                            };
-                            try bc.reportUninferable(bc.tokSpan(lhs.main_token), " '{s}' for '{s}'", .{ gsym.generic_params[ord], disp_name }, disp_name, out, &.{"{ .. }"}, null);
-                            return .invalid;
-                        },
-                    },
-                }
+                },
             }
-            ctor_id = id;
-            result = Type.structT(id);
         }
-        const sym = bc.model.structs[ctor_id];
-        return bc.checkStructFieldInits(node_idx, n, sym, targs, disp_name, result, null);
+        return bc.checkStructFieldInits(node_idx, n, bc.model.structs[id], &.{}, disp_name, Type.structT(id), null);
     }
 
     /// The field-init check shared by all three struct-construction paths (non-generic
@@ -1857,10 +1851,18 @@ pub const BodyChecker = struct {
                 try bc.typeArgsForEffect(node_form, args);
                 return .invalid;
             }
-            const tname = bc.nameText(lhs_node.main_token);
-            enum_id = bc.activeEnumMap().get(tname) orelse {
+            // The parser cannot tell a module head from an enum, so `lib.Pt { .. }`
+            // lands here too; the resolver bound its head to the module.
+            if (lhs_node.tag == .identifier and bc.resolutions[n.lhs.int()] == .module)
+                return bc.typeOfModuleStructInit(node_idx, n, node_form, args);
+            const found = switch (lhs_node.tag) {
+                .field_access => bc.qualifiedEnumId(n.lhs),
+                else => bc.activeEnumMap().get(bc.nameText(lhs_node.main_token)),
+            };
+            enum_id = found orelse {
                 try bc.typeArgsForEffect(node_form, args);
-                try bc.sink.report(.{ .span = bc.tokSpan(lhs_node.main_token), .code = .T0062 }, "'{s}' is not an enum type", .{tname});
+                const sp = bc.spanOf(n.lhs);
+                try bc.sink.report(.{ .span = sp, .code = .T0062 }, "'{s}' is not an enum type", .{bc.source[sp.start..sp.end]});
                 return .invalid;
             };
         } else {
@@ -1881,6 +1883,20 @@ pub const BodyChecker = struct {
             };
         }
         return bc.checkVariant(node_idx, enum_id, n.main_token, node_form, args);
+    }
+
+    /// `mod.S { .. }`: a literal of the struct `S` of module `mod`, reached as a
+    /// variant construction whose head the resolver bound to that module.
+    fn typeOfModuleStructInit(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, node_form: InitForm, args: Ast.Index) error{OutOfMemory}!Type {
+        if (node_form == .@"struct") {
+            const target = bc.resolutions[n.lhs.int()].module;
+            if (bc.model.graph.mods[target].struct_ids.get(bc.nameText(n.main_token))) |id|
+                return bc.typeOfNamedStructInit(node_idx, n, id, n.main_token);
+        }
+        try bc.typeArgsForEffect(node_form, args);
+        const sp: Span = .{ .start = bc.spanOf(n.lhs).start, .end = bc.tokSpan(n.main_token).end };
+        try bc.sink.report(.{ .span = sp, .code = .T0001 }, "unknown struct type '{s}'", .{bc.source[sp.start..sp.end]});
+        return .invalid;
     }
 
     fn typeOfEnumInitQualified(bc: *BodyChecker, node_idx: Ast.Index, node_form: InitForm, type_node: Ast.Index, vtok: u32, args: Ast.Index) error{OutOfMemory}!Type {
