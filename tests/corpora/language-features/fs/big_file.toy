@@ -1,0 +1,34 @@
+# Feature: a 1 MiB file round-trips through `fs.write_file` and `fs.read_file`, past the
+# read buffer's first doublings, and `write_file` replaces a longer file's contents.
+# expect: stdout "1048576\nsame\nshort\n"
+# expect: exit 0
+import std/io
+import std/fs
+fn main() -> int {
+    s := "0123456789abcdef"
+    while s.len() < 1048576 { s = s.concat(s) }
+    match fs.write_file("fs_big_file.bin", s) {
+        .ok(_) -> {},
+        .err(_) -> { return 1 },
+    }
+    match fs.read_file("fs_big_file.bin") {
+        .ok(back) -> {
+            io.println(back.len())
+            if back == s { io.println("same") }
+        },
+        .err(_) -> { return 2 },
+    }
+    match fs.write_file("fs_big_file.bin", "short") {
+        .ok(_) -> {},
+        .err(_) -> { return 3 },
+    }
+    match fs.read_file("fs_big_file.bin") {
+        .ok(back) -> io.println(back),
+        .err(_) -> { return 4 },
+    }
+    match fs.remove("fs_big_file.bin") {
+        .ok(_) -> {},
+        .err(_) -> { return 5 },
+    }
+    return 0
+}

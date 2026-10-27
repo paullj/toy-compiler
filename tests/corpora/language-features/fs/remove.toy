@@ -1,0 +1,21 @@
+# Feature: `fs.exists` is true for a written file and a directory, and false after
+# `fs.remove` deletes the file; a path with a NUL never exists.
+# expect: stdout "true\ntrue\nfalse\nfalse\n"
+# expect: exit 0
+import std/io
+import std/fs
+fn main() -> int {
+    match fs.write_file("fs_remove.txt", "x") {
+        .ok(_) -> {},
+        .err(_) -> { return 1 },
+    }
+    io.println(fs.exists("fs_remove.txt"))
+    io.println(fs.exists("."))
+    match fs.remove("fs_remove.txt") {
+        .ok(_) -> {},
+        .err(_) -> { return 2 },
+    }
+    io.println(fs.exists("fs_remove.txt"))
+    io.println(fs.exists(".\0"))
+    return 0
+}

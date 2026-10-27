@@ -1,0 +1,99 @@
+import core/fs
+
+# Why a file operation failed. It carries no path (D12): the caller has it, and a message
+# that wants it says it.
+pub enum IoError {
+    not_found,
+    permission_denied,
+    already_exists,
+    is_directory,
+    not_directory,
+    # The path holds a NUL byte, which would cut it short as a C string.
+    invalid_path,
+    # Any other errno, as libSystem set it.
+    other(int),
+}
+
+impl IoError has Display {
+    fn display(self) -> str {
+        return match self {
+            .not_found -> "not found",
+            .permission_denied -> "permission denied",
+            .already_exists -> "already exists",
+            .is_directory -> "is a directory",
+            .not_directory -> "not a directory",
+            .invalid_path -> "invalid path",
+            .other(e) -> "os error ".concat(e.to_string()),
+        }
+    }
+}
+
+# Darwin's errno values.
+fn from_errno(e: int) -> IoError {
+    return match e {
+        2 -> IoError.not_found,
+        1 | 13 -> IoError.permission_denied,
+        17 -> IoError.already_exists,
+        21 -> IoError.is_directory,
+        20 -> IoError.not_directory,
+        _ -> IoError.other(e),
+    }
+}
+
+fn has_nul(path: str) -> bool {
+    for i in 0..path.len() {
+        if path.byte_at(i) == 0 { return true }
+    }
+    return false
+}
+
+# The whole file at `path`.
+pub fn read_file(path: str) -> Result[str, IoError] {
+    if has_nul(path) { return Result[str, IoError].err(IoError.invalid_path) }
+    fd := fs.open_read(path)
+    if fd < 0 { return Result[str, IoError].err(from_errno(-fd)) }
+    r := fs.read_all(fd)
+    fs.close_fd(fd)
+    return match r {
+        .ok(s) -> Result[str, IoError].ok(s),
+        .err(e) -> Result[str, IoError].err(from_errno(e)),
+    }
+}
+
+# Replaces the file at `path` with `s`, creating it if it is missing.
+pub fn write_file(path: str, s: str) -> Result[(), IoError] {
+    if has_nul(path) { return Result[(), IoError].err(IoError.invalid_path) }
+    return write_to(fs.create(path), s)
+}
+
+# Adds `s` to the end of the file at `path`, creating it if it is missing. open(2) cannot
+# create here (core/fs), so a missing file is created by a second call.
+pub fn append_file(path: str, s: str) -> Result[(), IoError] {
+    if has_nul(path) { return Result[(), IoError].err(IoError.invalid_path) }
+    fd := fs.open_append(path)
+    if fd == -2 { fd = fs.create(path) }
+    return write_to(fd, s)
+}
+
+fn write_to(fd: int, s: str) -> Result[(), IoError] {
+    if fd < 0 { return Result[(), IoError].err(from_errno(-fd)) }
+    w := fs.write_all(fd, s)
+    c := fs.close_fd(fd)
+    if w < 0 { return Result[(), IoError].err(from_errno(-w)) }
+    if c < 0 { return Result[(), IoError].err(from_errno(-c)) }
+    return Result[(), IoError].ok(())
+}
+
+# Deletes the file at `path`.
+pub fn remove(path: str) -> Result[(), IoError] {
+    if has_nul(path) { return Result[(), IoError].err(IoError.invalid_path) }
+    r := fs.remove(path)
+    if r < 0 { return Result[(), IoError].err(from_errno(-r)) }
+    return Result[(), IoError].ok(())
+}
+
+# Whether `path` names an existing file or directory. A path with a NUL names none.
+pub fn exists(path: str) -> bool {
+    if has_nul(path) { return false }
+    return fs.exists(path)
+}

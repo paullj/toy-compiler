@@ -1,0 +1,30 @@
+# Feature: each failure maps to its `fs.IoError`, whose Display names it: a missing file or
+# directory is not_found, reading '.' is is_directory (open(2) accepts a directory, the
+# read fails), a path through a file is not_directory, and a NUL in a path is
+# invalid_path before any call.
+# expect: stdout "not found\nnot found\nnot found\nis a directory\nnot a directory\ninvalid path\ninvalid path\nnot found\n"
+# expect: exit 0
+import std/io
+import std/fs
+fn show_read(path: str) {
+    match fs.read_file(path) {
+        .ok(_) -> io.println("read"),
+        .err(e) -> io.println(e),
+    }
+}
+fn show(r: Result[(), fs.IoError]) {
+    match r {
+        .ok(_) -> io.println("ok"),
+        .err(e) -> io.println(e),
+    }
+}
+fn main() {
+    show_read("fs_errors_missing.txt")
+    show_read("fs_errors_missing_dir/x")
+    show(fs.write_file("fs_errors_missing_dir/x", "x"))
+    show_read(".")
+    show_read("/dev/null/x")
+    show_read("fs_errors\0.txt")
+    show(fs.write_file("fs_errors\0.txt", "x"))
+    show(fs.remove("fs_errors_missing.txt"))
+}
