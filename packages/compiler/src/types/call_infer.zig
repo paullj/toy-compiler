@@ -148,7 +148,7 @@ pub fn inferArgs(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, pa
         }
         const want: ?Type = if (typing == .receiver) blk: {
             const w = BC.substTy(bc, params[i], targs);
-            break :blk if (w.kind != .invalid and bc.isGround(w)) w else null;
+            break :blk if (w.kind != .invalid and bc.givesType(w)) w else null;
         } else null;
         arg_types[i] = try typeOfGenericArg(bc, a, typing, want);
     }

@@ -1500,7 +1500,7 @@ pub const BodyChecker = struct {
             // A field value is typed against its field, never against the struct's own
             // expected type (`s: S = S { tags: ["y"] }`). A fn-typed field hands its type down
             // even when it holds a type var: a lambda's params come from it.
-            const field_want: ?Type = if (want) |w| (if (w.isFunc() or (w.kind != .invalid and bc.isGround(w))) w else null) else null;
+            const field_want: ?Type = if (want) |w| (if (w.isFunc() or (w.kind != .invalid and bc.givesType(w))) w else null) else null;
             const vt = if (pretyped) |pt| pt[ii] else if (field_want) |w| try bc.typeOfExpected(fi.lhs, w) else try bc.typeOf(fi.lhs);
             if (found) |j| {
                 if (seen[j]) {
@@ -4397,7 +4397,8 @@ pub const BodyChecker = struct {
         return true;
     }
 
-    /// Whether `t` gives a lambda param or a `_` capture's param its type: a ground type,
+    /// Whether `t` can serve as an expected type (for a lambda param, a `_` capture's param,
+    /// a struct field's value, or a generic method arg once the receiver binds): a ground type,
     /// or in a bounded template's abstract check one that also holds the template's own
     /// type vars, which are as known there as any concrete type. A var of a generic call
     /// that is still open takes an ordinal past them (`openOrdBase`), so it gives none.
