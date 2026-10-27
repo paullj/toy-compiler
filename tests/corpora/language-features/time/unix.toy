@@ -1,0 +1,15 @@
+# Feature: `time.unix()` and `time.unix_ns()` read the wall clock, in seconds and
+# nanoseconds since 1970.
+# expect: stdout "ok\n"
+# expect: exit 0
+import std/io
+import std/time
+fn main() -> int {
+    s := time.unix()
+    if s <= 1700000000 { return 1 }
+    n := time.unix_ns()
+    if n / 1_000_000_000 < s { return 2 }
+    if n / 1_000_000_000 > s + 5 { return 3 }
+    io.println("ok")
+    return 0
+}

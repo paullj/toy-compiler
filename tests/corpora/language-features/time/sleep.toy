@@ -1,0 +1,16 @@
+# Feature: `time.sleep(d)` sleeps at least `d`, as `Instant.elapsed()` measures it.
+# expect: stdout "ok\n"
+# expect: exit 0
+import std/io
+import std/time
+fn main() -> int {
+    start := time.now()
+    time.sleep(time.ms(20))
+    took := start.elapsed()
+    if took < time.ms(20) { return 1 }
+    if took.ms() < 20 { return 2 }
+    time.sleep(time.ns(0))
+    time.sleep(time.ms(0) - time.ms(5))
+    io.println("ok")
+    return 0
+}

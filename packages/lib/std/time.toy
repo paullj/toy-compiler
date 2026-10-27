@@ -1,0 +1,84 @@
+import core/os
+
+# Both types hold nanoseconds. Other modules cannot write a qualified struct literal (#103),
+# so a Duration is built through `ns`, `us`, `ms` or `secs` and an Instant through `now`.
+pub struct Duration { nanos: int }
+pub struct Instant { nanos: int }
+
+pub fn ns(n: int) -> Duration {
+    return Duration { nanos: n }
+}
+
+pub fn us(n: int) -> Duration {
+    return Duration { nanos: n * 1_000 }
+}
+
+pub fn ms(n: int) -> Duration {
+    return Duration { nanos: n * 1_000_000 }
+}
+
+pub fn secs(n: int) -> Duration {
+    return Duration { nanos: n * 1_000_000_000 }
+}
+
+# Each reading truncates toward zero, so a negative Duration reads as one.
+impl Duration {
+    fn ns(self) -> int {
+        return self.nanos
+    }
+
+    fn us(self) -> int {
+        return self.nanos / 1_000
+    }
+
+    fn ms(self) -> int {
+        return self.nanos / 1_000_000
+    }
+
+    fn secs(self) -> int {
+        return self.nanos / 1_000_000_000
+    }
+}
+
+impl Duration has Add {
+    fn add(self, o: Duration) -> Duration {
+        return Duration { nanos: self.nanos + o.nanos }
+    }
+}
+
+impl Duration has Sub {
+    fn sub(self, o: Duration) -> Duration {
+        return Duration { nanos: self.nanos - o.nanos }
+    }
+}
+
+# A monotonic reading: it never goes back, but means nothing on its own. Compare two, or
+# measure from one with `elapsed`.
+pub fn now() -> Instant {
+    return Instant { nanos: os.monotonic_ns() }
+}
+
+impl Instant {
+    fn since(self, earlier: Instant) -> Duration {
+        return Duration { nanos: self.nanos - earlier.nanos }
+    }
+
+    fn elapsed(self) -> Duration {
+        return now().since(self)
+    }
+}
+
+# Wall-clock time since 1970. It can jump when the system clock is set, so measure with
+# `now` instead.
+pub fn unix_ns() -> int {
+    return os.realtime_ns()
+}
+
+pub fn unix() -> int {
+    return os.realtime_ns() / 1_000_000_000
+}
+
+# Sleeps at least `d`; a zero or negative `d` returns at once.
+pub fn sleep(d: Duration) {
+    os.sleep_ns(d.nanos)
+}

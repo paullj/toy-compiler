@@ -48,7 +48,7 @@ core is the private layer between the compiler and std. It is the only place whe
 |--------|-------|
 | `core/sys` | the libSystem `write` and `read` externs: `print(s)` to fd 1, `write_fd`, `read_fd_all` and `read_line_fd` |
 | `core/ffi` | the libm and `labs` externs and their safe wrappers |
-| `core/os` | the `_NSGetArgc`, `_NSGetArgv`, `getenv`, `strlen`, `exit` and `__error` externs: `argc`, `argv(i)`, `env`, `exit_process`, `errno`, and `from_cstr` (copies) / `to_cstr` |
+| `core/os` | the `_NSGetArgc`, `_NSGetArgv`, `getenv`, `strlen`, `exit`, `__error`, `clock_gettime_nsec_np` and `nanosleep` externs: `argc`, `argv(i)`, `env`, `exit_process`, `errno`, `monotonic_ns`, `realtime_ns`, `sleep_ns`, and `from_cstr` (copies) / `to_cstr` |
 | `core/mem` | the growable `gc_array` and the hash table behind Vec, Map and Set |
 | `core/text` | raw `str` parts: `slice`, and the `alloc`/`put`/`window`/`take` buffer that builds a str once |
 | `core/mem_selftest`, `core/desc_selftest` | heap and descriptor self-checks |
@@ -69,6 +69,7 @@ and never names a `.core` intrinsic.
 | `std/math` | integer and float math, over core/ffi |
 | `std/gc` | `collect()` and `collections()` |
 | `std/os` | `args()`, `env(name)` and `exit(code)`, over core/os |
+| `std/time` | `Instant`, `Duration`, `now()`, `sleep(d)`, `unix()` and `unix_ns()`, over core/os |
 
 ## std/io: output and input
 
@@ -149,6 +150,38 @@ fn main() {
         .none -> "hello",
     }
     io.println(greeting.concat(", ").concat(xs[1]))
+}
+```
+
+## std/time: clocks and sleep
+
+```toy
+pub fn now() -> Instant           # a monotonic reading
+pub fn ns(n: int) -> Duration     # also us(n), ms(n) and secs(n)
+pub fn sleep(d: Duration)         # at least d; a zero or negative d returns at once
+pub fn unix() -> int              # wall-clock seconds since 1970
+pub fn unix_ns() -> int           # wall-clock nanoseconds since 1970
+```
+
+- An `Instant` comes from the monotonic clock: it never goes back, and it keeps counting
+  while the machine sleeps. `t.elapsed()` is the `Duration` since `t`, and
+  `t.since(earlier)` the one between two readings. Instants compare with `<` and `==`.
+- A `Duration` holds nanoseconds. It is built through `ns`, `us`, `ms` or `secs`, since
+  another module cannot write its struct literal (#103). `d.ns()`, `d.us()`, `d.ms()` and
+  `d.secs()` read it back, truncated toward zero. Durations add, subtract and compare.
+- `unix()` and `unix_ns()` read the wall clock, which jumps when the system clock is set,
+  so measure with `now()` instead.
+- `sleep` sleeps again for the remainder when a signal cuts it short.
+
+```toy
+import std/io
+import std/time
+
+fn main() {
+    start := time.now()
+    time.sleep(time.ms(20))
+    if start.elapsed() >= time.ms(20) { io.println("slept") }
+    io.println((time.secs(1) + time.ms(500)).ms())   # 1500
 }
 ```
 

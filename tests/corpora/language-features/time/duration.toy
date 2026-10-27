@@ -1,0 +1,21 @@
+# Feature: a `Duration` is built by `ns`, `us`, `ms` or `secs`, reads back in each unit
+# (truncated toward zero), and adds, subtracts and compares.
+# expect: stdout "1500\n1500000\n1500000000\n1\n500\n-500\n3000\n2\n0\n1\n"
+# expect: exit 0
+import std/io
+import std/time
+fn main() {
+    d := time.secs(1) + time.ms(500)
+    io.println(d.ms())
+    io.println(d.us())
+    io.println(d.ns())
+    io.println(d.secs())
+    io.println((d - time.secs(1)).ms())
+    io.println((time.secs(1) - d).ms())
+    io.println(time.us(3_000_000).ms())
+    io.println(time.ns(2_999_999_999).secs())
+    io.println(time.ns(999).us())
+    r := 0
+    if time.ms(1000) == time.secs(1) && time.us(1) > time.ns(999) && d >= d { r = 1 }
+    io.println(r)
+}
