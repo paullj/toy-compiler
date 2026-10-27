@@ -782,3 +782,26 @@ test "hover on method calls inside generic bodies (#33)" {
         try testing.expectEqualStrings(want, h.value);
     }
 }
+
+test "hover on the struct of 'lib.S { .. }' never shows a same-named variant" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    try docs.put(gpa, "file:///q/lib.toy", "pub struct Pt { x: int }\n", 1);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\import lib
+        \\
+        \\enum Other { Pt(int), none }
+        \\
+        \\fn main() -> int {
+        \\    p := lib.Pt { x: 1 }
+        \\    return p.x
+        \\}
+        \\
+    ;
+    const pos = @import("test_util.zig").posOf(src, "Pt { x");
+    var h = (try hoverAt(gpa, ws, src, pos.line, pos.character, "file:///q/main.toy")) orelse return error.NoHover;
+    defer h.deinit();
+    try testing.expectEqualStrings("```toy\nPt\n```", h.value);
+}

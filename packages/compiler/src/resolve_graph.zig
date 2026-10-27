@@ -1151,7 +1151,10 @@ const GraphResolve = struct {
             },
             .enum_init_unit => {},
             .enum_init_tuple => for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |a| try g.resolveExpr(a),
-            .enum_init_struct => for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |fi| try g.resolveExpr(g.nodes()[fi.int()].lhs),
+            .enum_init_struct => {
+                try g.resolveInitHead(node_idx, n);
+                for (Ast.rangeSlice(g.tree(g.cur_mod), n.rhs.int())) |fi| try g.resolveExpr(g.nodes()[fi.int()].lhs);
+            },
             .match_expr => try g.resolveMatch(node_idx),
             .literal_unit => {},
             .block => try g.resolveBlock(node_idx),
@@ -1255,6 +1258,25 @@ const GraphResolve = struct {
         }
         // Ordinary receiver chain (value field access, or same-module `N.V`).
         try g.resolveExpr(n.lhs);
+    }
+
+    /// The parser reads every `a.B { .. }` as a struct-form variant, since it cannot tell a
+    /// module `a` from an enum. Bind a module head here, as for a `mod.member` access, so
+    /// `lib.Pt { .. }` names the imported struct and a private one is the usual R0005. A
+    /// bare enum-name head stays unresolved: the checker looks it up by name.
+    fn resolveInitHead(g: *GraphResolve, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!void {
+        if (n.lhs == Ast.none) return;
+        const head = g.nodes()[n.lhs.int()];
+        switch (head.tag) {
+            .identifier => {
+                if (g.lookupLocalOrFn(head.main_token) != null) return;
+                const target = g.tables[g.cur_mod].namespaces.get(g.nameText(head.main_token)) orelse return;
+                g.res(n.lhs, .{ .module = target });
+                try g.resolveModuleMember(node_idx, n, target);
+            },
+            .field_access => try g.resolveFieldAccess(n.lhs, head),
+            else => {},
+        }
     }
 
     /// Resolve the member tail of a `mod.member` access against module `target`'s pub

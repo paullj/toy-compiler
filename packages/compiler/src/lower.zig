@@ -2894,7 +2894,12 @@ pub fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Type
         .literal_string => try storeStrLiteralInto(b, expr, dst_ptr),
         .literal_char => try lowerCharLiteralInto(b, expr, dst_ptr),
         .struct_init => try lowerStructInitInto(b, expr, dst_ptr),
-        .enum_init_unit, .enum_init_tuple, .enum_init_struct => try lowerEnumInitInto(b, expr, dst_ptr, ty),
+        // The checker typed a module-headed `lib.S { .. }` as the struct it names.
+        .enum_init_struct => if (ty.kind == .@"struct")
+            try lowerStructInitInto(b, expr, dst_ptr)
+        else
+            try lowerEnumInitInto(b, expr, dst_ptr, ty),
+        .enum_init_unit, .enum_init_tuple => try lowerEnumInitInto(b, expr, dst_ptr, ty),
         // qualified `N.V` (field_access) / `N.V(args)` (call) that typecheck
         // classified as enum-valued are variant constructions, NOT field reads /
         // real calls. Detect by enum type + shape.

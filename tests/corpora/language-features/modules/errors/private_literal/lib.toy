@@ -1,0 +1,6 @@
+struct Hidden { x: int }
+
+pub fn make() -> int {
+    h := Hidden { x: 1 }
+    return h.x
+}

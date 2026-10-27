@@ -1,0 +1,9 @@
+# Feature: a module-qualified literal of a non-pub struct is the same
+# visibility error as any other private reference.
+# expect: compile-error "struct 'Hidden' is not exported by module 'lib'"
+import lib
+
+fn main() -> int {
+    h := lib.Hidden { x: 1 }
+    return h.x + lib.make()
+}

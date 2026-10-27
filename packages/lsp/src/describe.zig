@@ -128,8 +128,11 @@ pub const Describer = struct {
                 return true;
             },
             .struct_decl, .enum_decl, .protocol_decl => return d.typeDefinition(d.text(tok)),
-            else => return d.variant(i, ty),
+            // `lib.S { .. }` parses as a variant construction, yet builds the struct `S`.
+            .enum_init_struct => if (ty) |t| if (t.kind == .@"struct") return false,
+            else => {},
         }
+        return d.variant(i, ty);
     }
 
     /// A struct field's or a fn parameter's declared type, found through its owner.

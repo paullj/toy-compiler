@@ -1,0 +1,2 @@
+pub struct Pt { x: int, y: int }
+pub struct Pair[A, B] { a: A, b: B }

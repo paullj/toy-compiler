@@ -20,7 +20,9 @@ on each `main.toy` entry.
 | `own_generic_method/`         | an imported generic type's method with its own type param, two instances on one receiver |
 | `display_generic/`            | an imported generic struct's instance renders under its template name (`Bx{v: 2}`) |
 | `associated_fn/`              | an imported non-generic struct's and enum's associated fns, called through the module (`shapes.Rect.square(3)`) |
+| `qualified_literal/`          | `lib.Pt { .. }`, inferred `lib.Pair { .. }` and `shapes.Shape.sq { .. }` beside same-named local types |
 | `errors/private_ref/`         | referencing a non-`pub` decl across modules                    |
+| `errors/private_literal/`     | a module-qualified literal of a non-`pub` struct                |
 | `errors/cycle/`               | an import cycle (graph must be a DAG)                           |
 | `errors/missing/`             | importing a module file that does not exist                    |
 | `errors/main_not_in_entry/`   | `main` defined only in an imported module                      |
