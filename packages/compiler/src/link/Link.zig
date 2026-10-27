@@ -215,6 +215,96 @@ fn encodeSym(gpa: std.mem.Allocator, ref: SymName) ![]u8 {
     return key;
 }
 
+/// What the image keeps: `fns[i]` and `descs[i]` are parallel to the `reachable` inputs.
+pub const Reach = struct {
+    fns: []bool,
+    descs: []bool,
+
+    pub fn deinit(r: Reach, gpa: std.mem.Allocator) void {
+        gpa.free(r.fns);
+        gpa.free(r.descs);
+    }
+};
+
+/// Hashes a `SymName` in place, so the reachability walk looks up every reloc target
+/// without encoding a key per visit.
+const SymNameCtx = struct {
+    pub fn hash(_: SymNameCtx, s: SymName) u64 {
+        var h = std.hash.Wyhash.init(@intFromEnum(s.kind));
+        h.update(s.name);
+        return h.final();
+    }
+    pub fn eql(_: SymNameCtx, a: SymName, b: SymName) bool {
+        return a.eql(b);
+    }
+};
+
+/// Which fns and descriptors the image keeps: the fns reachable from `entry` through
+/// `.func` relocs (calls and fn-address pairs alike), and the descriptors a kept fn
+/// names by a `.cstr` reloc on its `desc_hash`, whose hash/eq/trace units are then
+/// walked like any callee. Codegen lowers every fn and plans a descriptor for every
+/// typechecked heap type, so without this every unused std/core fn, its strings, its
+/// imports and the GC runtime its heap types drag in would ride every binary.
+pub fn reachable(gpa: std.mem.Allocator, fns: []const FnCode, entry: SymName, descriptors: []const DescEntry) !Reach {
+    const none = std.math.maxInt(u32);
+    var heads: std.HashMapUnmanaged(SymName, u32, SymNameCtx, std.hash_map.default_max_load_percentage) = .empty;
+    defer heads.deinit(gpa);
+    // Duplicate definitions chain so that reaching the name keeps every copy and
+    // `link` still sees the set it would have seen without DFE.
+    const next = try gpa.alloc(u32, fns.len);
+    defer gpa.free(next);
+    var i: usize = fns.len;
+    while (i > 0) {
+        i -= 1;
+        const gop = try heads.getOrPut(gpa, fns[i].sym);
+        next[i] = if (gop.found_existing) gop.value_ptr.* else none;
+        gop.value_ptr.* = @intCast(i);
+    }
+    var desc_at: std.AutoHashMapUnmanaged(u64, u32) = .empty;
+    defer desc_at.deinit(gpa);
+    for (descriptors, 0..) |d, di| try desc_at.put(gpa, d.desc_hash, @intCast(di));
+
+    const keep = try gpa.alloc(bool, fns.len);
+    errdefer gpa.free(keep);
+    @memset(keep, false);
+    const keep_desc = try gpa.alloc(bool, descriptors.len);
+    errdefer gpa.free(keep_desc);
+    @memset(keep_desc, false);
+    var work: std.ArrayList(u32) = .empty;
+    defer work.deinit(gpa);
+
+    const Marker = struct {
+        heads: *const @TypeOf(heads),
+        next: []const u32,
+        keep: []bool,
+        work: *std.ArrayList(u32),
+        fn mark(m: @This(), a: std.mem.Allocator, s: SymName) !void {
+            var at = m.heads.get(s) orelse return;
+            while (at != none) : (at = m.next[at]) {
+                if (m.keep[at]) continue;
+                m.keep[at] = true;
+                try m.work.append(a, at);
+            }
+        }
+    };
+    const m: Marker = .{ .heads = &heads, .next = next, .keep = keep, .work = &work };
+    try m.mark(gpa, entry);
+    while (work.pop()) |at| {
+        for (fns[at].relocs) |rl| switch (rl.target) {
+            .func => |s| try m.mark(gpa, s),
+            .cstr => |h| if (desc_at.get(h)) |di| if (!keep_desc[di]) {
+                keep_desc[di] = true;
+                const d = descriptors[di];
+                for ([_]?[]const u8{ d.hash_name, d.eq_name, d.trace_name }) |nm| {
+                    if (nm) |n| try m.mark(gpa, .{ .kind = .user_fn, .name = n });
+                }
+            },
+            else => {},
+        };
+    }
+    return .{ .fns = keep, .descs = keep_desc };
+}
+
 /// The linker's output: the concatenated __text blob, the entry function's
 /// resolved text offset (threaded into MachO's LC_MAIN entryoff), and the
 /// cross-segment relocations rebased to absolute __text offsets. `link` CANNOT
@@ -1192,6 +1282,62 @@ test "layout offsets follow source order and are contiguous" {
 
     try testing.expectEqual(@as(usize, 24), linked.text.len);
     try testing.expectEqual(@as(u32, 0), linked.entry_off);
+}
+
+test "reachable: keeps the entry's transitive callees and drops the rest" {
+    const gpa = testing.allocator;
+    var fns = [_]FnCode{
+        try makeFn(gpa, 0, 1, &.{.{ .site = 0, .target = .{ .func = fname(2) }, .kind = .call26 }}),
+        try makeFn(gpa, 1, 1, &.{.{ .site = 0, .target = .{ .func = fname(0) }, .kind = .call26 }}),
+        try makeFn(gpa, 2, 2, &.{
+            .{ .site = 0, .target = .{ .func = fname(3) }, .kind = .adrp_page },
+            .{ .site = 4, .target = .{ .func = fname(3) }, .kind = .add_lo12 },
+        }),
+        try makeFn(gpa, 3, 1, &.{.{ .site = 0, .target = .{ .func = fname(3) }, .kind = .call26 }}),
+        try makeFn(gpa, 4, 1, &.{.{ .site = 0, .target = .{ .func = fname(9) }, .kind = .call26 }}),
+    };
+    defer freeFns(gpa, &fns);
+    const r = try reachable(gpa, &fns, fname(0), &.{});
+    defer r.deinit(gpa);
+    try testing.expectEqualSlices(bool, &.{ true, false, true, true, false }, r.fns);
+}
+
+test "reachable: a descriptor and its units are kept only when kept code names it" {
+    const gpa = testing.allocator;
+    const d_used = desc_table_base_hash | 1;
+    const d_elem = desc_table_base_hash | 2;
+    const d_dead = desc_table_base_hash | 3;
+    var fns = [_]FnCode{
+        try makeFn(gpa, 0, 2, &.{
+            .{ .site = 0, .target = .{ .cstr = d_used }, .kind = .adrp_page },
+            .{ .site = 4, .target = .{ .cstr = d_used }, .kind = .add_lo12 },
+        }),
+        try makeFn(gpa, 1, 1, &.{}),
+        // The used type's trace unit names its element's descriptor, so that one is kept too.
+        try makeFn(gpa, 2, 1, &.{.{ .site = 0, .target = .{ .cstr = d_elem }, .kind = .adrp_page }}),
+        try makeFn(gpa, 3, 1, &.{}),
+        try makeFn(gpa, 4, 1, &.{.{ .site = 0, .target = .{ .cstr = d_dead }, .kind = .adrp_page }}),
+        try makeFn(gpa, 5, 1, &.{}),
+    };
+    defer freeFns(gpa, &fns);
+    const descs = [_]DescEntry{
+        .{ .desc_hash = d_dead, .size = 8, .@"align" = 8, .size_class = 0, .trace_name = "f5" },
+        .{ .desc_hash = d_used, .size = 8, .@"align" = 8, .size_class = 0, .hash_name = "f1", .trace_name = "f2" },
+        .{ .desc_hash = d_elem, .size = 8, .@"align" = 8, .size_class = 0, .eq_name = "f3" },
+    };
+    const r = try reachable(gpa, &fns, fname(0), &descs);
+    defer r.deinit(gpa);
+    try testing.expectEqualSlices(bool, &.{ true, true, true, true, false, false }, r.fns);
+    try testing.expectEqualSlices(bool, &.{ false, true, true }, r.descs);
+}
+
+test "reachable: a missing entry keeps nothing" {
+    const gpa = testing.allocator;
+    var fns = [_]FnCode{try makeFn(gpa, 0, 1, &.{})};
+    defer freeFns(gpa, &fns);
+    const r = try reachable(gpa, &fns, fname(7), &.{});
+    defer r.deinit(gpa);
+    try testing.expectEqualSlices(bool, &.{false}, r.fns);
 }
 
 test "forward call patched to positive word delta" {

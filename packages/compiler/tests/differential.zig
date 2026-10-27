@@ -497,6 +497,51 @@ test "panic: div/mod/unwrap traps + user panic() write msg + a symbolized-backtr
     }
 }
 
+test "dfe: after the link drops an unreachable fn, a panic backtrace names only kept fns at BOTH -O levels" {
+    // The dropped fn sits BEFORE the panicking one in source order, so a symtab built
+    // from the pre-drop layout would mis-symbolize every frame after it.
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.requireToy(io);
+
+    const dir = ".toy-test-dfe-backtrace";
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    const src =
+        \\fn never_called_dfe(n: int) -> int {
+        \\  return n * 3 + 1
+        \\}
+        \\fn explode_dfe(n: int) -> int {
+        \\  return 10 / n
+        \\}
+        \\fn main() -> int {
+        \\  return explode_dfe(0)
+        \\}
+        \\
+    ;
+    inline for (.{ "-O0", "-O1" }) |lvl| {
+        try writeFixture(io, dir, &.{.{ "main.toy", src }});
+        const bld = try spawnExit(gpa, io, &.{ "build", lvl, dir ++ "/main.toy", "-o", dir ++ "/prog" ++ lvl });
+        try testing.expectEqual(@as(?u8, 0), exitCode(bld));
+        const abs = try Io.Dir.cwd().realPathFileAlloc(io, dir ++ "/prog" ++ lvl, gpa);
+        defer gpa.free(abs);
+        const r = try spawnBinaryTermStderr(gpa, io, abs);
+        defer gpa.free(r.stderr);
+        try testing.expectEqual(@as(?u8, 1), exitCode(r.term));
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "division by zero") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "explode_dfe\n") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, " main\n") != null);
+        try testing.expect(std.mem.indexOf(u8, r.stderr, "never_called_dfe") == null);
+
+        const image = try Io.Dir.cwd().readFileAlloc(io, abs, gpa, .limited(1 << 24));
+        defer gpa.free(image);
+        try testing.expect(std.mem.indexOf(u8, image, "never_called_dfe") == null);
+        try testing.expect(std.mem.indexOf(u8, image, "explode_dfe") != null);
+    }
+}
+
 /// Count backtrace frame lines (`0x<hex>`) in a panic's stderr. Each frame the
 /// `__panic` FP-chain walk emits is its own `0x`-prefixed line.
 fn countBacktraceFrames(stderr: []const u8) usize {

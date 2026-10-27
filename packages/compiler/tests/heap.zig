@@ -162,6 +162,133 @@ test "gc: an explicit collection bumps the collection count to 1" {
     try std.testing.expectEqual(@as(u8, 1), code);
 }
 
+test "dfe: a collection inside a kept fn works after the link drops an allocating fn, at -O0 and -O1" {
+    // The dropped fn precedes the kept ones, so a stack map keyed by the pre-drop layout
+    // would hand the collector the wrong frame's roots and free the live Vec.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.skipUnlessBackend(io);
+    const codes = try harness.exitAtBothLevels(gpa, io, ".toy-test-dfe-gc",
+        \\import std/gc
+        \\import std/vec
+        \\fn never_called_dfe() -> int {
+        \\    xs: Vec[int] = []
+        \\    for i in 0..100 { xs.push(i * 2) }
+        \\    return xs.len()
+        \\}
+        \\fn kept(n: int) -> int {
+        \\    xs: Vec[int] = []
+        \\    for i in 0..n { xs.push(i) }
+        \\    gc.collect()
+        \\    for i in 0..20000 {
+        \\        junk: Vec[int] = []
+        \\        junk.push(i)
+        \\    }
+        \\    total := 0
+        \\    for x in xs { total = total + x }
+        \\    if gc.collections() < 1 { return 0 }
+        \\    return total
+        \\}
+        \\fn main() -> int {
+        \\    if kept(10) == 45 { return 42 }
+        \\    return 1
+        \\}
+        \\
+    );
+    try std.testing.expectEqual([2]u8{ 42, 42 }, codes);
+}
+
+test "dfe: a heap type only dropped code uses leaves the heap-free image byte-identical, at -O0 and -O1" {
+    // Codegen plans a descriptor for every typechecked heap type, so rooting every planned
+    // descriptor would keep its hash/eq/trace units and the whole collector in a program
+    // that never allocates.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.skipUnlessBackend(io);
+    const dir = ".toy-test-dfe-desc";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    const plain = "fn main() -> int {\n    return 3\n}\n";
+    const variants = [_][]const u8{
+        "import std/vec\nfn dead() -> int {\n    xs: Vec[int] = []\n    xs.push(1)\n    return xs.len()\n}\n" ++ plain,
+        "import std/map\nfn dead(x: int) -> int {\n    m := Map[str, int].new()\n    m.set(\"q\", x)\n    return x\n}\n" ++ plain,
+        "import std/str\n" ++ plain,
+    };
+    inline for (.{ "-O0", "-O1" }) |lvl| {
+        const want = try harness.compile(gpa, io, dir ++ "/plain" ++ lvl, plain, &.{ "--no-cache", lvl });
+        defer gpa.free(want);
+        const want_bytes = try Io.Dir.cwd().readFileAlloc(io, want, gpa, .unlimited);
+        defer gpa.free(want_bytes);
+        for (variants, 0..) |src, i| {
+            const sub = try std.fmt.allocPrint(gpa, "{s}/v{d}{s}", .{ dir, i, lvl });
+            defer gpa.free(sub);
+            const got = try harness.compile(gpa, io, sub, src, &.{ "--no-cache", lvl });
+            defer gpa.free(got);
+            const got_bytes = try Io.Dir.cwd().readFileAlloc(io, got, gpa, .unlimited);
+            defer gpa.free(got_bytes);
+            if (!std.mem.eql(u8, want_bytes, got_bytes)) {
+                std.debug.print("variant {d} at {s}: {d} bytes, want {d}\n", .{ i, lvl, got_bytes.len, want_bytes.len });
+                return error.TestExpectedEqual;
+            }
+        }
+    }
+}
+
+test "dfe: warm builds that drop then re-reach a cached fn match cold builds" {
+    // The link is uncached and consumes cached FnCodes, so a fn dropped by one warm build
+    // must come back whole when the next one reaches it again.
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.skipUnlessBackend(io);
+    const dir = ".toy-test-dfe-warm";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    const abs = try Io.Dir.cwd().realPathFileAlloc(io, dir, gpa);
+    defer gpa.free(abs);
+
+    const helper =
+        \\import std/map
+        \\fn helper(n: int) -> int {
+        \\    m := Map[str, int].new()
+        \\    m.set("k", math.abs(n))
+        \\    return n * -1
+        \\}
+        \\
+    ;
+    const steps = [_]struct { body: []const u8, exit: u8 }{
+        .{ .body = "fn main() -> int {\n    return helper(-9)\n}\n", .exit = 9 },
+        .{ .body = "fn main() -> int {\n    return 3\n}\n", .exit = 3 },
+        .{ .body = "fn main() -> int {\n    return helper(-9)\n}\n", .exit = 9 },
+    };
+    for (steps, 0..) |st, i| {
+        const src = try std.mem.concat(gpa, u8, &.{ "import std/math\n", helper, st.body });
+        defer gpa.free(src);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/main.toy", .data = src });
+        const warm_out = try std.fmt.allocPrint(gpa, "w{d}/prog", .{i});
+        defer gpa.free(warm_out);
+        const cold_out = try std.fmt.allocPrint(gpa, "c{d}/prog", .{i});
+        defer gpa.free(cold_out);
+        var path_buf: [256]u8 = undefined;
+        for ([_][]const u8{ warm_out, cold_out }) |o| try Io.Dir.cwd().createDirPath(io, try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, std.fs.path.dirname(o).? }));
+        try harness.buildIn(gpa, io, abs, &.{ "build", "main.toy", "-o", warm_out });
+        try harness.buildIn(gpa, io, abs, &.{ "build", "--no-cache", "main.toy", "-o", cold_out });
+        try std.testing.expectEqual(st.exit, try harness.runExitIn(gpa, io, abs, warm_out));
+        const warm = try Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, warm_out }), gpa, .unlimited);
+        defer gpa.free(warm);
+        const cold = try Io.Dir.cwd().readFileAlloc(io, try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, cold_out }), gpa, .unlimited);
+        defer gpa.free(cold);
+        try std.testing.expectEqualSlices(u8, cold, warm);
+    }
+}
+
 test "gc: churning unreachable Vecs triggers at least one collection (falsifies never-collect)" {
     // The decisive proof that allocation alone triggers a collection: nothing here forces
     // one, so a bump-only allocator leaves the count at 0.
