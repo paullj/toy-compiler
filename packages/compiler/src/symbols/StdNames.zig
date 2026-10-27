@@ -160,6 +160,7 @@ const import_hints = std.StaticStringMap(ImportHint).initComptime(.{
     .{ "time", ImportHint{ .module = "time" } },
     .{ "fs", ImportHint{ .module = "fs" } },
     .{ "float", ImportHint{ .module = "float" } },
+    .{ "rand", ImportHint{ .module = "rand" } },
     .{ "vec", ImportHint{ .module = "vec" } },
     .{ "map", ImportHint{ .module = "map" } },
     .{ "set", ImportHint{ .module = "set" } },
@@ -183,7 +184,7 @@ const core_replacements = std.StaticStringMap([]const u8).initComptime(.{
     .{ "core/text", "std/str" },
     .{ "core/sys", "std/io" },
     .{ "core/ffi", "std/math" },
-    .{ "core/os", "std/os or std/time" },
+    .{ "core/os", "std/os, std/time or std/rand" },
     .{ "core/fs", "std/fs" },
     .{ "core/fmt", "std/float" },
 });
@@ -306,7 +307,7 @@ test "importHintFor: exact stdlib names hint; typos, prelude generics, and unkno
     try std.testing.expectEqualStrings("io.println", importHintFor("println").?.spelling.?);
     try std.testing.expectEqualStrings("io.print", importHintFor("console").?.spelling.?);
 
-    inline for (.{ "Map", "Set", "map", "set", "vec", "math", "iter", "os", "time", "fs", "float" }) |n|
+    inline for (.{ "Map", "Set", "map", "set", "vec", "math", "iter", "os", "time", "fs", "float", "rand" }) |n|
         try std.testing.expect(importHintFor(n) != null);
     try std.testing.expectEqualStrings("gc", importHintFor("gc").?.module);
     try std.testing.expectEqualStrings("ref", importHintFor("Ref").?.module);

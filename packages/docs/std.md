@@ -48,7 +48,7 @@ core is the private layer between the compiler and std. It is the only place whe
 |--------|-------|
 | `core/sys` | the libSystem `write` and `read` externs: `print(s)` to fd 1, `write_fd`, `read_fd_all` and `read_line_fd` |
 | `core/ffi` | the libm and `labs` externs and their safe wrappers |
-| `core/os` | the `_NSGetArgc`, `_NSGetArgv`, `getenv`, `strlen`, `exit`, `__error`, `clock_gettime_nsec_np` and `nanosleep` externs: `argc`, `argv(i)`, `env`, `exit_process`, `errno`, `monotonic_ns`, `realtime_ns`, `sleep_ns`, and `from_cstr` (copies) / `to_cstr` |
+| `core/os` | the `_NSGetArgc`, `_NSGetArgv`, `getenv`, `strlen`, `exit`, `__error`, `clock_gettime_nsec_np`, `nanosleep` and `getentropy` externs: `argc`, `argv(i)`, `env`, `exit_process`, `errno`, `monotonic_ns`, `realtime_ns`, `sleep_ns`, `entropy_u64`, and `from_cstr` (copies) / `to_cstr` |
 | `core/fs` | the `open` (two arguments, never `O_CREAT`), `creat`, `close`, `unlink` and `access` externs: `open_read`, `open_append`, `create`, `close_fd`, `remove`, `exists`, `write_all`, `read_some` and `read_all`, each failure as a negated errno |
 | `core/mem` | the growable `gc_array` and the hash table behind Vec, Map and Set |
 | `core/fmt` | the Darwin-private `__dtoa`/`__freedtoa` and the `strtod` externs: `shortest(f)` (the shortest round-trip digits, their decimal point and sign) and `parse(s)` |
@@ -74,6 +74,7 @@ and never names a `.core` intrinsic.
 | `std/os` | `args()`, `env(name)` and `exit(code)`, over core/os |
 | `std/time` | `Instant`, `Duration`, `now()`, `sleep(d)`, `unix()` and `unix_ns()`, over core/os |
 | `std/fs` | `IoError`, `read_file`, `write_file`, `append_file`, `remove`, `exists`, and `File` handles from `open`, `create` and `append`, over core/fs |
+| `std/rand` | the seeded `Rng` (`seeded`, `from_os`), `choose` and `shuffle`, over core/os |
 
 ## std/io: output and input
 
@@ -297,6 +298,47 @@ fn main() {
         .ok(_) -> {},
         .err(e) -> io.eprintln(e),
     }
+}
+```
+
+## std/rand: random numbers
+
+```toy
+pub fn seeded(seed: uint64) -> Rng          # the same sequence on every run
+pub fn from_os() -> Rng                     # 256 bits from getentropy
+pub fn choose[T](mut r: Rng, xs: Vec[T]) -> Option[T]
+pub fn shuffle[T](mut r: Rng, xs: Vec[T])   # in place
+```
+
+- An `Rng` is xoshiro256** over four uint64 words. `seeded` spreads the seed over them
+  with splitmix64. It is fast and passes the usual statistical tests, but its output
+  gives its state away: never use it for keys, tokens or anything secret.
+- Its methods take `mut self`, so the Rng must be a local or a field: `r.next()` is the
+  next uint64, `r.below(n)` an int in `[0, n)` (unbiased; it panics unless `n > 0`),
+  `r.range(lo, hi)` an int in `[lo, hi)` (any such range, even one wider than the int
+  max; it panics unless `lo < hi`), `r.float()` a float in `[0, 1)` from 53 bits, and
+  `r.bool()` a fair coin.
+- The seed is a `uint64`, since a negative int has no lossless conversion to one;
+  `rand.seeded(42)` works because the literal takes the parameter's type.
+- `choose` and `shuffle` are free functions, because a method of the non-generic `Rng`
+  cannot have its own type parameter yet.
+
+```toy
+import std/io
+import std/rand
+import std/vec
+
+fn main() {
+    r := rand.seeded(42)
+    io.println(r.below(6) + 1)        # a die roll, the same on every run
+    xs := [1, 2, 3, 4, 5]
+    rand.shuffle(r, xs)
+    match rand.choose(r, xs) {
+        .some(x) -> io.println(x),
+        .none -> {},
+    }
+    o := rand.from_os()
+    io.println(o.float())             # different on every run
 }
 ```
 

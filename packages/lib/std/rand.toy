@@ -1,0 +1,135 @@
+# Pseudo-random numbers from xoshiro256** (D17 a): fast and statistically strong, but
+# predictable from its output, so never use it for keys or tokens. Every Rng is a value the
+# caller owns, so a seeded program draws the same sequence on every run.
+import core/os
+import std/vec
+
+pub struct Rng { s0: uint64, s1: uint64, s2: uint64, s3: uint64 }
+
+# splitmix64 spreads one seed over the four words, as xoshiro's authors advise, so a small
+# or zero seed still gives a state that is not all zero (which would stay zero forever).
+pub fn seeded(seed: uint64) -> Rng {
+    s := seed
+    s = s + 0x9E3779B97F4A7C15
+    a := mix(s)
+    s = s + 0x9E3779B97F4A7C15
+    b := mix(s)
+    s = s + 0x9E3779B97F4A7C15
+    c := mix(s)
+    s = s + 0x9E3779B97F4A7C15
+    d := mix(s)
+    return Rng { s0: a, s1: b, s2: c, s3: d }
+}
+
+# A Rng seeded with 256 bits from the OS, different on every call.
+pub fn from_os() -> Rng {
+    return Rng { s0: os.entropy_u64(), s1: os.entropy_u64(), s2: os.entropy_u64(), s3: os.entropy_u64() }
+}
+
+fn mix(s: uint64) -> uint64 {
+    z := s
+    z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9
+    z = (z ^ (z >> 27)) * 0x94D049BB133111EB
+    return z ^ (z >> 31)
+}
+
+# The caller keeps x below 2^63.
+fn to_int(x: uint64) -> int {
+    r: int = match x.try_into() {
+        Result.ok(v) -> v,
+        Result.err(_) -> 0,
+    }
+    return r
+}
+
+fn rotl(x: uint64, k: uint64) -> uint64 {
+    return (x << k) | (x >> (64 - k))
+}
+
+impl Rng {
+    fn next(mut self) -> uint64 {
+        result := rotl(self.s1 * 5, 7) * 9
+        t := self.s1 << 17
+        self.s2 = self.s2 ^ self.s0
+        self.s3 = self.s3 ^ self.s1
+        self.s1 = self.s1 ^ self.s2
+        self.s0 = self.s0 ^ self.s3
+        self.s2 = self.s2 ^ t
+        self.s3 = rotl(self.s3, 45)
+        return result
+    }
+
+    # A uniform int in [0, n).
+    fn below(mut self, n: int) -> int {
+        if n <= 0 { panic("rand: below(n) needs n > 0") }
+        m: uint64 = match n.try_into() {
+            Result.ok(v) -> v,
+            Result.err(_) -> 1,
+        }
+        return to_int(self.below_u64(m))
+    }
+
+    # A uniform uint64 in [0, m). `x % m` alone favors the low values when m does not divide
+    # 2^64, so draws below 2^64 mod m are rejected; at most half of them ever are.
+    fn below_u64(mut self, m: uint64) -> uint64 {
+        floor := (0 - m) % m
+        x := self.next()
+        while x < floor {
+            x = self.next()
+        }
+        return x % m
+    }
+
+    # A uniform int in [lo, hi). When hi - lo exceeds the int max it wraps negative, so that
+    # span is drawn as a uint64 split at 2^63, keeping every int sum in range.
+    fn range(mut self, lo: int, hi: int) -> int {
+        if hi <= lo { panic("rand: range(lo, hi) needs lo < hi") }
+        d := hi - lo
+        if d > 0 { return lo + self.below(d) }
+        half: uint64 = 0x8000_0000_0000_0000
+        over: uint64 = match (d + 9223372036854775807 + 1).try_into() {
+            Result.ok(v) -> v,
+            Result.err(_) -> 0,
+        }
+        x := self.below_u64(over + half)
+        if x < half { return lo + to_int(x) }
+        return lo + to_int(x - half) + 9223372036854775807 + 1
+    }
+
+    # A uniform float in [0, 1): the top 53 bits, the most a float holds exactly, scaled by
+    # 2^-53.
+    fn float(mut self) -> float {
+        bits: int = match (self.next() >> 11).try_into() {
+            Result.ok(v) -> v,
+            Result.err(_) -> 0,
+        }
+        f: float = bits.into()
+        return f *. 1.1102230246251565e-16
+    }
+
+    # The top bit, since xoshiro's low bits are its weakest.
+    fn bool(mut self) -> bool {
+        return (self.next() >> 63) == 1
+    }
+}
+
+# `choose` and `shuffle` are free fns: a method of the non-generic Rng cannot declare its own
+# type parameter yet (T0013).
+
+# A uniformly picked element, or none when `xs` is empty.
+pub fn choose[T](mut r: Rng, xs: Vec[T]) -> Option[T] {
+    if xs.len() == 0 { return Option[T].none }
+    return Option.some(xs[r.below(xs.len())])
+}
+
+# Fisher-Yates: every order of `xs` is equally likely.
+pub fn shuffle[T](mut r: Rng, xs: Vec[T]) {
+    n := xs.len()
+    for k in 0..n {
+        i := n - 1 - k
+        j := r.below(i + 1)
+        tmp := xs[i]
+        xs[i] = xs[j]
+        xs[j] = tmp
+    }
+}

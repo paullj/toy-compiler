@@ -24,6 +24,7 @@ either runs cleanly or, under `errors/`, fails compilation on purpose.
 | `string/`       | the prelude `str`: `concat`, `to_string`, and the methods from `std/str`: `split`, `join`, `trim`, `contains`, `starts_with`, `ends_with`, `replace`, and `chars()` (UTF-8 decoding, U+FFFD for invalid input) |
 | `os/`           | `std/os`: `args()` (with `# args:`), `env(name)` (with `# env:`), and `exit(code)` |
 | `time/`         | `std/time`: `now()` and `Instant.elapsed()`, `Duration` math, `sleep(d)`, and `unix()` / `unix_ns()` |
+| `rand/`         | `std/rand`: `seeded(seed)` and `from_os()` Rngs, `next`, `below`, `range`, `float`, `bool`, and `choose` / `shuffle` |
 | `fs/`           | `std/fs`: `read_file`, `write_file`, `append_file`, `remove` and `exists` in the fixture's cwd, each `IoError`, and `File` handles from `open`, `create` and `append` (chunked reads, writes, use after close) |
 | `float/`        | `std/float`: float `Display` (shortest round-trip digits, exponent outside [1e-4, 1e16), inf/NaN, fields) and `float.parse` round trips |
 | `gc/`           | the mark-sweep collector: roots, tracing, reclaiming churned garbage, and `std/gc`'s `collect()` / `collections()` |

@@ -1,0 +1,5 @@
+# Random numbers (seeded, from_os, shuffle) live in std/rand; without the import a use names it.
+fn main() -> int {
+    r := rand.seeded(1)  #~ ERROR [R0001] add 'import std/rand'
+    return 0
+}

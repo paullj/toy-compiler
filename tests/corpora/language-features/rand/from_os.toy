@@ -1,0 +1,12 @@
+# Feature: `rand.from_os()` seeds from the OS, so two Rngs draw different sequences.
+# expect: stdout "ok\n"
+# expect: exit 0
+import std/io
+import std/rand
+fn main() -> int {
+    a := rand.from_os()
+    b := rand.from_os()
+    if a.next() == b.next() && a.next() == b.next() { return 1 }
+    io.println("ok")
+    return 0
+}

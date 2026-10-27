@@ -1,0 +1,57 @@
+# Feature: `below`, `range`, `float` and `bool` stay in bounds over 10k draws each and reach
+# every value they can. float has no `<`, so `floor(f) == 0.0` checks f is in [0, 1). A
+# range wider than the int max still draws from both halves.
+# expect: stdout "ok\n"
+# expect: exit 0
+import std/io
+import std/math
+import std/rand
+import std/vec
+fn main() -> int {
+    r := rand.seeded(2026)
+    seen := [0, 0, 0, 0, 0, 0, 0]
+    for _ in 0..10_000 {
+        v := r.below(7)
+        if v < 0 || v >= 7 { return 1 }
+        seen[v] += 1
+    }
+    for c in seen {
+        if c == 0 { return 2 }
+    }
+    lo_hit := false
+    hi_hit := false
+    for _ in 0..10_000 {
+        v := r.range(-3, 4)
+        if v < -3 || v >= 4 { return 3 }
+        if v == -3 { lo_hit = true }
+        if v == 3 { hi_hit = true }
+    }
+    if !lo_hit || !hi_hit { return 4 }
+    min: int = -9223372036854775807 - 1
+    max: int = 9223372036854775807
+    negs := 0
+    for _ in 0..10_000 {
+        v := r.range(min + 1, max)
+        if v == max { return 9 }
+        if v < 0 { negs += 1 }
+        w := r.range(min, max)
+        if w == max { return 10 }
+    }
+    if negs < 4500 || negs > 5500 { return 11 }
+    sum := 0.0
+    for _ in 0..10_000 {
+        f := r.float()
+        if math.floor(f) != 0.0 { return 5 }
+        sum = sum +. f
+    }
+    band := math.floor(sum /. 1000.0)
+    if band != 4.0 && band != 5.0 { return 6 }
+    trues := 0
+    for _ in 0..10_000 {
+        if r.bool() { trues += 1 }
+    }
+    if trues < 4500 || trues > 5500 { return 7 }
+    if r.below(1) != 0 { return 8 }
+    io.println("ok")
+    return 0
+}
