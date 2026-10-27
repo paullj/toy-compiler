@@ -1,4 +1,5 @@
 import core/fs
+import std/ref
 
 # Why a file operation failed. It carries no path (D12): the caller has it, and a message
 # that wants it says it.
@@ -54,10 +55,7 @@ pub fn read_file(path: str) -> Result[str, IoError] {
     if fd < 0 { return Result[str, IoError].err(from_errno(-fd)) }
     r := fs.read_all(fd)
     fs.close_fd(fd)
-    return match r {
-        .ok(s) -> Result[str, IoError].ok(s),
-        .err(e) -> Result[str, IoError].err(from_errno(e)),
-    }
+    return lift(r)
 }
 
 # Replaces the file at `path` with `s`, creating it if it is missing.
@@ -70,9 +68,14 @@ pub fn write_file(path: str, s: str) -> Result[(), IoError] {
 # create here (core/fs), so a missing file is created by a second call.
 pub fn append_file(path: str, s: str) -> Result[(), IoError] {
     if has_nul(path) { return Result[(), IoError].err(IoError.invalid_path) }
+    return write_to(open_append_or_create(path), s)
+}
+
+# ENOENT (2) from the O_APPEND open means the file is missing, so creat makes it.
+fn open_append_or_create(path: str) -> int {
     fd := fs.open_append(path)
-    if fd == -2 { fd = fs.create(path) }
-    return write_to(fd, s)
+    if fd == -2 { return fs.create(path) }
+    return fd
 }
 
 fn write_to(fd: int, s: str) -> Result[(), IoError] {
@@ -96,4 +99,82 @@ pub fn remove(path: str) -> Result[(), IoError] {
 pub fn exists(path: str) -> bool {
     if has_nul(path) { return false }
     return fs.exists(path)
+}
+
+# An open file. Close it with `close`: nothing closes it for you. Built only by `open`,
+# `create` and `append`. The fd sits in a shared cell because a File is a value: a copy (a
+# binding, an argument) must see a close made through any other copy.
+pub struct File { fd: Ref[int] }
+
+# Darwin's EBADF, as libSystem would report it for a closed fd.
+fn closed() -> IoError {
+    return IoError.other(9)
+}
+
+fn opened(fd: int) -> Result[File, IoError] {
+    if fd < 0 { return Result[File, IoError].err(from_errno(-fd)) }
+    return Result[File, IoError].ok(File { fd: Ref.new(fd) })
+}
+
+fn lift(r: Result[str, int]) -> Result[str, IoError] {
+    return match r {
+        .ok(s) -> Result[str, IoError].ok(s),
+        .err(e) -> Result[str, IoError].err(from_errno(e)),
+    }
+}
+
+# The file at `path`, for reading.
+pub fn open(path: str) -> Result[File, IoError] {
+    if has_nul(path) { return Result[File, IoError].err(IoError.invalid_path) }
+    return opened(fs.open_read(path))
+}
+
+# The file at `path`, for writing from the start: created if missing, emptied if not.
+pub fn create(path: str) -> Result[File, IoError] {
+    if has_nul(path) { return Result[File, IoError].err(IoError.invalid_path) }
+    return opened(fs.create(path))
+}
+
+# The file at `path`, for writing at its end: created if missing.
+pub fn append(path: str) -> Result[File, IoError] {
+    if has_nul(path) { return Result[File, IoError].err(IoError.invalid_path) }
+    return opened(open_append_or_create(path))
+}
+
+# Each op refuses a closed File (fd -1) before any call: the next open reuses the closed fd
+# number, so passing it on would read or write some other file.
+impl File {
+    # At most `n` bytes from the current position, or "" at the end of the file. One read
+    # returns at most 64 KiB.
+    fn read(self, n: int) -> Result[str, IoError] {
+        if n < 0 { panic("fs: read(n) needs n >= 0") }
+        fd := self.fd.get()
+        if fd == -1 { return Result[str, IoError].err(closed()) }
+        return lift(fs.read_some(fd, n))
+    }
+
+    # Everything from the current position to the end of the file.
+    fn read_all(self) -> Result[str, IoError] {
+        fd := self.fd.get()
+        if fd == -1 { return Result[str, IoError].err(closed()) }
+        return lift(fs.read_all(fd))
+    }
+
+    fn write(self, s: str) -> Result[(), IoError] {
+        fd := self.fd.get()
+        if fd == -1 { return Result[(), IoError].err(closed()) }
+        w := fs.write_all(fd, s)
+        if w < 0 { return Result[(), IoError].err(from_errno(-w)) }
+        return Result[(), IoError].ok(())
+    }
+
+    # The File is closed even when close(2) fails, since Darwin frees the fd either way.
+    fn close(self) -> Result[(), IoError] {
+        fd := self.fd.get()
+        if fd == -1 { return Result[(), IoError].err(closed()) }
+        self.fd.set(-1)
+        c := fs.close_fd(fd)
+        if c < 0 { return Result[(), IoError].err(from_errno(-c)) }
+        return Result[(), IoError].ok(())
+    }
 }

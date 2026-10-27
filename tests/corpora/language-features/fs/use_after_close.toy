@@ -1,0 +1,61 @@
+# Feature: `close` marks the File closed, so a later read, write or second close is an
+# error (EBADF, os error 9) rather than a call on a reused fd number: the file opened after
+# the close usually gets the same fd, and must stay unchanged. The close goes through a copy
+# handed to a helper, so every copy of a File must see it.
+# expect: stdout "os error 9\nos error 9\nos error 9\nos error 9\nos error 9\nok\nsecond\n"
+# expect: exit 0
+import std/io
+import std/fs
+fn show(r: Result[(), fs.IoError]) {
+    match r {
+        .ok(_) -> io.println("ok"),
+        .err(e) -> io.println(e),
+    }
+}
+fn shut(f: fs.File) -> Result[(), fs.IoError] {
+    return f.close()
+}
+fn main() -> int {
+    f := match fs.create("fs_use_after_close_a.txt") {
+        .ok(f) -> f,
+        .err(_) -> { return 1 },
+    }
+    g := f
+    match shut(g) {
+        .ok(_) -> {},
+        .err(_) -> { return 2 },
+    }
+    match fs.write_file("fs_use_after_close_b.txt", "second") {
+        .ok(_) -> {},
+        .err(_) -> { return 3 },
+    }
+    b := match fs.append("fs_use_after_close_b.txt") {
+        .ok(b) -> b,
+        .err(_) -> { return 4 },
+    }
+    show(f.write("clobbered"))
+    match f.read(4) {
+        .ok(_) -> io.println("read"),
+        .err(e) -> io.println(e),
+    }
+    match f.read_all() {
+        .ok(_) -> io.println("read"),
+        .err(e) -> io.println(e),
+    }
+    show(f.close())
+    show(g.write("clobbered"))
+    show(b.close())
+    match fs.read_file("fs_use_after_close_b.txt") {
+        .ok(s) -> io.println(s),
+        .err(_) -> { return 5 },
+    }
+    match fs.remove("fs_use_after_close_a.txt") {
+        .ok(_) -> {},
+        .err(_) -> { return 6 },
+    }
+    match fs.remove("fs_use_after_close_b.txt") {
+        .ok(_) -> {},
+        .err(_) -> { return 7 },
+    }
+    return 0
+}

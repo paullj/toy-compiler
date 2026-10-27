@@ -1,0 +1,38 @@
+# Feature: `fs.create` truncates or creates and `fs.append` adds to the end; writes through
+# either handle reach the file that `fs.read_file` then reads.
+# expect: stdout "one\ntwo\n|one\ntwo\nthree\n|\n"
+# expect: exit 0
+import std/io
+import std/fs
+fn check(r: Result[(), fs.IoError]) {
+    match r {
+        .ok(_) -> {},
+        .err(e) -> io.println(e),
+    }
+}
+fn read(path: str) -> str {
+    return match fs.read_file(path) {
+        .ok(s) -> s,
+        .err(e) -> "error: ".concat(e.to_string()),
+    }
+}
+fn main() -> int {
+    check(fs.write_file("fs_handle_write.txt", "old contents, longer"))
+    f := match fs.create("fs_handle_write.txt") {
+        .ok(f) -> f,
+        .err(_) -> { return 1 },
+    }
+    check(f.write("one\n"))
+    check(f.write("two\n"))
+    check(f.close())
+    io.print(read("fs_handle_write.txt").concat("|"))
+    a := match fs.append("fs_handle_write.txt") {
+        .ok(a) -> a,
+        .err(_) -> { return 2 },
+    }
+    check(a.write("three\n"))
+    check(a.close())
+    io.println(read("fs_handle_write.txt").concat("|"))
+    check(fs.remove("fs_handle_write.txt"))
+    return 0
+}
