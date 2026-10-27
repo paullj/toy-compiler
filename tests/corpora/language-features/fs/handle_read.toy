@@ -1,0 +1,69 @@
+# Feature: `fs.open` gives a `File` whose `read(n)` returns up to n bytes per call and ""
+# at EOF, so a loop reads a file in chunks; `read_all` takes the rest after a chunk. A huge
+# n reads what is there rather than allocating n bytes first.
+# expect: stdout "abcd|efgh|ij|\nab+cdefghij\nabcdefghij\nnot found\n"
+# expect: exit 0
+import std/io
+import std/fs
+fn main() -> int {
+    match fs.write_file("fs_handle_read.txt", "abcdefghij") {
+        .ok(_) -> {},
+        .err(_) -> { return 1 },
+    }
+    f := match fs.open("fs_handle_read.txt") {
+        .ok(f) -> f,
+        .err(_) -> { return 2 },
+    }
+    out := ""
+    loop {
+        chunk := match f.read(4) {
+            .ok(s) -> s,
+            .err(_) -> { return 3 },
+        }
+        if chunk == "" { break }
+        out = out.concat(chunk).concat("|")
+    }
+    io.println(out)
+    match f.close() {
+        .ok(_) -> {},
+        .err(_) -> { return 4 },
+    }
+    g := match fs.open("fs_handle_read.txt") {
+        .ok(g) -> g,
+        .err(_) -> { return 5 },
+    }
+    head := match g.read(2) {
+        .ok(s) -> s,
+        .err(_) -> { return 6 },
+    }
+    rest := match g.read_all() {
+        .ok(s) -> s,
+        .err(_) -> { return 7 },
+    }
+    io.println(head.concat("+").concat(rest))
+    match g.close() {
+        .ok(_) -> {},
+        .err(_) -> { return 8 },
+    }
+    h := match fs.open("fs_handle_read.txt") {
+        .ok(h) -> h,
+        .err(_) -> { return 10 },
+    }
+    match h.read(4611686018427387904) {
+        .ok(s) -> io.println(s),
+        .err(_) -> { return 11 },
+    }
+    match h.close() {
+        .ok(_) -> {},
+        .err(_) -> { return 12 },
+    }
+    match fs.open("fs_handle_read_missing.txt") {
+        .ok(_) -> io.println("opened"),
+        .err(e) -> io.println(e),
+    }
+    match fs.remove("fs_handle_read.txt") {
+        .ok(_) -> {},
+        .err(_) -> { return 9 },
+    }
+    return 0
+}

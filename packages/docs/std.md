@@ -49,7 +49,7 @@ core is the private layer between the compiler and std. It is the only place whe
 | `core/sys` | the libSystem `write` and `read` externs: `print(s)` to fd 1, `write_fd`, `read_fd_all` and `read_line_fd` |
 | `core/ffi` | the libm and `labs` externs and their safe wrappers |
 | `core/os` | the `_NSGetArgc`, `_NSGetArgv`, `getenv`, `strlen`, `exit`, `__error`, `clock_gettime_nsec_np` and `nanosleep` externs: `argc`, `argv(i)`, `env`, `exit_process`, `errno`, `monotonic_ns`, `realtime_ns`, `sleep_ns`, and `from_cstr` (copies) / `to_cstr` |
-| `core/fs` | the `open` (two arguments, never `O_CREAT`), `creat`, `close`, `unlink` and `access` externs: `open_read`, `open_append`, `create`, `close_fd`, `remove`, `exists`, `write_all` and `read_all`, each failure as a negated errno |
+| `core/fs` | the `open` (two arguments, never `O_CREAT`), `creat`, `close`, `unlink` and `access` externs: `open_read`, `open_append`, `create`, `close_fd`, `remove`, `exists`, `write_all`, `read_some` and `read_all`, each failure as a negated errno |
 | `core/mem` | the growable `gc_array` and the hash table behind Vec, Map and Set |
 | `core/text` | raw `str` parts: `slice`, and the `alloc`/`put`/`window`/`take` buffer that builds a str once |
 | `core/mem_selftest`, `core/desc_selftest` | heap and descriptor self-checks |
@@ -71,7 +71,7 @@ and never names a `.core` intrinsic.
 | `std/gc` | `collect()` and `collections()` |
 | `std/os` | `args()`, `env(name)` and `exit(code)`, over core/os |
 | `std/time` | `Instant`, `Duration`, `now()`, `sleep(d)`, `unix()` and `unix_ns()`, over core/os |
-| `std/fs` | `IoError`, `read_file`, `write_file`, `append_file`, `remove` and `exists`, over core/fs |
+| `std/fs` | `IoError`, `read_file`, `write_file`, `append_file`, `remove`, `exists`, and `File` handles from `open`, `create` and `append`, over core/fs |
 
 ## std/io: output and input
 
@@ -222,6 +222,58 @@ fn main() {
     }
     match fs.read_file("notes.txt") {
         .ok(s) -> io.print(s),
+        .err(e) -> io.eprintln(e),
+    }
+}
+```
+
+## std/fs: file handles
+
+```toy
+pub fn open(path: str) -> Result[File, IoError]      # for reading
+pub fn create(path: str) -> Result[File, IoError]    # for writing; creates or empties
+pub fn append(path: str) -> Result[File, IoError]    # for writing at the end; creates
+
+impl File {
+    fn read(self, n: int) -> Result[str, IoError]    # at most n bytes; "" at the end
+    fn read_all(self) -> Result[str, IoError]        # the rest of the file
+    fn write(self, s: str) -> Result[(), IoError]    # all of s
+    fn close(self) -> Result[(), IoError]
+}
+```
+
+- Close is explicit: nothing closes a File for you, so a File you drop keeps its fd open.
+- After `close`, every op on that File, a second `close` included, is `other(9)` (EBADF)
+  and makes no call. The next open reuses the closed fd number, so passing it on would
+  reach some other file. Copies of a File share its state, so a close through one copy
+  (or through a helper that took it by value) closes them all.
+- `read(n)` returns at most 64 KiB per call; a negative `n` panics.
+
+```toy
+import std/fs
+import std/io
+
+fn main() {
+    f := match fs.open("notes.txt") {
+        .ok(f) -> f,
+        .err(e) -> {
+            io.eprintln(e)
+            return
+        },
+    }
+    loop {
+        chunk := match f.read(4096) {
+            .ok(s) -> s,
+            .err(e) -> {
+                io.eprintln(e)
+                break
+            },
+        }
+        if chunk == "" { break }
+        io.print(chunk)
+    }
+    match f.close() {
+        .ok(_) -> {},
         .err(e) -> io.eprintln(e),
     }
 }

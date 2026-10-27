@@ -69,6 +69,19 @@ pub fn write_all(fd: int, s: str) -> int {
     return 0
 }
 
+# One read(2) of at most `n` bytes: "" at EOF, or the errno of the failed read. The buffer
+# is capped at 64 KiB because it is allocated before the read, and a huge `n` would fail the
+# allocation; read(2) may return fewer bytes than asked anyway.
+pub fn read_some(fd: int, n: int) -> Result[str, int] {
+    if n <= 0 { return Result[str, int].ok("") }
+    cap := n
+    if cap > 65536 { cap = 65536 }
+    buf := text.alloc(cap)
+    got := sys.read(fd, text.window(buf, 0, cap), cap)
+    if got < 0 { return Result[str, int].err(os.errno()) }
+    return Result.ok(text.take(buf, got))
+}
+
 # Everything left on `fd`, or the errno of the failed read: reading a directory fails only
 # here (EISDIR), since open(2) accepts one. The buffer doubles when full, as in
 # `sys.read_fd_all`, which drops errors and so cannot serve here.
