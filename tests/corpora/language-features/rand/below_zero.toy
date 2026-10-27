@@ -1,0 +1,9 @@
+# Feature: `below(n)` with n <= 0 has no value to give, so it panics.
+# expect: exit 1
+# expect: stdout ""
+# expect: stderr "rand: below(n) needs n > 0\n"
+import std/rand
+fn main() -> int {
+    r := rand.seeded(3)
+    return r.below(0)
+}

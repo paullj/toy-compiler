@@ -1,0 +1,23 @@
+# Feature: `rand.seeded(seed)` gives xoshiro256** seeded through splitmix64, so a seed draws
+# the same sequence on every run, and the reference implementation's.
+# expect: stdout "1546998764402558742\n6990951692964543102\n12544586762248559009\n17057574109182124193\n18295552978065317476\n11091344671253066420\n0.08386297105988216\nsame\n"
+# expect: exit 0
+import std/io
+import std/rand
+fn main() -> int {
+    r := rand.seeded(42)
+    for _ in 0..5 {
+        io.println(r.next())
+    }
+    z := rand.seeded(0)
+    io.println(z.next())
+    f := rand.seeded(42)
+    io.println(f.float())
+    a := rand.seeded(7)
+    b := rand.seeded(7)
+    for _ in 0..100 {
+        if a.next() != b.next() { return 1 }
+    }
+    io.println("same")
+    return 0
+}

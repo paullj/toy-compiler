@@ -101,3 +101,15 @@ pub fn sleep_ns(ns: int) {
         }
     }
 }
+
+# getentropy(2) fills at most 256 bytes and fails only for a bad buffer or a larger
+# request, so a failure here is a bug, not a condition a caller could handle.
+pub extern fn getentropy(buf: rawptr, len: int) -> int
+
+# 64 bits from the kernel's CSPRNG.
+pub fn entropy_u64() -> uint64 {
+    buf := gc_alloc(8)
+    if (getentropy(buf, 8) & 0xFFFF_FFFF) != 0 { panic("getentropy failed") }
+    v: uint64 = unsafe { load(buf) }
+    return v
+}

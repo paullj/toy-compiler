@@ -1,0 +1,47 @@
+# Feature: `rand.shuffle(r, xs)` reorders a Vec in place and keeps its elements;
+# `rand.choose(r, xs)` picks one, or none from an empty Vec. Both follow the seed.
+# expect: stdout "kept\nmoved\nsame\nnone\nok\n"
+# expect: exit 0
+import std/io
+import std/rand
+import std/vec
+fn main() -> int {
+    r := rand.seeded(1)
+    xs := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    rand.shuffle(r, xs)
+    moved := false
+    for i in 0..xs.len() {
+        if xs[i] != i + 1 { moved = true }
+    }
+    ys := [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
+    s := rand.seeded(1)
+    rand.shuffle(s, ys)
+    same := true
+    for i in 0..xs.len() {
+        if xs[i] != ys[i] { same = false }
+    }
+    xs.sort()
+    for i in 0..xs.len() {
+        if xs[i] != i + 1 { return 4 }
+    }
+    if xs.len() == 10 { io.println("kept") }
+    if moved { io.println("moved") }
+    if same { io.println("same") }
+    empty := Vec[str].new()
+    match rand.choose(r, empty) {
+        Option.some(_) -> io.println("some"),
+        Option.none -> io.println("none"),
+    }
+    names := ["a", "b", "c"]
+    for _ in 0..100 {
+        match rand.choose(r, names) {
+            Option.some(n) -> { if n != "a" && n != "b" && n != "c" { return 1 } },
+            Option.none -> { return 2 },
+        }
+    }
+    one := [9]
+    rand.shuffle(r, one)
+    if one[0] != 9 { return 3 }
+    io.println("ok")
+    return 0
+}
