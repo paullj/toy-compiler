@@ -42,7 +42,7 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
     // The scrutinee takes the arms' expected type only as a hint: `match n.try_into() {
     // .ok(c) -> c, .. }` needs it, but the scrutinee is no arm (`match 300 { .. }` in an
     // `int8` fn still matches an `int`).
-    const st = try bc.typeUnder(n.lhs, if (bc.body.expected) |e| .{ .ty = e.ty, .soft = true } else null);
+    const st = try bc.typeUnderHint(n.lhs, if (bc.body.expected) |e| e.ty else null);
     const arms = Ast.rangeSlice(bc.tree, (n.rhs).int());
     if (st.kind == .invalid) {
         // Poison-absorb: still walk arms (bodies may have their own errors) but

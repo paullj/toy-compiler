@@ -196,6 +196,13 @@ pub fn count(self: *const DiagnosticSink) usize {
     return self.diags.items.len;
 }
 
+/// Drop the diagnostics reported since `mark` (a `count()`), for a caller that types a
+/// node again another way. Their messages stay owned until `deinit`: `adopt` can put a
+/// message in `owned` out of step with `diags`, so freeing by position is unsafe.
+pub fn truncate(self: *DiagnosticSink, mark: usize) void {
+    self.diags.shrinkRetainingCapacity(mark);
+}
+
 /// The owned slices handed to a stage `Result`. The Result frees them via `deinit`.
 pub const Owned = struct {
     diags: []Diagnostic,
@@ -578,4 +585,18 @@ test "sort is idempotent and count tracks items" {
     try testing.expectEqualStrings(first[1], sink.items()[1].message);
     try testing.expectEqualStrings(first[2], sink.items()[2].message);
     try testing.expectEqual(@as(usize, 3), sink.count());
+}
+
+test "truncate drops the diagnostics reported since a mark and leaks nothing" {
+    var sink = DiagnosticSink.init(testing.allocator);
+    defer sink.deinit();
+    try sink.report(.{ .span = .{ .start = 1, .end = 1 } }, "kept {d}", .{1});
+    const mark = sink.count();
+    try sink.report(.{ .span = .{ .start = 2, .end = 2 } }, "dropped {d}", .{2});
+    try sink.report(.{ .span = .{ .start = 3, .end = 3 } }, "dropped {d}", .{3});
+    sink.truncate(mark);
+    try testing.expectEqual(@as(usize, 1), sink.count());
+    try testing.expectEqualStrings("kept 1", sink.items()[0].message);
+    try sink.report(.{ .span = .{ .start = 4, .end = 4 } }, "after", .{});
+    try testing.expectEqual(@as(usize, 2), sink.count());
 }
