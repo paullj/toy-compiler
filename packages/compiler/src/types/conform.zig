@@ -28,9 +28,9 @@ const eqlTypeVec = Typecheck.eqlTypeVec;
 /// thread-order-free linear scan over the frozen `model.conformances` by protocol id
 /// + `Type.eql` — the SAME determinism discipline `findMethod` uses, so bound
 /// resolution at the mono worklist is byte-identical at any `-jN`. A generic-App
-/// type-arg necessarily misses (conformances only record concrete `structT`/`enumT`/
-/// scalar receivers — `impl Box[T] has P` is rejected at parse), which is the correct
-/// "not conforming" answer.
+/// type-arg misses: `model.conformances` holds only concrete receivers, and a generic
+/// `impl Box[T] has P` is a `model.template_conformances` row, which only
+/// `iteratorItem` reads, so such an impl does not yet satisfy a `[T has P]` bound (#91).
 pub fn existence(model: *const Model, pid: u32, recv: Type, protocol_args: []const Type) bool {
     for (model.conformances) |c| {
         // Exact match first (a user `impl int8 has P` row, or any concrete receiver).

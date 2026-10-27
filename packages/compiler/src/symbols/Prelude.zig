@@ -1,7 +1,7 @@
-//! Native registration of the implicit PRELUDE, mirroring how `print` is a
-//! synthesized compiler entity with no module-graph / content-fingerprint surface. Runs
-//! SERIALLY at the head of Phase 0c, before the per-module `registerProtocols` loop, so
-//! the prelude protocol ids are a pure function of source (no hashmap/thread input).
+//! Native registration of the implicit PRELUDE, with no module-graph /
+//! content-fingerprint surface. Runs SERIALLY at the head of Phase 0c, before the
+//! per-module `registerProtocols` loop, so the prelude protocol ids are a pure function
+//! of source (no hashmap/thread input).
 //!
 //! The `ProtoSpec` table drives the whole protocol set in ONE append order that is
 //! LOAD-BEARING: `Eq=0, Ord=1, Add=2, Sub=3, Mul=4, Div=5, Hash=6, Display=7, From=8,
