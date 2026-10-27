@@ -31,6 +31,26 @@ toyc="$root/zig-out/bin/toy"
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
+# Decode `# stdin:` / `# args:` with the corpus harness's own rules (corpus.zig
+# decodeEscapes/parseArgs: only \n \r \t \" \\ are escapes), so both gates feed a
+# fixture the same bytes. printf %b and xargs each disagree on \".
+directive() {
+  perl -e '
+    my ($mode, $file) = @ARGV;
+    my %esc = (n => "\n", r => "\r", t => "\t", q(") => q("), "\\" => "\\");
+    sub dec { my $s = shift; $s =~ s/\\([nrt"\\])/$esc{$1}/g; $s }
+    open my $fh, "<", $file or die "$file: $!";
+    while (my $line = <$fh>) {
+      chomp $line;
+      if ($mode eq "stdin" && $line =~ /^# stdin:[^"]*"(.*)"/) { print dec($1) }
+      if ($mode eq "args" && $line =~ s/^# args://) {
+        while ($line =~ /\G[ \t\r]*"((?:\\.|[^"\\])*)"/gc) { print dec($1), "\0" }
+        $line =~ /\G[ \t\r]*\z/gc or die "$file: bad # args: directive\n";
+      }
+    }
+  ' "$1" "$2"
+}
+
 echo "building toy..."
 if command -v zig >/dev/null 2>&1; then zig="zig"
 elif command -v mise >/dev/null 2>&1; then zig="mise exec -- zig"
@@ -84,14 +104,14 @@ while IFS= read -r src; do
 
   # The fixture's `# stdin:` bytes, never the loop's own stdin: a program that reads
   # stdin would otherwise eat the rest of the file list.
-  stdin_bytes="$(grep -E '^# stdin:' "$src" | sed -E 's/^# stdin:[[:space:]]*"(.*)"$/\1/' | tr -d '\n')"
+  directive stdin "$src" > "$work/stdin"
   # `# args:` words and `# env:` pairs as the corpus harness gives them: the environment
-  # holds only the fixture's variables. xargs splits the quoted words without a shell eval.
+  # holds only the fixture's variables.
   run_args=(); run_env=()
-  while IFS= read -r -d '' w; do run_args+=("$w"); done < <(grep -E '^# args:' "$src" | sed -E 's/^# args:[[:space:]]*//' | xargs printf '%s\0')
+  while IFS= read -r -d '' w; do run_args+=("$w"); done < <(directive args "$src")
   while IFS= read -r kv; do run_env+=("$kv"); done < <(grep -E '^# env:' "$src" | sed -E 's/^# env:[[:space:]]*//')
-  o0="$(printf '%b' "$stdin_bytes" | limit 30 env -i ${run_env[@]+"${run_env[@]}"} "$b0" ${run_args[@]+"${run_args[@]}"})"; r0=$?
-  o1="$(printf '%b' "$stdin_bytes" | limit 30 env -i ${run_env[@]+"${run_env[@]}"} "$b1" ${run_args[@]+"${run_args[@]}"})"; r1=$?
+  o0="$(limit 30 env -i ${run_env[@]+"${run_env[@]}"} "$b0" ${run_args[@]+"${run_args[@]}"} < "$work/stdin")"; r0=$?
+  o1="$(limit 30 env -i ${run_env[@]+"${run_env[@]}"} "$b1" ${run_args[@]+"${run_args[@]}"} < "$work/stdin")"; r1=$?
 
   ok=1
   # #expect under -O0 FIRST (independent oracle).
