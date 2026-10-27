@@ -45,6 +45,14 @@ pub fn put(buf: rawptr, at: int, s: str) {
     }
 }
 
+# The address of the bytes [at, at + n) of `buf`, for a C call such as `read` to fill. The
+# caller hands it straight to the call: nothing may allocate while it is held.
+pub fn window(buf: rawptr, at: int, n: int) -> rawptr {
+    cap: int = unsafe { load(buf) }
+    if at < 0 || n < 0 || at > cap - n { panic("str buffer window out of bounds") }
+    return unsafe { offset(buf, 8 + at) }
+}
+
 # The first `n` bytes of `buf` as a str. The str points into `buf`, which the collector then
 # keeps alive through it.
 pub fn take(buf: rawptr, n: int) -> str {

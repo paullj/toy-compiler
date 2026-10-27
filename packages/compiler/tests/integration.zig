@@ -32,6 +32,7 @@ test {
     _ = @import("set.zig");
     _ = @import("string.zig");
     _ = @import("math.zig");
+    _ = @import("io.zig");
     _ = @import("unit.zig");
     _ = @import("grammar_agreement.zig");
 }

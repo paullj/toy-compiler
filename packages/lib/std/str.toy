@@ -79,6 +79,34 @@ impl str {
         return to.join(self.split(from))
     }
 
+    # A decimal int with an optional `+` or `-`: no spaces, no `_`, at least one digit. The
+    # value is accumulated negated because int's range reaches one further below zero than
+    # above, so the most negative int parses without overflowing on the way.
+    fn parse_int(self) -> Option[int] {
+        n := self.len()
+        i := 0
+        neg := false
+        if n > 0 && (self.byte_at(0) == 43 || self.byte_at(0) == 45) {
+            neg = self.byte_at(0) == 45
+            i = 1
+        }
+        if i == n { return Option[int].none }
+        min := -9223372036854775807 - 1
+        acc := 0
+        while i < n {
+            d := self.byte_at(i) - 48
+            if d < 0 || d > 9 { return Option[int].none }
+            if acc < min / 10 { return Option[int].none }
+            acc *= 10
+            if acc < min + d { return Option[int].none }
+            acc -= d
+            i += 1
+        }
+        if neg { return Option.some(acc) }
+        if acc == min { return Option[int].none }
+        return Option.some(-acc)
+    }
+
     fn chars(self) -> Chars[char] {
         return Chars[char] { s: self, i: 0 }
     }

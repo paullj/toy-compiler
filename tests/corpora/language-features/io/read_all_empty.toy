@@ -1,0 +1,11 @@
+# Feature: `io.read_all()` on empty stdin is the empty string, and a later read is too.
+# expect: stdout "0 0\n"
+# expect: exit 0
+import std/io
+fn main() {
+    a := io.read_all()
+    b := io.read_all()
+    io.print(a.len())
+    io.print(" ")
+    io.println(b.len())
+}

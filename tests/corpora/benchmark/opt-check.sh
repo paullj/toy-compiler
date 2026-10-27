@@ -82,8 +82,11 @@ while IFS= read -r src; do
     fail "$rel: compile failed (O0 rc=$c0 O1 rc=$c1)"; corpus_fail=$((corpus_fail+1)); continue
   fi
 
-  o0="$(limit 30 "$b0")"; r0=$?
-  o1="$(limit 30 "$b1")"; r1=$?
+  # The fixture's `# stdin:` bytes, never the loop's own stdin: a program that reads
+  # stdin would otherwise eat the rest of the file list.
+  stdin_bytes="$(grep -E '^# stdin:' "$src" | sed -E 's/^# stdin:[[:space:]]*"(.*)"$/\1/' | tr -d '\n')"
+  o0="$(printf '%b' "$stdin_bytes" | limit 30 "$b0")"; r0=$?
+  o1="$(printf '%b' "$stdin_bytes" | limit 30 "$b1")"; r1=$?
 
   ok=1
   # #expect under -O0 FIRST (independent oracle).

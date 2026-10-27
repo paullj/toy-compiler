@@ -1,0 +1,10 @@
+# Feature: on empty stdin the first `io.read_line()` is already `none`.
+# expect: stdout "none\n"
+# expect: exit 0
+import std/io
+fn main() {
+    match io.read_line() {
+        .some(_) -> io.println("some"),
+        .none -> io.println("none"),
+    }
+}

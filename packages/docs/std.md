@@ -46,10 +46,10 @@ core is the private layer between the compiler and std. It is the only place whe
 
 | module | holds |
 |--------|-------|
-| `core/sys` | the libSystem `write` extern and `print(s)`, which writes to fd 1 |
+| `core/sys` | the libSystem `write` and `read` externs: `print(s)` to fd 1, `write_fd`, `read_fd_all` and `read_line_fd` |
 | `core/ffi` | the libm and `labs` externs and their safe wrappers |
 | `core/mem` | the growable `gc_array` and the hash table behind Vec, Map and Set |
-| `core/text` | raw `str` parts: `slice`, and the `alloc`/`put`/`take` buffer that builds a str once |
+| `core/text` | raw `str` parts: `slice`, and the `alloc`/`put`/`window`/`take` buffer that builds a str once |
 | `core/mem_selftest`, `core/desc_selftest` | heap and descriptor self-checks |
 
 ## std
@@ -59,14 +59,63 @@ and never names a `.core` intrinsic.
 
 | module | holds |
 |--------|-------|
-| `std/io` | `print` and `println`, ordinary generics over `T has Display` |
+| `std/io` | `print`, `println`, `eprint` and `eprintln` over `T has Display`; `read_line` and `read_all` on stdin |
 | `std/vec`, `std/map`, `std/set` | the collections, over core/mem |
-| `std/str` | methods on `str`, over core/text |
+| `std/str` | methods on `str`, including `parse_int`, over core/text |
 | `std/option` | the closure methods of `Option` and `Result` |
 | `std/ref` | `Ref.new`, `get` and `set` |
 | `std/iter` | the `Iterator` protocol that `for`-in desugars to |
 | `std/math` | integer and float math, over core/ffi |
 | `std/gc` | `collect()` and `collections()` |
+
+## std/io: output and input
+
+```toy
+pub fn print[T has Display](x: T)      # to stdout
+pub fn println[T has Display](x: T)    # to stdout, then "\n"
+pub fn eprint[T has Display](x: T)     # to stderr
+pub fn eprintln[T has Display](x: T)   # to stderr, then "\n"
+pub fn read_line() -> Option[str]      # the next line of stdin, or none at end of input
+pub fn read_all() -> str               # the rest of stdin
+```
+
+- Output is unbuffered (see the conventions below). `eprint` writes again after a
+  short write, so a large message reaches stderr whole.
+- `read_line` strips the line's `\n` or `\r\n`. An empty line is `some("")`, a last
+  line with no final newline is returned as it is, and at end of input every call is
+  `none`.
+- stdin is unbuffered too: `read_line` reads one byte at a time and never takes bytes
+  past the newline, so `read_line` and `read_all` can follow each other freely. A
+  buffered line reader is later work.
+- A read error ends the input as end of input does.
+
+```toy
+import std/io
+import std/str
+
+fn main() -> int {
+    total := 0
+    done := false
+    while !done {
+        match io.read_line() {
+            .some(l) -> match l.parse_int() {
+                .some(n) -> { total += n },
+                .none -> io.eprintln("not a number: ".concat(l)),
+            },
+            .none -> { done = true },
+        }
+    }
+    io.println(total)
+    return 0
+}
+```
+
+## std/str: parse_int
+
+`s.parse_int() -> Option[int]` reads a decimal `int` with an optional `+` or `-` sign.
+It is `none` for an empty string, a lone sign, any other byte (spaces and `_`
+included) and a value outside `int`'s range. Call `trim` first to accept surrounding
+whitespace.
 
 ## Conventions
 

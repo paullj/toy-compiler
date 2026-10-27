@@ -1,0 +1,23 @@
+# Feature: `s.parse_int()` reads a decimal int with an optional sign. Anything else
+# (empty, a lone sign, spaces, other bytes, or a value outside int's range) is `none`.
+# expect: stdout "42 -7 5 0 -9223372036854775808 9223372036854775807 none none none none none none none none\n"
+# expect: exit 0
+import std/io
+import std/str
+import std/vec
+fn show(s: str) -> str {
+    return match s.parse_int() {
+        .some(n) -> n.to_string(),
+        .none -> "none",
+    }
+}
+fn main() {
+    cases := ["42", "-7", "+5", "-0", "-9223372036854775808", "9223372036854775807", "", "-", "+", " 1", "1 ", "12a", "9223372036854775808", "-9223372036854775809"]
+    first := true
+    for c in cases {
+        if !first { io.print(" ") }
+        first = false
+        io.print(show(c))
+    }
+    io.println("")
+}

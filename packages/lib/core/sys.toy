@@ -1,9 +1,76 @@
-# The quarantined libSystem write client. `extern` is legal only in `core/*`, so the
-# raw syscall lives here; std reaches stdout through the safe `print` wrapper, never
-# naming the extern. A `str` arg spreads to (buf,len) in the next two arg registers,
-# matching C write(fd, buf, count).
-pub extern fn write(fd: int, s: str) -> int
+# The quarantined libSystem read and write clients. `extern` is legal only in `core/*`, so
+# the raw syscalls live here; std reaches the fds through the safe wrappers, never naming
+# an extern. A `str` arg spreads to (buf,len) in the next two arg registers, matching C
+# write(fd, buf, count).
+import core/text
 
+pub extern fn write(fd: int, s: str) -> int
+pub extern fn read(fd: int, buf: rawptr, n: int) -> int
+
+# One `write` with no short-write loop: every printing binary links this, and changing it
+# would change them all.
 pub fn print(s: str) {
     write(1, s)
+}
+
+# A pipe or a full disk can take fewer bytes than asked, so the rest is written again. An
+# error (a closed pipe, say) drops the rest: there is no caller to report it to yet.
+pub fn write_fd(fd: int, s: str) {
+    rest := s
+    while rest.len() > 0 {
+        n := write(fd, rest)
+        if n <= 0 { return }
+        rest = text.slice(rest, n, rest.len())
+    }
+}
+
+# Everything left on `fd`, read into a buffer that doubles when full, so the copying stays
+# linear in the input. A read error ends the input like EOF.
+pub fn read_fd_all(fd: int) -> str {
+    cap := 4096
+    buf := text.alloc(cap)
+    len := 0
+    loop {
+        if len == cap {
+            buf = grow(buf, len, cap * 2)
+            cap *= 2
+        }
+        n := read(fd, text.window(buf, len, cap - len), cap - len)
+        if n <= 0 { break }
+        len += n
+    }
+    return text.take(buf, len)
+}
+
+# The next line of `fd` without its `\n` or `\r\n`, or none at EOF. It reads one byte per
+# call so it never takes bytes past the newline from the fd: a later `read_fd_all` or a
+# child process still sees them. A read error ends the input like EOF.
+pub fn read_line_fd(fd: int) -> Option[str] {
+    cap := 64
+    buf := text.alloc(cap)
+    len := 0
+    loop {
+        if len == cap {
+            buf = grow(buf, len, cap * 2)
+            cap *= 2
+        }
+        p := text.window(buf, len, 1)
+        if read(fd, p, 1) <= 0 {
+            if len == 0 { return Option[str].none }
+            return Option.some(text.take(buf, len))
+        }
+        b := unsafe { load_byte(p) }
+        if b == 10 {
+            line := text.take(buf, len)
+            if len > 0 && line.byte_at(len - 1) == 13 { return Option.some(text.slice(line, 0, len - 1)) }
+            return Option.some(line)
+        }
+        len += 1
+    }
+}
+
+fn grow(buf: rawptr, len: int, cap: int) -> rawptr {
+    next := text.alloc(cap)
+    text.put(next, 0, text.take(buf, len))
+    return next
 }

@@ -12,3 +12,24 @@ pub fn println[T has Display](x: T) {
     sys.print(x.to_string())
     sys.print("\n")
 }
+
+# stderr is unbuffered like stdout, so a message interleaves with stdout in program order.
+pub fn eprint[T has Display](x: T) {
+    sys.write_fd(2, x.to_string())
+}
+
+pub fn eprintln[T has Display](x: T) {
+    sys.write_fd(2, x.to_string())
+    sys.write_fd(2, "\n")
+}
+
+# The next line of stdin without its `\n` or `\r\n`, or none at end of input. Unbuffered,
+# so it never reads past the line it returns.
+pub fn read_line() -> Option[str] {
+    return sys.read_line_fd(0)
+}
+
+# The rest of stdin.
+pub fn read_all() -> str {
+    return sys.read_fd_all(0)
+}

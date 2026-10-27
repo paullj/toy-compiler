@@ -5,5 +5,6 @@ fn main() -> int {
     _n := s.split(",").len()  #~ ERROR [T0018] add 'import std/str'
     _t := s.trim()  #~ ERROR [T0018] no method 'trim' on type 'str'; add 'import std/str'
     _c := s.chars()  #~ ERROR [T0018] add 'import std/str'
+    _p := s.parse_int()  #~ ERROR [T0018] no method 'parse_int' on type 'str'; add 'import std/str'
     return s.len() + s.byte_at(0)
 }
