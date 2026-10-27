@@ -32,11 +32,13 @@ fn reportInferConflict(bc: *BodyChecker, args: []const Ast.Index, generic_params
 }
 
 /// How `inferArgs` types an argument that does not wait for the other arguments.
-const ArgTyping = enum {
-    /// Under the call's own expected type, as a bare generic call always has typed
-    /// its args, so `x: int8 = id(5)` infers `int8`.
-    call_expected,
-    /// With no expectation, as an associated call types its args.
+const ArgTyping = union(enum) {
+    /// Against its param through what the call's expected type binds when matched
+    /// against the callee's return type (this pattern): `x: int8 = id(5)` gives `5` an
+    /// `int8`, and `n: int = first([5, 6])` gives the list a `Vec[int]`.
+    ret: Type,
+    /// With no expectation from the call, as an associated call types its args: an
+    /// arg whose param holds no type parameter still has that type outright.
     none,
     /// Against its param with the bindings so far in, when that is ground: a method
     /// call, whose receiver binds the impl's params first.
@@ -61,8 +63,8 @@ fn waitsForTypeArgs(bc: *const BodyChecker, arg: Ast.Index) bool {
 
 /// The partly bound param `want` as a waiting arg's expected type, only when it gives
 /// the arg a type (`givesType`): the whole type for the hole, a fn type's param for one
-/// of a lambda's unannotated params. Otherwise null, and the arg is typed as it was
-/// before any other arg could bind, so an expected fn type on the call still types it
+/// of a lambda's unannotated params. Otherwise null, and the arg takes what the call's
+/// expected type gives its param, so an expected fn type on the call still types it
 /// (`g: fn(int) -> int = id(fn(x) { x + 1 })`). A fn type of another arity is passed
 /// on, so the lambda reports the count rather than an untypable param.
 fn helpfulWant(bc: *BodyChecker, arg: Ast.Index, want: Type) ?Type {
@@ -78,12 +80,30 @@ fn helpfulWant(bc: *BodyChecker, arg: Ast.Index, want: Type) ?Type {
     return null;
 }
 
-pub fn typeOfGenericArg(bc: *BodyChecker, arg: Ast.Index, typing: ArgTyping, want: ?Type) error{OutOfMemory}!Type {
+pub fn typeOfGenericArg(bc: *BodyChecker, arg: Ast.Index, want: ?BC.Expected) error{OutOfMemory}!Type {
     const was = bc.generic_arg;
     bc.generic_arg = arg;
     defer bc.generic_arg = was;
-    if (want) |w| return bc.typeOfExpected(arg, w);
-    return if (typing == .call_expected) bc.typeOf(arg) else bc.typeOfExpected(arg, null);
+    return bc.typeUnder(arg, want);
+}
+
+/// The callee's type args as the call's expected type binds them through `ret`, an
+/// open one at `openOrdBase`; null when there is no expected type or it cannot be the
+/// return type. Owned by the caller.
+fn retBindings(bc: *BodyChecker, ret: Type, n_gp: u32) error{OutOfMemory}!?[]Type {
+    const exp = bc.expectedTy() orelse return null;
+    const targs = try bc.gpa.alloc(Type, n_gp);
+    errdefer bc.gpa.free(targs);
+    const bnd = try bc.gpa.alloc(bool, n_gp);
+    defer bc.gpa.free(bnd);
+    const fp = try bc.gpa.alloc(usize, n_gp);
+    defer bc.gpa.free(fp);
+    if (Infer.match(n_gp, &.{ret}, &.{exp}, targs, bnd, fp, bc.composite.decomposer()) == .conflict) {
+        bc.gpa.free(targs);
+        return null;
+    }
+    fillOpen(targs, bnd, bc.openOrdBase());
+    return targs;
 }
 
 /// An open var substitutes to itself at `base + ord`, clear of the vars a bound one may
@@ -139,6 +159,11 @@ pub fn inferArgs(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, pa
     }
     fillOpen(targs, bnd, bc.openOrdBase());
     const mark = bc.sink.count();
+    const exp_targs: ?[]Type = switch (typing) {
+        .ret => |r| try retBindings(bc, r, n_gp),
+        else => null,
+    };
+    defer if (exp_targs) |t| bc.gpa.free(t);
     var waiting = false;
     for (nodes[first..], first..) |a, i| {
         if (waitsForTypeArgs(bc, a)) {
@@ -146,11 +171,11 @@ pub fn inferArgs(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, pa
             waiting = true;
             continue;
         }
-        const want: ?Type = if (typing == .receiver) blk: {
+        const want: ?BC.Expected = if (typing == .receiver) blk: {
             const w = BC.substTy(bc, params[i], targs);
-            break :blk if (w.kind != .invalid and bc.givesType(w)) w else null;
-        } else null;
-        arg_types[i] = try typeOfGenericArg(bc, a, typing, want);
+            break :blk if (w.kind != .invalid and bc.givesType(w)) .{ .ty = w } else null;
+        } else bc.partWant(params[i], exp_targs);
+        arg_types[i] = try typeOfGenericArg(bc, a, want);
     }
     var res = Infer.match(n_gp, params, arg_types, targs, bnd, fp, dec);
     if (waiting) {
@@ -166,13 +191,15 @@ pub fn inferArgs(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, pa
         bc.body.open_vars = open;
         for (nodes[first..], first..) |a, i| {
             if (!waitsForTypeArgs(bc, a)) continue;
+            const fallback = bc.partWant(params[i], exp_targs);
             if (res == .conflict) {
-                arg_types[i] = try typeOfGenericArg(bc, a, typing, null);
+                arg_types[i] = try typeOfGenericArg(bc, a, fallback);
                 continue;
             }
             fillOpen(targs, bnd, bc.openOrdBase());
             for (open, bnd) |*o, b| o.* = !b;
-            arg_types[i] = try typeOfGenericArg(bc, a, typing, helpfulWant(bc, a, BC.substTy(bc, params[i], targs)));
+            const helpful: ?BC.Expected = if (helpfulWant(bc, a, BC.substTy(bc, params[i], targs))) |w| .{ .ty = w } else null;
+            arg_types[i] = try typeOfGenericArg(bc, a, helpful orelse fallback);
             res = Infer.match(n_gp, params, arg_types, targs, bnd, fp, dec);
         }
     }

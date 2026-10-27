@@ -2,7 +2,7 @@
     .{ .path = "tests/corpora/diagnostics", .mode = .diagnostics, .unit = .single_file, .count = 144 },
     .{ .path = "tests/corpora/language-features", .mode = .expect, .unit = .single_file, .prune = .{"modules"}, .count = 490 },
     .{ .path = "tests/corpora/language-features/modules", .mode = .expect, .unit = .module_dir, .count = 20 },
-    .{ .path = "tests/corpora/regression", .mode = .expect, .unit = .single_file, .count = 5 },
+    .{ .path = "tests/corpora/regression", .mode = .expect, .unit = .single_file, .count = 6 },
     .{ .path = "tests/corpora/benchmark", .mode = .expect, .unit = .single_file, .prune = .{"medium"}, .count = 7 },
     .{ .path = "tests/corpora/benchmark/medium", .mode = .expect, .unit = .module_dir, .count = 1 },
 }

@@ -71,12 +71,22 @@ In the code these are `typeOf` (synth) and `typeOfExpected` / `typeOfBlockExpect
 (check). This formalizes the previously ad-hoc one-shot `expected`
 parameter into this synth/check split; it adds no inference power.
 
-A struct literal's field value is checked against its field's type (`P { x: 5 }` with
-`x: int8`, `S { tags: [] }`), never against the struct's own expected type. A method
-call's expected type belongs to its result, not its receiver: it reaches a receiver
-only as a hint, which a receiver that is itself a literal may take
-(`x: int8 = Box { v: 1 }.get()`) and which never makes an error of its own
-(`fn f() -> Box[str] { return Box { v: 1 }.map(fn(v) { v.to_string() }) }`, or
+A part of an expression — a struct literal's field value, a variant's payload, a
+generic call's argument — is checked against its own declared type, never against the
+expected type of the whole. A non-generic part has that type outright (`P { x: 5 }` with
+`x: int8`, `S { tags: [] }`). A part whose type holds the parent's type parameters takes
+them from the parent's expected type: a struct or variant with no type args matches it
+against its own type (`b: Bag[int] = Bag { xs: [1, 2] }` checks `[1, 2]` as a
+`Vec[int]`, `x: Option[int8] = Option.some(5)` makes `5` an `int8`), and a generic call
+matches it against the callee's return type (`n: int = first([5, 6])`, with
+`first[T](xs: Vec[T]) -> T`, checks the list as a `Vec[int]`; `x: int8 = id(5)` makes
+`5` an `int8`). A part whose type still holds a parameter the expected type leaves open,
+or whose parent has no expected type, is typed on its own.
+
+A method call's expected type belongs to its result, not its receiver: it reaches a
+receiver only as a hint, which a receiver that is itself a literal may take, along with
+the receiver's parts (`x: int8 = Box { v: 1 }.get()`), and which never makes an error of
+its own (`fn f() -> Box[str] { return Box { v: 1 }.map(fn(v) { v.to_string() }) }`, or
 `x: int8 = 300.small()` with `small` on `int`).
 
 A value `if`, `match`, `loop` or labeled block checks every arm against its own expected
@@ -307,8 +317,10 @@ the receiver's variables. The arguments are typed in this order:
 
 1. the receiver, which binds the impl's type parameters (`T` of `impl Box[T]`);
 2. every argument that types itself: a method's argument against its parameter with
-   the receiver's bindings in, a bare call's under the call's own expected type, an
-   associated call's with no expectation;
+   the receiver's bindings in, a bare call's against its parameter through what the
+   call's expected type binds against the return type, an associated call's with no
+   expectation from the call (a parameter with no type parameter is the argument's
+   type outright, as for any part);
 3. each argument that waits for the others, left to right: a lambda with an
    unannotated parameter, or the `_` of the capture being checked. It is typed against
    its parameter with the bindings so far, and the arguments bind again after it, so

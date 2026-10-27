@@ -11004,7 +11004,10 @@ test "a pass-1 conflict types the waiting lambda once" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn tri[T](a: T, b: T, f: fn(T) -> T) -> T { f(a) }
-        \\fn main() -> int { return tri(1, true, fn(x) { x }) }
+        \\fn main() -> int {
+        \\ r := tri(1, true, fn(x) { x })
+        \\ return r
+        \\}
         \\
     );
     defer c.deinit(gpa);
@@ -11327,6 +11330,29 @@ test "a struct literal's field value is typed against its field" {
     );
     defer c.deinit(gpa);
     try expectOwnGenericOk(&c);
+}
+
+test "a generic construction's part or call's arg takes its type from the parent's expected type" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct Box[T] { v: T }
+        \\struct OBox[T] { v: Option[T] }
+        \\fn wrap[T](x: T) -> Option[T] { Option.some(x) }
+        \\fn nest(v: int) -> Option[Option[int]] { Option.some(Option.some(v)) }
+        \\fn main() -> int {
+        \\ b: Box[int8] = Box { v: 1 }
+        \\ o: OBox[int] = OBox { v: Option.none }
+        \\ x: Option[int8] = Option.some(5)
+        \\ w: Option[int8] = wrap(5)
+        \\ ww: Option[Option[int]] = wrap(Option.some(1))
+        \\ return if b.v == 1 && o.v.is_none() && x.is_some() && w.is_some() && ww.is_some() && nest(1).is_some() { 1 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try expectOwnGenericOk(&c);
+    // The part is checked against its own type, so a literal too big for it is one T0034.
+    try expectOnlyDiag("struct Box[T] { v: T }\nfn main() -> int {\n b: Box[int8] = Box { v: 300 }\n return 0\n}\n", .T0034);
 }
 
 test "an own-generic call that selects no instance keeps its template, never another call's row" {
