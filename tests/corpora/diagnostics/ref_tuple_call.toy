@@ -1,0 +1,6 @@
+# `Ref` is a prelude type with a native cell layout, not a tuple struct the program can
+# fill positionally; `Ref(v)` used to pass check and overflow the stack in lower.
+fn main() -> int {
+    _r := Ref(3)  #~ ERROR [T0063] 'Ref' is built with 'Ref.new(v)', not 'Ref(...)'; add 'import std/ref'
+    return 0
+}

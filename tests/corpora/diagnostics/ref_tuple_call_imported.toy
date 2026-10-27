@@ -1,0 +1,7 @@
+import std/ref
+
+fn main() -> int {
+    _r := Ref(3)  #~ ERROR [T0063] 'Ref' is built with 'Ref.new(v)', not 'Ref(...)'
+    _s := Ref.new(3)
+    return 0
+}
