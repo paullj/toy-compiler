@@ -407,7 +407,7 @@ const Expect = struct {
     }
 };
 
-/// Decode the escape set the fixtures use in quoted directive bodies (`\n \t \" \\`);
+/// Decode the escape set the fixtures use in quoted directive bodies (`\n \r \t \" \\`);
 /// any other byte (including raw UTF-8) passes through verbatim. Caller owns the result.
 fn decodeEscapes(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
@@ -418,6 +418,7 @@ fn decodeEscapes(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
             const next = raw[i + 1];
             const decoded: ?u8 = switch (next) {
                 'n' => '\n',
+                'r' => '\r',
                 't' => '\t',
                 '"' => '"',
                 '\\' => '\\',
@@ -1152,7 +1153,7 @@ test "expect harness: parseExpect reads stderr, stdin, args and env directives" 
         \\# expect: stderr "boom\n"
         \\# expect: stderr "main"
         \\# stdin: "a\n"
-        \\# stdin: "b"
+        \\# stdin: "b\r\n"
         \\# args: "x" "y z"  "q\"r"
         \\# args: "w"
         \\# env: K=V=W
@@ -1163,7 +1164,7 @@ test "expect harness: parseExpect reads stderr, stdin, args and env directives" 
     try testing.expect(e.any);
     try testing.expectEqual(@as(usize, 2), e.stderr.items.len);
     try testing.expectEqualStrings("boom\n", e.stderr.items[0]);
-    try testing.expectEqualStrings("a\nb", e.stdin.items);
+    try testing.expectEqualStrings("a\nb\r\n", e.stdin.items);
     try testing.expectEqual(@as(usize, 4), e.args.items.len);
     try testing.expectEqualStrings("y z", e.args.items[1]);
     try testing.expectEqualStrings("q\"r", e.args.items[2]);

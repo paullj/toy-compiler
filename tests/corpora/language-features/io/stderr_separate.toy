@@ -1,0 +1,12 @@
+# Feature: `io.eprint`/`io.eprintln` write to stderr (fd 2) and `io.print`/`io.println`
+# to stdout, so the two streams stay separate. Any Display value prints.
+# expect: stdout "out 1\nout 2\n"
+# expect: stderr "err 1\nerr 42\n"
+# expect: exit 0
+import std/io
+fn main() {
+    io.println("out 1")
+    io.eprint("err 1\n")
+    io.eprintln("err ".concat(42.to_string()))
+    io.println("out 2")
+}

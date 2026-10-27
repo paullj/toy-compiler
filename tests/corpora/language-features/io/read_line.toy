@@ -1,0 +1,21 @@
+# Feature: `io.read_line()` returns each line of stdin without its `\n` or `\r\n`, an
+# empty line as `some("")`, a last line with no final newline as itself, and `none` at
+# end of input, every time after.
+# stdin: "a\n\nc\r\nlast"
+# expect: stdout "[a]\n[]\n[c]\n[last]\nend\nend\n"
+# expect: exit 0
+import std/io
+fn main() {
+    done := false
+    while !done {
+        match io.read_line() {
+            .some(l) -> io.println("[".concat(l).concat("]")),
+            .none -> { done = true },
+        }
+    }
+    io.println("end")
+    match io.read_line() {
+        .some(_) -> io.println("more"),
+        .none -> io.println("end"),
+    }
+}

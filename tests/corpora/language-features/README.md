@@ -33,7 +33,7 @@ Every file starts with a `# Feature:` line and one or more `# expect:` lines:
 ```
 # Feature: <one line describing the feature exercised>
 # expect: exit <N>             # process exit code (main's int return, & 0xFF)
-# expect: stdout "<bytes>"     # exact stdout; \n / \t / \" escapes
+# expect: stdout "<bytes>"     # exact stdout; \n / \r / \t / \" escapes
 # expect: stderr "<substr>"   # stderr CONTAINS substr (repeatable); same escapes
 # expect: compile-error "<substr>"  # must fail to compile; substr appears in a diagnostic
 ```

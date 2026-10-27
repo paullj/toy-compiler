@@ -1,0 +1,11 @@
+# Feature: `io.read_all()` returns the whole of stdin, newlines and all.
+# stdin: "one\ntwo\r\n"
+# stdin: "three"
+# expect: stdout "14|one\ntwo\r\nthree|"
+# expect: exit 0
+import std/io
+fn main() {
+    s := io.read_all()
+    io.print(s.len())
+    io.print("|".concat(s).concat("|"))
+}
