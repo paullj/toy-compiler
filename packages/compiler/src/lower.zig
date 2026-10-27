@@ -2899,7 +2899,7 @@ pub fn lowerExprInto(b: *Builder, expr: Ast.Index, dst_ptr: Ir.ValueId, ty: Type
         // classified as enum-valued are variant constructions, NOT field reads /
         // real calls. Detect by enum type + shape.
         .field_access => {
-            if (ty.kind == .@"enum" and symbols_res.placeRoot(b.in.tree, b.in.resolutions, expr) == null) {
+            if (ty.kind == .@"enum" and symbols_res.isQualifiedVariant(b.in.tree, b.in.resolutions, expr)) {
                 try lowerEnumInitInto(b, expr, dst_ptr, ty);
             } else {
                 try copyAggInto(b, expr, dst_ptr, ty);
@@ -3240,7 +3240,7 @@ fn lowerFieldAccess(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{
     }
     // A qualified enum unit-variant `N.V` reaches here as field_access but is a
     // construction, not a field read.
-    if (ty.kind == .@"enum" and symbols_res.placeRoot(b.in.tree, b.in.resolutions, node_idx) == null) {
+    if (ty.kind == .@"enum" and symbols_res.isQualifiedVariant(b.in.tree, b.in.resolutions, node_idx)) {
         return try aggregateValue(b, node_idx, ty);
     }
     const addr = try places.lowerPlaceAddr(b, node_idx);

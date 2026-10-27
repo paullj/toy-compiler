@@ -1,0 +1,31 @@
+# Regression: an enum-typed field read off a receiver that is no local (a Vec element,
+# a call result, a struct literal) was lowered as a qualified unit-variant construction,
+# so `ps[0].s` built a garbage enum instead of reading the field.
+# expect: exit 0
+import std/vec
+import std/map
+enum Shape { dot, circle(int) }
+struct P { x: int, s: Shape }
+struct Q { p: P }
+fn mk(r: int) -> P { return P { x: 0, s: Shape.circle(r) } }
+fn radius(s: Shape) -> int { return match s { .dot -> 0, .circle(r) -> r } }
+fn main() -> int {
+    ps: Vec[P] = [P { x: 1, s: Shape.circle(4) }, P { x: 2, s: Shape.dot }]
+    s := ps[0].s
+    if radius(s) != 4 { return 1 }
+    if radius(ps[0].s) != 4 { return 2 }
+    if radius(ps[1].s) != 0 { return 3 }
+    if radius(mk(5).s) != 5 { return 4 }
+    if radius(P { x: 3, s: Shape.circle(6) }.s) != 6 { return 5 }
+    qs: Vec[Q] = [Q { p: mk(7) }]
+    if radius(qs[0].p.s) != 7 { return 6 }
+    vs: Vec[Vec[P]] = [[mk(8)]]
+    if radius(vs[0][0].s) != 8 { return 7 }
+    m := Map[int, P].new()
+    m.set(1, mk(9))
+    if radius(m.get(1).unwrap().s) != 9 { return 8 }
+    t := match ps[0].s { .dot -> 0, .circle(r) -> r * 10 }
+    if t != 40 { return 9 }
+    if radius(Shape.dot) != 0 { return 10 }
+    return 0
+}
