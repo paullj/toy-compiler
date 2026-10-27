@@ -1,0 +1,42 @@
+# Regression: a receiver retried with no hint after an error under it typed its nested
+# receivers again on every retry, so each level of nesting doubled the check time.
+# expect: exit 1
+
+impl int {
+    fn small(self) -> int8 {
+        if self > 100 { return 1 }
+        return 0
+    }
+}
+
+fn main() -> int {
+    c := true
+    x: int8 = (if c { y25: int8 = (if c { y24: int8 = (if c { y23: int8 = (if c { y22: int8 = (if c { y21: int8 = (if c { y20: int8 = (if c { y19: int8 = (if c { y18: int8 = (if c { y17: int8 = (if c { y16: int8 = (if c { y15: int8 = (if c { y14: int8 = (if c { y13: int8 = (if c { y12: int8 = (if c { y11: int8 = (if c { y10: int8 = (if c { y9: int8 = (if c { y8: int8 = (if c { y7: int8 = (if c { y6: int8 = (if c { y5: int8 = (if c { y4: int8 = (if c { y3: int8 = (if c { y2: int8 = (if c { y1: int8 = (if c { y0: int8 = 1
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+ 300 } else { 1 }).small()
+    return x.into()
+}

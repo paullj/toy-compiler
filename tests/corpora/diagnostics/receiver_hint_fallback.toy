@@ -1,0 +1,45 @@
+# A receiver whose value cannot take its call's expected type as a whole is typed as it
+# would be with no expected type, so a value `if` or `match` whose arms meet the hint in
+# different ways reports what is really wrong, never that its arms disagree.
+import std/option
+import std/str
+
+impl int {
+    fn small(self) -> int8 {
+        if self > 100 { return 1 }
+        return 0
+    }
+}
+
+impl int8 {
+    fn tiny(self) -> int8 { self }
+}
+
+fn wide(c: bool) -> int8 {
+    (if c { 300 } else { 1 }).tiny()  #~ ERROR [T0018] no method 'tiny' on type 'int'
+}
+
+fn fits(c: bool) -> int8 {
+    (if c { 2 } else { 1 }).small()  #~ ERROR [T0018] no method 'small' on type 'int8'
+}
+
+fn none_last(c: bool) -> Option[str] {
+    (if c { Option.some(33) } else { Option.none }).map(fn(x) { x.to_string() })  #~ ERROR [T0016] cannot infer type parameter 'T' for 'Option.none'
+}
+
+fn none_first(c: bool) -> Option[str] {
+    (match c { true -> Option.none, false -> Option.some(33) }).map(fn(x) { x.to_string() })  #~ ERROR [T0016] cannot infer type parameter 'T' for 'Option.none'
+}
+
+fn real_error(c: bool) -> Option[int] {
+    (if c { Option.none } else { Option.some(1 + true) }).map(fn(v) { v })  #~ ERROR [T0044] operands of '+' must have the same type
+}
+
+fn main() -> int {
+    _r := real_error(true)
+    _a := wide(true)
+    _b := fits(true)
+    _n := none_last(true)
+    _f := none_first(true)
+    return 0
+}

@@ -85,9 +85,10 @@ or whose parent has no expected type, is typed on its own.
 
 A method call's expected type belongs to its result, not its receiver: it reaches a
 receiver only as a hint, which a receiver that is itself a literal may take, along with
-the receiver's parts (`x: int8 = Box { v: 1 }.get()`), and which never makes an error of
-its own (`fn f() -> Box[str] { return Box { v: 1 }.map(fn(v) { v.to_string() }) }`, or
-`x: int8 = 300.small()` with `small` on `int`).
+the receiver's parts (`x: int8 = Box { v: 1 }.get()`), and which never makes an error
+inside the receiver (`fn f() -> Box[str] { return Box { v: 1 }.map(fn(v) { v.to_string() }) }`,
+or `x: int8 = 300.small()` with `small` on `int`). The method is looked up on the type the
+receiver ends with, so a receiver that takes the hint can lack it (below).
 
 A value `if`, `match`, `loop` or labeled block checks every arm against its own expected
 type: each branch of an `if`/`else if` chain, each match arm, and each `break` value, so
@@ -96,6 +97,19 @@ hint stays a hint there: `(loop { break [1, 2] }).len()` is fine in an `int` slo
 condition or a match guard is a `bool` whatever the arms yield, so it takes none, and a
 match scrutinee takes the arms' type only as a hint (`match 300 { .. }` in an `int8` fn
 matches an `int`).
+
+Each arm decides alone whether it takes a hint, so arms can take it in different ways:
+in `x: int8 = (if c { 300 } else { 1 }).small()` the `1` fits an `int8` and the `300`
+does not. The hint is taken by the whole receiver or scrutinee or not at all: when
+typing it under the hint gives an error, it is typed again with no hint, so both arms are
+`int` here. Of the two typings the one with fewer errors stands, so an error of the
+receiver's own (`1 + true` in one arm) is reported once, under the hint the other arms
+needed. A receiver that takes the hint keeps it even when its
+type then has no such method: with `small` on `int` only, `x: int8 = 2.small()` and
+`x: int8 = (if c { 2 } else { 1 }).small()` are **T0018** on `int8`, while
+`r := 2.small()`, with no expected type, calls it. An arm never takes its type from another
+arm: `(if c { Option.some(1) } else { Option.none }).map(f)` has no expected type for
+`Option.none` and is **T0016**, as it is with no call around it.
 
 ## Assignability — the one relation
 

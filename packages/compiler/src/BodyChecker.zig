@@ -380,9 +380,17 @@ pub const BodyChecker = struct {
     /// parallel body fan-out; the answer is stable (layouts/conformances frozen).
     conforms_memo: std.AutoHashMapUnmanaged(u64, bool) = .empty,
 
+    /// What `typeUnderHint` chose for a node that erred under its hint, while an
+    /// outermost `typeUnderHint` runs: an outer retry types its nested receivers again, so
+    /// without it each level of nesting would double the work.
+    hint_choices: std.AutoHashMapUnmanaged(Ast.Index, HintChoice) = .empty,
+    hint_depth: u32 = 0,
+
     /// The ordered generic-param names + the concrete args they bind to, in
     /// generic-param order (`names[i]` binds `types[i]`).
     pub const Subst = struct { names: []const []const u8, types: []const Type };
+
+    pub const HintChoice = struct { hint: Type, keep: bool };
 
     /// `message` is the reported text (the sink's own buffer); `template` the same text with
     /// each instance type arg written as its param (owned).
@@ -399,6 +407,7 @@ pub const BodyChecker = struct {
         bc.derive_reqs.deinit(bc.gpa);
         bc.descriptor_reqs.deinit(bc.gpa);
         bc.conforms_memo.deinit(bc.gpa);
+        bc.hint_choices.deinit(bc.gpa);
         for (bc.template_spellings.items) |ts| bc.gpa.free(ts.template);
         bc.template_spellings.deinit(bc.gpa);
     }
@@ -463,6 +472,12 @@ pub const BodyChecker = struct {
     pub fn errorsSince(bc: *const BodyChecker, mark: usize) bool {
         for (bc.sink.items()[mark..]) |d| if (d.severity == .err) return true;
         return false;
+    }
+
+    fn errorCountSince(bc: *const BodyChecker, mark: usize) usize {
+        var n: usize = 0;
+        for (bc.sink.items()[mark..]) |d| n += @intFromBool(d.severity == .err);
+        return n;
     }
 
     // The control-flow / divergence / break family lives in `ControlFlow.zig` as
@@ -964,12 +979,49 @@ pub const BodyChecker = struct {
     /// A method call's receiver. The call's expected type is the result's, not the
     /// receiver's, yet a receiver that is itself a literal used to take it (`x: int8 =
     /// Box { v: 1 }.get()`), and programs rely on that; so it reaches the receiver only as
-    /// a hint that never turns into an error of its own.
+    /// a hint (`typeUnderHint`).
     fn typeOfReceiver(bc: *BodyChecker, recv: Ast.Index) error{OutOfMemory}!Type {
+        return bc.typeUnderHint(recv, if (bc.body.expected) |e| e.ty else null);
+    }
+
+    /// Type `node_idx` under `hint` as a soft expected type, which never turns into an
+    /// error of its own: when the node errs under it, it is typed again with none and
+    /// the typing with fewer errors stands. Each arm of a value `if` or `match` decides
+    /// alone whether it takes a hint (`1` fits an `int8`, `300` does not), so only the
+    /// whole value can tell that its arms took it in different ways; an error under the
+    /// hint is that signal. An error of the node's own (`1 + true` in one arm) errs either
+    /// way, and dropping the hint would only add the errors of arms that needed it. A
+    /// hint is no type the node must have, so it never fills a capture's hole
+    /// (`typeUnder`).
+    pub fn typeUnderHint(bc: *BodyChecker, node_idx: Ast.Index, hint: ?Type) error{OutOfMemory}!Type {
         const save = bc.body.expected;
-        if (save) |e| bc.body.expected = .{ .ty = e.ty, .soft = true };
         defer bc.body.expected = save;
-        return bc.typeOf(recv);
+        bc.body.expected = null;
+        const h = hint orelse return bc.typeOf(node_idx);
+        bc.hint_depth += 1;
+        defer {
+            bc.hint_depth -= 1;
+            if (bc.hint_depth == 0) bc.hint_choices.clearRetainingCapacity();
+        }
+        const hinted: Expected = .{ .ty = h, .soft = true };
+        if (bc.hint_choices.get(node_idx)) |c| if (c.hint.eql(h)) {
+            bc.body.expected = if (c.keep) hinted else null;
+            return bc.typeOf(node_idx);
+        };
+        const mark = bc.sink.count();
+        bc.body.expected = hinted;
+        const t = try bc.typeOf(node_idx);
+        const hinted_errs = bc.errorCountSince(mark);
+        if (hinted_errs == 0) return t;
+        bc.sink.truncate(mark);
+        bc.body.expected = null;
+        const bare = try bc.typeOf(node_idx);
+        const keep = bc.errorCountSince(mark) > hinted_errs;
+        try bc.hint_choices.put(bc.gpa, node_idx, .{ .hint = h, .keep = keep });
+        if (!keep) return bare;
+        bc.sink.truncate(mark);
+        bc.body.expected = hinted;
+        return bc.typeOf(node_idx);
     }
 
     /// Mint the poison type ONLY after THIS fn's local sink already reported a

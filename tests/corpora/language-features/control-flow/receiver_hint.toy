@@ -1,7 +1,9 @@
 # Feature: a method call's expected type reaches its receiver only as a hint, through every
 # arm, break and block tail of a value receiver and through a match scrutinee: a list
 # literal, a generic constructor or a literal that cannot produce it keeps its own type.
-# expect: stdout "3 1 2 2 31 32 33 34 1 1 1\n"
+# When the arms would meet the hint in different ways (`300` cannot be an `int8`, `1`
+# can), the receiver is typed with no hint, so its arms still agree.
+# expect: stdout "3 1 2 2 31 32 33 34 1 1 1 1 0 1 1 0 2\n"
 # expect: exit 1
 import std/io
 import std/option
@@ -17,6 +19,13 @@ impl int {
 
 fn scrutinee() -> int8 {
     match 300 {
+        300 -> 1,
+        _ -> 2,
+    }
+}
+
+fn scrutinee_arms(c: bool) -> int8 {
+    match (if c { 1 } else { 300 }) {
         300 -> 1,
         _ -> 2,
     }
@@ -39,9 +48,16 @@ fn main() -> int {
     x: int8 = (loop { break 300 }).small()
     y: int8 = (@b { break @b 300 }).small()
     z: int8 = 300.small()
+    i1: int8 = (if c { 300 } else { 1 }).small()
+    i2: int8 = (if c { 1 } else { 300 }).small()
+    m1: int8 = (match c { true -> 300, false -> 1 }).small()
+    p1: int8 = (if c { 300 } else { 1 } |> .small())
+    l1: int8 = (loop { if c { break 1 } else { break 300 } }).small()
     io.println(" ".join([
         a.to_string(), b.to_string(), d.to_string(), e.to_string(),
         show(s1), show(s2), show(s3), show(s4), x.to_string(), y.to_string(), z.to_string(),
+        i1.to_string(), i2.to_string(), m1.to_string(), p1.to_string(), l1.to_string(),
+        scrutinee_arms(c).to_string(),
     ]))
     k: int = scrutinee().into()
     return k
