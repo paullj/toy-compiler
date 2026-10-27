@@ -1,0 +1,67 @@
+# Regression: a struct field, a variant payload or a generic call's arg was typed under
+# the expected type of the whole expression, so a list literal, an integer literal or a
+# nested generic constructor read the parent's type (false T0065, T0015, T0016, T0041).
+# expect: exit 127
+import std/option
+import std/vec
+
+struct Bag[T] { xs: Vec[T] }
+struct Box[T] { v: T }
+struct OBox[T] { v: Option[T] }
+struct Pair[A, B] { a: A, b: Vec[B] }
+struct W[T] { inner: Option[T] }
+struct Wn[T] { v: T, n: int8 }
+enum E[T] { a(T, int8), b }
+
+impl Wn[T] {
+    fn of(v: T, n: int8) -> Wn[T] { Wn[T] { v: v, n: n } }
+}
+
+impl Box[T] {
+    fn get(self) -> T { self.v }
+}
+
+fn first[T](xs: Vec[T]) -> T { xs[0] }
+fn wrap[T](x: T) -> Option[T] { Option.some(x) }
+fn id[T](x: T) -> T { x }
+fn mk[T](v: T, n: int8) -> Wn[T] { Wn[T] { v: v, n: n } }
+
+fn nest(v: int) -> Option[Option[int]] { Option.some(Option.some(v)) }
+
+fn make(a: int) -> Pair[int, str] { Pair { a: a, b: [] } }
+
+fn repro() -> int {
+    b: Bag[int] = Bag { xs: [1, 2] }
+    n: int = first([5, 6])
+    o := nest(3)
+    return b.xs.len() + n + if o.is_some() { 1 } else { 0 }
+}
+
+fn main() -> int {
+    r := 0
+    if repro() == 8 { r = r + 1 }
+    b1: Box[int8] = Box { v: 1 }
+    b2: OBox[int] = OBox { v: Option.none }
+    p := make(4)
+    x1: Option[int8] = Option.some(5)
+    x2: Option[Vec[int]] = Option.some([1, 2])
+    n1: int8 = first([5, 6])
+    if b1.v == 1 && b2.v.is_none() && p.a == 4 && p.b.len() == 0 { r = r + 2 }
+    if x1.is_some() && x2.is_some() && n1 == 5 { r = r + 4 }
+    o1: Option[int8] = wrap(5)
+    o2: Option[Option[int]] = wrap(Option.some(1))
+    if o1.is_some() && o2.is_some() { r = r + 8 }
+    b3 := Bag[int] { xs: [1, 2] }
+    n2: int8 = id(5)
+    x3: int8 = Box { v: 1 }.get()
+    if b3.xs.len() == 2 && n2 == 5 && x3 == 1 { r = r + 16 }
+    w: W[int] = W { inner: Option.some(3) }
+    if w.inner.is_some() { r = r + 32 }
+    e := E.a(5, 3)
+    c := Wn { v: 5, n: 3 }
+    m := mk(5, 3)
+    a := Wn.of(5, 3)
+    en: int8 = match e { .a(_, k) -> k, .b -> 0 }
+    if en == 3 && c.n == 3 && m.n == 3 && a.n == 3 { r = r + 64 }
+    return r
+}

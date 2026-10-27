@@ -938,6 +938,29 @@ pub const BodyChecker = struct {
         return bc.typeOf(node_idx);
     }
 
+    /// The expected type of a part of a generic construction or call (a field value, a
+    /// payload, an arg): its declared pattern `pat` outright when that holds no type
+    /// parameter, else through `targs`, the type args the parent's own expected type
+    /// binds. When that gives no type the part is typed on its own, never against the
+    /// parent's type (`partHint`).
+    pub fn partWant(bc: *BodyChecker, pat: Type, targs: ?[]const Type) ?Expected {
+        const soft = if (bc.body.expected) |e| e.soft else false;
+        if (bc.isGround(pat)) return .{ .ty = pat, .soft = soft };
+        if (targs) |ta| {
+            const w = substTy(bc, pat, ta);
+            if (w.kind != .invalid and bc.givesType(w)) return .{ .ty = w, .soft = soft };
+        }
+        return bc.partHint();
+    }
+
+    /// What a part with no type of its own takes from its parent: nothing, unless the
+    /// parent holds only a receiver's hint, which never errors and so reaches the parts
+    /// as itself (`x: int8 = Box { v: 1 }.get()` makes the `1` an `int8`).
+    pub fn partHint(bc: *const BodyChecker) ?Expected {
+        const e = bc.body.expected orelse return null;
+        return if (e.soft) e else null;
+    }
+
     /// A method call's receiver. The call's expected type is the result's, not the
     /// receiver's, yet a receiver that is itself a literal used to take it (`x: int8 =
     /// Box { v: 1 }.get()`), and programs rely on that; so it reaches the receiver only as
@@ -1358,7 +1381,7 @@ pub const BodyChecker = struct {
         if (lhs.tag == .type_app and !bc.appHeadIsValue(n.lhs)) {
             const app_ty = bc.typeFromNode(n.lhs); // App or invalid (already diagnosed)
             if (!app_ty.isApp()) {
-                for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |fi| _ = try bc.typeOf(bc.tree.nodes[(fi).int()].lhs);
+                for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |fi| _ = try bc.typeUnder(bc.tree.nodes[(fi).int()].lhs, bc.partHint());
                 return .invalid;
             }
             const e = bc.composite.at(app_ty.appIdx());
@@ -1372,7 +1395,7 @@ pub const BodyChecker = struct {
             // always a plain type-name identifier; no enum routing needed.
             disp_name = bc.nameText(lhs.main_token);
             const id = bc.activeStructMap().get(disp_name) orelse {
-                for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |fi| _ = try bc.typeOf(bc.tree.nodes[(fi).int()].lhs);
+                for (Ast.rangeSlice(bc.tree, (n.rhs).int())) |fi| _ = try bc.typeUnder(bc.tree.nodes[(fi).int()].lhs, bc.partHint());
                 try bc.sink.report(.{ .span = bc.tokSpan(lhs.main_token), .code = .T0001 }, "unknown struct type '{s}'", .{disp_name});
                 return .invalid;
             };
@@ -1388,7 +1411,6 @@ pub const BodyChecker = struct {
                 // these via `pretyped`, so inner-value diagnostics aren't double-emitted.
                 const pre = try bc.gpa.alloc(Type, inits.len);
                 defer bc.gpa.free(pre);
-                for (inits, 0..) |fi_idx, ii| pre[ii] = try bc.typeOf(bc.tree.nodes[(fi_idx).int()].lhs);
                 // Align values to decl order + record each field's first supplier (for
                 // conflict spans). A missing field's slot stays `.invalid`/`Ast.none`: the
                 // matcher's never/invalid rule skips it and its span is never dereferenced.
@@ -1398,17 +1420,15 @@ pub const BodyChecker = struct {
                 const supplier = try bc.gpa.alloc(Ast.Index, gsym.field_names.len);
                 defer bc.gpa.free(supplier);
                 @memset(supplier, Ast.none);
+                const exp_args = bc.expectedAppArgs(id, false);
                 for (inits, 0..) |fi_idx, ii| {
-                    const fname = bc.nameText(bc.tree.nodes[(fi_idx).int()].main_token);
-                    for (gsym.field_names, 0..) |dn, j| {
-                        if (std.mem.eql(u8, dn, fname)) {
-                            if (supplier[j] == Ast.none) {
-                                supplier[j] = fi_idx;
-                                aligned[j] = pre[ii];
-                            }
-                            break;
-                        }
-                    }
+                    const fi = bc.tree.nodes[(fi_idx).int()];
+                    const j = fieldIndex(gsym.field_names, bc.nameText(fi.main_token));
+                    pre[ii] = try bc.typeUnder(fi.lhs, if (j) |k| bc.partWant(gsym.field_types[k], exp_args) else bc.partHint());
+                    if (j) |k| if (supplier[k] == Ast.none) {
+                        supplier[k] = fi_idx;
+                        aligned[k] = pre[ii];
+                    };
                 }
                 const n_gp: u32 = @intCast(gsym.generic_params.len);
                 const out = try bc.gpa.alloc(Type, n_gp);
@@ -1436,7 +1456,7 @@ pub const BodyChecker = struct {
                     // Target-fill any still-open param from the expected type
                     // (`p: Phantom[int] = Phantom{..}`); an arg-vs-expected disagreement
                     // surfaces as T0015. Byte-identical when no target exists.
-                    .ok, .unbound => switch (try bc.reconcileTargetArgs(out, bnd, bc.expectedAppArgs(id, false), gsym.generic_params, lhs.main_token)) {
+                    .ok, .unbound => switch (try bc.reconcileTargetArgs(out, bnd, exp_args, gsym.generic_params, lhs.main_token)) {
                         .ok => {
                             const app = Type.app(try bc.internApp(id, out, false));
                             return bc.checkStructFieldInits(node_idx, n, gsym, out, disp_name, app, pre);
@@ -1501,7 +1521,7 @@ pub const BodyChecker = struct {
             // expected type (`s: S = S { tags: ["y"] }`). A fn-typed field hands its type down
             // even when it holds a type var: a lambda's params come from it.
             const field_want: ?Type = if (want) |w| (if (w.isFunc() or (w.kind != .invalid and bc.givesType(w))) w else null) else null;
-            const vt = if (pretyped) |pt| pt[ii] else if (field_want) |w| try bc.typeOfExpected(fi.lhs, w) else try bc.typeOf(fi.lhs);
+            const vt = if (pretyped) |pt| pt[ii] else if (field_want) |w| try bc.typeOfExpected(fi.lhs, w) else try bc.typeUnder(fi.lhs, bc.partHint());
             if (found) |j| {
                 if (seen[j]) {
                     try bc.sink.report(.{ .span = bc.tokSpan(fi.main_token), .code = .T0064 }, "duplicate field '{s}' in '{s}'", .{ fname, disp_name });
@@ -1822,9 +1842,9 @@ pub const BodyChecker = struct {
     fn typeArgsForEffect(bc: *BodyChecker, node_form: InitForm, args: Ast.Index) error{OutOfMemory}!void {
         if (args == Ast.none) return;
         if (node_form == .@"struct") {
-            for (Ast.rangeSlice(bc.tree, (args).int())) |fi| _ = try bc.typeOf(bc.tree.nodes[(fi).int()].lhs);
+            for (Ast.rangeSlice(bc.tree, (args).int())) |fi| _ = try bc.typeUnder(bc.tree.nodes[(fi).int()].lhs, bc.partHint());
         } else {
-            for (Ast.rangeSlice(bc.tree, (args).int())) |a| _ = try bc.typeOf(a);
+            for (Ast.rangeSlice(bc.tree, (args).int())) |a| _ = try bc.typeUnder(a, bc.partHint());
         }
     }
 
@@ -1862,8 +1882,17 @@ pub const BodyChecker = struct {
         const arg_nodes: []const Ast.Index = if (args == Ast.none) &.{} else Ast.rangeSlice(bc.tree, (args).int());
         const pre = try bc.gpa.alloc(Type, arg_nodes.len);
         defer bc.gpa.free(pre);
+        const exp_args = bc.expectedAppArgs(enum_id, true);
+        const fits = formMatches(node_form, variant.form);
         for (arg_nodes, 0..) |a_idx, ii| {
-            pre[ii] = if (node_form == .@"struct") try bc.typeOf(bc.tree.nodes[(a_idx).int()].lhs) else try bc.typeOf(a_idx);
+            if (node_form == .@"struct") {
+                const fi = bc.tree.nodes[(a_idx).int()];
+                const j = if (fits) fieldIndex(variant.field_names, bc.nameText(fi.main_token)) else null;
+                pre[ii] = try bc.typeUnder(fi.lhs, if (j) |k| bc.partWant(variant.field_types[k], exp_args) else bc.partHint());
+            } else {
+                const pat: ?Type = if (fits and ii < variant.field_types.len) variant.field_types[ii] else null;
+                pre[ii] = try bc.typeUnder(a_idx, if (pat) |t| bc.partWant(t, exp_args) else bc.partHint());
+            }
         }
 
         // Align payload value types to the variant's declared payload PATTERNS: positional
@@ -1878,7 +1907,7 @@ pub const BodyChecker = struct {
         const supplier = try bc.gpa.alloc(Ast.Index, variant.field_types.len);
         defer bc.gpa.free(supplier);
         @memset(supplier, site);
-        if (formMatches(node_form, variant.form)) {
+        if (fits) {
             if (want_struct) {
                 for (arg_nodes, 0..) |fi_idx, ii| {
                     const fname = bc.nameText(bc.tree.nodes[(fi_idx).int()].main_token);
@@ -1920,7 +1949,7 @@ pub const BodyChecker = struct {
             // Both a full arg-bind (`.ok`) and a partial/nullary bind (`.unbound`) funnel
             // through the target-fill: the expected type (`x: Opt[int] = Opt.none`) pins
             // any still-open param, and an arg-vs-expected disagreement surfaces as T0015.
-            .ok, .unbound => switch (try bc.reconcileTargetArgs(out, bnd, bc.expectedAppArgs(enum_id, true), e.generic_params, vtok)) {
+            .ok, .unbound => switch (try bc.reconcileTargetArgs(out, bnd, exp_args, e.generic_params, vtok)) {
                 .ok => return bc.checkVariantPayloads(site, enum_id, vtok, node_form, args, out, pre),
                 .err => return .invalid,
                 .unbound => |ord| {
@@ -1932,6 +1961,11 @@ pub const BodyChecker = struct {
                 },
             },
         }
+    }
+
+    fn fieldIndex(names: []const []const u8, name: []const u8) ?usize {
+        for (names, 0..) |dn, j| if (std.mem.eql(u8, dn, name)) return j;
+        return null;
     }
 
     /// Whether a construction node's form matches a variant's declared form.
@@ -1982,7 +2016,7 @@ pub const BodyChecker = struct {
                 const elems = if (args == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, (args).int());
                 if (elems.len != variant.field_types.len) {
                     if (pretyped == null) {
-                        for (elems) |a| _ = try bc.typeOf(a);
+                        for (elems) |a| _ = try bc.typeUnder(a, bc.partHint());
                     }
                     try bc.sink.report(.{ .span = bc.countSpan(site), .code = .T0039 }, "variant '{s}.{s}' expects {d} value(s), got {d}{s}", .{ e.name, vname, variant.field_types.len, elems.len, bc.pipedArityHint(site) });
                     return result;
@@ -2021,7 +2055,7 @@ pub const BodyChecker = struct {
                         if (!Type.assignable(fty, vt))
                             try bc.sink.report(.{ .span = bc.spanOf(fi.lhs), .code = .T0041 }, "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
                     } else {
-                        if (pretyped == null) _ = try bc.typeOf(fi.lhs);
+                        if (pretyped == null) _ = try bc.typeUnder(fi.lhs, bc.partHint());
                         try bc.sink.report(.{ .span = bc.tokSpan(fi.main_token), .code = .T0046 }, "unknown field '{s}' in '{s}.{s}'", .{ fname, e.name, vname });
                     }
                 }
@@ -2051,7 +2085,7 @@ pub const BodyChecker = struct {
         const result = Type.structT(sid);
         const elems = if (n.rhs == Ast.none) &[_]Ast.Index{} else Ast.rangeSlice(bc.tree, (n.rhs).int());
         if (elems.len != sym.field_types.len) {
-            for (elems) |a| _ = try bc.typeOf(a); // surface inner arg errors first
+            for (elems) |a| _ = try bc.typeUnder(a, bc.partHint()); // surface inner arg errors first
             try bc.sink.report(.{ .span = bc.argsSpan(call), .code = .T0039 }, "tuple struct '{s}' expects {d} value(s), got {d}{s}", .{ sym.name, sym.field_types.len, elems.len, bc.pipedArityHint(call) });
             return result;
         }
@@ -3881,7 +3915,7 @@ pub const BodyChecker = struct {
             }
             const sig = bc.fnSig(f, bc.nameText(callee.main_token));
             if (args.len != f.params.len) {
-                for (args) |arg| _ = try CallInfer.typeOfGenericArg(bc, arg, .call_expected, null);
+                for (args) |arg| _ = try CallInfer.typeOfGenericArg(bc, arg, bc.partHint());
                 try bc.reportArity(node_idx, args.len, sig);
                 return .invalid; // never leak f.ret (a type_var) on the error path
             }
@@ -3889,7 +3923,7 @@ pub const BodyChecker = struct {
             defer bc.gpa.free(arg_types);
             const out = try bc.gpa.alloc(Type, f.generic_params.len);
             defer bc.gpa.free(out);
-            switch (try CallInfer.inferArgs(bc, .{ .call = node_idx, .sig = sig }, args, f.params, f.generic_params, null, .call_expected, arg_types, out)) {
+            switch (try CallInfer.inferArgs(bc, .{ .call = node_idx, .sig = sig }, args, f.params, f.generic_params, null, .{ .ret = f.ret }, arg_types, out)) {
                 .failed => return .invalid,
                 .unbound => |ord| {
                     try bc.reportUninferable(bc.spanOf(node_idx), " '{s}'", .{f.generic_params[ord]}, bc.calleeText(n.lhs), out, &.{"(..)"}, null);
