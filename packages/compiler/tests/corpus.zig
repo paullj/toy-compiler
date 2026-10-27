@@ -20,9 +20,12 @@
 //!
 //! `.expect` — the `# expect:` directive harness (ported from the old `check.sh`
 //!   pair). A fixture carries `# expect: exit <N>` / `# expect: stdout "<bytes>"` /
-//!   `# expect: compile-error "<substr>"`. A compile-error fixture must FAIL the
-//!   front-end with a diagnostic containing the substring; every other fixture must
-//!   compile, run, and match its exit code and/or stdout. The build+run is the same
+//!   `# expect: stderr "<substr>"` / `# expect: compile-error "<substr>"`. A
+//!   compile-error fixture must FAIL the front-end with a diagnostic containing the
+//!   substring; every other fixture must compile, run, and match its exit code, its
+//!   exact stdout and/or a substring of its stderr. The run gets `# stdin: "<bytes>"`
+//!   on a pipe (empty by default, never inherited), `# args: "a" "b c"` after argv[0],
+//!   only the `# env: K=V` variables, and its worker's scratch dir as cwd. The build+run is the same
 //!   in-process path the real `toy build` uses (`Graph.discover` -> `resolveGraph`
 //!   -> `checkGraph` -> `lowerGraphProgram` -> `buildImage`), so it follows imports
 //!   and multi-file module graphs. Codegen+exec is gated on macOS/aarch64; off that
@@ -373,19 +376,34 @@ const Corpus = struct {
 
 const manifest: []const Corpus = @import("corpus_manifest.zon");
 
-/// The parsed `# expect:` directives of one fixture. `any` gates the "a fixture with
-/// no directive is a mistake" check (matching the old bash). `stdout`/`cerr` are owned
-/// when non-null/non-empty (see `deinit`).
+/// The parsed directives of one fixture: the `# expect:` checks, and the `# stdin:`,
+/// `# args:` and `# env:` inputs the run gets. `any` gates the "a fixture with no
+/// expect directive is a mistake" check (matching the old bash). Every slice is owned
+/// (see `deinit`).
 const Expect = struct {
     any: bool = false,
     exit: ?u8 = null,
     stdout: ?[]const u8 = null,
+    /// Substrings stderr must contain. Not an exact match: a panic's backtrace ends in
+    /// unsymbolized frames whose addresses move with ASLR.
+    stderr: std.ArrayList([]const u8) = .empty,
     cerr_expected: bool = false,
     cerr: []const u8 = "",
+    stdin: std.ArrayList(u8) = .empty,
+    args: std.ArrayList([]const u8) = .empty,
+    /// `K=V` entries; the run's environment holds these and nothing else.
+    env: std.ArrayList([]const u8) = .empty,
 
     fn deinit(self: *Expect, gpa: std.mem.Allocator) void {
         if (self.stdout) |s| gpa.free(s);
         if (self.cerr.len != 0) gpa.free(self.cerr);
+        for (self.stderr.items) |s| gpa.free(s);
+        self.stderr.deinit(gpa);
+        self.stdin.deinit(gpa);
+        for (self.args.items) |s| gpa.free(s);
+        self.args.deinit(gpa);
+        for (self.env.items) |s| gpa.free(s);
+        self.env.deinit(gpa);
     }
 };
 
@@ -425,13 +443,56 @@ fn betweenQuotes(s: []const u8) ?[]const u8 {
     return s[first + 1 .. last];
 }
 
-/// Parse every `# expect:` directive out of `source`. Recognized directives:
-/// `exit <N>`, `stdout "<bytes>"`, `compile-error "<substr>"`. Caller `deinit`s.
+/// Split `# args:` into its quoted words (`"a" "b c"`), each escape-decoded. A word
+/// that is not quoted is an error rather than a guess at shell splitting.
+fn parseArgs(gpa: std.mem.Allocator, body: []const u8, out: *std.ArrayList([]const u8)) !void {
+    var i: usize = 0;
+    while (true) {
+        while (i < body.len and (body[i] == ' ' or body[i] == '\t' or body[i] == '\r')) i += 1;
+        if (i == body.len) return;
+        if (body[i] != '"') return error.BadArgsDirective;
+        const start = i + 1;
+        var j = start;
+        while (j < body.len and body[j] != '"') : (j += 1) {
+            if (body[j] == '\\') j += 1;
+        }
+        if (j >= body.len) return error.BadArgsDirective;
+        const word = try decodeEscapes(gpa, body[start..j]);
+        errdefer gpa.free(word);
+        try out.append(gpa, word);
+        i = j + 1;
+    }
+}
+
+/// Parse every directive out of `source`. The `# expect:` checks are `exit <N>`,
+/// `stdout "<bytes>"`, `stderr "<substr>"` and `compile-error "<substr>"`; the run
+/// inputs are `# stdin: "<bytes>"` (repeats concatenate), `# args: "a" "b c"` (repeats
+/// append) and `# env: K=V`. Caller `deinit`s.
 fn parseExpect(gpa: std.mem.Allocator, source: []const u8) !Expect {
     var e: Expect = .{};
     errdefer e.deinit(gpa);
     var it = std.mem.splitScalar(u8, source, '\n');
     while (it.next()) |line| {
+        if (std.mem.startsWith(u8, line, "# stdin:")) {
+            const raw = betweenQuotes(line["# stdin:".len..]) orelse return error.BadStdinDirective;
+            const bytes = try decodeEscapes(gpa, raw);
+            defer gpa.free(bytes);
+            try e.stdin.appendSlice(gpa, bytes);
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "# args:")) {
+            try parseArgs(gpa, line["# args:".len..], &e.args);
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "# env:")) {
+            const kv = std.mem.trim(u8, line["# env:".len..], " \t\r");
+            const eq = std.mem.indexOfScalar(u8, kv, '=') orelse return error.BadEnvDirective;
+            if (eq == 0) return error.BadEnvDirective;
+            const owned = try gpa.dupe(u8, kv);
+            errdefer gpa.free(owned);
+            try e.env.append(gpa, owned);
+            continue;
+        }
         const prefix = "# expect:";
         if (!std.mem.startsWith(u8, line, prefix)) continue;
         const body = std.mem.trim(u8, line[prefix.len..], " \t\r");
@@ -445,6 +506,12 @@ fn parseExpect(gpa: std.mem.Allocator, source: []const u8) !Expect {
                 e.stdout = try decodeEscapes(gpa, raw);
                 e.any = true;
             }
+        } else if (std.mem.startsWith(u8, body, "stderr")) {
+            const raw = betweenQuotes(body) orelse return error.BadStderrDirective;
+            const sub = try decodeEscapes(gpa, raw);
+            errdefer gpa.free(sub);
+            try e.stderr.append(gpa, sub);
+            e.any = true;
         } else if (std.mem.startsWith(u8, body, "compile-error")) {
             e.cerr_expected = true;
             e.any = true;
@@ -467,15 +534,27 @@ const RunResult = union(enum) {
     /// Front-end was clean but this host cannot exec the emitted binary; counted as
     /// covered without an exit/stdout check.
     skipped_exec,
-    /// The program compiled and ran; `stdout` is owned.
-    ran: struct { term: std.process.Child.Term, stdout: []const u8 },
+    /// The program compiled and ran.
+    ran: Ran,
 
     fn deinit(self: *RunResult, gpa: std.mem.Allocator) void {
         switch (self.*) {
             .compile_error => |s| gpa.free(s),
-            .ran => |r| gpa.free(r.stdout),
+            .ran => |r| r.deinit(gpa),
             .skipped_exec => {},
         }
+    }
+};
+
+/// One finished run of a binary; `stdout` and `stderr` are owned.
+const Ran = struct {
+    term: std.process.Child.Term,
+    stdout: []const u8,
+    stderr: []const u8 = "",
+
+    fn deinit(r: Ran, gpa: std.mem.Allocator) void {
+        gpa.free(r.stdout);
+        gpa.free(r.stderr);
     }
 };
 
@@ -528,6 +607,8 @@ fn compileAndRun(
     cache: Cache,
     entry: []const u8,
     out_name: []const u8,
+    e: *const Expect,
+    cwd: []const u8,
 ) !RunResult {
     var graph = try Graph.discover(gpa, io, cache, Driver.default_target, entry, .{});
     defer graph.deinit(gpa);
@@ -578,19 +659,55 @@ fn compileAndRun(
             return .{ .compile_error = try std.fmt.allocPrint(gpa, "codesign rejected {s}\n", .{out_name}) };
         }
     }
-    // Capture stderr too (and discard it): a fixture that panics writes a backtrace to
-    // fd 2, and under `zig build test` the test binary's inherited stderr is part of the
-    // build runner's `--listen=-` results stream — leaking a child backtrace onto it
-    // corrupts that protocol. Piping + draining stderr keeps it off the inherited fd.
-    var child = try std.process.spawn(io, .{ .argv = &.{abs}, .stdout = .pipe, .stderr = .pipe });
+    return .{ .ran = try runBinary(gpa, io, abs, e, cwd) };
+}
+
+/// Run `abs` with `e`'s args, stdin and environment, in `cwd`, capturing both output
+/// streams. Every stdio fd is piped: under `zig build test` the test binary's stdin and
+/// stderr are the build runner's `--listen=-` protocol stream, so a child that read
+/// the inherited stdin would eat protocol bytes, and one that wrote a backtrace to the
+/// inherited stderr would corrupt it. The environment starts empty so a fixture cannot
+/// pass or fail on whatever the developer's shell exports.
+fn runBinary(gpa: std.mem.Allocator, io: Io, abs: []const u8, e: *const Expect, cwd: []const u8) !Ran {
+    const argv = try gpa.alloc([]const u8, 1 + e.args.items.len);
+    defer gpa.free(argv);
+    argv[0] = abs;
+    @memcpy(argv[1..], e.args.items);
+
+    var env: std.process.Environ.Map = .init(gpa);
+    defer env.deinit();
+    for (e.env.items) |kv| {
+        const eq = std.mem.indexOfScalar(u8, kv, '=').?;
+        try env.put(kv[0..eq], kv[eq + 1 ..]);
+    }
+
+    var child = try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .environ_map = &env,
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    errdefer child.kill(io);
+    // The fixtures' stdin is far below a pipe buffer, so writing it all before reading
+    // any output cannot deadlock. A child that exits without reading it closes the pipe
+    // first; that is the child's business, not a harness failure.
+    child.stdin.?.writeStreamingAll(io, e.stdin.items) catch |err| switch (err) {
+        error.BrokenPipe => {},
+        else => return err,
+    };
+    child.stdin.?.close(io);
+    child.stdin = null;
+
     var rdr = child.stdout.?.readerStreaming(io, &.{});
     const got = try rdr.interface.allocRemaining(gpa, .limited(1 << 16));
     errdefer gpa.free(got);
     var errr = child.stderr.?.readerStreaming(io, &.{});
     const err_bytes = try errr.interface.allocRemaining(gpa, .limited(1 << 16));
-    gpa.free(err_bytes);
+    errdefer gpa.free(err_bytes);
     const term = try child.wait(io);
-    return .{ .ran = .{ .term = term, .stdout = got } };
+    return .{ .term = term, .stdout = got, .stderr = err_bytes };
 }
 
 /// The exit code of a finished child, or `null` for a signal death (a bounds/panic
@@ -639,6 +756,11 @@ fn judge(gpa: std.mem.Allocator, name: []const u8, e: Expect, r: RunResult) !?[]
                     return try std.fmt.allocPrint(gpa, "{s}: stdout mismatch (got \"{s}\", want \"{s}\")", .{ name, run.stdout, want });
                 }
             }
+            for (e.stderr.items) |want| {
+                if (std.mem.indexOf(u8, run.stderr, want) == null) {
+                    return try std.fmt.allocPrint(gpa, "{s}: stderr lacks \"{s}\" (got \"{s}\")", .{ name, want, run.stderr });
+                }
+            }
             return null;
         },
     }
@@ -662,6 +784,7 @@ fn checkExpectFixture(
     cache: Cache,
     entry: []const u8,
     out_name: []const u8,
+    cwd: []const u8,
 ) !?[]const u8 {
     const source = try Io.Dir.cwd().readFileAlloc(io, entry, gpa, .unlimited);
     defer gpa.free(source);
@@ -669,7 +792,7 @@ fn checkExpectFixture(
     var e = try parseExpect(gpa, source);
     defer e.deinit(gpa);
 
-    var r = try compileAndRun(gpa, io, cache, entry, out_name);
+    var r = try compileAndRun(gpa, io, cache, entry, out_name, &e, cwd);
     defer r.deinit(gpa);
 
     return judge(gpa, entry, e, r);
@@ -740,26 +863,28 @@ const Run = struct {
     out_dir: []const u8,
     next: std.atomic.Value(usize) = .init(0),
 
-    fn work(run: *Run, cache: Cache) void {
+    /// `cwd` is the worker's own scratch dir, so a fixture that touches files never
+    /// races another worker's fixture.
+    fn work(run: *Run, cache: Cache, cwd: []const u8) void {
         while (true) {
             const i = run.next.fetchAdd(1, .monotonic);
             if (i >= run.fixtures.len) return;
             const f = run.fixtures[i];
-            run.failures[i] = run.check(cache, i) catch |e| blk: {
+            run.failures[i] = run.check(cache, cwd, i) catch |e| blk: {
                 const msg: []const u8 = std.fmt.allocPrint(run.gpa, "{s}: {t}", .{ f.path, e }) catch @panic("OOM");
                 break :blk msg;
             };
         }
     }
 
-    fn check(run: *Run, cache: Cache, i: usize) !?[]const u8 {
+    fn check(run: *Run, cache: Cache, cwd: []const u8, i: usize) !?[]const u8 {
         const f = run.fixtures[i];
         return switch (f.mode) {
             .diagnostics => checkFixture(run.gpa, run.io, cache, f.path),
             .expect => {
                 const out_name = try std.fmt.allocPrint(run.gpa, "{s}/f{d}", .{ run.out_dir, i });
                 defer run.gpa.free(out_name);
-                return checkExpectFixture(run.gpa, run.io, cache, f.path, out_name);
+                return checkExpectFixture(run.gpa, run.io, cache, f.path, out_name, cwd);
             },
         };
     }
@@ -813,6 +938,8 @@ fn runCorpus(gpa: std.mem.Allocator) !void {
     const workers = @min(picked.items.len, std.Thread.getCpuCount() catch 1);
     const dirs = try gpa.alloc([80]u8, workers);
     defer gpa.free(dirs);
+    const cwds = try gpa.alloc([80]u8, workers);
+    defer gpa.free(cwds);
     const threads = try gpa.alloc(std.Thread, workers);
     defer gpa.free(threads);
     {
@@ -820,7 +947,9 @@ fn runCorpus(gpa: std.mem.Allocator) !void {
         defer for (threads[0..spawned]) |t| t.join();
         for (dirs, 0..) |*buf, w| {
             const cache = try Cache.init(io, std.fmt.bufPrint(buf, "{s}/cache{d}", .{ out_dir, w }) catch unreachable);
-            threads[w] = try std.Thread.spawn(.{}, Run.work, .{ &run, cache });
+            const cwd = std.fmt.bufPrint(&cwds[w], "{s}/cwd{d}", .{ out_dir, w }) catch unreachable;
+            try Io.Dir.cwd().createDirPath(io, cwd);
+            threads[w] = try std.Thread.spawn(.{}, Run.work, .{ &run, cache, cwd });
             spawned += 1;
         }
     }
@@ -1015,6 +1144,98 @@ test "expect harness: judge PASSES exact exit, trailing-newline-insensitive stdo
     try testing.expect((try judge(gpa, "t.toy", .{ .any = true, .cerr_expected = true, .cerr = "undeclared" }, .{ .compile_error = "[R0001]: undeclared identifier 'x'\n" })) == null);
     // A clean front-end off-target counts as covered.
     try testing.expect((try judge(gpa, "t.toy", .{ .any = true, .exit = 0 }, .skipped_exec)) == null);
+}
+
+test "expect harness: parseExpect reads stderr, stdin, args and env directives" {
+    const gpa = testing.allocator;
+    var e = try parseExpect(gpa,
+        \\# expect: stderr "boom\n"
+        \\# expect: stderr "main"
+        \\# stdin: "a\n"
+        \\# stdin: "b"
+        \\# args: "x" "y z"  "q\"r"
+        \\# args: "w"
+        \\# env: K=V=W
+        \\# env: EMPTY=
+        \\
+    );
+    defer e.deinit(gpa);
+    try testing.expect(e.any);
+    try testing.expectEqual(@as(usize, 2), e.stderr.items.len);
+    try testing.expectEqualStrings("boom\n", e.stderr.items[0]);
+    try testing.expectEqualStrings("a\nb", e.stdin.items);
+    try testing.expectEqual(@as(usize, 4), e.args.items.len);
+    try testing.expectEqualStrings("y z", e.args.items[1]);
+    try testing.expectEqualStrings("q\"r", e.args.items[2]);
+    try testing.expectEqualStrings("w", e.args.items[3]);
+    try testing.expectEqualStrings("K=V=W", e.env.items[0]);
+    try testing.expectEqualStrings("EMPTY=", e.env.items[1]);
+
+    // Input directives alone are not a check.
+    var only_in = try parseExpect(gpa, "# stdin: \"x\"\n# args: \"a\"\n");
+    defer only_in.deinit(gpa);
+    try testing.expect(!only_in.any);
+
+    try testing.expectError(error.BadArgsDirective, parseExpect(gpa, "# args: bare\n"));
+    try testing.expectError(error.BadArgsDirective, parseExpect(gpa, "# args: \"open\n"));
+    try testing.expectError(error.BadEnvDirective, parseExpect(gpa, "# env: NOEQ\n"));
+    try testing.expectError(error.BadEnvDirective, parseExpect(gpa, "# env: =V\n"));
+    try testing.expectError(error.BadStdinDirective, parseExpect(gpa, "# stdin: x\n"));
+    try testing.expectError(error.BadStderrDirective, parseExpect(gpa, "# expect: stderr x\n"));
+}
+
+test "expect harness: judge matches stderr by substring" {
+    const gpa = testing.allocator;
+    var e: Expect = .{ .any = true };
+    defer e.stderr.deinit(gpa);
+    try e.stderr.append(gpa, "boom\n");
+    const backtrace = "boom\n0x0000000000000054 main\n0x000000008f4fbbbc \n";
+    try testing.expect((try judge(gpa, "t.toy", e, .{ .ran = .{ .term = .{ .exited = 1 }, .stdout = "", .stderr = backtrace } })) == null);
+    try expectJudgeFailure(gpa, e, .{ .ran = .{ .term = .{ .exited = 1 }, .stdout = "", .stderr = "bang\n" } }, "stderr lacks");
+}
+
+test "expect harness: runBinary pipes stdin, passes args, empties env, and sets cwd" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var cwd_buf: [64]u8 = undefined;
+    const cwd = try std.fmt.bufPrint(&cwd_buf, ".zig-cache/tmp/{s}", .{&tmp.sub_path});
+    try tmp.dir.writeFile(io, .{ .sub_path = "marker", .data = "" });
+
+    var e = try parseExpect(gpa,
+        \\# stdin: "in\n"
+        \\# args: "a" "b c"
+        \\# env: K=V
+        \\
+    );
+    defer e.deinit(gpa);
+    // `$HOME` is set in every developer shell, so its absence proves the env is not inherited.
+    const script = "cat; printf '%s|' \"$#\" \"$1\" \"$2\" \"$K\" \"${HOME-unset}\"; ls; echo err >&2; exit 3";
+    var sh_e: Expect = .{};
+    defer sh_e.args.deinit(gpa);
+    try sh_e.args.appendSlice(gpa, &.{ "-c", script, "sh" });
+    try sh_e.args.appendSlice(gpa, e.args.items);
+    sh_e.stdin = e.stdin;
+    sh_e.env = e.env;
+
+    const r = try runBinary(gpa, io, "/bin/sh", &sh_e, cwd);
+    defer r.deinit(gpa);
+    try testing.expectEqual(@as(?u8, 3), exitCode(r.term));
+    try testing.expectEqualStrings("in\n2|a|b c|V|unset|marker\n", r.stdout);
+    try testing.expectEqualStrings("err\n", r.stderr);
+
+    // With no `# stdin:` the child reads EOF at once instead of blocking on an inherited fd.
+    var empty: Expect = .{};
+    defer empty.args.deinit(gpa);
+    try empty.args.appendSlice(gpa, &.{ "-c", "cat; echo done" });
+    const r2 = try runBinary(gpa, io, "/bin/sh", &empty, cwd);
+    defer r2.deinit(gpa);
+    try testing.expectEqualStrings("done\n", r2.stdout);
 }
 
 test "expect harness: parseExpect decodes escapes, passes raw UTF-8, and strips quotes" {

@@ -34,8 +34,23 @@ Every file starts with a `# Feature:` line and one or more `# expect:` lines:
 # Feature: <one line describing the feature exercised>
 # expect: exit <N>             # process exit code (main's int return, & 0xFF)
 # expect: stdout "<bytes>"     # exact stdout; \n / \t / \" escapes
+# expect: stderr "<substr>"   # stderr CONTAINS substr (repeatable); same escapes
 # expect: compile-error "<substr>"  # must fail to compile; substr appears in a diagnostic
 ```
+
+`# expect: stderr` is a substring match, not an exact one: a panic's backtrace
+ends in unsymbolized frames whose addresses change with ASLR.
+
+A program's run can also be given input:
+
+```
+# stdin: "<bytes>"             # piped to stdin; repeats concatenate; empty by default
+# args: "a" "b c"              # argv[1..], each word quoted; repeats append
+# env: K=V                     # the environment holds only these variables
+```
+
+stdin is always a pipe, never the harness's own, and the environment starts empty.
+Each program runs with its worker's scratch directory as cwd.
 
 A file may carry several `expect` lines (e.g. both `stdout` and `exit`). The
 prose after `# Feature:` and any further `#` comments explain the expected
