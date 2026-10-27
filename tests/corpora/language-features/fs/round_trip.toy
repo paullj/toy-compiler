@@ -1,0 +1,30 @@
+# Feature: `fs.write_file` then `fs.read_file` gives the bytes back; two `fs.append_file`
+# calls add to the end, and the first creates a missing file. Runs in the fixture's cwd.
+# expect: stdout "hello\nhello, world!\nab\n"
+# expect: exit 0
+import std/io
+import std/fs
+fn read(path: str) -> str {
+    return match fs.read_file(path) {
+        .ok(s) -> s,
+        .err(e) -> "error: ".concat(e.to_string()),
+    }
+}
+fn check(r: Result[(), fs.IoError]) {
+    match r {
+        .ok(_) -> {},
+        .err(e) -> io.println(e),
+    }
+}
+fn main() {
+    check(fs.write_file("fs_round_trip.txt", "hello"))
+    io.println(read("fs_round_trip.txt"))
+    check(fs.append_file("fs_round_trip.txt", ", world"))
+    check(fs.append_file("fs_round_trip.txt", "!"))
+    io.println(read("fs_round_trip.txt"))
+    check(fs.append_file("fs_round_trip_new.txt", "a"))
+    check(fs.append_file("fs_round_trip_new.txt", "b"))
+    io.println(read("fs_round_trip_new.txt"))
+    check(fs.remove("fs_round_trip.txt"))
+    check(fs.remove("fs_round_trip_new.txt"))
+}

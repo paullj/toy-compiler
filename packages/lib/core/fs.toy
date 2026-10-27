@@ -1,0 +1,92 @@
+# The quarantined libSystem file clients. Every wrapper returns its result (an fd, a byte
+# count or 0) or a negated errno, so std/fs maps a failure to an IoError without naming an
+# extern. Paths go through `os.to_cstr`; the caller has already rejected a NUL in them.
+import core/os
+import core/sys
+import core/text
+
+# open(2) is variadic: on arm64 Darwin its mode goes on the stack, which a toy extern call
+# cannot place (#72). So `open` never gets O_CREAT, and creating goes through creat(2),
+# which takes the mode as a plain second argument.
+pub extern fn open(path: rawptr, flags: int) -> int
+pub extern fn creat(path: rawptr, mode: int) -> int
+pub extern fn close(fd: int) -> int
+pub extern fn unlink(path: rawptr) -> int
+pub extern fn access(path: rawptr, mode: int) -> int
+
+# These calls return a C `int` in w0, and AAPCS64 leaves the top half of x0 unspecified, so
+# a -1 could read as 4294967295 without the sign extension.
+fn c_int(r: int) -> int {
+    v := r & 0xFFFF_FFFF
+    if v >= 0x8000_0000 { return v - 0x1_0000_0000 }
+    return v
+}
+
+fn or_errno(r: int) -> int {
+    v := c_int(r)
+    if v < 0 { return -os.errno() }
+    return v
+}
+
+pub fn open_read(path: str) -> int {
+    return or_errno(open(os.to_cstr(path), 0))
+}
+
+# Darwin's O_WRONLY (1) | O_APPEND (8).
+pub fn open_append(path: str) -> int {
+    return or_errno(open(os.to_cstr(path), 9))
+}
+
+# Creates `path` or truncates it, as 0644 (420), rw-r--r-- before the umask.
+pub fn create(path: str) -> int {
+    return or_errno(creat(os.to_cstr(path), 420))
+}
+
+pub fn close_fd(fd: int) -> int {
+    return or_errno(close(fd))
+}
+
+pub fn remove(path: str) -> int {
+    return or_errno(unlink(os.to_cstr(path)))
+}
+
+# access(2) with F_OK (0): whether the path resolves, whatever its permissions.
+pub fn exists(path: str) -> bool {
+    return c_int(access(os.to_cstr(path), 0)) == 0
+}
+
+# Writes all of `s`, again after a short write. Unlike `sys.write_fd` it reports an error,
+# since a file write that fails (a full disk, say) must reach the caller.
+pub fn write_all(fd: int, s: str) -> int {
+    rest := s
+    while rest.len() > 0 {
+        n := sys.write(fd, rest)
+        if n < 0 { return -os.errno() }
+        # A write that takes nothing would loop forever, so it reports EIO (5).
+        if n == 0 { return -5 }
+        rest = text.slice(rest, n, rest.len())
+    }
+    return 0
+}
+
+# Everything left on `fd`, or the errno of the failed read: reading a directory fails only
+# here (EISDIR), since open(2) accepts one. The buffer doubles when full, as in
+# `sys.read_fd_all`, which drops errors and so cannot serve here.
+pub fn read_all(fd: int) -> Result[str, int] {
+    cap := 4096
+    buf := text.alloc(cap)
+    len := 0
+    loop {
+        if len == cap {
+            next := text.alloc(cap * 2)
+            text.put(next, 0, text.take(buf, len))
+            buf = next
+            cap *= 2
+        }
+        n := sys.read(fd, text.window(buf, len, cap - len), cap - len)
+        if n < 0 { return Result[str, int].err(os.errno()) }
+        if n == 0 { break }
+        len += n
+    }
+    return Result.ok(text.take(buf, len))
+}

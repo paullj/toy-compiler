@@ -1,0 +1,4 @@
+# The file API (read_file, write_file, remove) lives in std/fs; without the import a use names it.
+fn main() -> bool {
+    return fs.exists("x")  #~ ERROR [R0001] add 'import std/fs'
+}

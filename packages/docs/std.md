@@ -49,6 +49,7 @@ core is the private layer between the compiler and std. It is the only place whe
 | `core/sys` | the libSystem `write` and `read` externs: `print(s)` to fd 1, `write_fd`, `read_fd_all` and `read_line_fd` |
 | `core/ffi` | the libm and `labs` externs and their safe wrappers |
 | `core/os` | the `_NSGetArgc`, `_NSGetArgv`, `getenv`, `strlen`, `exit`, `__error`, `clock_gettime_nsec_np` and `nanosleep` externs: `argc`, `argv(i)`, `env`, `exit_process`, `errno`, `monotonic_ns`, `realtime_ns`, `sleep_ns`, and `from_cstr` (copies) / `to_cstr` |
+| `core/fs` | the `open` (two arguments, never `O_CREAT`), `creat`, `close`, `unlink` and `access` externs: `open_read`, `open_append`, `create`, `close_fd`, `remove`, `exists`, `write_all` and `read_all`, each failure as a negated errno |
 | `core/mem` | the growable `gc_array` and the hash table behind Vec, Map and Set |
 | `core/text` | raw `str` parts: `slice`, and the `alloc`/`put`/`window`/`take` buffer that builds a str once |
 | `core/mem_selftest`, `core/desc_selftest` | heap and descriptor self-checks |
@@ -70,6 +71,7 @@ and never names a `.core` intrinsic.
 | `std/gc` | `collect()` and `collections()` |
 | `std/os` | `args()`, `env(name)` and `exit(code)`, over core/os |
 | `std/time` | `Instant`, `Duration`, `now()`, `sleep(d)`, `unix()` and `unix_ns()`, over core/os |
+| `std/fs` | `IoError`, `read_file`, `write_file`, `append_file`, `remove` and `exists`, over core/fs |
 
 ## std/io: output and input
 
@@ -182,6 +184,46 @@ fn main() {
     time.sleep(time.ms(20))
     if start.elapsed() >= time.ms(20) { io.println("slept") }
     io.println((time.secs(1) + time.ms(500)).ms())   # 1500
+}
+```
+
+## std/fs: whole files
+
+```toy
+pub fn read_file(path: str) -> Result[str, IoError]
+pub fn write_file(path: str, s: str) -> Result[(), IoError]    # creates or replaces
+pub fn append_file(path: str, s: str) -> Result[(), IoError]   # creates when missing
+pub fn remove(path: str) -> Result[(), IoError]
+pub fn exists(path: str) -> bool
+```
+
+- A relative path resolves against the process's working directory.
+- `IoError` names why a call failed, without the path (the caller has it):
+  `not_found`, `permission_denied`, `already_exists`, `is_directory`, `not_directory`,
+  `invalid_path` and `other(errno)`. Its Display is a short phrase such as `not found`
+  or `os error 28`.
+- A path holding a NUL byte is `invalid_path`, and makes no call: as a C string it would
+  name a shorter path. `exists` is false for one.
+- Reading a directory is `is_directory`, and a path through a file is `not_directory`.
+- A new file gets mode 0644 before the umask. Directories are not covered yet.
+
+```toy
+import std/fs
+import std/io
+
+fn main() {
+    match fs.write_file("notes.txt", "one\n") {
+        .ok(_) -> {},
+        .err(e) -> io.eprintln("write failed: ".concat(e.to_string())),
+    }
+    match fs.append_file("notes.txt", "two\n") {
+        .ok(_) -> {},
+        .err(e) -> io.eprintln(e),
+    }
+    match fs.read_file("notes.txt") {
+        .ok(s) -> io.print(s),
+        .err(e) -> io.eprintln(e),
+    }
 }
 ```
 
