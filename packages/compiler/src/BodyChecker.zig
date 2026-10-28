@@ -506,10 +506,6 @@ pub const BodyChecker = struct {
         return ControlFlow.stmtDiverges(bc.cflow(), stmt_idx);
     }
 
-    fn blockHasBreak(bc: *const BodyChecker, block_idx: Ast.Index, target: Ast.Index) bool {
-        return ControlFlow.blockHasBreak(bc.cflow(), block_idx, target);
-    }
-
     pub fn typeOfBlockExpected(bc: *BodyChecker, block_idx: Ast.Index, want_value: bool, exp: ?Type) error{OutOfMemory}!Type {
         const save = bc.body.expected;
         bc.body.expected = if (exp) |t| .{ .ty = t } else null;

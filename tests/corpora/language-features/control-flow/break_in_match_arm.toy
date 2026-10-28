@@ -1,0 +1,62 @@
+# Feature: a break inside a match arm leaves its loop (#128).
+# expect: exit 14
+# count stops at 3 through a bare break in an arm, init through a break in a binding's
+# match initializer (3), next_some on the none arm of an Option match (3), and outer
+# through a labeled break in an arm of an inner loop (5): 3 + 3 + 3 + 5.
+import std/option
+
+fn count() -> int {
+    i := 0
+    loop {
+        match i {
+            3 -> { break },
+            _ -> { i = i + 1 },
+        }
+    }
+    return i
+}
+
+fn init() -> int {
+    i := 0
+    loop {
+        x := match i {
+            3 -> { break },
+            _ -> i + 1,
+        }
+        i = x
+    }
+    return i
+}
+
+fn next(i: int) -> Option[int] {
+    if i < 3 { return Option.some(i + 1) }
+    return Option.none
+}
+
+fn next_some() -> int {
+    i := 0
+    loop {
+        match next(i) {
+            Option.some(v) -> { i = v },
+            Option.none -> { break },
+        }
+    }
+    return i
+}
+
+fn outer() -> int {
+    n := 0
+    @outer loop {
+        loop {
+            match n {
+                5 -> { break @outer },
+                _ -> { n = n + 1 },
+            }
+        }
+    }
+    return n
+}
+
+fn main() -> int {
+    return count() + init() + next_some() + outer()
+}
