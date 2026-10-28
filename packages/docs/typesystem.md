@@ -695,6 +695,15 @@ protocol id, the receiver kind/id, and each arg's kind/id. So `Into[int]` and
 value types (scalar/struct/enum); a composite `App` arg's check-time index is
 run-order-dependent, so it is rejected (would break key + fp determinism).
 
+**Generic conformances overlap when their args unify (T0020).** An impl on a generic
+receiver (`impl Box[T] has Conv[..]`) is a pattern over the receiver's own params, so
+two such impls of one protocol on one ctor share one variable space. Coherence unifies
+their protocol-arg patterns (two-sided, with an occurs check) and reports T0020 at the
+second impl when one substitution makes them equal: `Conv[T]` and `Conv[int]` are both
+`Conv[int]` on a `Box[int]`, where no call could choose. `Conv[int]` with `Conv[bool]`,
+or `Conv[T]` with `Conv[Option[T]]`, never meet and both stand. Bounds on the params
+do not count: an overlap is rejected even when a bound would rule the shared instance out.
+
 **Ordinal scheme: `Self = type_var(0)`, protocol params = `type_var(1..)`.** When a
 protocol method sig is decoded, the synthetic `self` slot is forced to `type_var(0)` and
 the protocol's generic params occupy ordinals `1..` (a `""` placeholder reserves index 0

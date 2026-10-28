@@ -1,0 +1,30 @@
+# Two generic conformances whose protocol args are equal at one instance: on a
+# Box[int], Conv[T] and Conv[int] are both Conv[int], and no call could choose. The
+# overlap is one error, at the second impl; non-overlapping patterns still check.
+protocol Conv[X] { fn conv(self) -> X }
+
+struct Box[T] { v: T }
+
+impl Box[T] has Conv[T] {
+    fn conv(self) -> T { self.v }
+}
+
+impl Box[T] has Conv[int] {  #~ ERROR [T0020] overlapping impl of protocol 'Conv' for type 'Box'
+    fn conv(self) -> int { 99 }
+}
+
+struct Two[T] { v: T }
+
+impl Two[T] has Conv[int] {
+    fn conv(self) -> int { 99 }
+}
+
+impl Two[T] has Conv[bool] {
+    fn conv(self) -> bool { true }
+}
+
+fn main() -> int {
+    b := Box { v: 1 }
+    t := Two { v: 1 }
+    return b.conv[int]() + t.conv[int]()
+}
