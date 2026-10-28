@@ -1,0 +1,78 @@
+# A break inside a match arm is a way out of its loop (#128): a fn that ends in such a
+# loop may fall off its end, and the statement after the loop is reachable. A loop
+# whose arms only return still diverges. A bare break in a nested loop's header (a
+# while condition, a for iterable) leaves the outer loop too.
+import std/vec
+
+fn f(i: int) -> int {  #~ ERROR [T0043] function 'f' must return int but may fall off the end
+    loop {
+        match i {
+            3 -> { break },
+            _ -> { return 1 },
+        }
+    }
+}
+
+fn g(i: int) -> int {
+    loop {
+        match i {
+            _ -> { return 1 },
+        }
+    }
+    return 2  #~ WARN [W0005] unreachable code
+}
+
+fn h() -> int {
+    i := 0
+    loop {
+        match i {
+            3 -> { break },
+            _ -> { i = i + 1 },
+        }
+    }
+    return i
+}
+
+fn k() -> int {
+    i := 0
+    loop {
+        x := match i {
+            3 -> { break },
+            _ -> i + 1,
+        }
+        i = x
+    }
+    return i
+}
+
+fn m() -> int {
+    n := 0
+    @outer loop {
+        loop {
+            match n {
+                5 -> { break @outer },
+                _ -> { n = n + 1 },
+            }
+        }
+    }
+    return n
+}
+
+fn p(c: bool) -> int {  #~ ERROR [T0043] function 'p' must return int but may fall off the end
+    loop {
+        while (if c { break } else { false }) { return 1 }
+        return 9
+    }
+}
+
+fn q(c: bool) -> int {
+    loop {
+        for x in (if c { break } else { [1] }) { return x }
+        return 9
+    }
+    return 7
+}
+
+fn main() -> int {
+    return f(3) + g(0) + h() + k() + m() + p(true) + q(true)
+}

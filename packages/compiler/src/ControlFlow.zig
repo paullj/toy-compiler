@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const Ast = @import("ast/Ast.zig");
+const Walk = @import("ast/Walk.zig");
 const Token = @import("ast/Token.zig").Token;
 const Resolution = @import("symbols/Resolution.zig").Resolution;
 const LayoutEngine = @import("layout/Engine.zig");
@@ -90,82 +91,76 @@ pub fn stmtReturns(ctx: Ctx, stmt_idx: Ast.Index) bool {
 }
 
 pub fn loopDiverges(ctx: Ctx, loop_idx: Ast.Index) bool {
-    return !blockHasBreak(ctx, ctx.tree.nodes[loop_idx.int()].lhs, loop_idx);
+    return !hasBreak(ctx, ctx.tree.nodes[loop_idx.int()].lhs, loop_idx);
 }
 
-pub fn blockHasBreak(ctx: Ctx, block_idx: Ast.Index, target: Ast.Index) bool {
-    for (Ast.rangeSlice(ctx.tree, ctx.tree.nodes[block_idx.int()].lhs.int())) |s| {
-        if (stmtHasBreak(ctx, s, target)) return true;
+/// Whether a `break` in the subtree at `root` leaves `target`, the loop or labeled
+/// block that a bare `break` in `root` would leave. A `break` can sit in any child that
+/// holds a block (a match arm, a binding's initializer, a call argument), so this rides
+/// the canonical `Walk` rather than a list of statement tags a new block-holding tag
+/// could miss.
+pub fn hasBreak(ctx: Ctx, root: Ast.Index, target: Ast.Index) bool {
+    return findBreak(ctx, root, target, false);
+}
+
+/// Whether a `break @target` in the subtree at `root` leaves `target`; bare breaks
+/// there bind to some loop inside `root`.
+pub fn hasLabeledBreak(ctx: Ctx, root: Ast.Index, target: Ast.Index) bool {
+    return findBreak(ctx, root, target, true);
+}
+
+fn findBreak(ctx: Ctx, root: Ast.Index, target: Ast.Index, labeled_only: bool) bool {
+    var finder: BreakFinder = .{ .ctx = ctx, .root = root, .target = target, .labeled_only = labeled_only };
+    Walk.walk(.{ .tree = ctx.tree, .tokens = ctx.tokens, .source = ctx.source }, root, &finder) catch unreachable;
+    return finder.found;
+}
+
+const BreakFinder = struct {
+    ctx: Ctx,
+    root: Ast.Index,
+    target: Ast.Index,
+    labeled_only: bool,
+    found: bool = false,
+
+    pub fn descend(f: *BreakFinder, idx: Ast.Index, tag: Ast.Node.Tag) bool {
+        if (f.found) return false;
+        if (tag == .break_stmt) {
+            const r = f.ctx.resolutions[idx.int()];
+            f.found = if (r == .label) r.label == f.target else !f.labeled_only;
+            return true;
+        }
+        if (idx == f.root) return true;
+        switch (tag) {
+            // A nested loop's body takes the bare breaks inside it, but its header runs
+            // outside that body, and a `break @target` anywhere in it still leaves `target`.
+            .loop_expr, .while_stmt, .for_stmt, .for_in_stmt, .for_in2_stmt => if (!f.labeled_only) {
+                f.found = hasLabeledBreak(f.ctx, idx, f.target) or f.headerBreaks(idx, tag);
+                return false;
+            },
+            // A closure body is its own fn: no break in it can leave an outer loop.
+            .lambda, .local_fn => return false,
+            else => {},
+        }
+        return true;
     }
-    return false;
-}
 
-pub fn stmtHasBreak(ctx: Ctx, stmt_idx: Ast.Index, target: Ast.Index) bool {
-    const stmt = ctx.tree.nodes[stmt_idx.int()];
-    return switch (stmt.tag) {
-        // A bare break (no label) binds to the innermost loop — counts only when
-        // `target` IS the innermost loop, i.e. the bare break is found before any
-        // nested loop swallows it (the nested-loop arms below stop the descent for
-        // bare breaks). A labeled break counts iff its resolved target matches.
-        .break_stmt => if (ctx.resolutions[stmt_idx.int()] == .label)
-            ctx.resolutions[stmt_idx.int()].label == target
-        else
-            true,
-        .expr_stmt => stmtHasBreak(ctx, stmt.lhs, target),
-        .block => blockHasBreak(ctx, stmt_idx, target),
-        // A labeled wrapper is transparent: descend its inner construct (a
-        // `break @target` may live inside a nested labeled loop).
-        .labeled => stmtHasBreak(ctx, stmt.lhs, target),
-        .if_stmt => blk: {
-            const h = Ast.ifHeaderAt(ctx.tree, stmt.rhs.int());
-            if (blockHasBreak(ctx, h.then_block, target)) break :blk true;
-            if (h.else_node == Ast.none) break :blk false;
-            break :blk if (ctx.tree.nodes[h.else_node.int()].tag == .if_stmt)
-                stmtHasBreak(ctx, h.else_node, target)
-            else
-                blockHasBreak(ctx, h.else_node, target);
-        },
-        // A nested loop/for/while swallows BARE breaks, but a `break @target`
-        // buried inside it still targets `target` — so descend its body and only
-        // count labeled breaks that name `target`.
-        .loop_expr => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].lhs, target),
-        .while_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].rhs, target),
-        .for_stmt, .for_in_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].lhs, target),
-        .for_in2_stmt => nestedHasLabeledBreak(ctx, Ast.forIn2HeaderAt(ctx.tree, ctx.tree.nodes[stmt_idx.int()].lhs.int()).body, target),
-        else => false,
-    };
-}
-
-pub fn nestedHasLabeledBreak(ctx: Ctx, block_idx: Ast.Index, target: Ast.Index) bool {
-    for (Ast.rangeSlice(ctx.tree, ctx.tree.nodes[block_idx.int()].lhs.int())) |s| {
-        if (stmtHasLabeledBreak(ctx, s, target)) return true;
+    fn headerBreaks(f: *const BreakFinder, idx: Ast.Index, tag: Ast.Node.Tag) bool {
+        const n = f.ctx.tree.nodes[idx.int()];
+        return switch (tag) {
+            .while_stmt => f.breaksIn(n.lhs),
+            .for_in_stmt, .for_in2_stmt => f.breaksIn(n.rhs),
+            .for_stmt => blk: {
+                const head = Ast.forHeaderAt(f.ctx.tree, n.rhs.int());
+                break :blk f.breaksIn(head.lo) or f.breaksIn(head.hi);
+            },
+            else => false,
+        };
     }
-    return false;
-}
 
-pub fn stmtHasLabeledBreak(ctx: Ctx, stmt_idx: Ast.Index, target: Ast.Index) bool {
-    const stmt = ctx.tree.nodes[stmt_idx.int()];
-    return switch (stmt.tag) {
-        .break_stmt => ctx.resolutions[stmt_idx.int()] == .label and ctx.resolutions[stmt_idx.int()].label == target,
-        .expr_stmt => stmtHasLabeledBreak(ctx, stmt.lhs, target),
-        .block => nestedHasLabeledBreak(ctx, stmt_idx, target),
-        .labeled => stmtHasLabeledBreak(ctx, stmt.lhs, target),
-        .if_stmt => blk: {
-            const h = Ast.ifHeaderAt(ctx.tree, stmt.rhs.int());
-            if (nestedHasLabeledBreak(ctx, h.then_block, target)) break :blk true;
-            if (h.else_node == Ast.none) break :blk false;
-            break :blk if (ctx.tree.nodes[h.else_node.int()].tag == .if_stmt)
-                stmtHasLabeledBreak(ctx, h.else_node, target)
-            else
-                nestedHasLabeledBreak(ctx, h.else_node, target);
-        },
-        .loop_expr => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].lhs, target),
-        .while_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].rhs, target),
-        .for_stmt, .for_in_stmt => nestedHasLabeledBreak(ctx, ctx.tree.nodes[stmt_idx.int()].lhs, target),
-        .for_in2_stmt => nestedHasLabeledBreak(ctx, Ast.forIn2HeaderAt(ctx.tree, ctx.tree.nodes[stmt_idx.int()].lhs.int()).body, target),
-        else => false,
-    };
-}
+    fn breaksIn(f: *const BreakFinder, header: Ast.Index) bool {
+        return header != Ast.none and hasBreak(f.ctx, header, f.target);
+    }
+};
 
 pub fn blockDiverges(ctx: Ctx, block_idx: Ast.Index) bool {
     const stmts = Ast.rangeSlice(ctx.tree, ctx.tree.nodes[block_idx.int()].lhs.int());
@@ -238,7 +233,7 @@ pub fn labeledDiverges(ctx: Ctx, idx: Ast.Index) bool {
     return switch (inner.tag) {
         .loop_expr => loopDiverges(ctx, inner_idx),
         .while_stmt, .for_stmt, .for_in_stmt, .for_in2_stmt => false,
-        .block => blockDiverges(ctx, inner_idx) and !blockHasBreak(ctx, inner_idx, inner_idx),
+        .block => blockDiverges(ctx, inner_idx) and !hasBreak(ctx, inner_idx, inner_idx),
         else => false,
     };
 }
@@ -326,6 +321,9 @@ pub fn orCoversType(ctx: Ctx, or_idx: Ast.Index, ty: Type) bool {
 
 const testing = std.testing;
 
+/// Every `Builder` node sits on token 0; the walks spell leaves from it.
+const builder_tokens = [_]Token{.{ .tag = .identifier, .start = 0, .end = 0 }};
+
 /// Test-support AST builder: appends nodes/extra by hand and hands back indices,
 /// pinning the exact node graph a walk sees without parsing. `pub` because
 /// `BodyChecker`'s in-file `Lint` tests reuse it to exercise the flow-lint walks
@@ -410,7 +408,7 @@ pub const Builder = struct {
             .resolutions = b.resolutions.items,
             .node_types = b.node_types.items,
             .enums = &.{},
-            .tokens = &.{},
+            .tokens = &builder_tokens,
             .source = "",
         };
     }
@@ -479,9 +477,42 @@ test "a labeled break escapes the outer loop it targets" {
     try testing.expect(loopDiverges(c, inner)); // bare-break gone; break is labeled to outer
     try testing.expect(!loopDiverges(c, outer)); // labeled break escapes outer
     // The break inside inner is a labeled break naming outer.
-    try testing.expect(stmtHasLabeledBreak(c, inner, outer));
-    try testing.expect(!stmtHasBreak(c, inner, inner)); // it does not target inner
-    try testing.expect(stmtHasBreak(c, outer, outer)); // it targets outer
+    try testing.expect(hasLabeledBreak(c, inner, outer));
+    try testing.expect(!hasBreak(c, inner_body, inner)); // it does not target inner
+    try testing.expect(hasBreak(c, outer_body, outer)); // it targets outer
+}
+
+test "a break in a match arm or a binding initializer leaves its loop" {
+    var b = Builder.init(testing.allocator);
+    defer b.deinit();
+
+    // loop { match s { _ -> { break } } }
+    const scrut = try b.add(.{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
+    const wild = try b.add(.{ .tag = .pattern_wildcard, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none });
+    const brk_body = try b.block(&.{try b.breakBare()});
+    const brk_arm = try b.add(.{ .tag = .match_arm, .main_token = 0, .lhs = wild, .rhs = try b.pair(Ast.none, brk_body) });
+    const brk_match = try b.add(.{ .tag = .match_expr, .main_token = 0, .lhs = scrut, .rhs = try b.range(&.{brk_arm}) });
+    const arm_loop = try b.loopOf(try b.block(&.{brk_match}));
+
+    // loop { x := match s { _ -> { break } } }
+    const init_body = try b.block(&.{try b.breakBare()});
+    const init_arm = try b.add(.{ .tag = .match_arm, .main_token = 0, .lhs = wild, .rhs = try b.pair(Ast.none, init_body) });
+    const init_match = try b.add(.{ .tag = .match_expr, .main_token = 0, .lhs = scrut, .rhs = try b.range(&.{init_arm}) });
+    const decl = try b.add(.{ .tag = .var_decl, .main_token = 0, .lhs = init_match, .rhs = Ast.none });
+    const init_loop = try b.loopOf(try b.block(&.{decl}));
+
+    // loop { match s { _ -> { return } } }
+    const ret_body = try b.block(&.{try b.ret()});
+    const ret_arm = try b.add(.{ .tag = .match_arm, .main_token = 0, .lhs = wild, .rhs = try b.pair(Ast.none, ret_body) });
+    const ret_match = try b.add(.{ .tag = .match_expr, .main_token = 0, .lhs = scrut, .rhs = try b.range(&.{ret_arm}) });
+    const ret_loop = try b.loopOf(try b.block(&.{ret_match}));
+
+    const c = b.ctx();
+    try testing.expect(!loopDiverges(c, arm_loop));
+    try testing.expect(!stmtReturns(c, arm_loop));
+    try testing.expect(!loopDiverges(c, init_loop));
+    try testing.expect(loopDiverges(c, ret_loop));
+    try testing.expect(stmtReturns(c, ret_loop));
 }
 
 test "if diverges only when both arms diverge; else-less never does" {

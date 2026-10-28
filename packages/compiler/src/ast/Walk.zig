@@ -201,7 +201,8 @@ fn VisitorError(comptime V: type) type {
 
 /// Drive ONE traversal of the subtree at `idx`, emitting events in canonical
 /// order. `visitor.on(ev)` runs IFF that method exists (comptime); otherwise the
-/// event is dropped at zero cost.
+/// event is dropped at zero cost. A visitor with `descend(idx, tag) bool` prunes the walk:
+/// `false` skips that node and its whole subtree.
 pub fn walk(src: Source, idx: Ast.Index, visitor: anytype) VisitorError(@TypeOf(visitor))!void {
     return walkInner(src, idx, true, visitor);
 }
@@ -246,6 +247,9 @@ fn walkInner(src: Source, idx: Ast.Index, collect: bool, visitor: anytype) Visit
     if (idx == Ast.none) return;
     const tree = src.tree;
     const n = tree.nodes[idx.int()];
+    if (comptime @hasDecl(@typeInfo(@TypeOf(visitor)).pointer.child, "descend")) {
+        if (!visitor.descend(idx, n.tag)) return;
+    }
     try emit(visitor, .{ .enter = .{ .idx = idx, .tag = n.tag } });
     if (collect) try emit(visitor, .{ .touch = .{ .idx = idx } });
     const leaf = src.leaf(idx);
@@ -604,4 +608,58 @@ pub fn opMethods(tag: TokenTag) []const []const u8 {
         .slash => &.{"div"},
         else => &.{},
     };
+}
+
+test "descend returning false skips that node's whole subtree, not its siblings" {
+    const testing = std.testing;
+    const source = "a b";
+    const tokens = [_]Token{
+        .{ .tag = .identifier, .start = 0, .end = 1 },
+        .{ .tag = .identifier, .start = 2, .end = 3 },
+    };
+    var nodes = [_]Ast.Node{
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .unary, .main_token = 0, .lhs = Ast.Index.from(0), .rhs = Ast.none },
+        .{ .tag = .identifier, .main_token = 1, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .binary, .main_token = 1, .lhs = Ast.Index.from(1), .rhs = Ast.Index.from(2) },
+    };
+    const src: Source = .{ .tree = .{ .nodes = &nodes, .extra = &.{} }, .tokens = &tokens, .source = source };
+
+    const Pruner = struct {
+        prune: Ast.Node.Tag,
+        entered: [8]u32 = undefined,
+        n_entered: usize = 0,
+        leaves: [8][]const u8 = undefined,
+        n_leaves: usize = 0,
+
+        pub fn descend(v: *@This(), _: Ast.Index, tag: Ast.Node.Tag) bool {
+            return tag != v.prune;
+        }
+
+        pub fn on(v: *@This(), ev: Event) void {
+            switch (ev) {
+                .enter => |e| {
+                    v.entered[v.n_entered] = e.idx.int();
+                    v.n_entered += 1;
+                },
+                .leaf => |l| {
+                    v.leaves[v.n_leaves] = l;
+                    v.n_leaves += 1;
+                },
+                else => {},
+            }
+        }
+    };
+
+    var unary_pruned: Pruner = .{ .prune = .unary };
+    try walk(src, Ast.Index.from(3), &unary_pruned);
+    try testing.expectEqualSlices(u32, &.{ 3, 2 }, unary_pruned.entered[0..unary_pruned.n_entered]);
+    try testing.expectEqual(@as(usize, 2), unary_pruned.n_leaves);
+    try testing.expectEqualStrings("b", unary_pruned.leaves[0]);
+    try testing.expectEqualStrings("b", unary_pruned.leaves[1]);
+
+    var root_pruned: Pruner = .{ .prune = .binary };
+    try walk(src, Ast.Index.from(3), &root_pruned);
+    try testing.expectEqual(@as(usize, 0), root_pruned.n_entered);
+    try testing.expectEqual(@as(usize, 0), root_pruned.n_leaves);
 }
