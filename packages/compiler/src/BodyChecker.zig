@@ -3289,11 +3289,7 @@ pub const BodyChecker = struct {
         const fa = bc.tree.nodes[(callee.lhs).int()];
         const member = bc.nameText(fa.main_token);
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-        if (on_type and m.has_self) {
-            try bc.drainArgs(args);
-            try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0018 }, "'{s}' is an instance method, not an associated function; call it on a value", .{member});
-            return .invalid;
-        }
+        if (on_type and m.has_self) return bc.reportInstanceMethodOnType(args, fa.main_token);
         if (!on_type and !m.has_self) {
             try bc.drainArgs(args);
             const e = bc.composite.at(recv_ty.appIdx());
@@ -3432,6 +3428,14 @@ pub const BodyChecker = struct {
         return null;
     }
 
+    /// `T.m(args)` naming an instance method `m` through a type, in any of its forms
+    /// (`P.m`, `Box.m`, `Box[int].m`): one T0018 at `m`.
+    fn reportInstanceMethodOnType(bc: *BodyChecker, args: []const Ast.Index, member_tok: u32) error{OutOfMemory}!Type {
+        try bc.drainArgs(args);
+        try bc.sink.report(.{ .span = bc.tokSpan(member_tok), .code = .T0018 }, "'{s}' is an instance method, not an associated function; call it on a value", .{bc.nameText(member_tok)});
+        return .invalid;
+    }
+
     /// `K.make(args)` on a non-generic struct or enum `K`: a self-less fn of the type's
     /// inherent impl. Recorded as its method callee, which lower calls with no receiver,
     /// as it does the generic `Box[int].new()`.
@@ -3441,8 +3445,7 @@ pub const BodyChecker = struct {
         switch (Typecheck.pickMethodIndex(bc.model.methods, ty, member, null, null, bc.methodSite())) {
             .one => |mi| {
                 if (bc.model.methods[mi].is_static) return bc.dispatchMethod(node_idx, n, callee, ty, member, mi);
-                try bc.drainArgs(args);
-                try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' is an instance method, not an associated function; call it on a value", .{member});
+                return try bc.reportInstanceMethodOnType(args, callee.main_token);
             },
             .ambiguous => {
                 try bc.drainArgs(args);
@@ -3485,11 +3488,7 @@ pub const BodyChecker = struct {
                 try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' has no associated function '{s}'{s}", .{ name, member, hint });
                 return .invalid;
             };
-            if (m.has_self) {
-                try bc.drainArgs(args);
-                try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{s}' is an instance method, not an associated function; call it on a value", .{member});
-                return .invalid;
-            }
+            if (m.has_self) return try bc.reportInstanceMethodOnType(args, callee.main_token);
             // Load-bearing: the reified receiver flows to scanCalls / reify / sealCallees off
             // `node_types[type_app]`.
             bc.node_types[(callee.lhs).int()] = app_ty;
@@ -3510,6 +3509,8 @@ pub const BodyChecker = struct {
             if (bc.activeStructMap().get(name)) |sid| {
                 if (sid < bc.structSyms().len and bc.structSyms()[sid].is_generic) {
                     if (Typecheck.findGenericMethod(bc.model.templates, sid, false, member, bc.methodSite())) |m| {
+                        // Before inference: its T0016 hint would name `Box[int].m`, which is this same error.
+                        if (m.has_self) return try bc.reportInstanceMethodOnType(args, callee.main_token);
                         if (try CallInfer.inferAssociatedCall(bc, node_idx, n, callee, m, args)) |t| return t;
                         try bc.drainArgs(args);
                         try CallInfer.reportUninferableAssociated(bc, recv, member, sid, null, &.{}, null);
