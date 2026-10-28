@@ -3635,7 +3635,7 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
             try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; its generic impl gives '{s}'", .{ tname, want.items, got.items });
         } else if (args[ord].isFunc()) {
             // No impl can be written for a function type, so the usual fixes do not apply.
-            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "function type '{s}' does not conform to protocol '{s}'; function values support only '==' (identity)", .{ tname, pname });
+            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "function type '{s}' does not conform to protocol '{s}'; a function value only compares by identity ('==') and renders as '<fn>'", .{ tname, pname });
         } else if (scalarImplModule(model, tname, pid)) |m| {
             try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; its impl is in std/{s}: " ++ StdNames.add_import, .{ tname, pname, m, m });
         } else if (try conform.displayBlockingBox(model.structs, model.enums, model.conformances, .of(model), t.composite, args[ord], pid, &cmemo, t.gpa)) |box| {
@@ -8491,7 +8491,7 @@ test "no .func survives reify" {
     for (c.result.sigs) |sg| if (std.mem.eql(u8, sg.name, "main.apply")) try testing.expect(sg.isGenericTemplate());
 }
 
-test "a struct with a fn field derives no Eq/Hash/Display" {
+test "a struct with a fn field derives Display but no Eq or Hash" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\pub struct S { id: int, run: fn(int) -> int }
@@ -8502,12 +8502,12 @@ test "a struct with a fn field derives no Eq/Hash/Display" {
         \\
     );
     defer c.deinit(gpa);
-    try testing.expectEqual(@as(usize, 3), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 2), c.result.diags.len);
     try testing.expectEqual(codes.Code.T0029, c.result.diags[0].code);
     try testing.expectEqual(codes.Code.T0030, c.result.diags[1].code);
-    try testing.expectEqual(codes.Code.T0031, c.result.diags[2].code);
     for (c.result.diags) |dg| try testing.expect(std.mem.indexOf(u8, dg.message, "'fn(int) -> int'") != null);
-    try testing.expectEqual(@as(usize, 0), c.result.derives.len);
+    try testing.expectEqual(@as(usize, 1), c.result.derives.len);
+    try testing.expectEqual(Derive.Kind.display, c.result.derives[0].kind);
 }
 
 /// The `nth` (node order) value-position identifier spelled `name` that resolves to a fn.
@@ -8683,7 +8683,7 @@ test "a call whose callee is a call or an index is checked, not silently poisone
     }
 }
 
-test "== on fn values is bool; different fn types T0044; f.hash() T0018; f < g T0027" {
+test "== on fn values is bool; f.to_string() is str; different fn types T0044; f.hash() T0018; f < g T0027" {
     const gpa = testing.allocator;
     {
         var c = try checkSource(
@@ -8691,6 +8691,7 @@ test "== on fn values is bool; different fn types T0044; f.hash() T0018; f < g T
             \\fn dec(x: int) -> int { return x - 1 }
             \\fn main() -> int {
             \\ f := inc
+            \\ s: str = f.to_string()
             \\ if f == inc { return 1 }
             \\ if f != dec { return 2 }
             \\ return 0
@@ -8703,7 +8704,6 @@ test "== on fn values is bool; different fn types T0044; f.hash() T0018; f < g T
     const cases = [_]struct { body: []const u8, code: codes.Code }{
         .{ .body = " b := inc == not\n", .code = .T0044 },
         .{ .body = " h := inc.hash()\n", .code = .T0018 },
-        .{ .body = " f := inc\n s := f.to_string()\n", .code = .T0018 },
         .{ .body = " b := inc < dec\n", .code = .T0027 },
     };
     for (cases) |cs| {

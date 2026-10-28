@@ -39,7 +39,7 @@ fn main() -> int {
   - A named function equals itself.
   - Two evaluations of the same lambda are equal only if it captures nothing: its environment is then null. A capturing lambda gets a new environment each time, so its evaluations are not equal.
   - Two different lambdas are never equal, even with the same text: each has its own code. A bound method value is never equal to another evaluation of it either (see [Bound methods](#bound-methods)).
-- **Protocols:** function values do not conform to `Hash` or `Display` (see issue #22).
+- **Protocols:** a function value conforms to `Display` only, and renders as `<fn>`: `io.println(add)`, `f.to_string()`, a fn field (`Button{label: ok, on_click: <fn>}`) and a `Vec` of them (`[<fn>, <fn>]`) all print it. It conforms to no other protocol (`==` is the identity above, not `Eq`), so it cannot be a `Map` or `Set` key (T0023).
 - **Dropped:** an expression statement that is a function value it never calls (a fn name `one`, a bound method `c.bump`, a fn-typed field, local or element, a lambda, a `_` capture) does nothing, so it is warning W0012, which spells the call: "function value is never called; did you mean 'c.bump()'?" (`(..)` when the function takes arguments). A value that is bound, assigned, passed, returned, piped or is a used block value does not warn, and neither does a call that returns a function: the call runs.
 
 ## Lambdas
@@ -263,7 +263,6 @@ Open issues that touch this page. Each has a repro.
 
 ## Out of scope
 
-- Deterministic `Display` for function values: issue #22.
 - Renaming `Option` / `Result` methods: issue #24.
 - `<T>` type arguments in expression position: issue #23.
 - Full, HM-style inference of lambda parameters from their uses.

@@ -4020,8 +4020,15 @@ pub const BodyChecker = struct {
         } else if (recv_ty.isTypeVar()) {
             return try bc.dispatchTypeVarMethod(node_idx, n, callee, recv_ty);
         } else if (recv_ty.isFunc()) {
+            const member = bc.nameText(callee.main_token);
+            if (std.mem.eql(u8, member, "to_string") and bc.model.preludeProtocols().display != null) {
+                bc.setCallee(n, Callee.builtinMethod(.display_to_string));
+                _ = try bc.checkCall(node_idx, Ast.rangeSlice(bc.tree, (n.rhs).int()), .{ .params = &.{}, .name = member });
+                bc.node_types[(node_idx).int()] = Type.str;
+                return Type.str;
+            }
             try bc.drainArgs(Ast.rangeSlice(bc.tree, (n.rhs).int()));
-            try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "function values have no methods ('{s}' on '{s}')", .{ bc.nameText(callee.main_token), bc.typeName(recv_ty) });
+            try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "a function value's only method is 'to_string' ('{s}' on '{s}')", .{ member, bc.typeName(recv_ty) });
             return Type.invalid;
         }
         // No final else: an unhandled receiver kind (.never) falls through to the

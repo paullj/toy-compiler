@@ -1,5 +1,5 @@
-# Function values compare by identity and conform to no protocol. The harness front-end is
-# single-file, so `[T has Display]` / `[K has Hashable]` proxies stand in for `io.println`
+# Function values compare by identity and conform to Display only, rendering as <fn>.
+# The harness front-end is single-file, so `[T has Display]` / `[K has Hashable]` proxies stand in for `io.println`
 # and a `Map` key.
 fn show[T has Display](x: T) -> str { x.to_string() }
 fn key[K has Hashable](_k: K) -> int { 0 }
@@ -10,9 +10,10 @@ fn not(b: bool) -> bool { !b }
 
 fn main() -> int {
     f := inc
-    _h := f.hash()  #~ ERROR [T0018] function values have no methods ('hash' on 'fn(int) -> int')
-    _s := show(f)  #~ ERROR [T0023] function type 'fn(int) -> int' does not conform to protocol 'Display'
-    _k := key(f)  #~ ERROR [T0023] function type 'fn(int) -> int' does not conform to protocol 'Hashable'
+    _h := f.hash()  #~ ERROR [T0018] a function value's only method is 'to_string' ('hash' on 'fn(int) -> int')
+    _s := show(f)
+    _t := f.to_string()
+    _k := key(f)  #~ ERROR [T0023] function type 'fn(int) -> int' does not conform to protocol 'Hashable'; a function value only compares by identity ('==') and renders as '<fn>'
     _lt := f < dec  #~ ERROR [T0027] '<' requires an 'Ord' impl for type 'fn(int) -> int'
     _ne := f == not  #~ ERROR [T0044] operands of '==' must have the same type
     return 0

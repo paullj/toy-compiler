@@ -1770,6 +1770,7 @@ pub fn appendPiece(b: *Builder, acc: Ir.SlotId, piece: Ir.SlotId) error{OutOfMem
 ///     a 64-bit unsigned int goes to `__uint_to_str` instead.
 ///   * bool   -> `cond_br` selecting the const-data `"true"`/`"false"` literal.
 ///   * unit   -> the const-data `"()"` literal (no alloc).
+///   * a fn value -> the const-data `"<fn>"` literal (no witness: no impl can name its type).
 ///   * anything else (a struct/enum incl `char`, a `float`) -> resolve the `display`
 ///     witness and call it -> a fresh str; a custom `impl Display` (std's for float) and a
 ///     structural derive land here identically, which is what makes `to_string` universal.
@@ -1777,6 +1778,7 @@ pub fn displayToSlot(b: *Builder, ty: Typecheck.Type, op: Ir.Operand) error{OutO
     // Switch on `ty.kind` (NOT `passKind`): a `Ref` box is a struct type whose display
     // witness is std's impl, reached through the struct arm; `passKind` would divert it to
     // `.box` and mis-drop it.
+    if (LayoutEngine.isFnStruct(ty, b.in.layouts)) return try emitStrLiteralSlot(b, "<fn>");
     switch (ty.kind) {
         .str => {
             const s = operandSlot(op);

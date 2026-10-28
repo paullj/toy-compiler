@@ -424,9 +424,10 @@ both). Reification maps every ground fn type to ONE 16-byte struct per grounded
 signature, `{code: int @0, env: rawptr @8}`, whose `Layout.fn_sig` records the
 signature; the pair is deduplicated on the grounded bytes, so `fn(Vec[T])` at
 `T = int` and a written `fn(Vec[int])` are one struct. Past reify only a generic
-template's signature keeps a `.func`. A function type conforms to no protocol (no
-`Eq`/`Hash`/`Display`/`Ord`), and neither does an aggregate holding one. A `Vec` of
-them gets a trace unit, because the `env` word is a managed pointer.
+template's signature keeps a `.func`. A function type conforms to `Display` only (it
+renders `<fn>`), not to `Eq`/`Hash`/`Ord`; an aggregate holding one derives `Display`
+but not `Eq` or `Hash`. A `Vec` of them gets a trace unit, because the `env` word is a
+managed pointer.
 
 ## Function values
 
@@ -456,8 +457,9 @@ block or body that is used, is used. A call that returns a function runs, so its
 result does not warn; nor does any value under a return type that is already an error.
 
 `==`/`!=` on two values of the same function type is identity (both words of the pair);
-different function types are T0044. A function value has no methods (T0018) and meets
-no protocol bound (T0023), so it is neither a `Map` key nor `Display`-able. A generic
+different function types are T0044. A function value's only method is `to_string`
+(`"<fn>"`; any other is T0018), and the only protocol bound it meets is `Display`
+(any other is T0023), so it renders but is no `Map` key. A generic
 function with a function-typed parameter (`fn apply[T](f: fn(T) -> T, x: T)`) infers
 through it and instantiates on the value's signature; the value is called through its
 pair, unless the call is specialized (see [Specialized generic calls](#specialized-generic-calls)).
@@ -926,6 +928,10 @@ from the same value on its own:
   never signed, so 2^63 and above print as their magnitude.
 - `bool` → the literal `true` or `false`; `()` → the literal `()`.
 - `str` → its raw bytes, never quoted.
+- a function value (a named fn, a lambda, a closure or a bound method) → the literal
+  `<fn>`. A function type conforms to `Display` and to no other protocol; no impl can
+  name it, so it has no witness and the derive passes a fn field straight to this arm.
+  `f.to_string()` is `"<fn>"`.
 - `char` → its UTF-8 encoding (the prelude `char` struct overrides the structural walk).
 - `float` → no builtin rendering: std/float's `impl float has Display` is its witness,
   called like a struct's, so a float prints only when std/float is in the program
@@ -974,11 +980,10 @@ never a fallback rendering (no addresses):
 | type | today |
 |------|-------|
 | `float` without std/float | its `Display` is an impl in std/float: a `[T has Display]` bound is **T0023** naming std/float, `(1.5).to_string()` is T0018 |
-| a function value | conforms to no protocol but `==`: **T0023** |
-| a struct or enum holding a function field (or a `float` one without std/float) | the derive is blocked: **T0023** at an `io.print`, **T0031** at a `to_string` naming the field |
+| a struct or enum holding a `float` field without std/float | the derive is blocked: **T0023** at an `io.print`, **T0031** at a `to_string` naming the field |
 | `rawptr` | no `Display`; it exists only inside core |
 | a generic `T` without a `Display` bound | checked per instance: `fn f[T has Eq](x: T) { io.print(x) }` accepts `f(2)` and `f(1.5)` (std/io brings std/float); an instance whose type does not conform is **T0023** at the call |
-| `Vec[X]`, `Map[K, V]`, `Set[X]` or `Ref[X]` whose type argument does not conform | std's impl bounds its params (`impl Vec[T has Display]`): **T0023** names the type argument that fails it, as `Vec[fn()]` does |
+| `Vec[X]`, `Map[K, V]`, `Set[X]` or `Ref[X]` whose type argument does not conform | std's impl bounds its params (`impl Vec[T has Display]`): **T0023** names the type argument that fails it |
 | a managed box with no impl (the private `gc_array`), and any aggregate holding one | a box never derives `Display` (its one field is a cell address); only an explicit impl makes it print. **T0023** at an `io.print`, whose hint names the box; T0031 at a struct's `to_string` naming the field. `Eq` (cell identity) and `Hash` (no box keys) keep their own rules |
 
 ## Two-phase checking (and parallelism)
