@@ -1,0 +1,12 @@
+# A negated literal into an unsigned width fits only when it is zero: `-1` is not a
+# `uint8`, as a param, a binding or a platform `uint`, and is one T0034 at the whole `-1`.
+fn id(x: uint8) -> uint8 { x }
+
+fn main() -> int {
+    a: uint8 = -1  #~ ERROR [T0034] literal out of range for type 'uint8'
+    b := id(-1)  #~ ERROR [T0034] literal out of range for type 'uint8'
+    c: uint = -1  #~ ERROR [T0034] literal out of range for type 'uint'
+    d: uint8 = -300  #~ ERROR [T0034] literal out of range for type 'uint8'
+    e: uint8 = 256  #~ ERROR [T0034] literal out of range for type 'uint8'
+    return if a == b && c == 0 && d == e { 1 } else { 0 }
+}

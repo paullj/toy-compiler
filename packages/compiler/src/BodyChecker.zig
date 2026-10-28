@@ -1259,14 +1259,13 @@ pub const BodyChecker = struct {
             },
             .unary => blk: {
                 const op = bc.tokens[n.main_token].tag;
-                // The most-negative signed literal (`-128: int8`, `-9223372036854775808:
-                // int`) has a magnitude one past the positive max, so range-checking the
-                // bare operand first would spuriously reject it. When negating a literal
-                // into a SIGNED width, range-check the magnitude against `maxMagnitude+1`
-                // (the signed-min magnitude) and pin the operand's node type so lowering
-                // (which parses the positive magnitude then negates + width-wraps) agrees.
+                // A negated literal is range-checked as the negative value it denotes,
+                // never as its bare magnitude: `-128: int8` is one past the positive max
+                // and fits, while `-1: uint8` fits the magnitude yet would wrap to 255.
+                // Pin the operand's node type so lowering (which parses the positive
+                // magnitude then negates + width-wraps) agrees.
                 if (op == .minus and n.lhs != Ast.none and bc.tree.nodes[n.lhs.int()].tag == .literal_number) {
-                    if (bc.expectedTy()) |e| if (e.isSigned()) {
+                    if (bc.expectedTy()) |e| if (e.isInteger()) {
                         const lit_tok = bc.tree.nodes[n.lhs.int()].main_token;
                         const raw = bc.tokens[lit_tok].text(bc.source);
                         if (!Literal.fitsWidth(raw, e, true))

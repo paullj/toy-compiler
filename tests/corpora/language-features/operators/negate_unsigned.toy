@@ -1,0 +1,12 @@
+# Feature: a negated zero literal fits an unsigned width and the signed min fits its
+# width (a nonzero negated literal into an unsigned width is T0034). Unary `-` on an
+# unsigned VALUE is `0 - u` and wraps at its width, as every integer operator does.
+fn main() -> int {
+    a: uint8 = -0
+    b: uint = -0x0
+    c: int8 = -128
+    u: uint8 = 1
+    v := -u
+    return if a == 0 && b == 0 && c < 0 && v == 255 { 42 } else { 0 }
+}
+# expect: exit 42
