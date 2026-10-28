@@ -1,0 +1,45 @@
+# Feature: a generic conformance `impl Box[T] has P` meets a `[T has P]` bound (#91), with
+# protocol args (`Into[int]`) and without. A bounded fn takes `Box[int]` directly, and a
+# bounded template passes its own `Box[T]` on; each instance calls the bound's witness even
+# where `Box` has a second `render` from `Debug`.
+# expect: stdout "1\n7\n41\n1\n"
+# expect: exit 0
+import std/io
+
+protocol Show { fn render(self) -> int }
+protocol Debug { fn render(self) -> int }
+
+struct Box[T] { v: T }
+
+impl Box[T] has Show {
+    fn render(self) -> int { 1 }
+}
+
+impl Box[T] has Debug {
+    fn render(self) -> int { 2 }
+}
+
+impl Box[T] has Into[int] {
+    fn into(self) -> int { 7 }
+}
+
+struct P { x: int }
+
+impl P has Show {
+    fn render(self) -> int { 40 }
+}
+
+fn use_show[T has Show](t: T) -> int { t.render() }
+
+fn conv[T has Into[int]](t: T) -> int { t.into() }
+
+fn inner[T has Show](b: Box[T]) -> int { use_show(b) + use_show(b.v) }
+
+fn main() -> int {
+    b: Box[int] = Box { v: 1 }
+    io.println(use_show(b))
+    io.println(conv(Box { v: true }))
+    io.println(inner(Box { v: P { x: 0 } }))
+    io.println(use_show(Box { v: Box { v: 1 } }))
+    return 0
+}

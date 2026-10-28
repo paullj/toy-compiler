@@ -183,6 +183,26 @@ fn main() -> int {
 }
 ' 1
 
+# generic conformance: adding `impl Box[T] has Display` swaps every `to_string` of a
+# `Box[X]` from the structural derive to the impl's instance; SOUNDNESS = no cached body
+# still calls the derived witness.
+run_scenario generic_conformance \
+'struct Box[T] { v: T }
+fn show[T has Display](t: T) -> int { t.to_string().len() }
+fn main() -> int {
+    b := Box { v: 1 }
+    return show(b) + b.to_string().len()
+}
+' \
+'struct Box[T] { v: T }
+impl Box[T has Display] has Display { fn display(self) -> str { "B" } }
+fn show[T has Display](t: T) -> int { t.to_string().len() }
+fn main() -> int {
+    b := Box { v: 1 }
+    return show(b) + b.to_string().len()
+}
+' 0
+
 # 4) COMMENT-ONLY — no semantic change; EVERYTHING cuts off (codegen compiled=0),
 #    the strongest cutoff (index-free codegen fingerprint).
 run_scenario comment \

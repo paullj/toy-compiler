@@ -160,7 +160,7 @@ module.exports = grammar({
     impl_block: ($) =>
       seq(
         "impl",
-        field("type", $._type),
+        field("type", $._impl_type),
         optional(seq("has", field("protocol", $._type))),
         "{",
         repeat($.function_declaration),
@@ -208,6 +208,18 @@ module.exports = grammar({
     type_name: ($) => sepBy1(".", $.identifier),
 
     type_arguments: ($) => seq("[", commaList($._type), "]"),
+
+    // An impl's receiver may bound the params it introduces: `impl Vec[T has Display]`.
+    _impl_type: ($) =>
+      choice(
+        $.unit_type,
+        $.function_type,
+        seq($.type_name, optional(alias($.impl_type_arguments, $.type_arguments))),
+      ),
+
+    impl_type_arguments: ($) => seq("[", commaList(choice($._type, $.bounded_type_argument)), "]"),
+
+    bounded_type_argument: ($) => seq($._type, "has", sepBy1("+", $._type)),
 
     // ---- Statements -------------------------------------------------------
 

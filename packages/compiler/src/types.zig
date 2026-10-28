@@ -1017,7 +1017,9 @@ pub fn pickMethodIndex(methods: []const Method, recv: Type, name: []const u8, wi
             if (first == null) first = @intCast(i);
             if (first_user == null and !m.bundled) first_user = @intCast(i);
             total += 1;
-            if (m.protocol_id != null) conform_count += 1;
+            // A reified instance row names its conformance only for a witness pick; a
+            // plain call on the instance was already resolved by its template.
+            if (m.protocol_id != null and m.instance == null) conform_count += 1;
         }
     }
     if (total == 0) return .none;
@@ -1472,19 +1474,30 @@ pub const Conformance = struct {
 };
 
 /// One recorded GENERIC conformance `impl Ctor[T] has P[..]` — kept in its OWN table
-/// (never `conformances`) precisely because its receiver is a template, not a concrete
-/// type: an `App` row in `conformances` would violate the concrete-only invariant
-/// `existence` relies on and be scanned by every conformance query forever. Keyed on the
-/// receiver type-CONSTRUCTOR (a plain int, never a composite deref), it is invisible to
-/// `existence`/`structural`/`deriveEqFromOrd`, so it perturbs no existing verdict. Read
-/// ONLY by the structural `for x in xs` desugar (`conform.iteratorItem`). `protocol_args`
-/// is the arg PATTERN (`Iterator[T]` -> `[type_var(0)]`), substituted through a concrete
-/// receiver App's args at the use site. OWNED by `t.template_conformances`.
+/// (never `conformances`) because its receiver is a template, not a concrete type: an
+/// `App` row in `conformances` would violate the concrete-only invariant `existence`
+/// relies on. Pre-reify queries reach it through `conform.generic`, which grounds the
+/// row through an App receiver and checks the impl's own `[T has P]` bounds; post-reify
+/// each reached instance gets a concrete `conformances` row (see `monomorphize`).
+/// `protocol_args` is the arg PATTERN (`Iterator[T]` -> `[type_var(0)]`) over the impl's
+/// params. OWNED by `t.template_conformances` (`protocol_args` only).
 pub const TemplateConformance = struct {
     protocol_id: u32,
     recv_ctor: u32,
     recv_is_enum: bool,
     protocol_args: []const Type = &.{},
+    /// The impl's receiver pattern (`Box[T]`), which binds the impl's params from a
+    /// receiver App's args.
+    recv: Type = .invalid,
+    /// How many leading generic params are the impl's own (`implParamCount`).
+    n_params: u32 = 0,
+    /// The impl's per-param bounds and bound args, BORROWED from an impl method's
+    /// `FnSym` (owned by `t.fns`), ordinal-indexed like `FnSym.generic_bounds`.
+    bounds: []const ?u32 = &.{},
+    bound_args: []const []const Type = &.{},
+    /// Set on the `Eq` row an `Ord` impl implies (Ord refines Eq): the protocol whose
+    /// methods witness this row.
+    refines: ?u32 = null,
 };
 
 /// A top-level function's signature, decoded once up front so calls can be
@@ -1621,9 +1634,8 @@ protocols: std.ArrayList(ProtocolSym) = .empty,
 conformances: std.ArrayList(Conformance) = .empty,
 
 /// Recorded GENERIC conformances `impl Ctor[T] has P[..]`, filled by the serial
-/// `checkCoherence` phase. Kept SEPARATE from `conformances` (see `TemplateConformance`)
-/// so it is invisible to every existing conformance query; read only by the `for x in xs`
-/// desugar. Frozen onto the `Model`; freed at teardown (each entry owns `protocol_args`).
+/// `checkCoherence` phase. Kept SEPARATE from `conformances` (see `TemplateConformance`).
+/// Frozen onto the `Model`; freed at teardown (each entry owns `protocol_args`).
 template_conformances: std.ArrayList(TemplateConformance) = .empty,
 
 /// The prelude protocol/enum ids, populated incrementally by `registerPrelude`
@@ -1858,7 +1870,7 @@ pub const Model = struct {
     protocols: []const ProtocolSym,
     conformances: []const Conformance,
     /// Recorded GENERIC conformances (`impl Ctor[T] has P[..]`), frozen from
-    /// `checkCoherence`. Read only by the `for x in xs` desugar (`conform.iteratorItem`).
+    /// `checkCoherence`. Read through `conform.generic` and `conform.iteratorItem`.
     template_conformances: []const TemplateConformance,
     /// The prelude protocol/enum ids, frozen from the checker, or `null` if
     /// `registerPrelude` never ran (a narrow internal caller). Every `==`/`<`/arith/
@@ -2719,6 +2731,10 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     }
     @memset(scratch, null);
 
+    var visited: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer visited.deinit(t.gpa);
+    var demanded: usize = 0;
+    try t.drainDemands(model, &demanded, &worklist, &seen, &visited);
     var capped = false;
     var idx: usize = 0;
     while (idx < worklist.items.len) : (idx += 1) {
@@ -2753,6 +2769,7 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
         try t.mono.append(t.gpa, inst);
         // Discover nested generic calls in the instance body, on the tables it was checked into.
         try t.scanCalls(model, templates, inst.mod, sc.node_types, sc.callees, span, &worklist, &seen);
+        try t.drainDemands(model, &demanded, &worklist, &seen, &visited);
         @memset(sc.node_types[span.start..span.end], .invalid);
         @memset(sc.callees[span.start..span.end], .{});
     }
@@ -2811,6 +2828,8 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
                     inst.params[0]
                 else
                     (t.reifiedStaticRecv(model.fns[tmpl.fn_id].self_type, inst.args, &app_of_reified) orelse continue);
+                const pargs = if (tmpl.protocol_id != null) try t.groundProtocolArgs(tmpl.protocol_args, inst.args) else null;
+                errdefer if (pargs) |a| t.gpa.free(a);
                 try t.methods.append(t.gpa, .{
                     .recv = recv,
                     .name = tmpl.name,
@@ -2820,7 +2839,20 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
                     .instance = @intCast(i),
                     .bundled = tmpl.bundled,
                     .shadows = tmpl.shadows,
+                    .protocol_id = if (pargs != null) tmpl.protocol_id else null,
+                    .protocol_args = pargs orelse &.{},
                 });
+                // The instance witnesses a generic conformance of the reified type: give
+                // it the concrete row every post-reify query reads (the derive synthesis
+                // then reuses this witness instead of deriving one).
+                if (pargs) |a| if (tmpl.has_self) {
+                    const pid = tmpl.protocol_id.?;
+                    if (!conform.existsIn(t.conformances.items, pid, recv, a))
+                        try t.conformances.append(t.gpa, .{ .protocol = pid, .recv = recv, .protocol_args = try t.gpa.dupe(Type, a) });
+                    // Ord refines Eq, as `deriveEqFromOrd` records before reify.
+                    if (t.prelude) |pre| if (pre.protocols.ord == pid) if (pre.protocols.eq) |eq_pid| if (!conform.existsIn(t.conformances.items, eq_pid, recv, &.{}))
+                        try t.conformances.append(t.gpa, .{ .protocol = eq_pid, .recv = recv });
+                };
                 break;
             }
         }
@@ -2880,6 +2912,21 @@ fn unifyInstanceHints(t: *Typecheck) !void {
 fn templateText(t: *const Typecheck, message: []const u8) []const u8 {
     for (t.instance_hints.items) |h| if (h.message.ptr == message.ptr) return if (h.template.len == 0) message else h.template;
     return message;
+}
+
+/// A generic conformance's arg pattern grounded through a reified instance's args, OWNED
+/// by the caller (empty for a zero-arg protocol). Null when an arg nests a composite: its
+/// ground App was never reified, so no concrete row can name it.
+fn groundProtocolArgs(t: *Typecheck, pattern: []const Type, args: []const Type) !?[]const Type {
+    const out = try t.gpa.alloc(Type, pattern.len);
+    for (pattern, out) |p, *o| {
+        o.* = t.substType(p, args);
+        if (o.isApp() or o.isFunc()) {
+            t.gpa.free(out);
+            return null;
+        }
+    }
+    return out;
 }
 
 /// Resolve every pending slot: only now are receiver types reified and every method row appended.
@@ -3213,7 +3260,14 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
             const member = mc.tokens[callee.main_token].text(mc.source);
             const m = switch (pickGenericMethod(model.templates, re.ctor, re.ctor_is_enum, member, Site.of(mc.bundled))) {
                 .one => |m| m,
-                .none, .ambiguous => continue,
+                .none => continue,
+                // The checker picked one through a bound (`boundTemplate`) and left it here.
+                .ambiguous => blk: {
+                    const crumb = callees[ci];
+                    if (crumb.tag != .pending_template) continue;
+                    for (model.templates) |tm| if (tm.fn_id == crumb.id) break :blk tm;
+                    continue;
+                },
             };
             const mf = model.fns[m.fn_id];
             const out = (if (hasOwnTypeParams(t.composite, mf))
@@ -3335,6 +3389,91 @@ fn anchorSpan(t: *const Typecheck, mod: u32, a: Anchor) Span {
     };
 }
 
+/// `demandWitnesses` for each derive request from `next.*` on.
+fn drainDemands(t: *Typecheck, model: *const Model, next: *usize, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void), visited: *std.AutoHashMapUnmanaged(u64, void)) !void {
+    while (next.* < t.derive_reqs.items.len) : (next.* += 1) {
+        const r = t.derive_reqs.items[next.*];
+        const site = r.site orelse continue;
+        try t.demandWitnesses(model, r.protocol_id, r.conform_ty, worklist, seen, visited, .{ .node = site.node }, site.scope);
+    }
+}
+
+/// Instantiate the witnesses a derive request leans on through explicit generic
+/// conformances: the request's type itself when an `impl Ctor[T] has P` covers it, or
+/// any component of the type the structural derive will reach. A builtin witness site
+/// (`to_string`, `==`) is no call, so `scanCalls` never discovers these instances.
+/// `visited` dedups `(pid, type)` across requests.
+fn demandWitnesses(t: *Typecheck, model: *const Model, pid: u32, ty: Type, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void), visited: *std.AutoHashMapUnmanaged(u64, void), at: Anchor, mod: u32) !void {
+    switch (ty.kind) {
+        .@"struct", .@"enum", .app => {},
+        else => return,
+    }
+    const id = if (ty.isApp()) ty.appIdx() else ty.nominalId();
+    const key = (@as(u64, pid) << 40) | (@as(u64, @intFromEnum(ty.kind)) << 32) | id;
+    if ((try visited.getOrPut(t.gpa, key)).found_existing) return;
+    var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer memo.deinit(t.gpa);
+    if (ty.isApp()) {
+        const e = t.composite.at(ty.appIdx());
+        switch (try conform.generic(t.conformTables(model, &.{}), &memo, ty, pid, &.{})) {
+            .none => {},
+            .unmet => return,
+            .met => |m| {
+                defer m.deinit(t.gpa);
+                const wpid = m.row.refines orelse pid;
+                for (model.templates) |tm| {
+                    if (tm.protocol_id != wpid or tm.recv_ctor != e.ctor or tm.recv_is_enum != e.ctor_is_enum) continue;
+                    if (!eqlTypeVec(tm.protocol_args, m.row.protocol_args)) continue;
+                    const mf = model.fns[tm.fn_id];
+                    if (hasOwnTypeParams(t.composite, mf)) continue;
+                    const targs = (try bindImplParams(t.gpa, t.composite, mf, e.args)) orelse continue;
+                    defer t.gpa.free(targs);
+                    try t.enqueueInstance(model, tm.fn_id, targs, worklist, seen, at, mod);
+                }
+                return;
+            },
+        }
+        if (e.is_fn) return;
+        if (e.ctor_is_enum) {
+            if (e.ctor < model.enums.len) for (model.enums[e.ctor].variants) |v| for (v.field_types) |ft|
+                try t.demandWitnesses(model, pid, try conform.substPattern(t.composite, t.gpa, ft, e.args), worklist, seen, visited, at, mod);
+        } else if (e.ctor < model.structs.len) for (model.structs[e.ctor].field_types) |ft|
+            try t.demandWitnesses(model, pid, try conform.substPattern(t.composite, t.gpa, ft, e.args), worklist, seen, visited, at, mod);
+        return;
+    }
+    if (ty.kind == .@"enum") {
+        if (ty.enum_id < model.enums.len) for (model.enums[ty.enum_id].variants) |v| for (v.field_types) |ft|
+            try t.demandWitnesses(model, pid, ft, worklist, seen, visited, at, mod);
+    } else if (ty.struct_id < model.structs.len) for (model.structs[ty.struct_id].field_types) |ft|
+        try t.demandWitnesses(model, pid, ft, worklist, seen, visited, at, mod);
+}
+
+/// `P[A, B]`, each arg by its type name.
+fn writeProtocolRef(t: *Typecheck, out: *std.ArrayList(u8), pname: []const u8, args: []const Type) !void {
+    try out.appendSlice(t.gpa, pname);
+    try out.append(t.gpa, '[');
+    for (args, 0..) |a, i| {
+        if (i != 0) try out.appendSlice(t.gpa, ", ");
+        try out.appendSlice(t.gpa, if (a.kind == .unit) "()" else t.typeName(a));
+    }
+    try out.append(t.gpa, ']');
+}
+
+/// Instantiate the explicit generic impls a Hashable key's erased hash/eq dispatch calls
+/// through `pids`. The dispatch is no call, so neither `scanCalls` nor a derive request
+/// discovers them, and without their instances the derive would stand in for them.
+fn demandKeyWitnesses(t: *Typecheck, model: *const Model, pids: []const u32, key: Type, worklist: *std.ArrayList(Pending), seen: *std.StringHashMapUnmanaged(void), at: Anchor, mod: u32) error{OutOfMemory}!void {
+    var visited: std.AutoHashMapUnmanaged(u64, void) = .empty;
+    defer visited.deinit(t.gpa);
+    for (pids) |pid| try t.demandWitnesses(model, pid, key, worklist, seen, &visited, at, mod);
+}
+
+/// The conformance tables over `model`, as a mono-tail query (no bounded template in
+/// scope unless `bound_protocols` says so) sees them.
+fn conformTables(t: *Typecheck, model: *const Model, bound_protocols: []const ?u32) conform.Tables {
+    return .{ .structs = model.structs, .enums = model.enums, .conformances = model.conformances, .gen = .of(model), .composite = t.composite, .gpa = t.gpa, .bound_protocols = bound_protocols };
+}
+
 /// Enqueue `(gid, args)` for instantiation, deduped on the canonical key. `args` is
 /// BORROWED (the caller keeps its scratch); a fresh owned copy is stored on the
 /// worklist. Shared by the explicit and inferred `scanCalls` branches so their dedup
@@ -3393,15 +3532,27 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
             for (bargs, 0..) |ba, k| subst_buf[k] = t.substType(ba, args);
         }
         if (conform.existence(model, pid, args[ord], subst_buf)) continue;
+        const is_hashable = if (model.prelude) |pre| pre.protocols.hashable == pid else false;
+        const unmet: ?conform.UnmetBound = switch (try conform.generic(t.conformTables(model, &.{}), &cmemo, args[ord], pid, subst_buf)) {
+            .none => null,
+            .met => |m| {
+                m.deinit(t.gpa);
+                if (is_hashable) try t.demandKeyWitnesses(model, &.{pid}, args[ord], worklist, seen, at, mod);
+                continue;
+            },
+            .unmet => |u| u,
+        };
         // A `[K has Hashable]` bound is satisfied structurally by an aggregate whose fields are
         // all Hashable AND which holds no managed box (a `Ref` has no stable hashable value) —
         // the SAME `conform.hashable` authority the descriptor's erased key dispatch gates on,
         // so a key that passes here always has resolvable hash/eq witnesses. A Ref-tainted /
         // non-hashable key falls through to the clean T0023 below (never the mislocated
         // internal T0030 the descriptor synth would otherwise emit).
-        if (subst_buf.len == 0) if (model.prelude) |pre| if (pre.protocols.hashable) |hpid| if (hpid == pid) {
-            if (pre.protocols.hash) |hp|
-                if (try conform.hashable(model.structs, model.enums, model.conformances, t.composite, args[ord], hpid, hp, pre.ref_struct, pre.gc_array_struct, &cmemo, t.gpa)) continue;
+        if (unmet == null and subst_buf.len == 0 and is_hashable) if (model.prelude) |pre| if (pre.protocols.hash) |hp| if (pre.protocols.eq) |ep| {
+            if (try conform.hashable(model.structs, model.enums, model.conformances, .of(model), t.composite, args[ord], pid, hp, pre.ref_struct, pre.gc_array_struct, &cmemo, t.gpa)) {
+                try t.demandKeyWitnesses(model, &.{ ep, hp }, args[ord], worklist, seen, at, mod);
+                continue;
+            }
         };
         // The frozen table holds only EXPLICIT/prelude conformances. A struct/enum that
         // merely DERIVES Eq/Ord/Hash structurally (no `impl`) satisfies a `[T has Ord]`
@@ -3410,14 +3561,29 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
         // protocol (structural conformance is undefined for a parameterized/custom one, so
         // a custom-protocol bound with no impl still correctly emits T0023). The per-
         // instance re-check records the ground derive request, so the witness is synthesized.
-        if (subst_buf.len == 0 and isDerivableProtocol(model, pid) and
-            try conform.structural(model.structs, model.enums, model.conformances, args[ord], pid, &cmemo, t.gpa, t.composite, &.{}))
+        if (unmet == null and subst_buf.len == 0 and isDerivableProtocol(model, pid) and
+            try conform.structural(model.structs, model.enums, model.conformances, .of(model), args[ord], pid, &cmemo, t.gpa, t.composite, &.{}))
             continue;
         if (rejectedConformance(model.rejected_impls, t.composite, args[ord], pid)) return;
         _ = t.gphSelect(mod);
         const tname = t.typeName(args[ord]);
         const pname = model.protocols[pid].name;
-        if (args[ord].isFunc()) {
+        // A generic impl exists but an impl-param bound fails: suggesting that impl again
+        // would be wrong, so name the type arg that fails it.
+        if (unmet) |u| {
+            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; its generic impl needs type argument '{s}' to conform to '{s}'", .{ tname, pname, t.typeName(u.arg), model.protocols[u.pid].name });
+        } else if (if (subst_buf.len > 0) try conform.givenArgs(t.conformTables(model, &.{}), args[ord], pid) else null) |given| {
+            // Its generic impl exists at other protocol args: name both rather than
+            // suggest writing the impl again.
+            defer t.gpa.free(given);
+            var want: std.ArrayList(u8) = .empty;
+            defer want.deinit(t.gpa);
+            var got: std.ArrayList(u8) = .empty;
+            defer got.deinit(t.gpa);
+            try t.writeProtocolRef(&want, pname, subst_buf);
+            try t.writeProtocolRef(&got, pname, given);
+            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; its generic impl gives '{s}'", .{ tname, want.items, got.items });
+        } else if (args[ord].isFunc()) {
             // No impl can be written for a function type, so the usual fixes do not apply.
             try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "function type '{s}' does not conform to protocol '{s}'; function values support only '==' (identity)", .{ tname, pname });
         } else if (scalarImplModule(model, tname, pid)) |m| {
@@ -6796,7 +6962,7 @@ test "firstNonConformingField names the field blocking a `Hash` derive (T0030 su
     defer memo.deinit(gpa);
     var co: Composite = .{};
     defer co.deinit(gpa);
-    const off = try conform.firstNonConformingField(&structs, &enums, &confs, Type.structT(0), hash_pid, &memo, gpa, &co, &.{});
+    const off = try conform.firstNonConformingField(&structs, &enums, &confs, .{}, Type.structT(0), hash_pid, &memo, gpa, &co, &.{});
     try testing.expect(off != null);
     try testing.expectEqualStrings("name", off.?.name);
     try testing.expect(Type.eql(Type.str, off.?.ty));
@@ -7697,20 +7863,21 @@ test "an unbounded template's per-instance T0025 and T0016 hints read as the tem
     }
 }
 
-test "T0025 on a generic type names the conformances no call can choose" {
+test "T0025 on a generic type offers a bounded fn, and following it compiles" {
     const gpa = testing.allocator;
-    var c = try checkSource(
+    const decls =
         \\protocol Show { fn render(self) -> int }
         \\protocol Debug { fn render(self) -> int }
         \\struct Box[T] { v: T }
         \\impl Box[T] has Show { fn render(self) -> int { 1 } }
         \\impl Box[T] has Debug { fn render(self) -> int { 2 } }
-        \\fn main() -> int { return Box { v: 1 }.render() }
         \\
-    );
+    ;
+    var c = try checkSource(decls ++ "fn main() -> int { return Box { v: 1 }.render() }\n");
     defer c.deinit(gpa);
     const msg = try onlyT0025(&c);
-    try testing.expect(std.mem.endsWith(u8, msg, "(Show and Debug); no call can choose 'Show' or 'Debug' on a generic type yet"));
+    try testing.expect(std.mem.endsWith(u8, msg, "(Show and Debug); call it through a fn bounded by 'Show', e.g. 'fn render_via[T has Show](x: T) -> int { x.render() }'"));
+    try expectNoErrors(decls ++ "fn render_via[T has Show](x: T) -> int { x.render() }\nfn main() -> int { return render_via(Box { v: 1 }) }\n");
 }
 
 test "a call on a bounded param takes the bound's conformance in each instance" {

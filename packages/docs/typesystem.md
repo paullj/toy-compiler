@@ -730,14 +730,32 @@ instance calls the `Show` witness even when its type also has `Debug.render`: th
 bound-as-axiom check records the protocol it resolved the call through, and the
 instance's re-check keeps to that protocol, with the bound's args grounded through the
 instance (`[T has Into[int]]` takes `Into[int]` among `Into[int]` and `Into[bool]`).
+On a generic type (`impl Box[T] has Show` beside `impl Box[T] has Debug`) the re-check
+picks the method template of the bound's conformance the same way.
+
+**A generic conformance meets a bound.** `impl Box[T] has Show` makes every `Box[X]`
+conform to `Show`, so `use_show(Box { v: 1 })` checks. The impl may bound its own
+params, `impl Vec[T has Display] has Display`: `Vec[X]` then conforms only where `X`
+does, by any route a bound accepts (an impl, a generic impl, or a structural derive).
+`conform.generic` decides it: the row of the receiver's type constructor binds the impl's
+params from the receiver's args (`Infer.match` over the impl's receiver pattern), its
+protocol-arg pattern must ground to the bound's args, and each impl-param bound must
+hold. Where a row covers the receiver but a bound fails, the type does not conform and
+the structural derive does not stand in: an explicit impl wins even where it does not
+apply, so the **T0023** names the type arg that fails it. The `[T has P]` check at the
+mono worklist, the operator and `to_string` gates, and the structural walk (a field of
+type `Box[int]`) all ask it. Its witness is an instance of the impl's method: a
+`to_string`, `==` or derived field that leans on it records a derive request as a
+structural derive does, the mono tail instantiates the impl's methods for it, and each
+reached instance gets a concrete conformance row on the reified type, so the derive
+synthesis reuses it rather than deriving one.
 
 **The T0025 hint is written from the case at hand**, and following it compiles. Each
 conformance whose protocol args no other conflicting conformance shares is named by
 them: `.into[int]() or .into[bool]()`. No call syntax names a protocol, so any other
 (a protocol without args, or args another one shares) is reached through a fn bounded by
 it, which the hint spells out: `fn render_via[T has Show](x: T) -> int { x.render() }`.
-A generic type cannot meet a bound yet, so on one the hint says that no call can choose
-those conformances. A method value takes no protocol args (`f := p.into[int]` is T0025
+A method value takes no protocol args (`f := p.into[int]` is T0025
 too), so at one the hint puts them in a lambda's call: `fn() { p.into[int]() }`. In an
 unbounded template, which only its instances check, the instances' reports at one site
 that differ only by the template's type args become one, written with the template's own

@@ -15,10 +15,12 @@ const Typecheck = @import("../types.zig");
 const LayoutEngine = @import("../layout/Engine.zig");
 const Composite = @import("../symbols/Composite.zig");
 const StdNames = @import("../symbols/StdNames.zig");
+const Infer = @import("../symbols/Infer.zig");
 
 const Type = Typecheck.Type;
 const Model = Typecheck.Model;
 const Conformance = Typecheck.Conformance;
+const TemplateConformance = Typecheck.TemplateConformance;
 const NonConformingField = Typecheck.NonConformingField;
 const StructSym = LayoutEngine.StructSym;
 const EnumSym = LayoutEngine.EnumSym;
@@ -28,11 +30,14 @@ const eqlTypeVec = Typecheck.eqlTypeVec;
 /// thread-order-free linear scan over the frozen `model.conformances` by protocol id
 /// + `Type.eql` — the SAME determinism discipline `findMethod` uses, so bound
 /// resolution at the mono worklist is byte-identical at any `-jN`. A generic-App
-/// type-arg misses: `model.conformances` holds only concrete receivers, and a generic
-/// `impl Box[T] has P` is a `model.template_conformances` row, which only
-/// `iteratorItem` reads, so such an impl does not yet satisfy a `[T has P]` bound (#91).
+/// receiver misses here: a generic `impl Box[T] has P` is a template row, which
+/// `generic` matches.
 pub fn existence(model: *const Model, pid: u32, recv: Type, protocol_args: []const Type) bool {
-    for (model.conformances) |c| {
+    return existsIn(model.conformances, pid, recv, protocol_args);
+}
+
+pub fn existsIn(conformances: []const Conformance, pid: u32, recv: Type, protocol_args: []const Type) bool {
+    for (conformances) |c| {
         // Exact match first (a user `impl int8 has P` row, or any concrete receiver).
         if (c.protocol == pid and Type.eql(c.recv, recv) and eqlTypeVec(c.protocol_args, protocol_args)) return true;
         // Then the integer-width normalization (see `intMatchesPlatformRow`): keeps the
@@ -40,6 +45,163 @@ pub fn existence(model: *const Model, pid: u32, recv: Type, protocol_args: []con
         if (intMatchesPlatformRow(recv, c.recv) and c.protocol == pid and eqlTypeVec(c.protocol_args, protocol_args)) return true;
     }
     return false;
+}
+
+/// What a pre-reify conformance query needs to see generic conformances: the template
+/// rows, and the prelude, whose derivable protocols an impl-param bound may be met by
+/// structurally. The empty value sees none, which is right post-reify (a reached generic
+/// conformance is a concrete `conformances` row by then) and for a prelude-less caller.
+pub const Generic = struct {
+    rows: []const TemplateConformance = &.{},
+    prelude: ?Typecheck.Prelude = null,
+
+    pub fn of(model: *const Model) Generic {
+        return .{ .rows = model.template_conformances, .prelude = model.prelude };
+    }
+};
+
+/// The tables `generic` reads, bundled so the recursion through impl-param bounds passes
+/// one value.
+pub const Tables = struct {
+    structs: []const StructSym,
+    enums: []const EnumSym,
+    conformances: []const Conformance,
+    gen: Generic,
+    composite: *Composite,
+    gpa: std.mem.Allocator,
+    bound_protocols: []const ?u32,
+    /// Set when called from inside `conformsRec`, so a bound's structural check joins
+    /// its in-progress stack (cycle-safe) and reports the assumptions it leaned on.
+    rec: ?Rec = null,
+
+    const Rec = struct { stack: *std.AutoHashMapUnmanaged(u64, u32), depth: u32, low: *u32 };
+};
+
+/// A generic conformance an App receiver meets: its row, and the impl's params bound
+/// from the receiver's args (OWNED by the caller).
+pub const GenericMatch = struct {
+    row: *const TemplateConformance,
+    params: []Type,
+
+    pub fn deinit(m: GenericMatch, gpa: std.mem.Allocator) void {
+        gpa.free(m.params);
+    }
+};
+
+/// How a generic conformance `impl Ctor[T] has P[..]` decides `pid[protocol_args]` for the
+/// App `recv`: no row covers `recv` (`none`); a row binds the impl's params from `recv`'s
+/// args, its arg pattern grounds to `protocol_args`, and every impl-param bound
+/// (`impl Box[T has Display]`) holds (`met`); or a row covers `recv` but a bound fails
+/// (`unmet`). An explicit impl wins over the structural derive even when it does not
+/// apply, so `unmet` is a denial, not a fall-through. `recv` may be abstract (a bounded
+/// template's `Box[T]`): a bound on `T` then holds by the axiom rule. Coherence keeps at
+/// most one row per `(pid, ctor, args)`.
+pub const Verdict = union(enum) { none, met: GenericMatch, unmet: UnmetBound };
+
+pub fn generic(tb: Tables, memo: *std.AutoHashMapUnmanaged(u64, bool), recv: Type, pid: u32, protocol_args: []const Type) error{OutOfMemory}!Verdict {
+    const row = (try bindRow(tb, recv, pid, protocol_args)) orelse return .none;
+    if (try firstUnmetBound(tb, memo, row)) |u| {
+        row.deinit(tb.gpa);
+        return .{ .unmet = u };
+    }
+    return .{ .met = row };
+}
+
+/// The impl-param bound a generic row leaves unmet: the bound arg and its protocol.
+pub const UnmetBound = struct { arg: Type, pid: u32 };
+
+/// The first impl-param bound of `m` whose arg does not conform, else null.
+fn firstUnmetBound(tb: Tables, memo: *std.AutoHashMapUnmanaged(u64, bool), m: GenericMatch) error{OutOfMemory}!?UnmetBound {
+    for (m.row.bounds, 0..) |maybe_bp, ord| {
+        const bp = maybe_bp orelse continue;
+        if (ord >= m.params.len) continue;
+        const arg = m.params[ord];
+        const pat: []const Type = if (ord < m.row.bound_args.len) m.row.bound_args[ord] else &.{};
+        var buf: [4]Type = undefined;
+        const bargs: []Type = if (pat.len <= buf.len) buf[0..pat.len] else try tb.gpa.alloc(Type, pat.len);
+        defer if (pat.len > buf.len) tb.gpa.free(bargs);
+        for (pat, bargs) |p, *b| b.* = try substPattern(tb.composite, tb.gpa, p, m.params);
+        if (!try meets(tb, memo, arg, bp, bargs)) return .{ .arg = arg, .pid = bp };
+    }
+    return null;
+}
+
+/// The row of `pid[protocol_args]` whose receiver pattern binds from the App `recv`,
+/// before its impl-param bounds are checked.
+fn bindRow(tb: Tables, recv: Type, pid: u32, protocol_args: []const Type) error{OutOfMemory}!?GenericMatch {
+    if (!recv.isApp()) return null;
+    const e = tb.composite.at(recv.appIdx());
+    if (e.is_fn) return null;
+    for (tb.gen.rows) |*row| {
+        if (row.protocol_id != pid or row.recv_ctor != e.ctor or row.recv_is_enum != e.ctor_is_enum) continue;
+        if (row.protocol_args.len != protocol_args.len or !row.recv.isApp()) continue;
+        const pat = tb.composite.at(row.recv.appIdx()).args;
+        if (pat.len != e.args.len) continue;
+        const params = try tb.gpa.alloc(Type, row.n_params);
+        errdefer tb.gpa.free(params);
+        const bnd = try tb.gpa.alloc(bool, row.n_params);
+        defer tb.gpa.free(bnd);
+        const fp = try tb.gpa.alloc(usize, row.n_params);
+        defer tb.gpa.free(fp);
+        if (Infer.match(row.n_params, pat, e.args, params, bnd, fp, tb.composite.decomposer()) != .ok) {
+            tb.gpa.free(params);
+            continue;
+        }
+        var args_ok = true;
+        for (row.protocol_args, protocol_args) |pa, want| {
+            if (!Type.eql(try substPattern(tb.composite, tb.gpa, pa, params), want)) {
+                args_ok = false;
+                break;
+            }
+        }
+        if (!args_ok) {
+            tb.gpa.free(params);
+            continue;
+        }
+        return .{ .row = row, .params = params };
+    }
+    return null;
+}
+
+/// The protocol args the first generic conformance of `pid` covering the App `recv` gives
+/// it, grounded through `recv`'s args and OWNED by the caller; null when none covers it.
+/// Names what an impl gives when a bound asks `pid` at other args.
+pub fn givenArgs(tb: Tables, recv: Type, pid: u32) error{OutOfMemory}!?[]Type {
+    if (!recv.isApp()) return null;
+    const e = tb.composite.at(recv.appIdx());
+    for (tb.gen.rows) |row| {
+        if (row.protocol_id != pid or row.recv_ctor != e.ctor or row.recv_is_enum != e.ctor_is_enum) continue;
+        if (row.n_params != e.args.len) continue;
+        const out = try tb.gpa.alloc(Type, row.protocol_args.len);
+        for (row.protocol_args, out) |pa, *o| o.* = try substPattern(tb.composite, tb.gpa, pa, e.args);
+        return out;
+    }
+    return null;
+}
+
+/// Whether `ty` meets the bound `[T has pid[protocol_args]]`, by every route a bound at
+/// an instantiation accepts: a concrete conformance, the axiom rule, a generic
+/// conformance, or a structural derive of a zero-arg derivable protocol.
+fn meets(tb: Tables, memo: *std.AutoHashMapUnmanaged(u64, bool), ty: Type, pid: u32, protocol_args: []const Type) error{OutOfMemory}!bool {
+    if (existsIn(tb.conformances, pid, ty, protocol_args)) return true;
+    if (axiom(ty, pid, tb.bound_protocols)) return true;
+    switch (try generic(tb, memo, ty, pid, protocol_args)) {
+        .none => {},
+        .met => |m| {
+            m.deinit(tb.gpa);
+            return true;
+        },
+        .unmet => return false,
+    }
+    if (protocol_args.len != 0) return false;
+    const pre = tb.gen.prelude orelse return false;
+    if (!pre.isDerivable(pid)) return false;
+    if (tb.rec) |r| {
+        const st = try conformsRec(tb.structs, tb.enums, tb.conformances, tb.gen, ty, pid, memo, r.stack, r.depth + 1, tb.gpa, tb.composite, tb.bound_protocols);
+        if (st.low < r.low.*) r.low.* = st.low;
+        return st.ok;
+    }
+    return structural(tb.structs, tb.enums, tb.conformances, tb.gen, ty, pid, memo, tb.gpa, tb.composite, tb.bound_protocols);
 }
 
 /// The builtin-protocol integer-width normalization: a width receiver (`int8`/`uint32`/…)
@@ -73,10 +235,11 @@ pub fn direct(model: *const Model, recv: Type, pid: u32, bound_protocols: []cons
     return axiom(recv, pid, bound_protocols);
 }
 
-/// Which tier of the composed operator verdict fired. `.structural` is the ONLY tier
-/// that carries a derive side-effect obligation (the caller records the request), so the
-/// caller gates on it without re-running the decision.
-pub const Tier = enum { none, direct, structural };
+/// Which tier of the composed operator verdict fired. `.generic` and `.structural` carry
+/// a side-effect obligation the caller records as a derive request: the generic impl's
+/// instance for the mono tail to instantiate, or the structural recipe for the synthesis
+/// barrier. They stay distinct tiers because only `.structural` is a derive.
+pub const Tier = enum { none, direct, generic, structural };
 
 /// The composed operator-gating verdict for the STRUCTURALLY-DERIVABLE protocols (Eq/Ord/
 /// Hash/Display): `direct` (existence ∨ axiom) FIRST, then — only when `recv` is an
@@ -100,7 +263,16 @@ pub fn classify(
         .@"struct", .@"enum", .app => {},
         else => return .none,
     }
-    if (try structural(model.structs, model.enums, model.conformances, recv, pid, memo, gpa, composite, bound_protocols))
+    const tb: Tables = .{ .structs = model.structs, .enums = model.enums, .conformances = model.conformances, .gen = .of(model), .composite = composite, .gpa = gpa, .bound_protocols = bound_protocols };
+    switch (try generic(tb, memo, recv, pid, &.{})) {
+        .none => {},
+        .met => |m| {
+            m.deinit(gpa);
+            return .generic;
+        },
+        .unmet => return .none,
+    }
+    if (try structural(model.structs, model.enums, model.conformances, .of(model), recv, pid, memo, gpa, composite, bound_protocols))
         return .structural;
     return .none;
 }
@@ -128,6 +300,7 @@ pub fn structural(
     structs: []const StructSym,
     enums: []const EnumSym,
     conformances: []const Conformance,
+    gen: Generic,
     recv: Type,
     pid: u32,
     memo: *std.AutoHashMapUnmanaged(u64, bool),
@@ -137,7 +310,7 @@ pub fn structural(
 ) error{OutOfMemory}!bool {
     var stack: std.AutoHashMapUnmanaged(u64, u32) = .empty;
     defer stack.deinit(gpa);
-    const r = try conformsRec(structs, enums, conformances, recv, pid, memo, &stack, 0, gpa, composite, bound_protocols);
+    const r = try conformsRec(structs, enums, conformances, gen, recv, pid, memo, &stack, 0, gpa, composite, bound_protocols);
     return r.ok;
 }
 
@@ -158,6 +331,7 @@ fn conformsRec(
     structs: []const StructSym,
     enums: []const EnumSym,
     conformances: []const Conformance,
+    gen: Generic,
     recv: Type,
     pid: u32,
     memo: *std.AutoHashMapUnmanaged(u64, bool),
@@ -193,12 +367,27 @@ fn conformsRec(
             const e = composite.at(ai);
             var aok = true;
             var low: u32 = no_assumption;
-            if (e.ctor_is_enum) {
+            // An explicit generic conformance wins over the structural walk, as a
+            // concrete `impl` does in the nominal arm below. Its impl-param bounds recurse
+            // on this stack: a bound arg may hold this very App (`Node[T]` through `Box`).
+            const tb: Tables = .{ .structs = structs, .enums = enums, .conformances = conformances, .gen = gen, .composite = composite, .gpa = gpa, .bound_protocols = bound_protocols, .rec = .{ .stack = stack, .depth = depth, .low = &low } };
+            const covered = switch (try generic(tb, memo, recv, pid, &.{})) {
+                .none => false,
+                .met => |m| blk: {
+                    m.deinit(gpa);
+                    break :blk true;
+                },
+                .unmet => blk: {
+                    aok = false;
+                    break :blk true;
+                },
+            };
+            if (covered) {} else if (e.ctor_is_enum) {
                 if (e.ctor < enums.len) {
                     outer: for (enums[e.ctor].variants) |v| {
                         for (v.field_types) |ft| {
                             const sub = try substPattern(composite, gpa, ft, e.args);
-                            const r = try conformsRec(structs, enums, conformances, sub, pid, memo, stack, depth + 1, gpa, composite, bound_protocols);
+                            const r = try conformsRec(structs, enums, conformances, gen, sub, pid, memo, stack, depth + 1, gpa, composite, bound_protocols);
                             if (r.low < low) low = r.low;
                             if (!r.ok) {
                                 aok = false;
@@ -211,7 +400,7 @@ fn conformsRec(
                 if (e.ctor < structs.len) {
                     for (structs[e.ctor].field_types) |ft| {
                         const sub = try substPattern(composite, gpa, ft, e.args);
-                        const r = try conformsRec(structs, enums, conformances, sub, pid, memo, stack, depth + 1, gpa, composite, bound_protocols);
+                        const r = try conformsRec(structs, enums, conformances, gen, sub, pid, memo, stack, depth + 1, gpa, composite, bound_protocols);
                         if (r.low < low) low = r.low;
                         if (!r.ok) {
                             aok = false;
@@ -262,7 +451,7 @@ fn conformsRec(
             if (recv.struct_id < structs.len) {
                 ok = true;
                 for (structs[recv.struct_id].field_types) |ft| {
-                    const r = try conformsRec(structs, enums, conformances, ft, pid, memo, stack, depth + 1, gpa, composite, bound_protocols);
+                    const r = try conformsRec(structs, enums, conformances, gen, ft, pid, memo, stack, depth + 1, gpa, composite, bound_protocols);
                     if (r.low < low) low = r.low;
                     if (!r.ok) {
                         ok = false;
@@ -275,7 +464,7 @@ fn conformsRec(
                 ok = true;
                 outer: for (enums[recv.enum_id].variants) |v| {
                     for (v.field_types) |ft| {
-                        const r = try conformsRec(structs, enums, conformances, ft, pid, memo, stack, depth + 1, gpa, composite, bound_protocols);
+                        const r = try conformsRec(structs, enums, conformances, gen, ft, pid, memo, stack, depth + 1, gpa, composite, bound_protocols);
                         if (r.low < low) low = r.low;
                         if (!r.ok) {
                             ok = false;
@@ -323,9 +512,7 @@ pub fn substPattern(composite: *Composite, gpa: std.mem.Allocator, pat: Type, ar
 /// GENERIC-conformance table for a row whose receiver ctor matches `iter_app`'s and whose
 /// protocol is named `Iterator`, then substitute the recorded arg PATTERN through
 /// `iter_app`'s concrete args. Null when `iter_app` is not an App or conforms to no
-/// `Iterator`. This is the ONLY reader of `model.template_conformances`, so recording a
-/// generic conformance there perturbs no other verdict. A malformed row (no args) yields
-/// null rather than crash.
+/// `Iterator`. A malformed row (no args) yields null rather than crash.
 pub fn iteratorItem(model: *const Model, composite: *Composite, gpa: std.mem.Allocator, iter_app: Type) error{OutOfMemory}!?Type {
     if (!iter_app.isApp()) return null;
     const e = composite.at(iter_app.appIdx());
@@ -346,6 +533,7 @@ pub fn firstNonConformingField(
     structs: []const StructSym,
     enums: []const EnumSym,
     conformances: []const Conformance,
+    gen: Generic,
     recv: Type,
     pid: u32,
     memo: *std.AutoHashMapUnmanaged(u64, bool),
@@ -356,7 +544,7 @@ pub fn firstNonConformingField(
     if (recv.kind != .@"struct" or recv.struct_id >= structs.len) return null;
     const s = structs[recv.struct_id];
     for (s.field_types, 0..) |ft, i| {
-        if (!try structural(structs, enums, conformances, ft, pid, memo, gpa, composite, bound_protocols)) {
+        if (!try structural(structs, enums, conformances, gen, ft, pid, memo, gpa, composite, bound_protocols)) {
             return .{ .name = if (i < s.field_names.len) s.field_names[i] else "?", .ty = ft };
         }
     }
@@ -431,8 +619,10 @@ fn containsManaged(structs: []const StructSym, enums: []const EnumSym, composite
 /// built AND call a resolvable witness". `existence`-FIRST (a builtin scalar row OR a
 /// top-level explicit `impl` — honored, and short-circuiting the Ref guard so an explicit box
 /// impl is respected), then the STRUCTURAL leg keyed on `hash_pid` (the pid the Hash/Eq
-/// emitters resolve each field through), minus managed-box keys (`containsManaged`).
-pub fn hashable(structs: []const StructSym, enums: []const EnumSym, conformances: []const Conformance, composite: *Composite, recv: Type, hashable_pid: u32, hash_pid: u32, ref_ctor: ?u32, gc_array_ctor: ?u32, memo: *std.AutoHashMapUnmanaged(u64, bool), gpa: std.mem.Allocator) error{OutOfMemory}!bool {
+/// emitters resolve each field through), minus managed-box keys (`containsManaged`). `gen`
+/// lets a pre-reify query see an explicit generic `Hash` impl, which wins over the derive
+/// as a concrete one does; post-reify its reached instances are concrete rows.
+pub fn hashable(structs: []const StructSym, enums: []const EnumSym, conformances: []const Conformance, gen: Generic, composite: *Composite, recv: Type, hashable_pid: u32, hash_pid: u32, ref_ctor: ?u32, gc_array_ctor: ?u32, memo: *std.AutoHashMapUnmanaged(u64, bool), gpa: std.mem.Allocator) error{OutOfMemory}!bool {
     for (conformances) |c| {
         if (c.protocol == hashable_pid and c.protocol_args.len == 0 and (Type.eql(c.recv, recv) or intMatchesPlatformRow(recv, c.recv))) return true;
     }
@@ -443,7 +633,7 @@ pub fn hashable(structs: []const StructSym, enums: []const EnumSym, conformances
     var mm: std.AutoHashMapUnmanaged(u64, bool) = .empty;
     defer mm.deinit(gpa);
     if (try containsManaged(structs, enums, composite, recv, ref_ctor, gc_array_ctor, &mm, gpa)) return false;
-    return structural(structs, enums, conformances, recv, hash_pid, memo, gpa, composite, &.{});
+    return structural(structs, enums, conformances, gen, recv, hash_pid, memo, gpa, composite, &.{});
 }
 
 const testing = std.testing;
@@ -488,7 +678,7 @@ test "structural conformance: scalar/struct/nested/empty-enum/payload-enum recur
     defer co.deinit(gpa);
     const C = struct {
         fn q(st: []const StructSym, en: []const EnumSym, cf: []const Conformance, ty: Type, m: *std.AutoHashMapUnmanaged(u64, bool), g: std.mem.Allocator, cp: *Composite) !bool {
-            return structural(st, en, cf, ty, 0, m, g, cp, &.{});
+            return structural(st, en, cf, .{}, ty, 0, m, g, cp, &.{});
         }
     };
     try testing.expect(try C.q(&structs, &enums, &confs, Type.int, &memo, gpa, &co));
@@ -502,7 +692,7 @@ test "structural conformance: scalar/struct/nested/empty-enum/payload-enum recur
     try testing.expect(!try C.q(&structs, &enums, &confs, Type.str, &memo, gpa, &co));
 
     // The blocked struct#3 names its first offending field (`d: E2`).
-    const off = try firstNonConformingField(&structs, &enums, &confs, Type.structT(3), 0, &memo, gpa, &co, &.{});
+    const off = try firstNonConformingField(&structs, &enums, &confs, .{}, Type.structT(3), 0, &memo, gpa, &co, &.{});
     try testing.expect(off != null);
     try testing.expectEqualStrings("d", off.?.name);
     try testing.expect(Type.eql(Type.enumT(2), off.?.ty));
@@ -536,12 +726,12 @@ test "structural conformance: App types, nested memoization, and the type_var bo
     var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
     defer memo.deinit(gpa);
 
-    try testing.expect(try structural(&structs, &enums, &confs, Type.app(box_int), ord_pid, &memo, gpa, &co, &.{}));
-    try testing.expect(!try structural(&structs, &enums, &confs, Type.app(box_int), doubler_pid, &memo, gpa, &co, &.{}));
+    try testing.expect(try structural(&structs, &enums, &confs, .{}, Type.app(box_int), ord_pid, &memo, gpa, &co, &.{}));
+    try testing.expect(!try structural(&structs, &enums, &confs, .{}, Type.app(box_int), doubler_pid, &memo, gpa, &co, &.{}));
 
-    try testing.expect(try structural(&structs, &enums, &confs, Type.app(box_box_int), ord_pid, &memo, gpa, &co, &.{}));
+    try testing.expect(try structural(&structs, &enums, &confs, .{}, Type.app(box_box_int), ord_pid, &memo, gpa, &co, &.{}));
     const n = memo.count();
-    try testing.expect(try structural(&structs, &enums, &confs, Type.app(box_box_int), ord_pid, &memo, gpa, &co, &.{}));
+    try testing.expect(try structural(&structs, &enums, &confs, .{}, Type.app(box_box_int), ord_pid, &memo, gpa, &co, &.{}));
     try testing.expectEqual(n, memo.count());
 
     // Abstract Box[T]: discharges from the axiom `T has Ord` iff the bound IS Ord.
@@ -551,12 +741,12 @@ test "structural conformance: App types, nested memoization, and the type_var bo
     defer memo_ord.deinit(gpa);
     var memo_dbl: std.AutoHashMapUnmanaged(u64, bool) = .empty;
     defer memo_dbl.deinit(gpa);
-    try testing.expect(try structural(&structs, &enums, &confs, Type.app(box_tv), ord_pid, &memo_ord, gpa, &co, &bp_ord));
-    try testing.expect(!try structural(&structs, &enums, &confs, Type.app(box_tv), ord_pid, &memo_dbl, gpa, &co, &bp_doubler));
+    try testing.expect(try structural(&structs, &enums, &confs, .{}, Type.app(box_tv), ord_pid, &memo_ord, gpa, &co, &bp_ord));
+    try testing.expect(!try structural(&structs, &enums, &confs, .{}, Type.app(box_tv), ord_pid, &memo_dbl, gpa, &co, &bp_doubler));
 
     var memo_s: std.AutoHashMapUnmanaged(u64, bool) = .empty;
     defer memo_s.deinit(gpa);
-    try testing.expect(try structural(&structs, &enums, &confs, Type.structT(1), ord_pid, &memo_s, gpa, &co, &.{}));
+    try testing.expect(try structural(&structs, &enums, &confs, .{}, Type.structT(1), ord_pid, &memo_s, gpa, &co, &.{}));
 }
 
 test "iteratorItem: a matching generic-conformance row substitutes Item through the App args" {
@@ -739,7 +929,7 @@ test "hashable: scalar/struct/nested/Ref/float/enum/explicit truth table" {
     defer memo.deinit(gpa);
     const H = struct {
         fn q(st: []const StructSym, en: []const EnumSym, cf: []const Conformance, cp: *Composite, ty: Type, rc: ?u32, m: *std.AutoHashMapUnmanaged(u64, bool), g: std.mem.Allocator) !bool {
-            return hashable(st, en, cf, cp, ty, 1, 0, rc, null, m, g);
+            return hashable(st, en, cf, .{}, cp, ty, 1, 0, rc, null, m, g);
         }
     };
     try testing.expect(try H.q(&structs, &enums, &confs, &co, Type.int, ref_ctor, &memo, gpa)); // scalar (Hashable row)
@@ -751,4 +941,56 @@ test "hashable: scalar/struct/nested/Ref/float/enum/explicit truth table" {
     try testing.expect(try H.q(&structs, &enums, &confs, &co, Type.enumT(1), ref_ctor, &memo, gpa)); // payload enum {int}
     try testing.expect(!try H.q(&structs, &enums, &confs, &co, Type.enumT(2), ref_ctor, &memo, gpa)); // payload enum {float}
     try testing.expect(try H.q(&structs, &enums, &confs, &co, Type.structT(4), ref_ctor, &memo, gpa)); // explicit impl over a box
+}
+
+test "generic: a template row meets, fails or misses by its impl-param bounds and arg pattern" {
+    const gpa = testing.allocator;
+    const show: u32 = 0;
+    const into: u32 = 1;
+    var co: Composite = .{};
+    defer co.deinit(gpa);
+    // `Box[T]` (ctor 0) with `impl Box[T has Show] has Show` and `impl Box[T] has Into[T]`.
+    const box_t = Type.app(try co.intern(gpa, 0, &.{Type.typeVar(0)}, false));
+    const box_int = Type.app(try co.intern(gpa, 0, &.{Type.int}, false));
+    const box_bool = Type.app(try co.intern(gpa, 0, &.{Type.bool}, false));
+    const box_box_int = Type.app(try co.intern(gpa, 0, &.{box_int}, false));
+    const other_int = Type.app(try co.intern(gpa, 1, &.{Type.int}, false));
+    const bounds = [_]?u32{show};
+    const no_bounds = [_]?u32{null};
+    const into_pat = [_]Type{Type.typeVar(0)};
+    const rows = [_]TemplateConformance{
+        .{ .protocol_id = show, .recv_ctor = 0, .recv_is_enum = false, .recv = box_t, .n_params = 1, .bounds = &bounds },
+        .{ .protocol_id = into, .recv_ctor = 0, .recv_is_enum = false, .recv = box_t, .n_params = 1, .bounds = &no_bounds, .protocol_args = &into_pat },
+    };
+    // Only `int` conforms to Show concretely.
+    const confs = [_]Conformance{.{ .protocol = show, .recv = Type.int }};
+    var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer memo.deinit(gpa);
+    const tb: Tables = .{ .structs = &.{}, .enums = &.{}, .conformances = &confs, .gen = .{ .rows = &rows }, .composite = &co, .gpa = gpa, .bound_protocols = &.{} };
+
+    const met = try generic(tb, &memo, box_int, show, &.{});
+    try testing.expect(met == .met);
+    met.met.deinit(gpa);
+    // The bound recurses through the same row: `Box[Box[int]]` holds because `Box[int]` does.
+    const nested = try generic(tb, &memo, box_box_int, show, &.{});
+    try testing.expect(nested == .met);
+    nested.met.deinit(gpa);
+    const unmet = try generic(tb, &memo, box_bool, show, &.{});
+    try testing.expect(unmet == .unmet);
+    try testing.expect(Type.eql(unmet.unmet.arg, Type.bool));
+    try testing.expect((try generic(tb, &memo, other_int, show, &.{})) == .none);
+    try testing.expect((try generic(tb, &memo, Type.int, show, &.{})) == .none);
+    // The arg pattern grounds through the bound params: `Box[int]` is `Into[int]`, not `Into[bool]`.
+    const into_int = try generic(tb, &memo, box_int, into, &.{Type.int});
+    try testing.expect(into_int == .met);
+    into_int.met.deinit(gpa);
+    try testing.expect((try generic(tb, &memo, box_int, into, &.{Type.bool})) == .none);
+    // In a bounded template's check, `Box[T]` meets the bound by the axiom on `T`.
+    const bp = [_]?u32{show};
+    var abstract = tb;
+    abstract.bound_protocols = &bp;
+    const ax = try generic(abstract, &memo, box_t, show, &.{});
+    try testing.expect(ax == .met);
+    ax.met.deinit(gpa);
+    try testing.expect((try generic(tb, &memo, box_t, show, &.{})) == .unmet);
 }

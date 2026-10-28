@@ -1,0 +1,32 @@
+# Feature: an explicit `impl Box[T has Display] has Display` wins over the structural derive
+# everywhere a value renders: `to_string`, `io.println` (a `[T has Display]` bound), and a
+# derived field (`Outer`, an enum payload, `Option[Box[int]]`). The impl's own bound holds
+# through a derive (`Box[Pt]`) and through another generic impl (`Box[Box[int]]`).
+# expect: stdout "B(1)\nB(1)\nOuter{b: B(2), n: 3}\na(B(true))\nsome(B(4))\nB(Pt{x: 5})\nB(B(6))\n"
+# expect: exit 0
+import std/io
+import std/option
+
+struct Box[T] { v: T }
+
+impl Box[T has Display] has Display {
+    fn display(self) -> str { "B(".concat(self.v.to_string()).concat(")") }
+}
+
+struct Outer { b: Box[int], n: int }
+
+enum E { a(Box[bool]), b }
+
+struct Pt { x: int }
+
+fn main() -> int {
+    b := Box { v: 1 }
+    io.println(b.to_string())
+    io.println(b)
+    io.println(Outer { b: Box { v: 2 }, n: 3 })
+    io.println(E.a(Box { v: true }))
+    io.println(Option.some(Box { v: 4 }))
+    io.println(Box { v: Pt { x: 5 } })
+    io.println(Box { v: Box { v: 6 } })
+    return 0
+}
