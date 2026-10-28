@@ -109,6 +109,16 @@ fn roundUp16(n: u32) u32 {
     return (n + 15) / 16 * 16;
 }
 
+/// Lay the next `size`-byte cell at the 8-aligned end of `running` and return
+/// its offset. The bound is checked per cell in u64 because a fn's cells can sum
+/// past 4 GiB; a u32 total would wrap back under `MAX_FRAME` and pass the guard.
+fn place(running: *u32, out_base: u32, size: u32) error{FrameTooLarge}!u32 {
+    const off = roundUp8(running.*);
+    if (@as(u64, out_base) + off + size > MAX_FRAME) return error.FrameTooLarge;
+    running.* = off + size;
+    return out_base + off;
+}
+
 /// The largest slot `func`'s frame holds, over its slots and its values.
 pub fn largestSlot(func: *const Ir.Function, layouts: []const Layout, enum_layouts: []const EnumLayout) u32 {
     var max: u32 = 0;
@@ -196,26 +206,20 @@ pub fn compute(
     errdefer gpa.free(slot_off);
     var running: u32 = 0;
     for (func.slots, 0..) |slot, i| {
-        running = roundUp8(running);
-        slot_off[i] = out_base + running;
-        running += slotSize(slot.type, layouts, enum_layouts);
+        slot_off[i] = try place(&running, out_base, slotSize(slot.type, layouts, enum_layouts));
     }
 
     // (3) value region: each SSA value its OWN slot (spill-all), 8-aligned.
     const value_off = try gpa.alloc(u32, func.values.len);
     errdefer gpa.free(value_off);
     for (func.values, 0..) |vdef, i| {
-        running = roundUp8(running);
-        value_off[i] = out_base + running;
-        running += slotSize(vdef.type, layouts, enum_layouts);
+        value_off[i] = try place(&running, out_base, slotSize(vdef.type, layouts, enum_layouts));
     }
 
     // (4) sret save slot (8 bytes) when the return is a >16B aggregate.
     var sret_save_off: u32 = NO_SRET;
     if (Abi.classifyRet(func.ret_type, layouts, enum_layouts) == .sret) {
-        running = roundUp8(running);
-        sret_save_off = out_base + running;
-        running += 8;
+        sret_save_off = try place(&running, out_base, 8);
     }
 
     // (5) frame = 16-aligned total. Assert the layout invariants.
@@ -688,6 +692,16 @@ test "frame: a frame past 4095 bytes lays out; FrameTooLarge only past MAX_FRAME
     try testing.expectEqual(MAX_FRAME, at_cap.frame);
     const over = [_]Layout{.{ .name = "S", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = MAX_FRAME + 1, .@"align" = 8 }};
     try testing.expectError(error.FrameTooLarge, compute(gpa, &slot, &over, &.{}));
+}
+
+test "frame: slots summing past 4 GiB give FrameTooLarge, not a wrapped total" {
+    const gpa = testing.allocator;
+    var slot_types: [257]Type = undefined;
+    for (&slot_types) |*t| t.* = Type.structT(0);
+    var func = try buildSimple(gpa, &slot_types, &.{}, 0, Type.unit);
+    defer func.deinit(gpa);
+    const max = [_]Layout{.{ .name = "S", .field_names = &.{}, .field_types = &.{}, .offsets = &.{}, .size = MAX_FRAME - 8, .@"align" = 8 }};
+    try testing.expectError(error.FrameTooLarge, compute(gpa, &func, &max, &.{}));
 }
 
 test "frame: ParamOffsetTooLarge when an incoming stack-arg offset exceeds imm12" {
