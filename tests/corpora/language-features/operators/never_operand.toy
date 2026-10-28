@@ -1,0 +1,107 @@
+# expect: exit 42
+# Feature: a `never` operand (a `panic(..)`, a break-less `loop {}`) fits either side of
+# an operator and fits a condition, as it fits a binding. Each one here is on a path the
+# program does not take, so lowering ends the block at it and drops the operator. A
+# value `if` or labeled block whose arms all leave is `never` too, as is a match guard.
+fn add(n: int) -> int {
+    if n < 0 { return 1 + panic("add") }
+    if n < -1 { return loop {} + 1 }
+    if n < -2 { return 1 + loop {} }
+    return n
+}
+
+fn neg(n: int) -> int {
+    if n < 0 { return -panic("neg") }
+    if n < -1 { return -(loop {}) }
+    return n
+}
+
+fn rem(n: int) -> int {
+    if n < 0 { return n % panic("rem") }
+    return n
+}
+
+fn narrow(n: int8) -> int8 {
+    if n < 0 { return 1 + panic("narrow") }
+    return n
+}
+
+fn both(n: int) -> int {
+    if n < 0 { return panic("a") * loop {} }
+    return n
+}
+
+fn and_or(c: int) -> int {
+    if c > 1 && panic("and") { return 0 }
+    b := c > 5 && loop {}
+    d := c < 5 || panic("or")
+    return if !b && d { c } else { 0 }
+}
+
+fn conds(n: int) -> int {
+    if n < 0 {
+        if panic("if") { return 0 }
+    }
+    if n < -1 {
+        while panic("while") { }
+    }
+    if n < -2 {
+        if (loop {}) { return 0 }
+    }
+    if n < -3 {
+        return if panic("value-if") { 1 } else { 2 }
+    }
+    return n
+}
+
+fn compound(n: int) -> int {
+    x := n
+    if n < 0 { x += panic("compound") }
+    return x
+}
+
+fn cmp(n: int, s: str) -> int {
+    if n < 0 {
+        if panic("lt") < n { return 1 }
+    }
+    if n < -1 {
+        if panic("eq") == n { return 1 }
+    }
+    if n < -2 {
+        while (loop {}) != n { }
+    }
+    if n < -3 {
+        return if panic("ge") >= n { 1 } else { 2 }
+    }
+    if n < -4 {
+        if s < panic("str-lt") { return 1 }
+    }
+    if n < -5 {
+        if n > 1 && "a" == panic("str-eq") { return 1 }
+    }
+    return 0
+}
+
+fn joins(c: bool, n: int) -> int {
+    if n < 0 {
+        x := (if c { return 3 } else { return 4 }) + 1
+        return x
+    }
+    if n < -1 {
+        y := (if c { panic("q") } else { panic("r") }) == 1
+        return if y { 1 } else { 2 }
+    }
+    if n < -2 {
+        return @b { panic("b") } + 1
+    }
+    return 0
+}
+
+fn guard(n: int) -> int {
+    return match n { 5 if panic("guard") -> 1, _ -> 0 }
+}
+
+fn main() -> int {
+    w: int = narrow(4).into()
+    return add(1) + neg(2) + rem(3) + w + both(5) + and_or(1) + conds(6) + compound(20) + cmp(3, "x") + joins(true, 3) + guard(3)
+}

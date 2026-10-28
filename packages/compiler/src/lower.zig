@@ -928,6 +928,19 @@ fn emitZeroGuard(b: *Builder, rhs: Ir.ValueId, ty: Typecheck.Type, reason: Ir.Te
     b.switchTo(cont);
 }
 
+/// A `never` operand ends the block, so the operator is never applied: lower the
+/// operands up to the one that leaves and report true. The operator's arm would read
+/// the never side's type, or open fresh live blocks (a zero guard, a desugared
+/// comparison) that use the missing value. `&&`/`||` keep their arm: a never rhs runs
+/// only on one path.
+fn lowerNeverOperands(b: *Builder, op: TokenTag, lhs_node: Ast.Index, rhs_node: Ast.Index) error{OutOfMemory}!bool {
+    if (op == .amp_amp or op == .pipe_pipe) return false;
+    if (b.in.nodes.typeOf(lhs_node).kind != .never and b.in.nodes.typeOf(rhs_node).kind != .never) return false;
+    _ = try lowerExpr(b, lhs_node);
+    if (!b.termSet()) _ = try lowerExpr(b, rhs_node);
+    return true;
+}
+
 fn lowerBinary(b: *Builder, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
     return lowerBinOp(b, n.main_token, b.in.tokens[n.main_token].tag, n.lhs, n.rhs);
 }
@@ -935,6 +948,7 @@ fn lowerBinary(b: *Builder, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
 /// `lhs op rhs` as a value. `op` is passed apart from `op_tok` (the token a lowering
 /// note blames) so a compound `place op= v` can lower through the same arms.
 fn lowerBinOp(b: *Builder, op_tok: u32, op: TokenTag, lhs_node: Ast.Index, rhs_node: Ast.Index) error{OutOfMemory}!Ir.Operand {
+    if (try lowerNeverOperands(b, op, lhs_node, rhs_node)) return .none;
     switch (op) {
         .plus, .minus, .star, .slash => {
             // int stays an inline machine add/sub/mul/sdiv (bytes unchanged); a struct/enum
@@ -4452,6 +4466,7 @@ fn genCond(b: *Builder, node_idx: Ast.Index, true_bb: Ir.BlockId, false_bb: Ir.B
     switch (n.tag) {
         .binary => {
             const op = b.in.tokens[n.main_token].tag;
+            if (try lowerNeverOperands(b, op, n.lhs, n.rhs)) return;
             switch (op) {
                 .lt, .lt_eq, .gt, .gt_eq => {
                     // int/bool stay an inline `icmp` then cond_br (bytes unchanged);
@@ -4540,8 +4555,13 @@ pub fn brTo(b: *Builder, dest: Ir.BlockId, arg: Ir.Operand) error{OutOfMemory}!v
 /// call, fn identity `==`, a field read, a `match` scrutinee) take the address of an
 /// `Operand.slot`; fed a `.value`, they fail to lower or read garbage. So an aggregate
 /// if/loop/labeled-block value is produced into a temp slot, as `match` and `?` are.
+///
+/// A `never` join (a break-less loop's exit, an `if` or labeled block whose arms all
+/// leave) has no predecessor, so it is sealed unreachable as a never `match`'s is: what
+/// follows (an operator, a condition) is dropped, not read from no value.
 fn paramOperand(b: *Builder, ty: Typecheck.Type, merge: Ir.ValueId) Ir.Operand {
     std.debug.assert(!isAggregatePass(b, ty));
+    if (ty.kind == .never) b.blocks.items[b.cur].term_set = true;
     if (merge == Ir.none_value) return .none;
     return .{ .value = merge };
 }
