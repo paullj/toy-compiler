@@ -1820,42 +1820,14 @@ fn parseStmt(p: *Parser) Error!Ast.Index {
                 const init_expr = try p.parseExpr(0);
                 return p.addNode(.{ .tag = .var_decl, .main_token = name_tok, .lhs = init_expr, .rhs = type_ref });
             },
-            // A `.`- or `[`-rooted place: `p.x = v`, `p.a.b = v`, `ps[0].x = v`. Parse the
-            // place (a postfix chain over a name); if `=` follows it is a store, otherwise
-            // it is an expression statement (continue the infix climb). `xs[i] = v` is an
-            // element store, and `xs[i].f = v` a store to a field of one.
-            .dot, .l_bracket => {
-                const first = p.index;
-                const place = try p.parsePostfix(try p.parsePrefix());
-                if (p.atAssignOp()) return p.parseAssignTail(place);
-                const expr = try p.continueInfix(place, 0);
-                return p.addNode(.{ .tag = .expr_stmt, .main_token = first, .lhs = expr, .rhs = Ast.none });
-            },
-            else => |next| {
-                if (!isAssignOp(next)) return p.parseExprStmt();
-                const target = try p.leaf(.identifier, p.index); // advances past name
-                return p.parseAssignTail(target);
-            },
-        },
-        // Recovery only: a statement led by the removed `*r` (`*r = v`). `parsePrefix`
-        // reports the one P0015; the rest of the statement still parses (as an assign or
-        // an expression statement) so the next statement starts clean.
-        .star => {
-            const first = p.index;
-            const place = try p.parsePostfix(try p.parsePrefix());
-            if (p.atAssignOp()) return p.parseAssignTail(place);
-            const expr = try p.continueInfix(place, 0);
-            return p.addNode(.{ .tag = .expr_stmt, .main_token = first, .lhs = expr, .rhs = Ast.none });
+            else => return p.parseExprStmt(),
         },
         else => return p.parseExprStmt(),
     }
 }
 
 fn atAssignOp(p: *const Parser) bool {
-    return isAssignOp(p.peek().tag);
-}
-
-fn isAssignOp(tag: token.Tag) bool {
+    const tag = p.peek().tag;
     return tag == .eq or tag.compoundBase() != null;
 }
 
@@ -2021,9 +1993,14 @@ fn recoverCStyleFor(p: *Parser, for_tok: u32) Error!Ast.Index {
     return p.addNode(.{ .tag = .error_node, .main_token = for_tok, .lhs = Ast.none, .rhs = Ast.none });
 }
 
+/// An expression statement, or a store when an assignment operator follows the
+/// expression. Any expression parses as the target so the parser never decides what a
+/// place is: the resolver rejects a non-place (R0007) and the checker a field of a
+/// temporary (T0075), so `mk().x = 1` gets the same error as `p.moved(1).x = 1`.
 fn parseExprStmt(p: *Parser) Error!Ast.Index {
     const first = p.index;
     const expr = try p.parseExpr(0);
+    if (p.atAssignOp()) return p.parseAssignTail(expr);
     return p.addNode(.{ .tag = .expr_stmt, .main_token = first, .lhs = expr, .rhs = Ast.none });
 }
 
@@ -4299,6 +4276,13 @@ test "an index-rooted place parses as a store, other index-led statements as bef
     try expectProgram(
         "fn f() {\n ps[0].x = 5\n ps[i].x = 6\n xs[1] = 7\n xs[0] == 1\n id[int](5)\n Vec[int].new()\n return\n}\n",
         "(program (fn f () _ (block (= (. (index ps 0) x) 5) (= (. (tyapp ps i) x) 6) (= (index xs 1) 7) (== (index xs 0) 1) (call (tyapp id int) 5) (call (. (tyapp Vec int) new)) (return))))",
+    );
+}
+
+test "a call- or paren-led place parses as a store" {
+    try expectProgram(
+        "fn f() {\n mk().x = 1\n mk().x += 1\n mk().p.x = 1\n (p).x = 1\n mk() = 2\n mk().x\n (p).x == 1\n}\n",
+        "(program (fn f () _ (block (= (. (call mk) x) 1) (+= (. (call mk) x) 1) (= (. (. (call mk) p) x) 1) (= (. p x) 1) (= (call mk) 2) (. (call mk) x) (== (. p x) 1))))",
     );
 }
 

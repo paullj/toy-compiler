@@ -1,6 +1,7 @@
 # A call result has no home of its own, so assigning one of its fields would write a
 # copy and lose the write (T0075), whether the call is a method's, a generic fn's or
-# follows a field. A field of a local stays a place.
+# follows a field, or leads the statement. A field of a local stays a place, also
+# through parentheses.
 struct P { x: int }
 struct W { p: P }
 
@@ -10,10 +11,19 @@ impl P {
 
 fn id[T](x: T) -> T { x }
 
+fn mk() -> P { P { x: 0 } }
+
+fn mkw() -> W { W { p: mk() } }
+
 fn main() -> int {
     w := W { p: P { x: 1 } }
     w.p.moved(1).x = 5  #~ ERROR [T0075] cannot assign to a field of a temporary value, such as a call result; it is a copy, so the write would be lost
     id[P](w.p).x = 6  #~ ERROR [T0075] cannot assign to a field of a temporary value
+    mk().x = 7  #~ ERROR [T0075] cannot assign to a field of a temporary value
+    mk().x += 1  #~ ERROR [T0075] cannot assign to a field of a temporary value
+    mkw().p.x = 8  #~ ERROR [T0075] cannot assign to a field of a temporary value
     w.p.x = 2
+    (w).p.x = 3
+    (w.p).x += 1
     return w.p.x
 }
