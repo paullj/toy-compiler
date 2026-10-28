@@ -1,4 +1,5 @@
 import core/mem
+import core/text
 import std/iter
 
 # A thin, growable `Vec[T]` face over `core/mem`'s `GcArray` primitive. `std` may call
@@ -168,6 +169,21 @@ impl Vec[T] {
 impl Vec[T has Ord] {
     fn sort(self) {
         self.sort_by(fn(a: T, b: T) { a < b })
+    }
+}
+
+# `[1, 2, 3]`: each element's own render, so a nested collection renders its contents. A
+# cycle through handles (a Vec that holds itself, through a Ref) does not terminate.
+impl Vec[T has Display] has Display {
+    fn display(self) -> str {
+        n := mem.ga_len[T](self.h)
+        parts := mem.ga_new[str]()
+        i := 0
+        while i < n {
+            mem.ga_push[str](parts, mem.ga_get[T](self.h, i).to_string())
+            i += 1
+        }
+        return text.join(parts, "[", ", ", "]")
     }
 }
 

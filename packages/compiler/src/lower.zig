@@ -1774,9 +1774,9 @@ pub fn appendPiece(b: *Builder, acc: Ir.SlotId, piece: Ir.SlotId) error{OutOfMem
 ///     witness and call it -> a fresh str; a custom `impl Display` (std's for float) and a
 ///     structural derive land here identically, which is what makes `to_string` universal.
 pub fn displayToSlot(b: *Builder, ty: Typecheck.Type, op: Ir.Operand) error{OutOfMemory}!Ir.SlotId {
-    // Switch on `ty.kind` (NOT `passKind`): a `Ref`/`gc_array` box is a struct type that
-    // renders STRUCTURALLY (`Ref$int{0: <cell>}`) through its derived display witness, so it
-    // must reach the struct arm — `passKind` would divert it to `.box` and mis-drop it.
+    // Switch on `ty.kind` (NOT `passKind`): a `Ref` box is a struct type whose display
+    // witness is std's impl, reached through the struct arm; `passKind` would divert it to
+    // `.box` and mis-drop it.
     switch (ty.kind) {
         .str => {
             const s = operandSlot(op);

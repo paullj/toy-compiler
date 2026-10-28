@@ -1,4 +1,5 @@
 import core/mem
+import core/text
 import std/iter
 import std/vec
 
@@ -93,6 +94,22 @@ impl Map[K has Hashable, V] {
             i += 1
         }
         return out
+    }
+}
+
+# `{1: a, 2: b}` in insertion order. It reads entries through the unbounded `mem.mp_*`
+# readers, so it needs no Hashable key. A cycle through handles does not terminate.
+impl Map[K has Display, V has Display] has Display {
+    fn display(self) -> str {
+        n := mem.mp_len[K, V](self.h)
+        parts := mem.ga_new[str]()
+        i := 0
+        while i < n {
+            k := mem.mp_key_at[K, V](self.h, i).to_string()
+            mem.ga_push[str](parts, k.concat(": ").concat(mem.mp_val_at[K, V](self.h, i).to_string()))
+            i += 1
+        }
+        return text.join(parts, "{", ", ", "}")
     }
 }
 

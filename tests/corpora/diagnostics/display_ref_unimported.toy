@@ -1,0 +1,15 @@
+# Ref is a prelude type, but its Display impl is library code: a program that never
+# imports std/ref gets the import hint, as for any other Ref method.
+import std/io
+
+pub struct Holder { r: Ref[int] }
+
+pub fn show(r: Ref[int]) {
+    io.println(r)  #~ ERROR [T0023] type 'Ref' does not conform to protocol 'Display'; its impl is in std/ref: add 'import std/ref'
+}
+
+pub fn hold(h: Holder) {
+    io.println(h)  #~ ERROR [T0023] type 'Holder' does not conform to protocol 'Display'; its field type 'Ref' has its impl in std/ref: add 'import std/ref'
+}
+
+fn main() {}

@@ -953,6 +953,21 @@ A scalar field renders through `displayToSlot`; an aggregate field calls its sib
 | enum payload variant | `variant(<v0>, <v1>)`: payload fields in declaration order |
 | nested `str` | its raw bytes, unquoted |
 
+**std renderings.** The boxes print through explicit generic impls in std, each bounded
+by `Display` on its params, so an aggregate holding one derives through them:
+
+| type | spelling |
+|------|----------|
+| `Ref[T]` (std/ref) | `Ref(<v>)`: the value in the cell, never its address |
+| `Vec[T]` (std/vec) | `[<v0>, <v1>]`; empty `[]` |
+| `Map[K, V]` (std/map) | `{<k0>: <v0>, <k1>: <v1>}` in insertion order; empty `{}` |
+| `Set[T]` (std/set) | `{<v0>, <v1>}` in insertion order; empty `{}` |
+
+Each element renders through its own `display`, so `[[1], []]` and `Ref([1, 2])` show
+contents. A render walks handles without a guard: a cycle through them (a `Vec` that
+holds itself through a `Ref`) does not terminate. A collection's render is written once,
+into a buffer of its final length (`core/text.join`).
+
 **What cannot print.** A type that does not conform to `Display` is a compile error,
 never a fallback rendering (no addresses):
 
@@ -963,7 +978,8 @@ never a fallback rendering (no addresses):
 | a struct or enum holding a function field (or a `float` one without std/float) | the derive is blocked: **T0023** at an `io.print`, **T0031** at a `to_string` naming the field |
 | `rawptr` | no `Display`; it exists only inside core |
 | a generic `T` without a `Display` bound | checked per instance: `fn f[T has Eq](x: T) { io.print(x) }` accepts `f(2)` and `f(1.5)` (std/io brings std/float); an instance whose type does not conform is **T0023** at the call |
-| the boxes `Ref`, `gc_array` (so `Vec`, `Map`, `Set`), and any aggregate holding one | a box never derives `Display` (its one field is a cell address); only an explicit impl makes it print. **T0023** at an `io.print`, whose hint names the box; T0031 at a struct's `to_string` naming the field. `Eq` (cell identity) and `Hash` (no box keys) keep their own rules |
+| `Vec[X]`, `Map[K, V]`, `Set[X]` or `Ref[X]` whose type argument does not conform | std's impl bounds its params (`impl Vec[T has Display]`): **T0023** names the type argument that fails it, as `Vec[fn()]` does |
+| a managed box with no impl (the private `gc_array`), and any aggregate holding one | a box never derives `Display` (its one field is a cell address); only an explicit impl makes it print. **T0023** at an `io.print`, whose hint names the box; T0031 at a struct's `to_string` naming the field. `Eq` (cell identity) and `Hash` (no box keys) keep their own rules |
 
 ## Two-phase checking (and parallelism)
 

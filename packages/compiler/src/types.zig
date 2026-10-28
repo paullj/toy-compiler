@@ -1380,6 +1380,17 @@ fn holdsPoison(composite: *Composite, ty: Type) bool {
     return false;
 }
 
+/// The std module to import for the blocking `box`'s Display impl: std/ref for a `Ref`,
+/// a prelude type whose impl a program may not have imported. A collection's impl comes
+/// with its own module, so its box is the private `gc_array`, which no import fixes.
+fn refImportModule(model: *const Model, composite: *Composite, box: Type) ?[]const u8 {
+    const rs = (model.prelude orelse return null).ref_struct orelse return null;
+    if (!box.isApp()) return null;
+    const e = composite.at(box.appIdx());
+    if (e.ctor_is_enum or e.ctor != rs) return null;
+    return StdNames.familyModule(.ref);
+}
+
 /// The std module whose `impl` makes the scalar named `tname` conform to protocol `pid`, or
 /// null. Only a prelude protocol qualifies: a program's own protocol may reuse a prelude
 /// name, and no std import satisfies it.
@@ -3627,8 +3638,14 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
             try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "function type '{s}' does not conform to protocol '{s}'; function values support only '==' (identity)", .{ tname, pname });
         } else if (scalarImplModule(model, tname, pid)) |m| {
             try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; its impl is in std/{s}: " ++ StdNames.add_import, .{ tname, pname, m, m });
-        } else if (try conform.boxBlocksDisplay(model.structs, model.enums, model.conformances, .of(model), t.composite, args[ord], pid, &cmemo, t.gpa)) {
-            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; it is or holds a managed box (a 'Ref' or a collection), which never derives '{s}': add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, pname, tname, pname });
+        } else if (try conform.displayBlockingBox(model.structs, model.enums, model.conformances, .of(model), t.composite, args[ord], pid, &cmemo, t.gpa)) |box| {
+            if (refImportModule(model, t.composite, box)) |m| {
+                if (Type.eql(box, args[ord])) {
+                    try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; its impl is in std/{s}: " ++ StdNames.add_import, .{ tname, pname, m, m });
+                } else {
+                    try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; its field type '{s}' has its impl in std/{s}: " ++ StdNames.add_import, .{ tname, pname, t.typeName(box), m, m });
+                }
+            } else try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; it is or holds a managed box (a 'Ref' or a collection), which never derives '{s}': add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, pname, tname, pname });
         } else if (isDerivableProtocol(model, pid) and isAggregate(args[ord])) {
             try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; make every field of '{s}' conform to '{s}' (it then derives automatically), or add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname, tname, pname });
         } else {

@@ -1,0 +1,12 @@
+# A program's own Display for one Vec instance next to std's generic one: an impl on a
+# concrete instance is not yet supported. This pins today's behavior; #98 decides the rule.
+import std/io
+import std/vec
+
+impl Vec[int] has Display {  #~ ERROR [T0013] a conformance 'impl' on a concrete type instance is not yet supported
+    fn display(self) -> str { return "ints" }
+}
+
+fn main() {
+    io.println([1, 2])
+}

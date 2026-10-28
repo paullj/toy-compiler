@@ -579,11 +579,24 @@ fn neverDerives(structs: []const StructSym, composite: *Composite, gen: Generic,
     return isManagedBox(structs, composite, recv, pre.ref_struct, pre.gc_array_struct);
 }
 
-/// Whether a managed box is what keeps `recv` from deriving Display: `recv` is a box, or
-/// a field (or variant payload) that fails Display is, down the by-value chain. Lets the
-/// T0023 hint stop telling the user to make a collection's private `gc_array` conform.
-pub fn boxBlocksDisplay(structs: []const StructSym, enums: []const EnumSym, conformances: []const Conformance, gen: Generic, composite: *Composite, recv: Type, pid: u32, memo: *std.AutoHashMapUnmanaged(u64, bool), gpa: std.mem.Allocator) error{OutOfMemory}!bool {
-    if (neverDerives(structs, composite, gen, recv, pid)) return true;
+/// The managed box that keeps `recv` from deriving Display, or null: `recv` itself, or
+/// a field (or variant payload) that fails Display, down the by-value chain. Lets the
+/// T0023 hint name the box rather than ask for a collection's private `gc_array` to conform.
+pub fn displayBlockingBox(structs: []const StructSym, enums: []const EnumSym, conformances: []const Conformance, gen: Generic, composite: *Composite, recv: Type, pid: u32, memo: *std.AutoHashMapUnmanaged(u64, bool), gpa: std.mem.Allocator) error{OutOfMemory}!?Type {
+    if (neverDerives(structs, composite, gen, recv, pid)) {
+        // A box that an impl covers (std's `impl Ref[T has Display]`) fails on a type arg
+        // instead, which the plain field hint names.
+        if (recv.kind != .app) return recv;
+        const tb: Tables = .{ .structs = structs, .enums = enums, .conformances = conformances, .gen = gen, .composite = composite, .gpa = gpa, .bound_protocols = &.{} };
+        return switch (try generic(tb, memo, recv, pid, &.{})) {
+            .none => recv,
+            .met => |m| blk: {
+                m.deinit(gpa);
+                break :blk null;
+            },
+            .unmet => null,
+        };
+    }
     var comps: std.ArrayList(Type) = .empty;
     defer comps.deinit(gpa);
     switch (recv.kind) {
@@ -595,14 +608,14 @@ pub fn boxBlocksDisplay(structs: []const StructSym, enums: []const EnumSym, conf
                 if (e.ctor < enums.len) for (enums[e.ctor].variants) |v| for (v.field_types) |ft| try comps.append(gpa, try substPattern(composite, gpa, ft, e.args));
             } else if (e.ctor < structs.len) for (structs[e.ctor].field_types) |ft| try comps.append(gpa, try substPattern(composite, gpa, ft, e.args));
         },
-        else => return false,
+        else => return null,
     }
     // Terminates: a box is a leaf (answered above) and by-value cycles are a compile error.
     for (comps.items) |ft| {
         if (try structural(structs, enums, conformances, gen, ft, pid, memo, gpa, composite, &.{})) continue;
-        if (try boxBlocksDisplay(structs, enums, conformances, gen, composite, ft, pid, memo, gpa)) return true;
+        if (try displayBlockingBox(structs, enums, conformances, gen, composite, ft, pid, memo, gpa)) |box| return box;
     }
-    return false;
+    return null;
 }
 
 /// Whether `recv` is, or transitively (by-value) HOLDS, a managed box. A box has no stable
@@ -1057,7 +1070,7 @@ test "a Ref field blocks the Display derive but not Eq" {
     try testing.expect(try structural(&structs, &.{}, &confs, gen, Type.structT(1), eq_pid, &memo, gpa, &co, &.{}));
     try testing.expect(!try structural(&structs, &.{}, &confs, gen, Type.structT(1), disp_pid, &memo, gpa, &co, &.{}));
     try testing.expect(!try structural(&structs, &.{}, &confs, gen, Type.structT(0), disp_pid, &memo, gpa, &co, &.{}));
-    try testing.expect(try boxBlocksDisplay(&structs, &.{}, &confs, gen, &co, Type.structT(1), disp_pid, &memo, gpa));
+    try testing.expect(Type.eql((try displayBlockingBox(&structs, &.{}, &confs, gen, &co, Type.structT(1), disp_pid, &memo, gpa)).?, Type.structT(0)));
 
     // An explicit impl on the box wins, as it will for std's `impl Ref[T has Display]`.
     const with_impl = confs ++ [_]Conformance{.{ .protocol = disp_pid, .recv = Type.structT(0) }};

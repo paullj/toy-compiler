@@ -203,6 +203,28 @@ fn main() -> int {
 }
 ' 0
 
+# std's Vec render calls its element's Display: giving the element type an explicit impl
+# must change the render on a warm rebuild, not serve the cached derived-element instance.
+run_scenario vec_elem_display \
+'import std/vec
+struct P { v: int }
+fn main() -> int { return [P { v: 1 }].to_string().len() }
+' \
+'import std/vec
+struct P { v: int }
+impl P has Display { fn display(self) -> str { "p" } }
+fn main() -> int { return [P { v: 1 }].to_string().len() }
+' 0
+vd="$work/vec_elem_display"
+"$vd/base.bin"; vb=$?
+"$vd/inc.bin"; vi=$?
+if [ "$vb" = 9 ] && [ "$vi" = 3 ]; then
+  echo "  OK   vec_elem_display: render [P{v: 1}] -> [p] on the warm rebuild"
+  pass=$((pass + 1))
+else
+  fail_one "vec_elem_display: exit base=$vb inc=$vi, want 9 then 3"
+fi
+
 # 4) COMMENT-ONLY — no semantic change; EVERYTHING cuts off (codegen compiled=0),
 #    the strongest cutoff (index-free codegen fingerprint).
 run_scenario comment \

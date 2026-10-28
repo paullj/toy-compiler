@@ -1,0 +1,41 @@
+# expect: stdout "[1, 2, 3]\n[]\n[[1, 2], [], [3]]\nsome([4, 5])\nnone\n{}\n{a: [2, 3], b: []}\n{1: a, 2: b}\n{}\n{1, 2}\nHolder{r: Ref(42)}\nRef(42)\nRef([1, 2])\n[1.5, 2.0]\nsome(Ref(7))\n"
+# expect: exit 0
+# Collections render their contents in insertion order, and a Ref the value in its cell,
+# never an address: the output is the same on every run.
+import std/io
+import std/map
+import std/ref
+import std/set
+import std/vec
+
+struct Holder { r: Ref[int] }
+
+fn main() {
+    io.println([1, 2, 3])
+    io.println(Vec[int].new())
+    io.println([[1, 2], [], [3]])
+    io.println(Option.some([4, 5]))
+    o: Option[Vec[int]] = Option[Vec[int]].none
+    io.println(o)
+    m := Map[str, Vec[int]].new()
+    io.println(m)
+    m.set("a", [1])
+    m.set("b", [])
+    m.set("a", [2, 3])
+    io.println(m)
+    n := Map[int, str].new()
+    n.set(1, "a")
+    n.set(2, "b")
+    io.println(n)
+    s := Set[int].new()
+    io.println(s)
+    s.add(1)
+    s.add(2)
+    s.add(1)
+    io.println(s)
+    io.println(Holder { r: Ref.new(42) })
+    io.println(Ref.new(42))
+    io.println(Ref.new([1, 2]))
+    io.println([1.5, 2.0])
+    io.println(Option.some(Ref.new(7)).to_string())
+}
