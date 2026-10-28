@@ -1382,6 +1382,40 @@ test "run passes the words after -- to the program, and rejects a second word wi
     try testing.expect(std.mem.indexOf(u8, term.out, "w\n") != null);
 }
 
+test "build -o into a missing directory or onto a directory is one error line, not a trace (#119)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.requireToy(io);
+
+    const dir_name = ".toy-test-driver-out-missing-dir";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const path = dir_name ++ "/main.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "fn main() -> int {\n    return 3\n}\n" });
+
+    const cases = [_]struct { verb: []const u8, o: []const u8, line: []const u8 }{
+        .{ .verb = "build", .o = dir_name ++ "/nodir/prog", .line = "error: cannot write '" ++ dir_name ++ "/nodir/prog': directory '" ++ dir_name ++ "/nodir' does not exist\n" },
+        .{ .verb = "run", .o = dir_name ++ "/nodir/prog", .line = "error: cannot write '" ++ dir_name ++ "/nodir/prog': directory '" ++ dir_name ++ "/nodir' does not exist\n" },
+        .{ .verb = "build", .o = dir_name, .line = "error: cannot write '" ++ dir_name ++ "': it is a directory\n" },
+        .{ .verb = "build", .o = "/", .line = "error: cannot write '/': it is a directory\n" },
+        .{ .verb = "build", .o = dir_name ++ "/nodir/", .line = "error: cannot write '" ++ dir_name ++ "/nodir/': no such file or directory\n" },
+        .{ .verb = "build", .o = "", .line = "error: cannot write '': no such file or directory\n" },
+    };
+    for (cases) |c| {
+        const r = try spawnToyBoth(gpa, io, &.{ c.verb, path, "-o", c.o });
+        defer gpa.free(r.out);
+        defer gpa.free(r.err);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try testing.expectEqualStrings(c.line, r.out);
+        try testing.expectEqualStrings("", r.err);
+    }
+    try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, dir_name ++ "/nodir", .{}));
+}
+
 /// Spawn `toy` with `args` over a one-file fixture (the `return nope` R0001 program),
 /// capturing stdout and the exit code. Returns the captured bytes (the caller frees) and
 /// the term. Stderr (usage errors) is dropped: inherited, it reaches the build runner,
