@@ -312,6 +312,8 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
                     else => continue,
                 }
                 if (hasConformanceLive(t, disp_pid, ft)) continue; // explicit Display field: reuse its witness
+                // `conforms` here passes no prelude, so it cannot apply the checker's box rule.
+                if (isRefType(t, ft)) continue;
                 if (try conforms(t.structs.items, t.enums.items, t.conformances.items, .{}, ft, disp_pid, &memo, gpa, t.composite, &.{}))
                     try disp_work.add(gpa, disp_pid, .display, ft, disp_work.sites.items[wi]);
             }

@@ -935,9 +935,10 @@ from the same value on its own:
 `to_string` use (which `io.print` makes), through the same source-less
 synthetic-codegen-unit channel as `Eq`/`Ord`/`Hash`, keyed on the same non-AST
 `(kind, layout, resolved-field-witnesses)` fingerprint. It fires iff every field and
-payload conforms to `Display` (recursively) and no explicit impl exists; an unused derive
-emits zero codegen. The derived unit returns a `str`: it appends each fixed run (name and
-separators, one interned literal) and each field's rendering into one accumulator `str`.
+payload conforms to `Display` (recursively), none is a managed box, and no explicit impl
+exists; an unused derive emits zero codegen. The derived unit returns a `str`: it
+appends each fixed run (name and separators, one interned literal) and each field's
+rendering into one accumulator `str`.
 A scalar field renders through `displayToSlot`; an aggregate field calls its sibling
 `display` witness.
 
@@ -962,7 +963,7 @@ never a fallback rendering (no addresses):
 | a struct or enum holding a function field (or a `float` one without std/float) | the derive is blocked: **T0023** at an `io.print`, **T0031** at a `to_string` naming the field |
 | `rawptr` | no `Display`; it exists only inside core |
 | a generic `T` without a `Display` bound | checked per instance: `fn f[T has Eq](x: T) { io.print(x) }` accepts `f(2)` and `f(1.5)` (std/io brings std/float); an instance whose type does not conform is **T0023** at the call |
-| the boxes `Ref`, `gc_array` (so `Vec`, `Map`, `Set`) | **known gap:** they derive structurally and print their handles (`Ref{0: <cell address>}`), which is not deterministic |
+| the boxes `Ref`, `gc_array` (so `Vec`, `Map`, `Set`), and any aggregate holding one | a box never derives `Display` (its one field is a cell address); only an explicit impl makes it print. **T0023** at an `io.print`, whose hint names the box; T0031 at a struct's `to_string` naming the field. `Eq` (cell identity) and `Hash` (no box keys) keep their own rules |
 
 ## Two-phase checking (and parallelism)
 
