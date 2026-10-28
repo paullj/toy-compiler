@@ -29,14 +29,14 @@ pub const Sig = @import("../symbols/Sig.zig").Sig;
 const Fingerprint = @import("Fingerprint.zig");
 pub const TouchedType = Fingerprint.TouchedType;
 
-/// Fixed sentinel params for the builtin scalar `eq` fold. FILE-SCOPE (not a stack
-/// temporary) because `Fingerprint.fingerprint` reads each folded `Sig.params` AFTER the
-/// call walk returns — a `&.{recv,recv}` local would dangle. `eq` is homogeneous, so the
-/// params mirror the receiver Kind; choosing per-kind (int vs bool) is strictly more
-/// forward-stable than a single kind-agnostic array at zero cost, and — once chosen —
-/// must stay stable or warm caches invalidate.
-const eq_params_int = [_]Typecheck.Type{ Typecheck.Type.int, Typecheck.Type.int };
-const eq_params_bool = [_]Typecheck.Type{ Typecheck.Type.bool, Typecheck.Type.bool };
+/// Fixed sentinel params for the 2-ary builtin scalar `eq` and `cmp` folds (the name
+/// tells them apart). FILE-SCOPE (not a stack temporary) because `Fingerprint.fingerprint`
+/// reads each folded `Sig.params` AFTER the call walk returns — a `&.{recv,recv}` local
+/// would dangle. Both are homogeneous, so the params mirror the receiver Kind; choosing
+/// per-kind (int vs bool) is strictly more forward-stable than a single kind-agnostic
+/// array at zero cost, and — once chosen — must stay stable or warm caches invalidate.
+const binary_params_int = [_]Typecheck.Type{ Typecheck.Type.int, Typecheck.Type.int };
+const binary_params_bool = [_]Typecheck.Type{ Typecheck.Type.bool, Typecheck.Type.bool };
 // The builtin scalar `hash` sentinel params: 1-ary (`hash(self) -> int`), so a single
 // receiver-typed element — distinct from the 2-ary `eq` sentinel above by both count + name.
 const hash_params_int = [_]Typecheck.Type{Typecheck.Type.int};
@@ -245,12 +245,17 @@ pub const CallVisitor = struct {
                     .none, .ambiguous => {},
                 },
                 .scalar_eq => {
-                    const params: []const Typecheck.Type = if (recv.kind == .bool) &eq_params_bool else &eq_params_int;
+                    const params: []const Typecheck.Type = if (recv.kind == .bool) &binary_params_bool else &binary_params_int;
                     try self.out.append(self.gpa, .{ .kind = .builtin, .name = "eq", .params = params, .ret = Typecheck.Type.bool });
                 },
                 .scalar_hash => {
                     const params: []const Typecheck.Type = if (recv.kind == .bool) &hash_params_bool else &hash_params_int;
                     try self.out.append(self.gpa, .{ .kind = .builtin, .name = "hash", .params = params, .ret = Typecheck.Type.int });
+                },
+                .scalar_cmp => {
+                    const params: []const Typecheck.Type = if (recv.kind == .bool) &binary_params_bool else &binary_params_int;
+                    const call_ty: Typecheck.Type = if (fr.nodes.has(call_idx)) fr.nodes.typeOf(call_idx) else .{ .kind = .invalid };
+                    try self.out.append(self.gpa, .{ .kind = .builtin, .name = "cmp", .params = params, .ret = call_ty });
                 },
                 // A `try_into` to or from `char`, or from `float`, calls a shared witness.
                 .conv_try_into => {

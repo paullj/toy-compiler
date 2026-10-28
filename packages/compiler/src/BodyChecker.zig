@@ -1780,13 +1780,14 @@ pub const BodyChecker = struct {
 
     /// Whether `member` on concrete `recv` is a method the compiler provides with no
     /// `methods` row: a scalar or `str` builtin, a target-directed conversion, or the
-    /// derivable `hash`/`to_string` of a struct or enum.
+    /// derivable `hash`/`to_string`/`cmp` of a struct or enum.
     fn isBuiltinMethod(bc: *const BodyChecker, recv: Type, member: []const u8) bool {
         const char_id = if (bc.model.prelude) |p| p.char_struct else null;
         if (Typecheck.isBuiltinTypeMethod(recv, member, char_id)) return true;
         if (recv.kind != .@"struct" and recv.kind != .@"enum") return false;
         const pp = bc.model.preludeProtocols();
-        return (std.mem.eql(u8, member, "hash") and pp.hash != null) or (std.mem.eql(u8, member, "to_string") and pp.display != null);
+        return (std.mem.eql(u8, member, "hash") and pp.hash != null) or (std.mem.eql(u8, member, "to_string") and pp.display != null) or
+            (std.mem.eql(u8, member, "cmp") and pp.ord != null);
     }
 
     fn reportNotAValue(bc: *BodyChecker, fa: Ast.Node, member: []const u8, what: []const u8) error{OutOfMemory}!Type {
@@ -4127,6 +4128,8 @@ pub const BodyChecker = struct {
                 }
             }
         }
+        if (std.mem.eql(u8, member, "cmp") and (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or Typecheck.isBuiltinOrdScalar(recv_ty)))
+            if (try bc.checkOrdCmp(node_idx, n, callee, args, recv_ty)) |t| return t;
         // A direct `.hash()` on a struct/enum with NO explicit impl: the
         // structural `Hash` derive trigger. Hash has no operator, so (unlike
         // `==`/`Eq`) this is the ONLY firing site — a direct method call. Mirrors
@@ -4225,6 +4228,28 @@ pub const BodyChecker = struct {
         const text = bc.source[rs.start..rs.end];
         const recv = if (std.mem.indexOfScalar(u8, text, '\n') == null) text else "x";
         try bc.sink.report(at, "'{s}' is both an associated function of '{s}' and a field of fn type: '{s}{s}.{s}(..)' calls the function and '{s}.{s}' reads the field", .{ member, type_name, type_name, targs, member, recv, member });
+    }
+
+    /// A direct `.cmp(other)` with no explicit `impl T has Ord`: answered by the same
+    /// conformance the comparison operators use, so `a.cmp(b)` works wherever `a < b`
+    /// does. A builtin `Ord` scalar lowers inline; an aggregate (a generic instance
+    /// included) records the structural derive and seals onto its witness. Null when the
+    /// prelude has no `Ord`, so the caller falls through to T0018.
+    fn checkOrdCmp(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node, args: []const Ast.Index, recv_ty: Type) error{OutOfMemory}!?Type {
+        const ord = bc.model.preludeProtocols().ord orelse return null;
+        const ordering = Type.enumT(bc.model.prelude.?.ordering_enum.?);
+        const self_param = [_]Type{recv_ty};
+        _ = try bc.checkCall(node_idx, args, .{ .params = &self_param, .name = "cmp" });
+        if (Typecheck.isBuiltinOrdScalar(recv_ty)) {
+            bc.setCallee(n, Callee.builtinMethod(.scalar_cmp));
+        } else if (try bc.conformsTo(recv_ty, ord, node_idx)) {
+            bc.setCallee(n, Callee.pending);
+        } else {
+            try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0027 }, "'cmp' requires an 'Ord' impl for type '{s}'", .{bc.typeName(recv_ty)});
+            return .invalid;
+        }
+        bc.node_types[(node_idx).int()] = ordering;
+        return ordering;
     }
 
     fn dispatchAppMethod(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node, recv_ty: Type) error{OutOfMemory}!Type {
@@ -4333,6 +4358,7 @@ pub const BodyChecker = struct {
                 }
             }
         }
+        if (std.mem.eql(u8, member, "cmp")) if (try bc.checkOrdCmp(node_idx, n, callee, args, recv_ty)) |t| return t;
         // The universal `to_string` on a reified generic instance (e.g. `Option[int]`):
         // it reifies to a concrete struct/enum whose structural `Display` derive fires
         // through the SAME `conformsTo(display)` gate a plain struct/enum uses. Mirrors the

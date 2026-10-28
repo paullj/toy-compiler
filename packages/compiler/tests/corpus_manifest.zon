@@ -1,6 +1,6 @@
 .{
-    .{ .path = "tests/corpora/diagnostics", .mode = .diagnostics, .unit = .single_file, .count = 162 },
-    .{ .path = "tests/corpora/language-features", .mode = .expect, .unit = .single_file, .prune = .{"modules"}, .count = 509 },
+    .{ .path = "tests/corpora/diagnostics", .mode = .diagnostics, .unit = .single_file, .count = 163 },
+    .{ .path = "tests/corpora/language-features", .mode = .expect, .unit = .single_file, .prune = .{"modules"}, .count = 510 },
     .{ .path = "tests/corpora/language-features/modules", .mode = .expect, .unit = .module_dir, .count = 22 },
     .{ .path = "tests/corpora/regression", .mode = .expect, .unit = .single_file, .count = 8 },
     .{ .path = "tests/corpora/benchmark", .mode = .expect, .unit = .single_file, .prune = .{"medium"}, .count = 7 },

@@ -1238,13 +1238,21 @@ pub fn builtinStrMethod(recv: Type, name: []const u8) ?struct { ret: Type, param
     return null;
 }
 
+/// Whether `recv` is a builtin scalar with the compiler-registered `Ord` conformance
+/// (`int` of any width, `bool`, `str`), whose `cmp` lowers inline. Kept apart from
+/// `builtinScalarMethod` because its `Ordering` result is a prelude enum, not a fixed type.
+pub fn isBuiltinOrdScalar(recv: Type) bool {
+    return recv.isInteger() or recv.kind == .bool or recv.kind == .str;
+}
+
 /// Whether the compiler provides method `name` on the builtin type `recv`, with no method
-/// row: a scalar's `eq`/`hash`, `str`'s `len`/`byte_at`/`concat`, a scalar's `to_string`,
+/// row: a scalar's `eq`/`hash`/`cmp`, `str`'s `len`/`byte_at`/`concat`, a scalar's `to_string`,
 /// and `into`/`try_into` on an integer, a float or `char`. The derivable `hash`/`to_string`
 /// of a struct or enum is not counted: a type's own method of that name is how the type
 /// implements it.
 pub fn isBuiltinTypeMethod(recv: Type, name: []const u8, char_id: ?u32) bool {
     if (builtinScalarMethod(recv, name) != null or builtinStrMethod(recv, name) != null) return true;
+    if (isBuiltinOrdScalar(recv) and std.mem.eql(u8, name, "cmp")) return true;
     return (recv.isInteger() or recv.kind == .float or isCharTy(recv, char_id)) and
         (std.mem.eql(u8, name, "into") or std.mem.eql(u8, name, "try_into"));
 }
@@ -1336,7 +1344,7 @@ pub fn builtinOptResult(k: Callee.Builtin) ?OptResultMethod {
         .opt_is_tag1 => .is_tag1,
         .opt_unwrap => .unwrap,
         .opt_unwrap_or => .unwrap_or,
-        .scalar_eq, .scalar_hash, .str_concat, .str_len, .str_byte_at, .scalar_to_string, .display_to_string, .conv_into, .conv_try_into => null,
+        .scalar_eq, .scalar_hash, .scalar_cmp, .str_concat, .str_len, .str_byte_at, .scalar_to_string, .display_to_string, .conv_into, .conv_try_into => null,
     };
 }
 
@@ -10990,6 +10998,28 @@ test "every dispatch branch records its callee" {
         }
         try expectNoPending(&c.result);
     }
+}
+
+test "a direct cmp: a builtin on an Ord scalar, the derived witness on an aggregate" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\fn main() -> int {
+        \\    a := (1).cmp(2)
+        \\    b := "a".cmp("b")
+        \\    c := true.cmp(false)
+        \\    w: uint8 = 3
+        \\    d := w.cmp(4)
+        \\    e := P { x: 1 }.cmp(P { x: 2 })
+        \\    return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    for (0..4) |nth| try testing.expectEqual(Callee.View{ .builtin = .scalar_cmp }, try calleeView(&c, "cmp", nth));
+    try testing.expect((try calleeMethod(&c, "cmp", 4)).derive != null);
+    try expectNoPending(&c.result);
 }
 
 test "template spans: the module slice holds the abstract pick, each instance slice its own" {

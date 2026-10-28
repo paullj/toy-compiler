@@ -1270,6 +1270,21 @@ fn lowerOrdValue(b: *Builder, operand_ty: Typecheck.Type, lhs_node: Ast.Index, r
     return .{ .value = try b.emit(.{ .icmp = .{ .cc = spec.cc, .lhs = d, .rhs = k } }, Typecheck.Type.bool) };
 }
 
+/// The branch-free 3-way discriminant (0=lt/1=eq/2=gt) of two int/bool VALUES:
+/// `(lhs > rhs) - (lhs < rhs) + 1`. `unsigned` selects the unsigned magnitude conds:
+/// a derived `Ord` on a `uint64` field must compare unsigned or a high-bit-set value
+/// mis-orders as negative. Signed conds are correct for signed ints, bools (0/1), and
+/// the small non-negative enum tags.
+pub fn threeWayInt(b: *Builder, lv: Ir.ValueId, rv: Ir.ValueId, unsigned: bool) error{OutOfMemory}!Ir.ValueId {
+    const int_ty = Typecheck.Type.int;
+    const bool_ty = Typecheck.Type.bool;
+    const gt = try b.emit(.{ .icmp = .{ .cc = if (unsigned) .ugt else .gt, .lhs = lv, .rhs = rv } }, bool_ty);
+    const lt = try b.emit(.{ .icmp = .{ .cc = if (unsigned) .ult else .lt, .lhs = lv, .rhs = rv } }, bool_ty);
+    const diff = try b.emit(.{ .sub = .{ .lhs = gt, .rhs = lt } }, int_ty);
+    const one = try b.emit(.{ .iconst = 1 }, int_ty);
+    return try b.emit(.{ .add = .{ .lhs = diff, .rhs = one } }, int_ty);
+}
+
 /// The int 3-way `Ord` discriminant (0=lt/1=eq/2=gt) of `lhs`/`rhs`:
 ///   * str -> a heap-free lexicographic `load_byte` loop (`lowerStrCmp`), NO witness call.
 ///   * struct/enum -> the `cmp` witness call into a fresh ret_slot, then `get_tag` at
@@ -2499,6 +2514,20 @@ noinline fn lowerBuiltinMethod(b: *Builder, node_idx: Ast.Index, n: Ast.Node, k:
                     return .{ .value = try b.emit(.{ .iconst = hash_seed }, Typecheck.Type.int) };
                 },
             }
+        },
+        .scalar_cmp => {
+            // The same discriminant `<` and a derived `Ord` field compute, materialized as
+            // the `Ordering` value whose tag it is.
+            std.debug.assert(args.len == 1);
+            const recv_ty = b.in.nodes.typeOf(recv);
+            const disc = if (recv_ty.kind == .str)
+                try lowerStrCmp(b, recv, args[0])
+            else
+                try threeWayInt(b, operandValue(try lowerExpr(b, recv)), operandValue(try lowerExpr(b, args[0])), recv_ty.isUnsignedInt());
+            const slot = try b.addSlot(b.in.nodes.typeOf(node_idx));
+            const addr = try b.emit(.{ .slot_addr = slot }, int_ty);
+            _ = try b.emit(.{ .store = .{ .addr = addr, .val = disc, .ty = int_ty } }, null);
+            return .{ .slot = slot };
         },
         .str_concat => return try lowerStrConcat(b, node_idx, recv, args[0]),
         .str_len => {
