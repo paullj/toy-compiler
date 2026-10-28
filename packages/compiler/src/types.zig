@@ -1516,6 +1516,10 @@ pub const TemplateConformance = struct {
     /// Set on the `Eq` row an `Ord` impl implies (Ord refines Eq): the protocol whose
     /// methods witness this row.
     refines: ?u32 = null,
+    /// The `impl` decl that declares the row, and its module, so an overlap reports like
+    /// a concrete one (`coherence.reportOverlap`).
+    impl_mod: u32 = 0,
+    impl_decl: Ast.Index = Ast.none,
 };
 
 /// A top-level function's signature, decoded once up front so calls can be
