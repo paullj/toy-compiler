@@ -9298,6 +9298,15 @@ test "a return-only generic call reports T0016 (explicit args required)" {
     try testing.expectEqual(@as(usize, 0), c.result.instances.len);
 }
 
+test "an arg that takes its type from its slot takes what an earlier arg binds" {
+    const gpa = testing.allocator;
+    var c = try checkSource("enum Opt[T] { some(T), none }\nfn pair[U](_a: U, _b: Opt[U]) -> int { return 2 }\nfn main() -> int {\n t := 5\n return pair(t, Opt.none)\n}\n");
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.instances.len);
+    try testing.expectEqualStrings("main.pair$int", c.result.instances[0].name.?);
+}
+
 test "explicit type args still override inference and satisfy an otherwise-uninferable call" {
     const gpa = testing.allocator;
     // The return-only `ro[T]` is uninferable bare, but explicit `ro[int]()` compiles.

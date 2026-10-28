@@ -386,11 +386,20 @@ pub const BodyChecker = struct {
     hint_choices: std.AutoHashMapUnmanaged(Ast.Index, HintChoice) = .empty,
     hint_depth: u32 = 0,
 
+    /// What `retypeFromEarlier` chose for an arg that erred under its want, while an
+    /// outermost generic call's args are typed: as for `hint_choices`, an outer retry
+    /// types the inner args again, so without it each level of nesting would triple the
+    /// work.
+    retype_choices: std.AutoHashMapUnmanaged(Ast.Index, RetypeChoice) = .empty,
+    infer_depth: u32 = 0,
+
     /// The ordered generic-param names + the concrete args they bind to, in
     /// generic-param order (`names[i]` binds `types[i]`).
     pub const Subst = struct { names: []const []const u8, types: []const Type };
 
     pub const HintChoice = struct { hint: Type, keep: bool };
+
+    pub const RetypeChoice = struct { want: ?Expected, from_earlier: Type, keep: bool };
 
     /// `message` is the reported text (the sink's own buffer); `template` the same text with
     /// each instance type arg written as its param (owned).
@@ -408,6 +417,7 @@ pub const BodyChecker = struct {
         bc.descriptor_reqs.deinit(bc.gpa);
         bc.conforms_memo.deinit(bc.gpa);
         bc.hint_choices.deinit(bc.gpa);
+        bc.retype_choices.deinit(bc.gpa);
         for (bc.template_spellings.items) |ts| bc.gpa.free(ts.template);
         bc.template_spellings.deinit(bc.gpa);
     }
@@ -474,7 +484,7 @@ pub const BodyChecker = struct {
         return false;
     }
 
-    fn errorCountSince(bc: *const BodyChecker, mark: usize) usize {
+    pub fn errorCountSince(bc: *const BodyChecker, mark: usize) usize {
         var n: usize = 0;
         for (bc.sink.items()[mark..]) |d| n += @intFromBool(d.severity == .err);
         return n;

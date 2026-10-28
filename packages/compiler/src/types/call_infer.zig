@@ -146,6 +146,11 @@ const InferSite = struct { call: Ast.Index, sig: BodyChecker.CallSig };
 /// argument's shape cannot fit its param: that argument is the error.
 pub fn inferArgs(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, params: []const Type, names: []const []const u8, recv: ?Type, typing: ArgTyping, arg_types: []Type, targs: []Type) error{OutOfMemory}!InferResult {
     const n_gp: u32 = @intCast(targs.len);
+    bc.infer_depth += 1;
+    defer {
+        bc.infer_depth -= 1;
+        if (bc.infer_depth == 0) bc.retype_choices.clearRetainingCapacity();
+    }
     const bnd = try bc.gpa.alloc(bool, n_gp);
     defer bc.gpa.free(bnd);
     const fp = try bc.gpa.alloc(usize, n_gp);
@@ -175,7 +180,13 @@ pub fn inferArgs(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, pa
             const w = BC.substTy(bc, params[i], targs);
             break :blk if (w.kind != .invalid and bc.givesType(w)) .{ .ty = w } else null;
         } else bc.partWant(params[i], exp_targs);
+        if (try recallRetype(bc, a, params[0 .. i + 1], arg_types[0..i], n_gp, want)) |chosen| {
+            arg_types[i] = try typeOfGenericArg(bc, a, chosen);
+            continue;
+        }
+        const arg_mark = bc.sink.count();
         arg_types[i] = try typeOfGenericArg(bc, a, want);
+        if (bc.errorsSince(arg_mark)) arg_types[i] = try retypeFromEarlier(bc, a, params[0 .. i + 1], arg_types[0..i], n_gp, want, arg_mark, arg_types[i]);
     }
     var res = Infer.match(n_gp, params, arg_types, targs, bnd, fp, dec);
     if (waiting) {
@@ -231,6 +242,58 @@ pub fn inferArgs(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, pa
         },
         .ok => return .ok,
     }
+}
+
+/// An arg that errs under the want it was given is typed again against its param (the
+/// last of `params`) with what the earlier args bind, and keeps that typing when it errs
+/// less: `Option.none`, `.none` and `[]` take their type only from their slot, which
+/// `pair(t, Option.none)` fixes through `t`. Only an erring arg is typed again, and only
+/// earlier args count, so an arg that types itself (`f(x8, 5)`) binds as before and
+/// check and discovery bind the same type args.
+fn retypeFromEarlier(bc: *BodyChecker, arg: Ast.Index, params: []const Type, earlier: []const Type, n_gp: u32, want: ?BC.Expected, mark: usize, got: Type) error{OutOfMemory}!Type {
+    const w = (try earlierWant(bc, params, earlier, n_gp)) orelse return got;
+    if (want) |e| if (e.ty.eql(w)) return got;
+    const errs = bc.errorCountSince(mark);
+    bc.sink.truncate(mark);
+    const t = try typeOfGenericArg(bc, arg, .{ .ty = w });
+    const keep = bc.errorCountSince(mark) < errs;
+    try bc.retype_choices.put(bc.gpa, arg, .{ .want = want, .from_earlier = w, .keep = keep });
+    if (keep) return t;
+    bc.sink.truncate(mark);
+    return typeOfGenericArg(bc, arg, want);
+}
+
+/// The want `retypeFromEarlier` chose for `arg` when it was last typed in the same
+/// context (its want and what the earlier args bind), so it is typed once under it.
+fn recallRetype(bc: *BodyChecker, arg: Ast.Index, params: []const Type, earlier: []const Type, n_gp: u32, want: ?BC.Expected) error{OutOfMemory}!??BC.Expected {
+    const c = bc.retype_choices.get(arg) orelse return null;
+    if (!sameWant(c.want, want)) return null;
+    const w = (try earlierWant(bc, params, earlier, n_gp)) orelse return null;
+    if (!w.eql(c.from_earlier)) return null;
+    return if (c.keep) .{ .ty = w } else want;
+}
+
+fn sameWant(a: ?BC.Expected, b: ?BC.Expected) bool {
+    const x = a orelse return b == null;
+    const y = b orelse return false;
+    return x.soft == y.soft and x.ty.eql(y.ty);
+}
+
+/// The last of `params` with what `earlier` (the args before it) binds, when that is a
+/// type an arg can take from its slot.
+fn earlierWant(bc: *BodyChecker, params: []const Type, earlier: []const Type, n_gp: u32) error{OutOfMemory}!?Type {
+    const targs = try bc.gpa.alloc(Type, n_gp);
+    defer bc.gpa.free(targs);
+    const bnd = try bc.gpa.alloc(bool, n_gp);
+    defer bc.gpa.free(bnd);
+    const fp = try bc.gpa.alloc(usize, n_gp);
+    defer bc.gpa.free(fp);
+    const i = earlier.len;
+    if (Infer.match(n_gp, params[0..i], earlier, targs, bnd, fp, bc.composite.decomposer()) == .conflict) return null;
+    fillOpen(targs, bnd, bc.openOrdBase());
+    const w = BC.substTy(bc, params[i], targs);
+    if (w.kind == .invalid or !bc.givesType(w)) return null;
+    return w;
 }
 
 /// Whether `got` can stand where `want` is wanted once `want`'s type vars are bound: a
