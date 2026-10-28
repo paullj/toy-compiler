@@ -1,0 +1,20 @@
+# Feature: a generic conformance with no methods (`impl Cell[T] has Marker {}`) is recorded
+# and meets a `[T has Marker]` bound (#101), with and without a bound on the impl's param.
+# expect: exit 3
+protocol Marker {}
+protocol Tag {}
+
+struct Cell[T] { v: T }
+struct Box[T] { v: T }
+
+impl Cell[T] has Marker {}
+
+impl int has Tag {}
+
+impl Box[T has Tag] has Marker {}
+
+fn mark[T has Marker](_t: T) -> int { 1 }
+
+fn main() -> int {
+    return mark(Cell { v: 7 }) + mark(Cell { v: true }) + mark(Box { v: 3 })
+}

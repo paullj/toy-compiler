@@ -1,0 +1,24 @@
+# An impl with no methods still has its receiver pattern checked (#101): one T0013 at
+# each receiver, and the rejected conformance adds no T0023 at a bounded call. An
+# accepted one with a bound on its param meets the bound only where its arg does.
+protocol Marker {}
+protocol Tag {}
+
+struct Cell[T] { v: T }
+struct Pair[A, B] { a: A, b: B }
+struct Box[T] { v: T }
+
+impl Cell[int] has Marker {}  #~ ERROR [T0013] a conformance 'impl' on a concrete type instance is not yet supported (use 'impl Cell[T]')
+
+impl Cell[int] {}  #~ ERROR [T0013] an inherent 'impl' on a concrete type instance is not yet supported (use 'impl Cell[T]')
+
+impl Pair[A, int] has Marker {}  #~ ERROR [T0013] a conformance 'impl' whose pattern is partly concrete or repeats a name is not yet supported; name each type parameter once, as in 'impl Pair[A, B]'
+
+impl Box[T has Tag] has Marker {}
+
+fn mark[T has Marker](_t: T) -> int { 1 }
+
+fn main() -> int {
+    n := mark(Box { v: true })  #~ ERROR [T0023] type 'Box' does not conform to protocol 'Marker'; its generic impl needs type argument 'bool' to conform to 'Tag'
+    return mark(Cell { v: 7 }) + n
+}

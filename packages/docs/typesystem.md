@@ -365,7 +365,8 @@ impl's (`impl Box[T] { fn conv[T](..) }`), and no fn declares one name twice
 (**T0053**). An impl's pattern, inherent or a conformance, names each type parameter
 once (`impl Pair[A, B]`); one on a single instance (`impl Box[int]`,
 `impl Box[int] has Into[int]`) or a partly concrete or repeated one
-(`impl Pair[T, int]`, `impl Pair[T, T]`) is **T0013**, and that is the impl's only
+(`impl Pair[T, int]`, `impl Pair[T, T]`) is **T0013**, once per impl and whether or
+not it has methods (`impl Box[int] has Marker {}`), and that is the impl's only
 error: its methods are not checked against the protocol (no **T0024**), a call of one,
 on a value or through the type, reports nothing more (no **T0018**), and a bound it
 would have met is not reported unmet (no **T0023**). So is a conformance rejected for a

@@ -774,6 +774,25 @@ pub const TemplateMethod = struct {
     protocol_args: []const Type = &.{},
 };
 
+/// A generic impl's receiver pattern (`Box[T]`) and its params' bounds, decoded once from
+/// the impl's header so that an impl with no methods is checked and conforms like any
+/// other. Only impls whose pattern T0013 accepts have one.
+pub const ImplHead = struct {
+    mod: u32,
+    recv_node: Ast.Index,
+    recv: Type,
+    /// Owned, ordinal-indexed like `FnSym.generic_bounds`.
+    bounds: []const ?u32,
+    bound_args: []const []const Type,
+    /// The impl's param names in order (borrowed source slices in an owned array).
+    gnames: []const []const u8,
+
+    fn deinit(h: ImplHead, gpa: std.mem.Allocator) void {
+        (Bounds{ .ids = @constCast(h.bounds), .args = @constCast(h.bound_args) }).deinit(gpa);
+        gpa.free(h.gnames);
+    }
+};
+
 /// An impl T0013 rejected: for its receiver pattern (`impl Box[int]`), or for a protocol
 /// arg it cannot take (`impl P has Into[Option[int]]`). That is its only error, so a
 /// conformance or method it would have provided is not reported missing.
@@ -1491,8 +1510,7 @@ pub const TemplateConformance = struct {
     recv: Type = .invalid,
     /// How many leading generic params are the impl's own (`implParamCount`).
     n_params: u32 = 0,
-    /// The impl's per-param bounds and bound args, BORROWED from an impl method's
-    /// `FnSym` (owned by `t.fns`), ordinal-indexed like `FnSym.generic_bounds`.
+    /// The impl's per-param bounds and bound args, BORROWED from its `ImplHead`.
     bounds: []const ?u32 = &.{},
     bound_args: []const []const Type = &.{},
     /// Set on the `Eq` row an `Ord` impl implies (Ord refines Eq): the protocol whose
@@ -1620,6 +1638,9 @@ rejected_methods: std.ArrayList(TemplateMethod) = .empty,
 
 /// Every impl T0013 rejects, once each (see `RejectedImpl`).
 rejected_impls: std.ArrayList(RejectedImpl) = .empty,
+
+/// Every generic impl T0013 accepts, built serially before Phase A (see `ImplHead`).
+impl_heads: std.ArrayList(ImplHead) = .empty,
 
 /// The program-wide protocol table, built SERIALLY in Phase 0c
 /// (`registerProtocols`) in module-then-decl order (a protocol's global id is its
@@ -2184,6 +2205,8 @@ pub fn checkGraph(
         t.templates.deinit(gpa);
         t.rejected_methods.deinit(gpa);
         t.rejected_impls.deinit(gpa);
+        for (t.impl_heads.items) |h| h.deinit(gpa);
+        t.impl_heads.deinit(gpa);
         // On success `toOwnedSlice` empties the protocol table (the result frees it).
         freeProtocolEntries(gpa, t.protocols.items);
         t.protocols.deinit(gpa);
@@ -2557,6 +2580,8 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
         if (t.enums.items[id].is_generic) continue;
         try LayoutEngine.layoutEnum(t.layoutEnv(), @intCast(id));
     }
+
+    try t.decodeImplHeads(mods);
 
     // Phase A: decode every fn signature into the GLOBAL fn table, in the exact
     // order of `fns` (parallel to the resolver's global fn ids), so `.func` ids
@@ -4323,37 +4348,9 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
     // referencing another param resolves to a `type_var` rather than an unknown type.
     t.cur_generic_params = gnames;
     defer t.cur_generic_params = &.{};
-    if (proto.generic_params.len > 0) {
-        gbounds = try t.gpa.alloc(?u32, proto.generic_params.len);
-        gbound_args = try t.gpa.alloc([]const Type, proto.generic_params.len);
-        for (gbound_args) |*ba| ba.* = &.{};
-        for (proto.generic_params, 0..) |gp, i| {
-            const bound = Ast.genericParamBound(t.tree, gp);
-            gbounds[i] = if (bound) |bn| (t.protocolIdFromNode(bn) orelse blk: {
-                const ref_tok = t.tree.nodes[Ast.protocolRefBase(t.tree, bn).int()].main_token;
-                try t.sink.report(.{ .span = t.tokSpan(ref_tok), .code = .T0021 }, "'{s}' is not a declared protocol", .{t.nameText(ref_tok)});
-                break :blk null;
-            }) else null;
-            // Decode the bound's protocol type-args. A composite `App` arg is out of
-            // scope (its check-time index is run-order-dependent — would break the coherence
-            // key + fp determinism); reject it and drop the arg. A `type_var` (another
-            // param) is fine — it grounds at the mono worklist.
-            if (bound) |bn| {
-                const arg_nodes = Ast.protocolRefArgs(t.tree, bn);
-                if (arg_nodes.len > 0) {
-                    const av = try t.gpa.alloc(Type, arg_nodes.len);
-                    for (arg_nodes, 0..) |an, k| {
-                        const aty = t.typeFromNode(an);
-                        if (aty.isApp() or aty.isFunc()) {
-                            try t.sink.report(.{ .span = t.spanOf(an), .code = .T0013 }, "a generic-protocol bound argument must be a concrete non-composite type (composite protocol args are not yet supported)", .{});
-                            av[k] = .invalid;
-                        } else av[k] = aty;
-                    }
-                    gbound_args[i] = av;
-                }
-            }
-        }
-    }
+    const bounds = try t.decodeBounds(proto.generic_params);
+    gbounds = bounds.ids;
+    gbound_args = bounds.args;
 
     // Inherent method: resolve the receiver type and put it in scope so the
     // synthesized `self` param and any `Self` type-ref in the signature decode to it.
@@ -4402,10 +4399,9 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
                 .has_self = has_self,
                 .bundled = t.graph.mods[mod].bundled,
             };
-            if (implPatternFault(e.args)) |fault| {
-                try t.reportImplPattern(recv_type, e, fault);
+            // `decodeImplHeads` already reported the pattern, once for the impl.
+            if (implPatternFault(e.args) != null) {
                 try t.rejected_methods.append(t.gpa, tm);
-                try t.noteRejectedImpl(mod, recv_type, if (e.ctor_is_enum) Type.enumT(e.ctor) else Type.structT(e.ctor));
                 return;
             }
             try t.templates.append(t.gpa, tm);
@@ -4420,6 +4416,126 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
             });
         }
     }
+}
+
+/// The bound protocol id (null = unbounded) and protocol args of each generic param,
+/// owned by the caller. The caller puts the params in scope first, so a bound arg naming
+/// another param decodes to its `type_var`.
+const Bounds = struct {
+    ids: []?u32 = &.{},
+    args: [][]const Type = &.{},
+
+    fn deinit(b: Bounds, gpa: std.mem.Allocator) void {
+        if (b.ids.len > 0) gpa.free(b.ids);
+        for (b.args) |ba| if (ba.len > 0) gpa.free(@constCast(ba));
+        if (b.args.len > 0) gpa.free(b.args);
+    }
+};
+
+fn decodeBounds(t: *Typecheck, gparams: []const Ast.Index) !Bounds {
+    if (gparams.len == 0) return .{};
+    const ids = try t.gpa.alloc(?u32, gparams.len);
+    errdefer t.gpa.free(ids);
+    const args = try t.gpa.alloc([]const Type, gparams.len);
+    for (args) |*ba| ba.* = &.{};
+    errdefer {
+        for (args) |ba| if (ba.len > 0) t.gpa.free(@constCast(ba));
+        t.gpa.free(args);
+    }
+    for (gparams, 0..) |gp, i| {
+        const bound = Ast.genericParamBound(t.tree, gp);
+        ids[i] = if (bound) |bn| (t.protocolIdFromNode(bn) orelse blk: {
+            const ref_tok = t.tree.nodes[Ast.protocolRefBase(t.tree, bn).int()].main_token;
+            try t.sink.report(.{ .span = t.tokSpan(ref_tok), .code = .T0021 }, "'{s}' is not a declared protocol", .{t.nameText(ref_tok)});
+            break :blk null;
+        }) else null;
+        // Decode the bound's protocol type-args. A composite `App` arg is out of
+        // scope (its check-time index is run-order-dependent — would break the coherence
+        // key + fp determinism); reject it and drop the arg. A `type_var` (another
+        // param) is fine — it grounds at the mono worklist.
+        if (bound) |bn| {
+            const arg_nodes = Ast.protocolRefArgs(t.tree, bn);
+            if (arg_nodes.len > 0) {
+                const av = try t.gpa.alloc(Type, arg_nodes.len);
+                for (arg_nodes, 0..) |an, k| {
+                    const aty = t.typeFromNode(an);
+                    if (aty.isApp() or aty.isFunc()) {
+                        try t.sink.report(.{ .span = t.spanOf(an), .code = .T0013 }, "a generic-protocol bound argument must be a concrete non-composite type (composite protocol args are not yet supported)", .{});
+                        av[k] = .invalid;
+                    } else av[k] = aty;
+                }
+                args[i] = av;
+            }
+        }
+    }
+    return .{ .ids = ids, .args = args };
+}
+
+/// Check each generic impl's receiver pattern once, from the impl's own header rather
+/// than from its methods, which an impl may not have: T0013 rejects a pattern no template
+/// can serve, and an accepted one gets its `ImplHead`.
+fn decodeImplHeads(t: *Typecheck, mods: []const GraphModuleInput) !void {
+    for (mods, 0..) |_, mi| {
+        const mod: u32 = @intCast(mi);
+        _ = t.gphSelect(mod);
+        if (t.tree.nodes.len == 0) continue;
+        const prog = t.tree.nodes[Ast.root(t.tree.nodes).int()];
+        if (prog.tag != .program) continue;
+        for (Ast.rangeSlice(t.tree, prog.lhs.int())) |d| {
+            const decl = t.tree.nodes[d.int()];
+            if (decl.tag != .impl_decl and decl.tag != .impl_has_decl) continue;
+            const recv_node = decl.lhs;
+            const recv_ref = t.tree.nodes[recv_node.int()];
+            if (recv_ref.tag != .type_app) {
+                // Resolved here too so an impl with no methods still reports its receiver;
+                // the sink drops the repeat a method's own decode makes.
+                if (t.typeFromNode(recv_node).kind == .invalid) try t.noteRejectedImpl(mod, recv_node, t.implRecvNominal(recv_node));
+                continue;
+            }
+            const gparams = Ast.rangeSlice(t.tree, recv_ref.rhs.int());
+            const gnames = try t.gpa.alloc([]const u8, gparams.len);
+            var kept = false;
+            defer if (!kept) t.gpa.free(gnames);
+            for (gparams, gnames) |gp, *gn| gn.* = t.nameText(t.tree.nodes[gp.int()].main_token);
+            t.cur_generic_params = gnames;
+            defer t.cur_generic_params = &.{};
+            const recv = t.typeFromNode(recv_node);
+            if (!recv.isApp()) {
+                try t.noteRejectedImpl(mod, recv_node, t.implRecvNominal(recv_node));
+                continue;
+            }
+            const e = t.composite.at(recv.appIdx());
+            if (implPatternFault(e.args)) |fault| {
+                try t.reportImplPattern(recv_node, e, fault);
+                try t.noteRejectedImpl(mod, recv_node, if (e.ctor_is_enum) Type.enumT(e.ctor) else Type.structT(e.ctor));
+                continue;
+            }
+            const bounds = try t.decodeBounds(gparams);
+            errdefer bounds.deinit(t.gpa);
+            try t.impl_heads.append(t.gpa, .{ .mod = mod, .recv_node = recv_node, .recv = recv, .bounds = bounds.ids, .bound_args = bounds.args, .gnames = gnames });
+            kept = true;
+        }
+    }
+}
+
+/// The type a rejected impl's receiver names (`Box` for `impl Box` or `impl Box[T, U]`),
+/// so the conformance it would have given is still known as rejected; `.invalid` when the
+/// name is no local struct or enum.
+fn implRecvNominal(t: *Typecheck, recv_node: Ast.Index) Type {
+    var n = t.tree.nodes[recv_node.int()];
+    if (n.tag == .type_app) n = t.tree.nodes[n.lhs.int()];
+    if (n.tag != .identifier) return .invalid;
+    const name = t.nameText(n.main_token);
+    if (t.activeStructMap().get(name)) |id| return Type.structT(id);
+    if (t.activeEnumMap().get(name)) |id| return Type.enumT(id);
+    return .invalid;
+}
+
+/// The head of the generic impl at receiver node `recv_node` of module `mod`, or null
+/// when it has none (not generic, or rejected).
+pub fn implHead(t: *const Typecheck, mod: u32, recv_node: Ast.Index) ?ImplHead {
+    for (t.impl_heads.items) |h| if (h.mod == mod and h.recv_node == recv_node) return h;
+    return null;
 }
 
 /// Why an impl's receiver pattern cannot be a template: a fully ground receiver
