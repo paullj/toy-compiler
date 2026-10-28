@@ -1,6 +1,7 @@
 # A receiver whose value cannot take its call's expected type as a whole is typed as it
 # would be with no expected type, so a value `if` or `match` whose arms meet the hint in
-# different ways reports what is really wrong, never that its arms disagree.
+# different ways reports what is really wrong, never that its arms disagree. An arm takes
+# its type only from the arms before it, so a leading `Option.none` has none.
 import std/option
 import std/str
 
@@ -23,8 +24,9 @@ fn fits(c: bool) -> int8 {
     (if c { 2 } else { 1 }).small()  #~ ERROR [T0018] no method 'small' on type 'int8'
 }
 
-fn none_last(c: bool) -> Option[str] {
-    (if c { Option.some(33) } else { Option.none }).map(fn(x) { x.to_string() })  #~ ERROR [T0016] cannot infer type parameter 'T' for 'Option.none'
+fn none_first_bare(c: bool) -> Option[int] {
+    o := if c { Option.none } else { Option.some(33) }  #~ ERROR [T0016] cannot infer type parameter 'T' for 'Option.none'
+    o
 }
 
 fn none_first(c: bool) -> Option[str] {
@@ -39,7 +41,7 @@ fn main() -> int {
     _r := real_error(true)
     _a := wide(true)
     _b := fits(true)
-    _n := none_last(true)
+    _n := none_first_bare(true)
     _f := none_first(true)
     return 0
 }
