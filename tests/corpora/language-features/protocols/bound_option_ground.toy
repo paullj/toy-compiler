@@ -1,0 +1,51 @@
+# Feature: a bounded template calls a protocol method whose signature nests the protocol's
+# params inside a type (#93): an `Option[X]` return (inferred and explicit args), an
+# `Option[X]` param, and an `Option[Self]` return where the bounded param is not first.
+# expect: stdout "3\n3\n3\n3\n3\n"
+# expect: exit 3
+import std/io
+import std/option
+
+protocol Tagged[X] { fn tag(self, n: X) -> Option[X] }
+protocol Take[X] { fn take(self, n: Option[X]) -> int }
+protocol Wrap { fn wrap(self) -> Option[Self] }
+
+struct P { x: int }
+
+impl P has Tagged[int] {
+    fn tag(self, n: int) -> Option[int] { Option.some(n + self.x) }
+}
+
+impl P has Take[int] {
+    fn take(self, n: Option[int]) -> int { n.unwrap_or(0) + self.x }
+}
+
+impl P has Wrap {
+    fn wrap(self) -> Option[P] { Option.some(self) }
+}
+
+fn ret[T has Tagged[int]](x: T, n: int) -> Option[int] { x.tag(n) }
+
+fn local[T has Tagged[int]](x: T, n: int) -> int {
+    r := x.tag(n)
+    return r.unwrap_or(0)
+}
+
+fn explicit[T has Tagged[int]](x: T, n: int) -> Option[int] { x.tag[int](n) }
+
+fn param[T has Take[int]](x: T, n: int) -> int { x.take(Option.some(n)) }
+
+fn wrapped[U, T has Wrap](_u: U, x: T) -> int {
+    w: Option[T] = x.wrap()
+    return match w { .some(_) -> 3, .none -> 0 }
+}
+
+fn main() -> int {
+    p := P { x: 1 }
+    io.println(ret(p, 2).unwrap_or(0))
+    io.println(local(p, 2))
+    io.println(explicit(p, 2).unwrap_or(0))
+    io.println(param(p, 2))
+    io.println(wrapped(true, p))
+    return wrapped(0, p)
+}

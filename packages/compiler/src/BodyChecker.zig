@@ -2467,7 +2467,7 @@ pub const BodyChecker = struct {
         return switch (sig.map) {
             .id, .unbound => p,
             .subst => |ta| substTy(bc, p, ta),
-            .ground => |g| Typecheck.groundProtoType(p, g.self_ty, g.pargs),
+            .ground => |g| Typecheck.groundProtoType(bc, p, g.self_ty, g.pargs),
         };
     }
 
@@ -3186,7 +3186,7 @@ pub const BodyChecker = struct {
                         .name = member,
                         .map = .{ .ground = .{ .self_ty = recv_ty, .pargs = explicit } },
                     });
-                    const ret = Typecheck.groundProtoType(p.method_rets[k], recv_ty, explicit);
+                    const ret = Typecheck.groundProtoType(bc, p.method_rets[k], recv_ty, explicit);
                     bc.node_types[(node_idx).int()] = ret;
                     return ret;
                 };
@@ -4389,7 +4389,7 @@ pub const BodyChecker = struct {
                     .name = member,
                     .map = .{ .ground = .{ .self_ty = recv_ty, .pargs = pargs } },
                 });
-                const ret = Typecheck.groundProtoType(p.method_rets[k], recv_ty, pargs);
+                const ret = Typecheck.groundProtoType(bc, p.method_rets[k], recv_ty, pargs);
                 bc.node_types[(node_idx).int()] = ret;
                 return ret;
             }

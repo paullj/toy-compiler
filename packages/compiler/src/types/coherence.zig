@@ -182,12 +182,12 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
                 var mismatch = impl_fn.params.len != want_params.len;
                 if (!mismatch) {
                     for (want_params, impl_fn.params) |wp, ip| {
-                        if (!Type.eql(Typecheck.groundProtoTypeDeep(t, wp, recv, pargs), ip)) {
+                        if (!Type.eql(Typecheck.groundProtoType(t, wp, recv, pargs), ip)) {
                             mismatch = true;
                             break;
                         }
                     }
-                    if (!mismatch and !Type.eql(Typecheck.groundProtoTypeDeep(t, want_ret, recv, pargs), impl_fn.ret)) mismatch = true;
+                    if (!mismatch and !Type.eql(Typecheck.groundProtoType(t, want_ret, recv, pargs), impl_fn.ret)) mismatch = true;
                 }
                 if (mismatch)
                     try t.sink.report(.{ .span = sigSpan(t, method_node), .code = .T0024 }, "impl method '{s}' has a signature incompatible with protocol '{s}'", .{ req, prot.name });
@@ -310,12 +310,12 @@ fn recordGenericConformance(
         var mismatch = impl_fn.params.len != want_params.len;
         if (!mismatch) {
             for (want_params, impl_fn.params) |wp, ip| {
-                if (!Type.eql(Typecheck.groundProtoTypeDeep(t, wp, recv_app, pargs), ip)) {
+                if (!Type.eql(Typecheck.groundProtoType(t, wp, recv_app, pargs), ip)) {
                     mismatch = true;
                     break;
                 }
             }
-            if (!mismatch and !Type.eql(Typecheck.groundProtoTypeDeep(t, want_ret, recv_app, pargs), impl_fn.ret)) mismatch = true;
+            if (!mismatch and !Type.eql(Typecheck.groundProtoType(t, want_ret, recv_app, pargs), impl_fn.ret)) mismatch = true;
         }
         if (mismatch)
             try t.sink.report(.{ .span = sigSpan(t, method_node), .code = .T0024 }, "impl method '{s}' has a signature incompatible with protocol '{s}'", .{ req, prot.name });
