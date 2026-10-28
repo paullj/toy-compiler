@@ -101,7 +101,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
             // `receiverTypeFromNode` returns null for a `type_app`, so the concrete path
             // below never handles this shape.
             if (t.tree.nodes[decl.lhs.int()].tag == .type_app) {
-                try recordGenericConformance(t, mod, decl, proto_ref, pid, prot, provided);
+                try recordGenericConformance(t, mod, decl_idx, proto_ref, pid, prot, provided);
                 continue;
             }
 
@@ -211,7 +211,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
             const gop = try seen.getOrPut(t.gpa, keybuf.items);
             const here: ImplAt = .{ .mod = mod, .decl = decl_idx };
             if (gop.found_existing) {
-                try reportOverlap(t, pid, gop.value_ptr.*, here);
+                _ = try reportOverlap(t, pid, gop.value_ptr.*, here, "");
             } else {
                 gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items);
                 gop.value_ptr.* = here;
@@ -222,20 +222,20 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
 }
 
 /// Record a GENERIC conformance `impl Ctor[T] has P[..]` into `t.template_conformances`
-/// and validate its method signatures
-/// (T0024) monomorphized per the receiver's own type-params. The impl's methods live in
-/// `t.templates`, so there is no `t.methods` witness to stamp (the `for x in xs` desugar
-/// dispatches structurally on the reified receiver). Overlap detection compares the
+/// and validate its method signatures (T0024) monomorphized per the receiver's own
+/// type-params. Its witnesses are the impl's templates, stamped below; each reached
+/// instance gets its concrete row in `monomorphize`. Overlap detection compares the
 /// receiver CTOR int (the App index is interning-order dependent — would break `-jN`).
 fn recordGenericConformance(
     t: *Typecheck,
     mod: u32,
-    decl: Ast.Node,
+    decl_idx: Ast.Index,
     proto_ref: Ast.Index,
     pid: u32,
     prot: Typecheck.ProtocolSym,
     provided: []const Ast.Index,
 ) !void {
+    const decl = t.tree.nodes[decl_idx.int()];
     // No head: the receiver did not resolve, which Phase A reported.
     const head = t.implHead(mod, decl.lhs) orelse return;
     const recv_app = head.recv;
@@ -314,14 +314,18 @@ fn recordGenericConformance(
     // Two raw patterns that differ (`Conv[T]`, `Conv[int]`) can still both apply at one
     // instance (`Box[int]`), where no call could choose between them.
     const n_vars: u32 = @intCast(e.args.len);
-    for (t.template_conformances.items) |tc| {
+    const here: ImplAt = .{ .mod = mod, .decl = decl_idx };
+    var replaces: ?*Typecheck.TemplateConformance = null;
+    for (t.template_conformances.items) |*tc| {
         if (tc.protocol_id != pid or tc.recv_ctor != e.ctor or tc.recv_is_enum != e.ctor_is_enum) continue;
         if (!try patternsOverlap(t.gpa, @max(n_vars, tc.n_params), tc.protocol_args, pargs, t.composite.decomposer())) continue;
-        try t.sink.report(.{ .span = implHeaderSpan(t, decl, proto_ref), .code = .T0020 }, "overlapping impl of protocol '{s}' for type '{s}': an earlier impl's protocol arguments can equal these at one instance", .{ prot.name, t.nameText(decl.main_token) });
-        return;
+        const loser = try reportOverlap(t, pid, .{ .mod = tc.impl_mod, .decl = tc.impl_decl }, here, ": an earlier impl's protocol arguments can equal these at one instance");
+        if (loser.mod == here.mod and loser.decl == here.decl) return;
+        replaces = tc;
+        break;
     }
     const owned_pargs = try t.gpa.dupe(Type, pargs);
-    t.template_conformances.append(t.gpa, .{
+    const row: Typecheck.TemplateConformance = .{
         .protocol_id = pid,
         .recv_ctor = e.ctor,
         .recv_is_enum = e.ctor_is_enum,
@@ -330,7 +334,15 @@ fn recordGenericConformance(
         .n_params = n_vars,
         .bounds = head.bounds,
         .bound_args = head.bound_args,
-    }) catch |err| {
+        .impl_mod = mod,
+        .impl_decl = decl_idx,
+    };
+    if (replaces) |tc| {
+        // The earlier impl lost (a program impl overlapping std's) and its templates are
+        // gone, so its row would conform with no witness.
+        if (tc.protocol_args.len > 0) t.gpa.free(@constCast(tc.protocol_args));
+        tc.* = row;
+    } else t.template_conformances.append(t.gpa, row) catch |err| {
         t.gpa.free(owned_pargs);
         return err;
     };
@@ -426,9 +438,10 @@ const ImplAt = struct { mod: u32, decl: Ast.Index };
 /// T0020 for the impl `second`, which repeats the conformance `first` claimed. When one of
 /// the two is in bundled std the program's impl is the one to remove, so the error sits on
 /// it and names std's module, whichever came first in module order. The losing impl's
-/// method rows are dropped, so its calls neither shadow std's (W0011) nor look ambiguous
-/// between two witnesses (T0025): this error is the only one the overlap gives.
-fn reportOverlap(t: *Typecheck, pid: u32, first: ?ImplAt, second: ImplAt) !void {
+/// method rows and templates are dropped, so its calls neither shadow std's (W0011) nor
+/// look ambiguous between two witnesses (T0025): this error is the only one the overlap
+/// gives. Returns the loser.
+fn reportOverlap(t: *Typecheck, pid: u32, first: ?ImplAt, second: ImplAt, detail: []const u8) !ImplAt {
     const mods = t.graph.mods;
     var loser = second;
     var std_mod: ?u32 = null;
@@ -448,7 +461,7 @@ fn reportOverlap(t: *Typecheck, pid: u32, first: ?ImplAt, second: ImplAt) !void 
     if (std_mod) |sm|
         try t.sink.report(.{ .span = span, .code = .T0020 }, "overlapping impl of protocol '{s}' for type '{s}': {s} already provides one; remove this impl", .{ pname, t.nameText(decl.main_token), mods[sm].path })
     else
-        try t.sink.report(.{ .span = span, .code = .T0020 }, "overlapping impl of protocol '{s}' for type '{s}'", .{ pname, t.nameText(decl.main_token) });
+        try t.sink.report(.{ .span = span, .code = .T0020 }, "overlapping impl of protocol '{s}' for type '{s}'{s}", .{ pname, t.nameText(decl.main_token), detail });
     for (Ast.implMethods(t.tree, decl)) |pn| {
         const fid = for (t.fns.items, 0..) |f, fi| {
             if (f.mod == loser.mod and f.decl_node == pn) break fi;
@@ -463,7 +476,13 @@ fn reportOverlap(t: *Typecheck, pid: u32, first: ?ImplAt, second: ImplAt) !void 
             if (m.protocol_args.len > 0) t.gpa.free(@constCast(m.protocol_args));
             _ = t.methods.orderedRemove(i);
         }
+        // A template borrows its `protocol_args` from its conformance row.
+        var j: usize = 0;
+        while (j < t.templates.items.len) {
+            if (t.templates.items[j].fn_id == fid) _ = t.templates.orderedRemove(j) else j += 1;
+        }
     }
+    return loser;
 }
 
 fn implHeaderSpan(t: *const Typecheck, decl: Ast.Node, proto_ref: Ast.Index) Span {

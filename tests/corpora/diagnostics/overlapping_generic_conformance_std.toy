@@ -1,0 +1,13 @@
+# A program's generic conformance that overlaps std's at one instance is one error, on
+# the program's impl and naming std's module, as a concrete overlap is: no shadow
+# warning for its methods and no error inside std.
+import std/vec
+import std/iter
+
+impl vec.VecIter[T] has iter.Iterator[int] {  #~ ERROR [T0020] overlapping impl of protocol 'Iterator' for type 'VecIter': std/vec already provides one; remove this impl
+    fn next(mut self) -> Option[int] { Option[int].none }
+}
+
+fn main() -> int {
+    return 0
+}
