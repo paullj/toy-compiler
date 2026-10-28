@@ -1276,6 +1276,7 @@ pub const BodyChecker = struct {
                 }
                 const operand = try bc.typeOf(n.lhs);
                 if (operand.kind == .invalid) break :blk Type.invalid; // poison propagation: no emit (exempt)
+                if (bc.expectedTy()) |e| if (e.isInteger() and bc.isConstInt(node_idx)) try bc.checkConstRange(node_idx, e);
                 switch (op) {
                     .minus => {
                         if (operand.isInteger()) break :blk operand;
@@ -1294,31 +1295,31 @@ pub const BodyChecker = struct {
                 break :blk Type.invalid;
             },
             .binary => blk: {
-                // Type each operand with NO expected type (the only `typeOf` consumer of
-                // `bc.body.expected` is the literal arm, so scoping it off here is safe), then
-                // let a bare-literal operand adopt its typed sibling's width — so `a + 1`
-                // (a: int8) adopts int8 and `a + 300` fires T0034 exactly once via the
-                // sibling path, never also via the outer expected.
+                const op_tok = bc.tokens[n.main_token];
                 const saved = bc.body.expected;
+                // A constant operand pair (`c: int8 = 1 + 2`, a sibling's `b + (1 + 2)`)
+                // has no typed operand to take a width from, so both take the expected
+                // width; else both stay platform `int` and the narrow bind is rejected.
+                if (saved) |e| if (e.ty.isInteger() and bc.isConstInt(node_idx)) {
+                    const lt = try bc.typeOfExpected(n.lhs, e.ty);
+                    const rt = try bc.typeOfExpected(n.rhs, e.ty);
+                    if (lt.kind == .invalid or rt.kind == .invalid) break :blk Type.invalid; // poison propagation: no emit (exempt)
+                    try bc.checkConstRange(node_idx, e.ty);
+                    break :blk try bc.binaryResult(node_idx, .{ .node = node_idx }, op_tok.tag, op_tok.text(bc.source), lt, rt);
+                };
+                // Type each operand with NO expected type, then let a constant operand
+                // adopt its typed sibling's width: `a + 1` (a: int8) adopts int8 and
+                // `a + 300` fires T0034 exactly once via the sibling path, never also via
+                // the outer expected.
                 bc.body.expected = null;
                 var lt = try bc.typeOf(n.lhs);
                 var rt = try bc.typeOf(n.rhs);
                 bc.body.expected = saved;
                 if (lt.kind == .invalid or rt.kind == .invalid) break :blk Type.invalid; // poison propagation: no emit (exempt)
-                const l_lit = bc.tree.nodes[n.lhs.int()].tag == .literal_number;
-                const r_lit = bc.tree.nodes[n.rhs.int()].tag == .literal_number;
-                if (!l_lit) rt = try bc.adoptLiteralWidth(n.rhs, rt, lt);
-                if (!r_lit) lt = try bc.adoptLiteralWidth(n.lhs, lt, rt);
-                // Both operands bare literals (`c: int8 = 1 + 2`): no typed sibling to
-                // adopt from, so re-type each under the OUTER expected width (running the
-                // per-literal range check) — else both stay platform `int`, the homogeneous
-                // arm yields `int`, and the annotated bind is wrongly rejected. A no-op for
-                // a platform-`int` target, so `x: int = 1 + 2` is unaffected.
-                if (l_lit and r_lit) if (saved) |e| if (e.ty.isInteger()) {
-                    lt = try bc.typeOfExpected(n.lhs, e.ty);
-                    rt = try bc.typeOfExpected(n.rhs, e.ty);
-                };
-                const op_tok = bc.tokens[n.main_token];
+                const l_const = bc.isConstInt(n.lhs);
+                const r_const = bc.isConstInt(n.rhs);
+                if (!l_const) rt = try bc.adoptConstWidth(n.rhs, rt, lt);
+                if (!r_const) lt = try bc.adoptConstWidth(n.lhs, lt, rt);
                 break :blk try bc.binaryResult(node_idx, .{ .node = node_idx }, op_tok.tag, op_tok.text(bc.source), lt, rt);
             },
             .empty_list => blk: {
@@ -4705,21 +4706,79 @@ pub const BodyChecker = struct {
         return Type.invalid;
     }
 
-    /// The type of binary operand `operand` (typed `t` with no expected type): a bare
-    /// integer literal beside an operand of integer type `sibling` takes that width.
-    fn adoptLiteralWidth(bc: *BodyChecker, operand: Ast.Index, t: Type, sibling: Type) error{OutOfMemory}!Type {
-        if (bc.tree.nodes[operand.int()].tag != .literal_number or !sibling.isInteger()) return t;
+    /// The type of binary operand `operand` (typed `t` with no expected type): a constant
+    /// integer operand beside an operand of integer type `sibling` takes that width.
+    fn adoptConstWidth(bc: *BodyChecker, operand: Ast.Index, t: Type, sibling: Type) error{OutOfMemory}!Type {
+        if (!bc.isConstInt(operand) or !sibling.isInteger()) return t;
         return bc.typeOfExpected(operand, sibling);
     }
 
+    /// Whether `node` is an integer constant built from literals alone, which, like a bare
+    /// literal, has no width of its own until a place or sibling gives it one.
+    fn isConstInt(bc: *const BodyChecker, node: Ast.Index) bool {
+        if (node == Ast.none) return false;
+        const n = bc.tree.nodes[node.int()];
+        return switch (n.tag) {
+            .literal_number => true,
+            .unary => switch (bc.tokens[n.main_token].tag) {
+                .minus, .tilde => bc.isConstInt(n.lhs),
+                else => false,
+            },
+            .binary => switch (bc.tokens[n.main_token].tag) {
+                // A shift is left out: `constValue` cannot fold it, so a narrow width it
+                // took would go unchecked and wrap (`b + (1 << 10)` at int8).
+                .plus, .minus, .star, .slash, .percent, .amp, .pipe, .caret => bc.isConstInt(n.lhs) and bc.isConstInt(n.rhs),
+                else => false,
+            },
+            else => false,
+        };
+    }
+
+    /// The value constant `node` denotes at integer type `t`, or null when it does not
+    /// fold: a zero divisor or an i128 overflow, which a range check cannot judge.
+    fn constValue(bc: *const BodyChecker, node: Ast.Index, t: Type) ?i128 {
+        const n = bc.tree.nodes[node.int()];
+        const op = bc.tokens[n.main_token].tag;
+        if (n.tag == .literal_number) return Literal.intValue(bc.tokens[n.main_token].text(bc.source));
+        const l = bc.constValue(n.lhs, t) orelse return null;
+        if (n.tag == .unary) return if (op == .tilde) Literal.complement(l, t) else -l;
+        const r = bc.constValue(n.rhs, t) orelse return null;
+        return switch (op) {
+            .plus => std.math.add(i128, l, r) catch null,
+            .minus => std.math.sub(i128, l, r) catch null,
+            .star => std.math.mul(i128, l, r) catch null,
+            .slash => if (r == 0) null else @divTrunc(l, r),
+            .percent => if (r == 0) null else @rem(l, r),
+            .amp => l & r,
+            .pipe => l | r,
+            .caret => l ^ r,
+            else => null,
+        };
+    }
+
+    /// T0034 when constant `node`, typed at `t`, folds outside `t` though each operand
+    /// fits it: an operand that does not fit has reported already, and the wider
+    /// expression would only repeat it.
+    fn checkConstRange(bc: *BodyChecker, node: Ast.Index, t: Type) error{OutOfMemory}!void {
+        const v = bc.constValue(node, t) orelse return;
+        if (Literal.fitsValue(v, t)) return;
+        const n = bc.tree.nodes[node.int()];
+        const operands = [_]Ast.Index{ n.lhs, if (n.tag == .binary) n.rhs else Ast.none };
+        for (operands) |o| if (o != Ast.none) {
+            const ov = bc.constValue(o, t) orelse return;
+            if (!Literal.fitsValue(ov, t)) return;
+        };
+        try bc.sink.report(.{ .span = bc.spanOf(node), .code = .T0034 }, "literal out of range for type '{s}'", .{bc.typeName(t)});
+    }
+
     /// The type `place op= v` stores, `place op v`, given the place type `lt`. `v` is typed
-    /// as a binary operand is, with no expected type, so a bare literal adopts the place's
+    /// as a binary operand is, with no expected type, so a constant adopts the place's
     /// width and anything else must already match it; errors name the compound operator.
     fn compoundValue(bc: *BodyChecker, stmt_idx: Ast.Index, base: TokenTag, lt: Type) error{OutOfMemory}!Type {
         const stmt = bc.tree.nodes[stmt_idx.int()];
         var rt = try bc.typeOfExpected(stmt.rhs, null);
         if (lt.kind == .invalid or rt.kind == .invalid) return Type.invalid;
-        rt = try bc.adoptLiteralWidth(stmt.rhs, rt, lt);
+        rt = try bc.adoptConstWidth(stmt.rhs, rt, lt);
         const op_tok = bc.tokens[stmt.main_token];
         return bc.binaryResult(stmt_idx, .{ .token = stmt.main_token }, base, op_tok.text(bc.source), lt, rt);
     }

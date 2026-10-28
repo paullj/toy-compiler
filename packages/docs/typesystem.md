@@ -59,9 +59,14 @@ one of its variants (`Color.red`).
 An integer literal takes the width it is expected to have and must fit it (**T0034**).
 A negated literal is checked as the negative value it denotes: `-128` fits an `int8`,
 and `-1` fits no unsigned width (`v: uint8 = -1`, `id(-1)` with `fn id(x: uint8)` and
-`v: uint = -1` are T0034); only `-0` does. Operators on values never check at run time:
-they wrap at the operand width, so two `int8` 100s add to -56, and unary `-` on an
-unsigned value is `0 - u` (`u: uint8 = 1` then `-u` is 255).
+`v: uint = -1` are T0034); only `-0` does. A constant built from literals alone (`-1`,
+`~1`, `1 + 2`, but not a shift) is a literal too: beside an operand of an integer type
+it takes that width, as a bare literal does (`b + -1` and `b += 1 + 2` with `b: int8`
+are `int8`), and its folded value must fit the width it takes (`c: int8 = 100 + 100` is
+T0034). One given no width (`x := 9223372036854775807 + 1`) is an `int` whose folded
+value is not checked. Operators on values never check at run time: they wrap at the
+operand width, so two `int8` 100s add to -56, and unary `-` on an unsigned value is
+`0 - u` (`u: uint8 = 1` then `-u` is 255).
 
 ## Bidirectional checking: synth / check
 
@@ -196,8 +201,8 @@ from two angles — assignability is directional (want ← got), join is symmetr
   `xs[i].f = ..` does, copying the element in only after `e`.
 * `place op= e` — compound assignment, for `op` in `+ - * / % | & ^ << >>` and the
   float forms `+. -. *. /.`. It means `place = place op e`: the place is read
-  before `e` runs, `e` is typed like a binary operand (a bare integer literal takes the
-  place's width), and the codes are the same as for that long form — **T0044** and
+  before `e` runs, `e` is typed like a binary operand (an integer constant such as `1` or
+  `-1` takes the place's width), and the codes are the same as for that long form — **T0044** and
   **T0028** at the operator, the place codes of `=` at the place. A user type gets
   `+=` from its `Add` impl; there is no separate `AddAssign`.
 * `return e` / bare `return` — `assignable(declared_ret, T)` where `T` is the

@@ -11,6 +11,22 @@ const std = @import("std");
 const LayoutEngine = @import("../layout/Engine.zig");
 const Type = @import("../layout/Type.zig").Type;
 
+/// The value of a numeric-literal token, or null if it does not parse.
+pub fn intValue(raw: []const u8) ?i128 {
+    return std.math.cast(i128, magnitude(raw) orelse return null);
+}
+
+/// Whether integer value `v` lies in the range of integer type `t`.
+pub fn fitsValue(v: i128, t: Type) bool {
+    const max: i128 = @intCast(maxMagnitude(t));
+    return if (t.int_desc.signed) v >= -max - 1 and v <= max else v >= 0 and v <= max;
+}
+
+/// `~v` at the width of integer type `t`: an unsigned complement flips only `t`'s bits.
+pub fn complement(v: i128, t: Type) i128 {
+    return if (t.int_desc.signed) -v - 1 else @as(i128, @intCast(maxMagnitude(t))) - v;
+}
+
 /// Pack a numeric-literal token into `buf`, dropping `_` digit separators, and return
 /// the packed slice (or null if it overflows `buf`). The one base-0 grammar both the
 /// range gate and codegen decode, so they can't disagree on well-formedness.
@@ -278,6 +294,16 @@ test "floatValue: separator-stripping decode, null on malformed" {
     try testing.expectEqual(@as(?f64, 0.015), floatValue("1.5e-2"));
     try testing.expectEqual(@as(?f64, null), floatValue("1.2.3"));
     try testing.expectEqual(@as(?f64, null), floatValue("abc"));
+}
+
+test "fitsValue and complement: a folded constant's range and complement at a width" {
+    try testing.expect(fitsValue(-128, Type.int8) and fitsValue(127, Type.int8));
+    try testing.expect(!fitsValue(128, Type.int8) and !fitsValue(-129, Type.int8));
+    try testing.expect(fitsValue(255, Type.uint8) and !fitsValue(-1, Type.uint8));
+    try testing.expectEqual(@as(i128, -2), complement(1, Type.int8));
+    try testing.expectEqual(@as(i128, 254), complement(1, Type.uint8));
+    try testing.expectEqual(@as(i128, 0xFFFF_FFFF_FFFF_FFFE), complement(1, Type.uint));
+    try testing.expectEqual(@as(?i128, 200), intValue("0xC8"));
 }
 
 test "fitsWidth: per-width range verdict, base-aware, with the negated signed-min allowance" {

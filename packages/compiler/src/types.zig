@@ -12852,6 +12852,31 @@ test "a negative literal into an unsigned width is one T0034 at the whole litera
     try expectChecksClean("fn main() -> int {\n _a: uint8 = -0\n _b: int8 = -128\n _c: uint = -0x0\n return 0\n}\n");
 }
 
+test "a constant integer operand takes a narrow sibling's width and is range-checked there once" {
+    try expectChecksClean(
+        \\fn main() -> int {
+        \\ b: int8 = 5
+        \\ b += -1
+        \\ b = b + -1
+        \\ b = -1 + b
+        \\ b = b * -(1)
+        \\ b += 1 + 2
+        \\ b = b + (1 + 2)
+        \\ u: uint8 = 3
+        \\ u = u & ~1
+        \\ _c: int8 = 1 + 2 + 3
+        \\ return if b == 4 && u == 2 { 0 } else { 1 }
+        \\}
+        \\
+    );
+    try expectSoleDiagAt("fn main() -> int {\n b: int8 = 5\n b += -200\n return if b == 0 { 0 } else { 1 }\n}\n", .T0034, "literal out of range for type 'int8'", "-200");
+    try expectSoleDiagAt("fn main() -> int {\n b: int8 = 5\n b = b + (100 + 100)\n return if b == 0 { 0 } else { 1 }\n}\n", .T0034, "literal out of range for type 'int8'", "100 + 100");
+    try expectSoleDiagAt("fn main() -> int {\n _c: int8 = -(100 + 100)\n return 0\n}\n", .T0034, "literal out of range for type 'int8'", "100 + 100");
+    try expectSoleDiagAt("fn main() -> int {\n _c: int8 = -(-128)\n return 0\n}\n", .T0034, "literal out of range for type 'int8'", "-(-128)");
+    try expectSoleDiagAt("fn main() -> int {\n _d: uint8 = 1 - 2\n return 0\n}\n", .T0034, "literal out of range for type 'uint8'", "1 - 2");
+    try expectSoleDiagAt("fn main() -> int {\n b: int8 = 5\n x: int = 1\n b = b + x\n return if b == 0 { 0 } else { 1 }\n}\n", .T0044, "operands of '+' must have the same type", "b + x");
+}
+
 test "a body ending in a value of the wrong type is T0042 at that value, not a missing return" {
     // A lambda held to an expected type it does not declare names the type it really has.
     try expectSoleDiagAt(
