@@ -543,20 +543,26 @@ pub const BodyChecker = struct {
         }
         const last = stmts[stmts.len - 1];
         const last_n = bc.tree.nodes[(last).int()];
+        // A labeled block's tail is one more arm after its `break @b v`s, so it takes
+        // their type as a later arm does.
+        const join: Type = if (bc.loop_stack.getLastOrNull()) |ctx|
+            (if (ctx.kind == .labeled_block and ctx.construct_node == block_idx) ctx.join else .never)
+        else
+            .never;
         var bt: Type = .unit;
         if (last_n.tag == .expr_stmt) {
-            bt = try bc.typeUnder(last_n.lhs, if (want_value) block_expected else null);
+            bt = if (want_value) try bc.typeOfArm(last_n.lhs, block_expected, join) else try bc.typeUnder(last_n.lhs, null);
             bc.node_types[(last).int()] = bt; // the expr_stmt carries the value type
             if (!want_value) try bc.warnDroppedValue(last, bt);
         } else if (want_value and last_n.tag == .block) {
-            bt = try bc.typeUnder(last, block_expected); // value context: validates + types + memoizes
+            bt = try bc.typeOfArm(last, block_expected, join); // value context: validates + types + memoizes
         } else if (want_value and last_n.tag == .if_stmt and
             Ast.ifHeaderAt(bc.tree, (last_n.rhs).int()).else_node != Ast.none)
         {
             // A value-if needs both arms to yield a value; an else-less trailing
             // `if` produces nothing, so it is an effect statement, not this
             // block's value.
-            bt = try bc.typeUnder(last, block_expected); // value context: validates + types + memoizes
+            bt = try bc.typeOfArm(last, block_expected, join); // value context: validates + types + memoizes
         } else {
             try bc.checkStmt(last); // statement context (else-less trailing if / want_value=false)
         }
@@ -728,7 +734,7 @@ pub const BodyChecker = struct {
                     ctx.saw_bare_break = true;
                     if (ctx.is_value) ctx.join = try bc.merge(stmt.main_token, ctx.join, Type.unit);
                 } else {
-                    const vt = try bc.typeUnder(stmt.lhs, ctx.expected);
+                    const vt = try bc.typeOfArm(stmt.lhs, ctx.expected, ctx.join);
                     if (!ctx.is_value) {
                         if (vt.kind != .invalid and vt.kind != .unit)
                             try bc.sink.report(.{ .span = bc.spanOf(stmt_idx), .code = .T0060 }, "cannot break with a value out of a while/for loop", .{});
@@ -2347,14 +2353,10 @@ pub const BodyChecker = struct {
         }
         const then_ty0 = try bc.checkBlock(h.then_block, true);
         const then_ty: Type = if (bc.blockDiverges(h.then_block)) Type.never else then_ty0;
-        var else_ty: Type = undefined;
-        if (bc.tree.nodes[(h.else_node).int()].tag == .if_stmt) {
-            const e0 = try bc.typeOfIf(h.else_node, bc.tree.nodes[(h.else_node).int()]); // else-if ladder
-            else_ty = if (bc.stmtDiverges(h.else_node)) Type.never else e0;
-        } else {
-            const e0 = try bc.checkBlock(h.else_node, true);
-            else_ty = if (bc.blockDiverges(h.else_node)) Type.never else e0;
-        }
+        const else_ladder = bc.tree.nodes[(h.else_node).int()].tag == .if_stmt;
+        const e0 = try bc.typeOfArm(h.else_node, bc.body.expected, then_ty);
+        const else_diverges = if (else_ladder) bc.stmtDiverges(h.else_node) else bc.blockDiverges(h.else_node);
+        const else_ty: Type = if (else_diverges) Type.never else e0;
         return bc.merge(n.main_token, then_ty, else_ty);
     }
 
@@ -2374,6 +2376,15 @@ pub const BodyChecker = struct {
         const ty: Type = if (!ctx.saw_value_break and !ctx.saw_bare_break) Type.never else ctx.join;
         bc.node_types[(node_idx).int()] = ty;
         return ty;
+    }
+
+    /// An arm of a value construct (a branch, a match arm, a break value) under `exp`,
+    /// the construct's expected type. With none, `join`, what the arms before it agree on,
+    /// reaches it as a hint, so an arm with no type of its own (`Option.none`, `[]`) takes
+    /// theirs; as a hint it never errs where the arm alone would not (`typeUnderHint`).
+    pub fn typeOfArm(bc: *BodyChecker, node_idx: Ast.Index, exp: ?Expected, join: Type) error{OutOfMemory}!Type {
+        if (exp == null and join.kind != .never and join.kind != .invalid) return bc.typeUnderHint(node_idx, join);
+        return bc.typeUnder(node_idx, exp);
     }
 
     pub fn merge(bc: *BodyChecker, at: u32, a: Type, b: Type) error{OutOfMemory}!Type {

@@ -1,0 +1,46 @@
+# Feature: an arm of a value `if`, `match`, `loop` or labeled block that has no expected
+# type takes the type the arms before it agree on, as a hint: a bare `Option.none`, `[]`
+# or `.none` after an `Option.some(33)` is an `Option[int]`, and a `3` after an `int8` is
+# an `int8`. That makes a receiver whose
+# arms disagree under its call's hint (`Option.none` alone would take `Option[str]`)
+# check with no hint.
+# expect: stdout "33 none 0 3 34 35 n n n none none\n"
+# expect: exit 1
+import std/io
+import std/option
+import std/str
+import std/vec
+
+fn show(o: Option[int]) -> str {
+    o.map(fn(x) { x.to_string() }).or_else(fn() { "none" })
+}
+
+fn main() -> int {
+    c := true
+    a := if c { Option.some(33) } else { Option.none }
+    b := if !c { Option.some(1) } else if c { Option.none } else { .none }
+    l := if !c { [1, 2] } else { [] }
+    w: int8 = 7
+    n := if !c { w } else { 3 }
+    m := match c { true -> Option.some(34), false -> Option.none }
+    p := loop {
+        if c { break Option.some(35) }
+        break Option.none
+    }
+    q := @b {
+        if !c { break @b Option.some(36) }
+        break @b Option.none
+    }
+    q2 := @b {
+        if !c { break @b Option.some(37) }
+        Option.none
+    }
+    r: Option[str] = (if c { Option.some(33) } else { Option.none }).map(fn(_x) { "n" })
+    s: Option[str] = (match c { true -> Option.some(33), false -> Option.none }).map(fn(_x) { "n" })
+    t: Option[str] = (if c { Option.some(33) } else { Option.none } |> .map(fn(_x) { "n" }))
+    io.println(" ".join([
+        show(a), show(b), l.len().to_string(), n.to_string(), show(m), show(p),
+        r.or_else(fn() { "-" }), s.or_else(fn() { "-" }), t.or_else(fn() { "-" }), show(q), show(q2),
+    ]))
+    return if r.is_some() { 1 } else { 0 }
+}

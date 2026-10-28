@@ -123,9 +123,14 @@ receiver's own (`1 + true` in one arm) is reported once, under the hint the othe
 needed. A receiver that takes the hint keeps it even when its
 type then has no such method: with `small` on `int` only, `x: int8 = 2.small()` and
 `x: int8 = (if c { 2 } else { 1 }).small()` are **T0018** on `int8`, while
-`r := 2.small()`, with no expected type, calls it. An arm never takes its type from another
-arm: `(if c { Option.some(1) } else { Option.none }).map(f)` has no expected type for
-`Option.none` and is **T0016**, as it is with no call around it.
+`r := 2.small()`, with no expected type, calls it.
+
+An arm with no expected type takes the type the arms before it agree on, as a hint (taken
+whole or not at all, as above): `o := if c { Option.some(1) } else { Option.none }` is an
+`Option[int]`, and so is the receiver of `(if c { Option.some(1) } else { Option.none })
+.map(f)`, whose `Option.none` would take a different type from the call's hint. Only
+earlier arms count, so a leading `Option.none` or `[]` is still **T0016**, and in
+`if c { x8 } else { 3 }` the `3` is an `int8` while `if c { 3 } else { x8 }` is **T0058**.
 
 ## Assignability — the one relation
 
