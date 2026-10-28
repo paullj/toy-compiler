@@ -1,0 +1,25 @@
+# expect: stdout "Bag{items: [some(1)]}\nBag{items: [[1], []]}\nBag{items: [<fn>]}\nBx{r: Ref(some(2))}\nBx{r: Ref(<fn>)}\none([some(1)])\n"
+# expect: exit 0
+# A program's generic struct or enum over a Vec[T] or Ref[T] renders through std's impl
+# when T is itself a generic instance or a fn type.
+import std/io
+import std/ref
+import std/vec
+
+struct Bag[T] { items: Vec[T] }
+
+struct Bx[T] { r: Ref[T] }
+
+enum Wr[T] { one(Vec[T]), zero }
+
+fn main() {
+    xs: Vec[Option[int]] = [Option.some(1)]
+    ws: Vec[Vec[int]] = [[1], []]
+    fs: Vec[fn()] = [fn() {}]
+    io.println(Bag { items: xs })
+    io.println(Bag { items: ws })
+    io.println(Bag { items: fs })
+    io.println(Bx { r: Ref.new(Option.some(2)) })
+    io.println(Bx { r: Ref.new(fn() {}) })
+    io.println(Wr.one(xs))
+}

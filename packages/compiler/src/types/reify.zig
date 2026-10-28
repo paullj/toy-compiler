@@ -149,6 +149,38 @@ fn fnStructFor(t: *Typecheck, params: []const Type, ret: Type) error{OutOfMemory
     return sid;
 }
 
+/// The owned dedup key of a generic instance over its grounded args.
+pub fn groundedAppKey(t: *Typecheck, ctor: u32, is_enum: bool, cargs: []const Type) error{OutOfMemory}![]u8 {
+    var kb: std.ArrayList(u8) = .empty;
+    defer kb.deinit(t.gpa);
+    try kb.append(t.gpa, @intFromBool(is_enum));
+    var w: [4]u8 = undefined;
+    std.mem.writeInt(u32, &w, ctor, .little);
+    try kb.appendSlice(t.gpa, &w);
+    for (cargs) |a| try a.appendKeyBytes(t.gpa, &kb);
+    return kb.toOwnedSlice(t.gpa);
+}
+
+/// Memoize `app_idx` to the instance its grounded `key` already reified to, returning
+/// it; else record `fresh` under both and return null so the caller mints it. Two
+/// indices ground to one instance (`Vec[Vec[int]]` as written, and `Vec[T]` at
+/// `T = Vec[int]` interned over the already-reified arg), and a second struct would split
+/// the instance's conformances from its fields. Takes ownership of `key`.
+fn claimGrounded(t: *Typecheck, app_idx: u32, key: []u8, fresh: Type) error{OutOfMemory}!?Type {
+    const gop = t.app_reify_dedup.getOrPut(t.gpa, key) catch |err| {
+        t.gpa.free(key);
+        return err;
+    };
+    if (gop.found_existing) {
+        t.gpa.free(key);
+        try t.reify_map.put(t.gpa, app_idx, gop.value_ptr.*);
+        return gop.value_ptr.*;
+    }
+    gop.value_ptr.* = fresh;
+    try t.reify_map.put(t.gpa, app_idx, fresh);
+    return null;
+}
+
 /// Reify a struct-`App` (`Box[int]`) to a fresh concrete `struct_id`, memoized by
 /// the `reifyAppTo` dispatcher (which owns the memo check + depth guard). Grounds the
 /// `App`'s own args (a nested `App` arg -> its reified concrete type via `reifyAppTo`,
@@ -163,10 +195,11 @@ fn reifyAppToStruct(t: *Typecheck, app_idx: u32) error{OutOfMemory}!u32 {
     const cargs: []Type = if (e.args.len <= abuf.len) abuf[0..e.args.len] else try t.gpa.alloc(Type, e.args.len);
     defer if (e.args.len > abuf.len) t.gpa.free(cargs);
     for (e.args, 0..) |a, i| cargs[i] = try groundTy(t, a);
+    const key = try groundedAppKey(t, e.ctor, false, cargs);
+    if (try claimGrounded(t, app_idx, key, Type.structT(@intCast(t.structs.items.len)))) |rt| return rt.struct_id;
 
     const tmpl = t.structs.items[e.ctor]; // value copy; its field slices are stable
     const sid: u32 = @intCast(t.structs.items.len);
-    try t.reify_map.put(t.gpa, app_idx, Type.structT(sid));
 
     const name = try Mangle.instance(t.gpa, tmpl.name, cargs);
     try t.reified_names.append(t.gpa, name); // owns the minted name (freed at teardown)
@@ -212,10 +245,11 @@ fn reifyAppToEnum(t: *Typecheck, app_idx: u32) error{OutOfMemory}!Type {
     const cargs: []Type = if (e.args.len <= abuf.len) abuf[0..e.args.len] else try t.gpa.alloc(Type, e.args.len);
     defer if (e.args.len > abuf.len) t.gpa.free(cargs);
     for (e.args, 0..) |a, i| cargs[i] = try groundTy(t, a);
+    const key = try groundedAppKey(t, e.ctor, true, cargs);
+    if (try claimGrounded(t, app_idx, key, Type.enumT(@intCast(t.enums.items.len)))) |rt| return rt;
 
     const tmpl = t.enums.items[e.ctor]; // value copy; its variant slices are stable
     const eid: u32 = @intCast(t.enums.items.len);
-    try t.reify_map.put(t.gpa, app_idx, Type.enumT(eid));
 
     const name = try Mangle.instance(t.gpa, tmpl.name, cargs);
     try t.reified_names.append(t.gpa, name); // owns the minted name (freed at teardown)
