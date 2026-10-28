@@ -1,0 +1,40 @@
+# expect: exit 2
+# Feature: a generic call's arg that takes its type from its slot (`Option.none`, `.none`,
+# `[]`) takes the type an earlier arg binds, in a plain fn and in both kinds of template.
+import std/option
+import std/vec
+
+protocol P {
+    fn p(self) -> int
+}
+
+impl int has P {
+    fn p(self) -> int { return self }
+}
+
+fn pair[U](_a: U, b: Option[U]) -> int {
+    return if b.is_some() { 1 } else { 2 }
+}
+
+fn count[U](_a: U, xs: Vec[U]) -> int {
+    return xs.len() + 2
+}
+
+fn go[T](t: T) -> int {
+    return pair(t, Option.none)
+}
+
+fn go_bounded[T has P](t: T) -> int {
+    return pair(t, Option.none)
+}
+
+fn main() -> int {
+    t := 5
+    if pair(t, Option.none) != 2 { return 10 }
+    if pair(t, .none) != 2 { return 11 }
+    if count(t, []) != 2 { return 12 }
+    if go(5) != 2 { return 13 }
+    if go_bounded(5) != 2 { return 14 }
+    if pair(t, Option[int].none) != 2 { return 15 }
+    return go(true)
+}

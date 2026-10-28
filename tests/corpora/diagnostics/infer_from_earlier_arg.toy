@@ -1,0 +1,10 @@
+# An arg that disagrees with what an earlier arg binds is a conflict, not uninferable.
+import std/option
+
+fn pair[U](_a: U, b: Option[U]) -> int {
+    return if b.is_some() { 1 } else { 2 }
+}
+
+fn main() -> int {
+    return pair(5, Option[bool].none)  #~ ERROR [T0015] conflicting types for type parameter 'U': int vs bool
+}

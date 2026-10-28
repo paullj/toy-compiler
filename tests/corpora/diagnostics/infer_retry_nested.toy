@@ -1,0 +1,13 @@
+# A deep nest of generic calls whose innermost arg is an error reports that one error
+# promptly: an outer call's retry of an erring arg does not retry every inner one again.
+import std/option
+
+fn g[U](a: U, _b: U) -> U { a }
+fn w[U](_a: U, b: Option[U]) -> Option[U] { b }
+
+fn main() -> int {
+    t := 5
+    _x := g(1, g(1, g(1, g(1, g(1, g(1, g(1, g(1, g(1, g(1, g(1, g(1, g(1, g(1, g(1, g(1, g(1, g(1, g(1, g(1, g(1, g(1, 1 + true))))))))))))))))))))))  #~ ERROR [T0044] operands of '+' must have the same type
+    _z := w(t, w(t, w(t, w(t, w(t, w(t, w(t, w(t, w(t, w(t, w(t, w(t, w(t, w(t, w(t, w(t, w(t, w(t, w(t, w(t, w(t, w(t, Option.some("s")))))))))))))))))))))))  #~ ERROR [T0015] conflicting types for type parameter 'U': int vs str
+    return t
+}

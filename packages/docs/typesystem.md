@@ -350,7 +350,11 @@ the receiver's variables. The arguments are typed in this order:
    the receiver's bindings in, a bare call's against its parameter through what the
    call's expected type binds against the return type, an associated call's with no
    expectation from the call (a parameter with no type parameter is the argument's
-   type outright, as for any part);
+   type outright, as for any part). One that errs under that is typed again against
+   its parameter with what the earlier arguments bind, and keeps that typing when it
+   errs less: `pair(t, Option.none)`, `pair(t, .none)` and `count(t, [])` take `t`'s
+   type, while an argument that types itself binds as before (`f(x8, 5)` with
+   `fn f[T](a: T, b: T)` is still **T0015**);
 3. each argument that waits for the others, left to right: a lambda with an
    unannotated parameter, or the `_` of the capture being checked. It is typed against
    its parameter with the bindings so far, and the arguments bind again after it, so
