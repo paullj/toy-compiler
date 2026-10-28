@@ -7974,6 +7974,39 @@ test "a call on a bounded param takes the bound's conformance in each instance" 
     try testing.expectEqual(@as(usize, 4), seen);
 }
 
+test "two bounds of one generic protocol take their own args at one instance type" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct P { x: int }
+        \\impl P has Into[int] { fn into(self) -> int { self.x } }
+        \\impl P has Into[bool] { fn into(self) -> bool { self.x > 0 } }
+        \\fn f[A has Into[int], B has Into[bool]](a: A, b: B) -> int {
+        \\ n: int = a.into()
+        \\ ok: bool = b.into()
+        \\ return if ok { n } else { 0 }
+        \\}
+        \\fn main() -> int {
+        \\ p := P { x: 5 }
+        \\ return f(p, p)
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    var kinds: [2]@TypeOf(Type.int.kind) = undefined;
+    var seen: usize = 0;
+    for (c.result.instances) |inst| for (inst.callees) |cl| switch (cl.view()) {
+        .method => |mi| {
+            kinds[seen] = c.result.methods[mi].protocol_args[0].kind;
+            seen += 1;
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 2), seen);
+    try testing.expectEqual(Type.int.kind, kinds[0]);
+    try testing.expectEqual(Type.bool.kind, kinds[1]);
+}
+
 test "the T0016 hint, in place of the callee, gets past T0001 and T0016 at every site" {
     const gpa = testing.allocator;
     const decls =

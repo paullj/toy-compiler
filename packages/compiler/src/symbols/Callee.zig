@@ -10,7 +10,9 @@ const Ast = @import("../ast/Ast.zig");
 /// parallel to `node_types`. Zero is `.none`, so a fresh table is all-unselected.
 pub const Callee = extern struct {
     tag: Tag = .none,
-    /// `.builtin`: the `Builtin` ordinal.
+    /// `.builtin`: the `Builtin` ordinal. `.protocol`: the type-var ordinal of the
+    /// bounded param the call's receiver is, which two bounds of one protocol with
+    /// different args at one instance type need to tell their conformances apart.
     sub: u8 = 0,
     /// `.protocol`: the method's index within its protocol.
     aux: u16 = 0,
@@ -64,7 +66,7 @@ pub const Callee = extern struct {
         opt_unwrap_or,
     };
 
-    pub const ProtocolMethod = struct { protocol: u32, method: u16 };
+    pub const ProtocolMethod = struct { protocol: u32, method: u16, bound: u8 };
 
     pub const View = union(enum) {
         none,
@@ -141,8 +143,8 @@ pub const Callee = extern struct {
         return .{ .tag = .bound_method, .id = index };
     }
 
-    pub fn protocolMethod(protocol: u32, k: u16) Callee {
-        return .{ .tag = .protocol, .aux = k, .id = protocol };
+    pub fn protocolMethod(protocol: u32, k: u16, bound: u8) Callee {
+        return .{ .tag = .protocol, .sub = bound, .aux = k, .id = protocol };
     }
 
     pub fn builtinMethod(k: Builtin) Callee {
@@ -154,7 +156,7 @@ pub const Callee = extern struct {
         return switch (c.tag) {
             .none, .pending_method, .pending_bound, .pending_call, .pending_template, .template, .elem_write, .elem_store => .none,
             .method => .{ .method = c.id },
-            .protocol => .{ .protocol = .{ .protocol = c.id, .method = c.aux } },
+            .protocol => .{ .protocol = .{ .protocol = c.id, .method = c.aux, .bound = c.sub } },
             .builtin => .{ .builtin = @enumFromInt(c.sub) },
             .value => .value,
             .fn_ref => .{ .fn_ref = c.id },
@@ -203,7 +205,7 @@ test "Callee is 8 bytes and zero is none" {
 
 test "view round-trips every constructor" {
     try std.testing.expectEqual(Callee.View{ .method = 7 }, Callee.method(7).view());
-    try std.testing.expectEqual(Callee.View{ .protocol = .{ .protocol = 3, .method = 2 } }, Callee.protocolMethod(3, 2).view());
+    try std.testing.expectEqual(Callee.View{ .protocol = .{ .protocol = 3, .method = 2, .bound = 1 } }, Callee.protocolMethod(3, 2, 1).view());
     inline for (@typeInfo(Callee.Builtin).@"enum".fields) |f| {
         const k: Callee.Builtin = @enumFromInt(f.value);
         try std.testing.expectEqual(Callee.View{ .builtin = k }, Callee.builtinMethod(k).view());

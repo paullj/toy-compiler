@@ -2801,31 +2801,23 @@ pub const BodyChecker = struct {
 
     /// The conformance a call takes in a bounded template's instance re-check when the
     /// bound-as-axiom check resolved it through a param's bound (`[T has Show]`,
-    /// `t.render()`): that bound's protocol, and its args grounded through the instance
-    /// (null when two bounds of the protocol on this type disagree). The receiver's own
-    /// methods would offer every conformance of the instance type, which is ambiguous
-    /// once it has a second `render`. Null for any other call. `buf` holds the args.
+    /// `t.render()`): that bound's protocol, and its args grounded through the instance.
+    /// The receiver's own methods would offer every conformance of the instance type,
+    /// which is ambiguous once it has a second `render`. The bound is the receiver's own
+    /// param, never one found by the instance type: two params bounded by `Into[int]` and
+    /// `Into[bool]` can share it. Null for any other call. `buf` holds the args.
     fn boundConformance(bc: *BodyChecker, call: Ast.Node, recv: Type, buf: *std.ArrayList(Type)) error{OutOfMemory}!?BoundConformance {
         const fa = Callee.memberNode(bc.tree, call) orelse return null;
         if (fa.int() >= bc.axiom_callees.len) return null;
-        const pid = switch (bc.axiom_callees[fa.int()].view()) {
-            .protocol => |p| p.protocol,
+        const pm = switch (bc.axiom_callees[fa.int()].view()) {
+            .protocol => |p| p,
             else => return null,
         };
-        const s = bc.subst orelse return .{ .pid = pid, .args = null };
-        var found = false;
-        for (bc.bound_protocols, 0..) |bp, ord| {
-            if ((bp orelse continue) != pid or ord >= s.types.len or !Type.eql(s.types[ord], recv)) continue;
-            const pargs: []const Type = if (ord < bc.bound_protocol_args.len) bc.bound_protocol_args[ord] else &.{};
-            if (!found) {
-                for (pargs) |pa| try buf.append(bc.gpa, substTy(bc, pa, s.types));
-                found = true;
-                continue;
-            }
-            if (pargs.len != buf.items.len) return .{ .pid = pid, .args = null };
-            for (pargs, buf.items) |pa, have| if (!Type.eql(substTy(bc, pa, s.types), have)) return .{ .pid = pid, .args = null };
-        }
-        return .{ .pid = pid, .args = if (found) buf.items else null };
+        const s = bc.subst orelse return .{ .pid = pm.protocol, .args = null };
+        if (pm.bound >= s.types.len or !Type.eql(s.types[pm.bound], recv)) return .{ .pid = pm.protocol, .args = null };
+        const pargs: []const Type = if (pm.bound < bc.bound_protocol_args.len) bc.bound_protocol_args[pm.bound] else &.{};
+        for (pargs) |pa| try buf.append(bc.gpa, substTy(bc, pa, s.types));
+        return .{ .pid = pm.protocol, .args = buf.items };
     }
 
     /// The method template of a generic receiver that a call resolved through a bound
@@ -3177,7 +3169,7 @@ pub const BodyChecker = struct {
             if (pid_opt) |pid| {
                 const p = bc.model.protocols[pid];
                 for (p.methods, 0..) |mn, k| if (std.mem.eql(u8, mn, member)) {
-                    bc.setCallee(n, Callee.protocolMethod(pid, @intCast(k)));
+                    bc.setCallee(n, Callee.protocolMethod(pid, @intCast(k), @intCast(ord)));
                     const psig = p.method_params[k];
                     // No callee FnSym exists for a bound-as-axiom protocol method, so there is
                     // no decl to point at.
@@ -4382,7 +4374,7 @@ pub const BodyChecker = struct {
                 break;
             };
             if (mi) |k| {
-                bc.setCallee(n, Callee.protocolMethod(pid, @intCast(k)));
+                bc.setCallee(n, Callee.protocolMethod(pid, @intCast(k), @intCast(ord)));
                 const psig = p.method_params[k]; // [self, ...]
                 _ = try bc.checkCall(node_idx, args, .{
                     .params = psig[@min(psig.len, 1)..],
