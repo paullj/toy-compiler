@@ -700,9 +700,10 @@ protocol method sig is decoded, the synthetic `self` slot is forced to `type_var
 the protocol's generic params occupy ordinals `1..` (a `""` placeholder reserves index 0
 for `Self`, since `""` never matches a source identifier). So `fn into(self) -> U`
 decodes to `[type_var(0)] -> type_var(1)`, and `U` never aliases the receiver.
-`groundProtoType(ty, recv, args)` grounds `tv(0)→recv` and `tv(k≥1)→args[k-1]` — used
-consistently in the protocol-sig decode, the T0024 coherence signature check, and the
-bound-as-axiom body dispatch.
+`groundProtoType(ctx, ty, recv, args)` grounds `tv(0)→recv` and `tv(k≥1)→args[k-1]`,
+through `App` args and fn types as well as at the top level (`Option[Item]` grounds to
+`Option[int]`) — the one grounding used by the T0024 coherence signature check and the
+bound-as-axiom body dispatch (each param and the return of `x.m(..)` on a bounded `T`).
 
 **Multi-conformance requires explicit args (T0025).** At a use site `p.into()` where the
 receiver conforms to one generic protocol **multiple times** and no protocol type-args

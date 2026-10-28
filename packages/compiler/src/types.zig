@@ -4242,38 +4242,31 @@ pub fn receiverTypeFromNode(t: *Typecheck, node_idx: Ast.Index) ?Type {
     return null;
 }
 
-/// Ground a protocol-signature type-var to a conformance's concrete types. A
-/// protocol's decoded sig uses `type_var(0)` for the `self` slot + any `Self`-typed
-/// param/return, and `type_var(k>=1)` for the protocol's generic params (`protocol
-/// Into[U]` -> `U == type_var(1)`, ordinal-offset so `Self` keeps 0). Ground `tv(0)` to
-/// `recv` and `tv(k>=1)` to `protocol_args[k-1]`; anything else (a concrete type) passes
-/// through. The `k-1 < len` guard is defensive against an arity-mismatched impl (already
-/// rejected before this is trusted for a witness).
-pub fn groundProtoType(ty: Type, recv: Type, protocol_args: []const Type) Type {
-    if (!ty.isTypeVar()) return ty;
-    const ord = ty.typeVarOrd();
-    if (ord == 0) return recv;
-    return if (ord - 1 < protocol_args.len) protocol_args[ord - 1] else ty;
-}
-
-/// `groundProtoType` extended to recurse into composite `App`s and fn types: a protocol return
-/// spelled `Option[Item]` decodes to `App(Option, [type_var(1)])`, whose `type_var(1)`
-/// (Item) must ground THROUGH the App to the conformance's arg pattern before the T0024
-/// signature comparison. Shallow `groundProtoType` leaves it as `App(Option, [tv1])`,
-/// spuriously mismatching a `next(mut self) -> Option[T]` impl. Deep-grounds each App arg
-/// and re-interns (a transient query-only index, never fingerprinted). Deep ≡ shallow for
-/// every EXISTING protocol (all have top-level-only `type_var` sigs), so existing coherence
-/// verdicts are byte-identical. A bad intern degrades to `.invalid` (already an error path).
-pub fn groundProtoTypeDeep(t: *Typecheck, ty: Type, recv: Type, protocol_args: []const Type) Type {
-    if (ty.isTypeVar()) return groundProtoType(ty, recv, protocol_args);
-    return refs.mapComposite(t, ty, struct {
-        t: *Typecheck,
+/// Ground a protocol-signature type to a conformance's concrete types. A protocol's
+/// decoded sig uses `type_var(0)` for the `self` slot + any `Self`-typed param/return,
+/// and `type_var(k>=1)` for the protocol's generic params (`protocol Into[U]` -> `U ==
+/// type_var(1)`, ordinal-offset so `Self` keeps 0). Grounds `tv(0)` to `recv` and
+/// `tv(k>=1)` to `protocol_args[k-1]`, through composite `App`s and fn types too: a
+/// return spelled `Option[Item]` decodes to `App(Option, [type_var(1)])`, and a stray
+/// `type_var(1)` left inside would read as an unrelated generic param of whatever
+/// template the caller is checking. Re-interned Apps are transient query-only indices
+/// (never fingerprinted). `ctx` is any holder of `composite` + `gpa` (the checker or the
+/// body checker). The `k-1 < len` guard is defensive against an arity-mismatched impl
+/// (already rejected before this is trusted for a witness).
+pub fn groundProtoType(ctx: anytype, ty: Type, recv: Type, protocol_args: []const Type) Type {
+    if (ty.isTypeVar()) {
+        const ord = ty.typeVarOrd();
+        if (ord == 0) return recv;
+        return if (ord - 1 < protocol_args.len) protocol_args[ord - 1] else ty;
+    }
+    return refs.mapComposite(ctx, ty, struct {
+        ctx: @TypeOf(ctx),
         recv: Type,
         protocol_args: []const Type,
         pub fn map(m: @This(), x: Type) Type {
-            return groundProtoTypeDeep(m.t, x, m.recv, m.protocol_args);
+            return groundProtoType(m.ctx, x, m.recv, m.protocol_args);
         }
-    }{ .t = t, .recv = recv, .protocol_args = protocol_args });
+    }{ .ctx = ctx, .recv = recv, .protocol_args = protocol_args });
 }
 
 /// Decode one fn's signature (param + return types) and append a `FnSym` to the
@@ -7428,6 +7421,64 @@ test "a bounded generic compiles ONCE against the bound and monomorphizes over a
     try testing.expectEqualStrings("Doubler", c.result.instances[0].conformances[0].protocol_name);
     try testing.expectEqual(@as(usize, 1), c.result.instances[0].conformances[0].witness_syms.len);
     try testing.expectEqualStrings("main.P.dbl$Doubler", c.result.instances[0].conformances[0].witness_syms[0]);
+}
+
+fn expectChecksClean(source: []const u8) !void {
+    var c = try checkSource(source);
+    defer c.deinit(testing.allocator);
+    for (c.result.diags) |d| std.debug.print("unexpected: {s}\n", .{d.message});
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+}
+
+test "a bounded call grounds a protocol's Option[X] return through the App" {
+    try expectChecksClean(
+        \\protocol Tagged[X] { fn tag(self, n: X) -> Option[X] }
+        \\struct P { x: int }
+        \\impl P has Tagged[int] { fn tag(self, n: int) -> Option[int] { Option[int].some(n + self.x) } }
+        \\fn via[T has Tagged[int]](x: T, n: int) -> Option[int] { x.tag(n) }
+        \\fn local[T has Tagged[int]](x: T, n: int) -> int {
+        \\ r := x.tag(n)
+        \\ return match r { .some(v) -> v, .none -> 0 }
+        \\}
+        \\fn main() -> int { return match via(P { x: 1 }, 2) { .some(v) -> v + local(P { x: 1 }, 2), .none -> 0 } }
+        \\
+    );
+}
+
+test "a bounded call grounds a protocol's Option[X] param through the App" {
+    try expectChecksClean(
+        \\protocol Take[X] { fn take(self, n: Option[X]) -> int }
+        \\struct P { x: int }
+        \\impl P has Take[int] { fn take(self, n: Option[int]) -> int { match n { .some(v) -> v + self.x, .none -> 0 } } }
+        \\fn via[T has Take[int]](x: T, n: int) -> int { x.take(Option[int].some(n)) }
+        \\fn main() -> int { return via(P { x: 1 }, 2) }
+        \\
+    );
+}
+
+test "an explicit-args bounded call grounds a protocol's Option[X] return" {
+    try expectChecksClean(
+        \\protocol Tagged[X] { fn tag(self, n: X) -> Option[X] }
+        \\struct P { x: int }
+        \\impl P has Tagged[int] { fn tag(self, n: int) -> Option[int] { Option[int].some(n + self.x) } }
+        \\fn via[T has Tagged[int]](x: T, n: int) -> Option[int] { x.tag[int](n) }
+        \\fn main() -> int { return match via(P { x: 1 }, 2) { .some(v) -> v, .none -> 0 } }
+        \\
+    );
+}
+
+test "a bounded call grounds Option[Self] to the receiver when it is not the first param" {
+    try expectChecksClean(
+        \\protocol Wrap { fn wrap(self) -> Option[Self] }
+        \\struct P { x: int }
+        \\impl P has Wrap { fn wrap(self) -> Option[P] { Option[P].some(self) } }
+        \\fn via[U, T has Wrap](_u: U, x: T) -> int {
+        \\ w: Option[T] = x.wrap()
+        \\ return match w { .some(_) -> 3, .none -> 0 }
+        \\}
+        \\fn main() -> int { return via(true, P { x: 1 }) }
+        \\
+    );
 }
 
 test "reify grounds a bounded instance's conform_ty when the type-arg is a generic-aggregate App" {
