@@ -2828,6 +2828,28 @@ pub const BodyChecker = struct {
         return .{ .pid = pid, .args = if (found) buf.items else null };
     }
 
+    /// The method template of a generic receiver that a call resolved through a bound
+    /// takes (`boundConformance`): the one witnessing that bound's conformance, when the
+    /// receiver's ctor has several same-named conformance methods. Null for any other call.
+    fn boundTemplate(bc: *BodyChecker, call: Ast.Node, recv: Type, member: []const u8) error{OutOfMemory}!?Typecheck.TemplateMethod {
+        var buf: std.ArrayList(Type) = .empty;
+        defer buf.deinit(bc.gpa);
+        const b = (try bc.boundConformance(call, recv, &buf)) orelse return null;
+        const want = b.args orelse return null;
+        const e = bc.composite.at(recv.appIdx());
+        const site = bc.methodSite();
+        for (bc.model.templates) |tm| {
+            if (tm.recv_ctor != e.ctor or tm.recv_is_enum != e.ctor_is_enum or !std.mem.eql(u8, tm.name, member)) continue;
+            if (site == .bundled and tm.shadows) continue;
+            if ((tm.protocol_id orelse continue) != b.pid or tm.protocol_args.len != want.len) continue;
+            const same = for (tm.protocol_args, want) |pa, w| {
+                if (!Type.eql(try conform.substPattern(bc.composite, bc.gpa, pa, e.args), w)) break false;
+            } else true;
+            if (same) return tm;
+        }
+        return null;
+    }
+
     /// Emit the T0025 ambiguity diagnostic: the receiver conforms more than once with a
     /// method `member` and the use site gave no disambiguating type-args. Names the
     /// conflicting conformances in table (source fn-id) order — deterministic at any `-jN`.
@@ -2898,8 +2920,7 @@ pub const BodyChecker = struct {
     /// How to choose among `confs`, in text that compiles where it is written. Explicit
     /// args name a conformance whose args no other one shares; a method value takes none,
     /// so at `value_recv.m` they go in a lambda's call. Any other is reached through a fn
-    /// bounded by its protocol, since no call syntax names a protocol; a generic type
-    /// cannot meet a bound yet, so on one it cannot be chosen at all.
+    /// bounded by its protocol, since no call syntax names a protocol.
     fn writeAmbiguityHint(bc: *BodyChecker, out: *std.ArrayList(u8), recv: Type, member: []const u8, confs: []const AmbiguousConformance, buf: []const Type, value_recv: ?Ast.Index) error{OutOfMemory}!void {
         var named: usize = 0;
         var unnamed: ?AmbiguousConformance = null;
@@ -2931,20 +2952,6 @@ pub const BodyChecker = struct {
         }
         const c = unnamed orelse return;
         if (named > 0) try out.appendSlice(bc.gpa, ", or ");
-        if (recv.isApp()) {
-            try out.appendSlice(bc.gpa, "no call can choose ");
-            var k: usize = 0;
-            for (confs, 0..) |d, i| {
-                if (namedByArgs(confs, buf, i)) continue;
-                if (k != 0) try out.appendSlice(bc.gpa, " or ");
-                k += 1;
-                try out.append(bc.gpa, '\'');
-                try bc.writeConformance(out, d, buf);
-                try out.append(bc.gpa, '\'');
-            }
-            try out.appendSlice(bc.gpa, " on a generic type yet");
-            return;
-        }
         try out.appendSlice(bc.gpa, "call it through a fn bounded by '");
         try bc.writeConformance(out, c, buf);
         try out.appendSlice(bc.gpa, "', e.g. '");
@@ -4203,9 +4210,13 @@ pub const BodyChecker = struct {
         const member = bc.nameText(callee.main_token);
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         const e = bc.composite.at(recv_ty.appIdx());
+        var by_bound = false;
         const picked: ?Typecheck.TemplateMethod = switch (Typecheck.pickGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite())) {
             .one => |m| m,
-            .ambiguous => {
+            .ambiguous => if (try bc.boundTemplate(n, recv_ty, member)) |m| blk: {
+                by_bound = true;
+                break :blk m;
+            } else {
                 try bc.drainArgs(args);
                 try bc.emitAmbiguousConformance(bc.tokSpan(callee.main_token), recv_ty, member, null);
                 return .invalid;
@@ -4237,7 +4248,11 @@ pub const BodyChecker = struct {
                 .ok => {},
                 else => bound_ok = false, // an unbound impl param: poison, no cascade
             };
-            if (bound_ok) bc.setCallee(n, Callee.pending);
+            if (bound_ok and by_bound) {
+                // The receiver's rows share this name; only the template tells them apart.
+                bc.setCallee(n, Callee.pendingCall(node_idx));
+                bc.setCalleeAt(node_idx, Callee.pendingTemplate(m.fn_id, false));
+            } else if (bound_ok) bc.setCallee(n, Callee.pending);
             _ = try bc.checkCall(node_idx, args, bc.methodSig(mf, member).substituted(if (bound_ok) targs else null));
             if (!bound_ok) return .invalid;
             return bc.substRet(node_idx, mf, targs);
@@ -4312,6 +4327,11 @@ pub const BodyChecker = struct {
                 const field_ty = bc.typeName(blocker.ty);
                 const hint = importHint(&buf, Typecheck.scalarImplModule(bc.model, field_ty, bc.model.preludeProtocols().display.?));
                 try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0031 }, "cannot 'to_string' a '{s}': field '{s}' of type '{s}' does not conform to 'Display'{s}", .{ bc.typeName(recv_ty), blocker.name, field_ty, hint });
+                return .invalid;
+            }
+            if (try bc.unmetGenericBound(recv_ty, bc.model.preludeProtocols().display)) |u| {
+                try bc.drainArgs(args);
+                try bc.sink.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "no method 'to_string' on type '{s}'; its generic impl of 'Display' needs type argument '{s}' to conform to '{s}'", .{ bc.typeName(recv_ty), bc.typeName(u.arg), bc.model.protocols[u.pid].name });
                 return .invalid;
             }
         }
@@ -4474,7 +4494,9 @@ pub const BodyChecker = struct {
         switch (try Conform.classify(bc.model, bc.composite, bc.bound_protocols, &bc.conforms_memo, bc.gpa, t, pid)) {
             .none => return false,
             .direct => return true,
-            .structural => {
+            // An explicit generic conformance: its witness is an instance of the impl's
+            // method, which the mono tail instantiates from this same request.
+            .generic, .structural => {
                 // Record a derive request ONLY for a GROUND operand: an abstract `App`
                 // (a `type_var` inside, e.g. `Box[T]` in a bounded template's definition
                 // check) is accepted-but-not-recorded — its concrete instance re-check
@@ -4483,6 +4505,22 @@ pub const BodyChecker = struct {
                 return true;
             },
         }
+    }
+
+    /// The impl-param bound that keeps `t`'s explicit generic impl of `pid_opt` from
+    /// applying, if one does: an error naming it beats suggesting an impl that exists.
+    fn unmetGenericBound(bc: *BodyChecker, t: Type, pid_opt: ?u32) error{OutOfMemory}!?Conform.UnmetBound {
+        const pid = pid_opt orelse return null;
+        if (!t.isApp()) return null;
+        const tb: Conform.Tables = .{ .structs = bc.model.structs, .enums = bc.model.enums, .conformances = bc.model.conformances, .gen = .of(bc.model), .composite = bc.composite, .gpa = bc.gpa, .bound_protocols = bc.bound_protocols };
+        return switch (try Conform.generic(tb, &bc.conforms_memo, t, pid, &.{})) {
+            .none => null,
+            .met => |m| {
+                m.deinit(bc.gpa);
+                return null;
+            },
+            .unmet => |u| u,
+        };
     }
 
     /// Whether `t` is fully ground: no `type_var` anywhere. A struct/enum id and any
@@ -4567,7 +4605,7 @@ pub const BodyChecker = struct {
     fn deriveBlocker(bc: *BodyChecker, t: Type, pid_opt: ?u32) error{OutOfMemory}!?Typecheck.NonConformingField {
         if (t.kind != .@"struct") return null;
         const pid = pid_opt orelse return null;
-        return Conform.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, t, pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols);
+        return Conform.firstNonConformingField(bc.model.structs, bc.model.enums, bc.model.conformances, .of(bc.model), t, pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols);
     }
 
     /// Where an operator error underlines, resolved only when one is reported: a
@@ -4619,6 +4657,8 @@ pub const BodyChecker = struct {
                     try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0044 }, "operands of '{s}' must have the same type", .{op_text});
                 } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().ord, site)) {
                     return Type.bool;
+                } else if (try bc.unmetGenericBound(lt, bc.model.preludeProtocols().ord)) |u| {
+                    try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0027 }, "'{s}' requires an 'Ord' impl for type '{s}'; its generic impl needs type argument '{s}' to conform to '{s}'", .{ op_text, bc.typeName(lt), bc.typeName(u.arg), bc.model.protocols[u.pid].name });
                 } else {
                     try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0027 }, "'{s}' requires an 'Ord' impl for type '{s}'", .{ op_text, bc.nonConformingName(lt, bc.model.preludeProtocols().ord) });
                 }
@@ -4636,6 +4676,8 @@ pub const BodyChecker = struct {
                     return Type.bool;
                 } else if (try bc.conformsTo(lt, bc.model.preludeProtocols().eq, site)) {
                     return Type.bool;
+                } else if (try bc.unmetGenericBound(lt, bc.model.preludeProtocols().eq)) |u| {
+                    try bc.sink.report(.{ .span = bc.blameSpan(blame), .code = .T0026 }, "'{s}' requires an 'Eq' impl for type '{s}'; its generic impl needs type argument '{s}' to conform to '{s}'", .{ op_text, bc.typeName(lt), bc.typeName(u.arg), bc.model.protocols[u.pid].name });
                 } else if (try bc.deriveBlocker(lt, bc.model.preludeProtocols().eq)) |blocker| {
                     // A struct that would derive `Eq` but for one non-conforming
                     // field names that field (T0029). A payload enum / other type
@@ -4781,7 +4823,7 @@ pub const BodyChecker = struct {
     }
 
     fn conformsQuiet(bc: *BodyChecker, t: Type, pid: u32) bool {
-        return Conform.structural(bc.model.structs, bc.model.enums, bc.model.conformances, t, pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols) catch true;
+        return Conform.structural(bc.model.structs, bc.model.enums, bc.model.conformances, .of(bc.model), t, pid, &bc.conforms_memo, bc.gpa, bc.composite, bc.bound_protocols) catch true;
     }
 
     pub fn typeName(bc: *const BodyChecker, ty: Type) []const u8 {

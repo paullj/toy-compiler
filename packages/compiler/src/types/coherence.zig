@@ -221,7 +221,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
 }
 
 /// Record a GENERIC conformance `impl Ctor[T] has P[..]` into `t.template_conformances`
-/// (invisible to every existing conformance query) and validate its method signatures
+/// and validate its method signatures
 /// (T0024) monomorphized per the receiver's own type-params. The impl's methods live in
 /// `t.templates`, so there is no `t.methods` witness to stamp (the `for x in xs` desugar
 /// dispatches structurally on the reified receiver). Duplicate detection keys on the
@@ -338,7 +338,16 @@ fn recordGenericConformance(
     gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items);
     gop.value_ptr.* = null;
     const owned_pargs = try t.gpa.dupe(Type, pargs);
-    t.template_conformances.append(t.gpa, .{ .protocol_id = pid, .recv_ctor = e.ctor, .recv_is_enum = e.ctor_is_enum, .protocol_args = owned_pargs }) catch |err| {
+    t.template_conformances.append(t.gpa, .{
+        .protocol_id = pid,
+        .recv_ctor = e.ctor,
+        .recv_is_enum = e.ctor_is_enum,
+        .protocol_args = owned_pargs,
+        .recv = recv_app,
+        .n_params = Typecheck.implParamCount(t.composite, impl_fn0),
+        .bounds = impl_fn0.generic_bounds,
+        .bound_args = impl_fn0.generic_bound_args,
+    }) catch |err| {
         t.gpa.free(owned_pargs);
         return err;
     };
@@ -492,6 +501,22 @@ pub fn deriveEqFromOrd(t: *Typecheck) !void {
     defer add.deinit(t.gpa);
     try ordEqRefinementReceivers(t.gpa, t.conformances.items[0..prefix], ord_pid, eq_pid, &add);
     for (add.items) |recv| try t.conformances.append(t.gpa, .{ .protocol = eq_pid, .recv = recv });
+
+    // The same refinement for a generic `impl Box[T] has Ord`, with the impl's bounds.
+    const gprefix = t.template_conformances.items.len;
+    for (0..gprefix) |i| {
+        const row = t.template_conformances.items[i];
+        if (row.protocol_id != ord_pid) continue;
+        const has_eq = for (t.template_conformances.items) |o| {
+            if (o.protocol_id == eq_pid and o.recv_ctor == row.recv_ctor and o.recv_is_enum == row.recv_is_enum) break true;
+        } else false;
+        if (has_eq) continue;
+        var eq_row = row;
+        eq_row.protocol_id = eq_pid;
+        eq_row.protocol_args = &.{};
+        eq_row.refines = ord_pid;
+        try t.template_conformances.append(t.gpa, eq_row);
+    }
 }
 
 /// Append a little-endian u32 to a byte buffer (coherence-key serialization helper).

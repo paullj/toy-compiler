@@ -57,7 +57,7 @@ fn swapped(s: Swapped[int]) -> int {
 }
 
 fn shown(s: Shown[int]) -> int {
-    return s.render()  #~ ERROR [T0025] 'render' on 'Shown' matches multiple conformances (Show and Debug); no call can choose 'Show' or 'Debug' on a generic type yet
+    return s.render()  #~ ERROR [T0025] 'render' on 'Shown' matches multiple conformances (Show and Debug); call it through a fn bounded by 'Show'
 }
 
 fn bound(b: Box[int]) -> int {

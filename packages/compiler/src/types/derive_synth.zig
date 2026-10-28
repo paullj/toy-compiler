@@ -102,7 +102,8 @@ fn resolveTraceFieldWitness(t: *const Typecheck, ft: Type) Derive.FieldWitness {
 }
 
 /// True when `recv` has an EXPLICIT/prelude/Ord-refinement `(pid, recv)` conformance in
-/// the live table (the double-fire guard: such a type is never structurally derived).
+/// the live table, or a reached instance of a generic one (the double-fire guard: such a
+/// type is never structurally derived).
 fn hasConformanceLive(t: *const Typecheck, pid: u32, recv: Type) bool {
     for (t.conformances.items) |c| {
         if (c.protocol == pid and Type.eql(c.recv, recv) and c.protocol_args.len == 0) return true;
@@ -153,6 +154,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     if (ord_pid_opt) |ord_pid| {
         for (t.derive_reqs.items) |req| {
             if (req.protocol_id != ord_pid) continue;
+            if (hasConformanceLive(t, ord_pid, req.conform_ty)) continue; // an explicit generic impl's instance
             try ord_work.add(gpa, ord_pid, .ord, req.conform_ty, req.site);
         }
         var oi: usize = 0;
@@ -165,7 +167,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
                     else => continue,
                 }
                 if (hasConformanceLive(t, ord_pid, ft)) continue; // explicit Ord field: reuse its witness
-                if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, ord_pid, &memo, gpa, t.composite, &.{}))
+                if (try conforms(t.structs.items, t.enums.items, t.conformances.items, .{}, ft, ord_pid, &memo, gpa, t.composite, &.{}))
                     try ord_work.add(gpa, ord_pid, .ord, ft, ord_work.sites.items[oi]);
             }
         }
@@ -193,7 +195,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
                 break;
             };
             if (dup or hasConformanceLive(t, hashable_pid, k)) continue;
-            if (try Typecheck.conform.hashable(t.structs.items, t.enums.items, t.conformances.items, t.composite, k, hashable_pid, hash_pid, pre.ref_struct, pre.gc_array_struct, &memo, gpa))
+            if (try Typecheck.conform.hashable(t.structs.items, t.enums.items, t.conformances.items, .{}, t.composite, k, hashable_pid, hash_pid, pre.ref_struct, pre.gc_array_struct, &memo, gpa))
                 try desc_keys.append(gpa, k);
         }
     };
@@ -204,6 +206,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
 
     for (t.derive_reqs.items) |req| {
         if (req.protocol_id != eq_pid) continue;
+        if (hasConformanceLive(t, eq_pid, req.conform_ty)) continue; // an explicit generic impl's instance
         if (isRefType(t, req.conform_ty)) continue; // a Ref is compared inline (cell identity), no witness
         if (try ordFills(t, &ord_work.seen, ord_pid_opt, req.conform_ty)) continue; // Ord fills Eq
         try eq_work.add(gpa, eq_pid, .eq, req.conform_ty, req.site);
@@ -232,7 +235,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
             if (isRefType(t, ft)) continue; // a Ref field is compared inline (cell identity), no witness
             if (hasConformanceLive(t, eq_pid, ft)) continue; // explicit Eq field: reuse its witness
             if (try ordFills(t, &ord_work.seen, ord_pid_opt, ft)) continue; // Ord fills Eq: the field's cmp witness serves `==`
-            if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, eq_pid, &memo, gpa, t.composite, &.{}))
+            if (try conforms(t.structs.items, t.enums.items, t.conformances.items, .{}, ft, eq_pid, &memo, gpa, t.composite, &.{}))
                 try eq_work.add(gpa, eq_pid, .eq, ft, eq_work.sites.items[ei]);
         }
     }
@@ -249,6 +252,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     if (hash_pid_opt) |hash_pid| {
         for (t.derive_reqs.items) |req| {
             if (req.protocol_id != hash_pid) continue;
+            if (hasConformanceLive(t, hash_pid, req.conform_ty)) continue; // an explicit generic impl's instance
             try hash_work.add(gpa, hash_pid, .hash, req.conform_ty, req.site);
         }
         for (desc_keys.items) |k| {
@@ -276,7 +280,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
                     continue;
                 }
                 if (hasConformanceLive(t, hash_pid, ft)) continue; // explicit Hash field: reuse its witness
-                if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, hash_pid, &memo, gpa, t.composite, &.{}))
+                if (try conforms(t.structs.items, t.enums.items, t.conformances.items, .{}, ft, hash_pid, &memo, gpa, t.composite, &.{}))
                     try hash_work.add(gpa, hash_pid, .hash, ft, site);
             }
         }
@@ -295,6 +299,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
     if (display_pid_opt) |disp_pid| {
         for (t.derive_reqs.items) |req| {
             if (req.protocol_id != disp_pid) continue;
+            if (hasConformanceLive(t, disp_pid, req.conform_ty)) continue; // an explicit generic impl's instance
             try disp_work.add(gpa, disp_pid, .display, req.conform_ty, req.site);
         }
         var wi: usize = 0;
@@ -307,7 +312,7 @@ pub fn synthesizeDerives(t: *Typecheck) !void {
                     else => continue,
                 }
                 if (hasConformanceLive(t, disp_pid, ft)) continue; // explicit Display field: reuse its witness
-                if (try conforms(t.structs.items, t.enums.items, t.conformances.items, ft, disp_pid, &memo, gpa, t.composite, &.{}))
+                if (try conforms(t.structs.items, t.enums.items, t.conformances.items, .{}, ft, disp_pid, &memo, gpa, t.composite, &.{}))
                     try disp_work.add(gpa, disp_pid, .display, ft, disp_work.sites.items[wi]);
             }
         }
@@ -564,7 +569,7 @@ pub fn synthesizeDescriptors(t: *Typecheck) !void {
     defer tmemo.deinit(gpa);
     for (uniq.items) |ty| {
         const hashable = if (pre.protocols.hashable) |hpid| (if (hash_pid_opt) |hp|
-            try Typecheck.conform.hashable(t.structs.items, t.enums.items, t.conformances.items, t.composite, ty, hpid, hp, pre.ref_struct, pre.gc_array_struct, &memo, gpa)
+            try Typecheck.conform.hashable(t.structs.items, t.enums.items, t.conformances.items, .{}, t.composite, ty, hpid, hp, pre.ref_struct, pre.gc_array_struct, &memo, gpa)
         else
             false) else false;
         try t.descriptor_types.append(gpa, .{ .ty = ty, .hashable = hashable });

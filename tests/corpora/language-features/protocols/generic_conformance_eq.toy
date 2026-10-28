@@ -1,0 +1,34 @@
+# Feature: an explicit generic `Eq` meets `[T has Eq]` and drives `==` on a type that cannot
+# derive it (a fn field), and a generic `Ord` refines `Eq` as a concrete one does: `==` on
+# `Tag[T]` compares by `cmp`, not field by field.
+# expect: stdout "true\ntrue\ntrue\nfalse\n"
+# expect: exit 0
+import std/io
+
+fn inc(x: int) -> int { x + 1 }
+
+struct Box[T] { v: T, f: fn(int) -> int }
+
+impl Box[T] has Eq {
+    fn eq(self, _other: Box[T]) -> bool { true }
+}
+
+struct Tag[T] { v: T, rank: int }
+
+impl Tag[T] has Ord {
+    fn cmp(self, other: Tag[T]) -> Ordering {
+        if self.rank < other.rank { Ordering.lt } else if self.rank == other.rank { Ordering.eq } else { Ordering.gt }
+    }
+}
+
+fn same[T has Eq](a: T, b: T) -> bool { a == b }
+
+fn main() -> int {
+    a := Box { v: 1, f: inc }
+    b := Box { v: 2, f: inc }
+    io.println(same(a, b))
+    io.println(a == b)
+    io.println(Tag { v: 1, rank: 3 } == Tag { v: 2, rank: 3 })
+    io.println(same(Tag { v: 1, rank: 3 }, Tag { v: 1, rank: 4 }))
+    return 0
+}

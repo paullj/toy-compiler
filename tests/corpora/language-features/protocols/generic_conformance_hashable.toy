@@ -1,0 +1,63 @@
+# Feature: explicit generic `Eq` + `Hash` impls drive a Map/Set key, as concrete ones do:
+# the key meets `[K has Hashable]` even when its fields cannot derive (a float, a fn), and
+# the map compares and hashes keys through the user's impls, not the structural derive. A
+# generic `Hashable` impl serves the key's erased dispatch directly.
+# expect: stdout "1\n3\n1\n1\n1\n9\n"
+# expect: exit 0
+import std/io
+import std/map
+import std/set
+import std/option
+
+fn inc(x: int) -> int { x + 1 }
+
+struct Box[T] { v: T }
+
+impl Box[T] has Eq {
+    fn eq(self, _o: Box[T]) -> bool { true }
+}
+
+impl Box[T] has Hash {
+    fn hash(self) -> int { 7 }
+}
+
+struct Fn[T] { v: T, f: fn(int) -> int }
+
+impl Fn[T] has Eq {
+    fn eq(self, _o: Fn[T]) -> bool { true }
+}
+
+impl Fn[T] has Hash {
+    fn hash(self) -> int { 1 }
+}
+
+struct Key[T] { v: T }
+
+impl Key[T] has Hashable {
+    fn hash(self) -> int { 0 }
+    fn eq(self, _o: Key[T]) -> bool { true }
+}
+
+fn main() -> int {
+    m := Map[Box[int], int].new()
+    m.set(Box { v: 1 }, 3)
+    m.set(Box { v: 2 }, 3)
+    io.println(m.len())
+    io.println(m.get(Box { v: 9 }).unwrap_or(-1))
+    f := Map[Box[float], int].new()
+    f.set(Box { v: 1.5 }, 1)
+    f.set(Box { v: 2.5 }, 2)
+    io.println(f.len())
+    g := Map[Fn[int], int].new()
+    g.set(Fn { v: 1, f: inc }, 5)
+    g.set(Fn { v: 2, f: inc }, 6)
+    io.println(g.len())
+    s := Set[Key[int]].new()
+    s.add(Key { v: 1 })
+    s.add(Key { v: 2 })
+    io.println(s.len())
+    k := Map[Key[int], int].new()
+    k.set(Key { v: 1 }, 9)
+    io.println(k.get(Key { v: 4 }).unwrap_or(-1))
+    return 0
+}
