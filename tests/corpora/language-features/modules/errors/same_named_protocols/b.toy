@@ -1,0 +1,3 @@
+pub protocol Q {
+    fn q(self) -> int
+}

@@ -1,0 +1,39 @@
+# Feature: conformances that differ only by a module qualifier, in a protocol arg
+# (`Conv[a.K]`, `Conv[b.K]`) or in the receiver (`impl a.K`, `impl b.K`), are distinct
+# conformances with distinct methods, not a duplicate method.
+# expect: exit 129
+import a
+import b
+
+protocol Conv[X] {
+    fn conv(self) -> X
+}
+
+protocol Q {
+    fn q(self) -> int
+}
+
+struct P { v: int }
+
+impl P has Conv[a.K] {
+    fn conv(self) -> a.K { a.make(self.v) }
+}
+
+impl P has Conv[b.K] {
+    fn conv(self) -> b.K { b.make(self.v * 2) }
+}
+
+impl a.K has Q {
+    fn q(self) -> int { self.v + 1 }
+}
+
+impl b.K has Q {
+    fn q(self) -> int { self.v + 100 }
+}
+
+fn main() -> int {
+    p := P { v: 7 }
+    x := p.conv[a.K]()
+    y := p.conv[b.K]()
+    return x.v + y.v + a.make(3).q() + b.make(4).q()
+}

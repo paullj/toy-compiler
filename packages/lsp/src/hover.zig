@@ -393,6 +393,37 @@ test "hover on the callee of a function value's call shows its type" {
     }
 }
 
+test "hover on a method of a qualified-protocol conformance shows the method's name" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\import std/iter
+        \\struct C { n: int }
+        \\impl C has iter.Iterator[int] {
+        \\    fn next(mut self) -> Option[int] {
+        \\        self.n = self.n + 1
+        \\        return Option.some(self.n)
+        \\    }
+        \\}
+        \\fn main() -> int {
+        \\    c := C { n: 0 }
+        \\    _x := c.next()
+        \\    return 0
+        \\}
+        \\
+    ;
+    const test_util = @import("test_util.zig");
+    const want = "```toy\nfn next(mut self: C) -> Option[int]\n```";
+    for ([_][]const u8{ "next(mut", "next()" }) |needle| {
+        const pos = test_util.posOf(src, needle);
+        var h = (try hoverAt(gpa, ws, src, pos.line, pos.character, "file:///p/main.toy")) orelse return error.NoHover;
+        defer h.deinit();
+        try testing.expectEqualStrings(want, h.value);
+    }
+}
+
 test "hover on a method callee shows the selected method" {
     const gpa = testing.allocator;
     var docs: @import("Documents.zig") = .{};

@@ -2931,9 +2931,19 @@ pub const BodyChecker = struct {
         }
     };
 
-    /// `Into[int]`, or `Show` for a protocol without args.
+    /// `Into[int]`, or `Show` for a protocol without args. A protocol of an imported
+    /// module takes that import's qualifier (`a.Q`), so two same-named protocols differ and
+    /// the hinted bound can be written as is.
     fn writeConformance(bc: *BodyChecker, out: *std.ArrayList(u8), c: AmbiguousConformance, buf: []const Type) error{OutOfMemory}!void {
-        try out.appendSlice(bc.gpa, bc.model.protocols[c.pid].name);
+        const p = bc.model.protocols[c.pid];
+        if (p.mod != bc.graph_mod) {
+            var it = bc.model.graph.mods[bc.graph_mod].namespaces.iterator();
+            while (it.next()) |ns| if (ns.value_ptr.* == p.mod) {
+                try out.print(bc.gpa, "{s}.", .{ns.key_ptr.*});
+                break;
+            };
+        }
+        try out.appendSlice(bc.gpa, p.name);
         try bc.writeTypeArgsSource(out, c.args(buf), &.{});
     }
 
