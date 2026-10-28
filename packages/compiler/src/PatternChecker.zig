@@ -93,7 +93,7 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
             // A guard is a bool whatever the arms yield, so their expected type is no hint
             // for it (the scrutinee keeps it: `match n.try_into() { .ok(c) -> c, .. }`).
             const gt = try bc.typeOfExpected(h.guard, null);
-            if (gt.kind != .invalid and gt.kind != .bool)
+            if (!BodyChecker.condFits(gt))
                 try bc.sink.report(.{ .span = bc.spanOf(h.guard), .code = .T0045 }, "match guard must be bool, got {s}", .{bc.typeName(gt)});
         }
         const body_ty0 = try bc.typeUnder(h.body, bc.body.expected);

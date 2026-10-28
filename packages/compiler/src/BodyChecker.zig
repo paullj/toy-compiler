@@ -685,7 +685,7 @@ pub const BodyChecker = struct {
             .block => _ = try bc.checkBlock(stmt_idx, false),
             .if_stmt => {
                 const ct = try bc.typeOf(stmt.lhs);
-                if (ct.kind != .invalid and ct.kind != .bool)
+                if (!condFits(ct))
                     try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0045 }, "if condition must be bool", .{});
                 try bc.warnConstIfCond(stmt.lhs);
                 const h = Ast.ifHeaderAt(bc.tree, (stmt.rhs).int());
@@ -765,10 +765,16 @@ pub const BodyChecker = struct {
         return null;
     }
 
+    /// Whether a condition of type `t` needs no T0045: a bool, a poison, or a `never`
+    /// that leaves before the branch is taken.
+    pub fn condFits(t: Type) bool {
+        return t.kind == .bool or t.kind == .invalid or t.kind == .never;
+    }
+
     fn checkWhile(bc: *BodyChecker, stmt_idx: Ast.Index, label: ?[]const u8) error{OutOfMemory}!void {
         const stmt = bc.tree.nodes[(stmt_idx).int()];
         const ct = try bc.typeOf(stmt.lhs);
-        if (ct.kind != .invalid and ct.kind != .bool)
+        if (!condFits(ct))
             try bc.sink.report(.{ .span = bc.spanOf(stmt.lhs), .code = .T0045 }, "while condition must be bool", .{});
         try bc.loop_stack.append(bc.gpa, .{ .kind = .while_for, .label = label, .construct_node = stmt_idx, .is_value = false, .join = Type.never, .saw_value_break = false, .saw_bare_break = false });
         _ = try bc.checkBlock(stmt.rhs, false);
@@ -1276,6 +1282,7 @@ pub const BodyChecker = struct {
                 }
                 const operand = try bc.typeOf(n.lhs);
                 if (operand.kind == .invalid) break :blk Type.invalid; // poison propagation: no emit (exempt)
+                if (operand.kind == .never) break :blk Type.never;
                 if (bc.expectedTy()) |e| if (e.isInteger() and bc.isConstInt(node_idx)) try bc.checkConstRange(node_idx, e);
                 switch (op) {
                     .minus => {
@@ -1318,8 +1325,11 @@ pub const BodyChecker = struct {
                 if (lt.kind == .invalid or rt.kind == .invalid) break :blk Type.invalid; // poison propagation: no emit (exempt)
                 const l_const = bc.isConstInt(n.lhs);
                 const r_const = bc.isConstInt(n.rhs);
-                if (!l_const) rt = try bc.adoptConstWidth(n.rhs, rt, lt);
-                if (!r_const) lt = try bc.adoptConstWidth(n.lhs, lt, rt);
+                // A `never` sibling has no width to give, so a constant beside it takes
+                // the expected one as if it stood alone: `x: int8 = 1 + panic("x")`.
+                const outer: Type = if (saved) |e| e.ty else Type.never;
+                if (!l_const) rt = try bc.adoptConstWidth(n.rhs, rt, if (lt.kind == .never) outer else lt);
+                if (!r_const) lt = try bc.adoptConstWidth(n.lhs, lt, if (rt.kind == .never) outer else rt);
                 break :blk try bc.binaryResult(node_idx, .{ .node = node_idx }, op_tok.tag, op_tok.text(bc.source), lt, rt);
             },
             .empty_list => blk: {
@@ -2316,7 +2326,7 @@ pub const BodyChecker = struct {
         // The expected type is the arms', not the condition's, which types as it does in a
         // statement `if`.
         const ct = try bc.typeOfExpected(n.lhs, null);
-        if (ct.kind != .invalid and ct.kind != .bool)
+        if (!condFits(ct))
             try bc.sink.report(.{ .span = bc.spanOf(n.lhs), .code = .T0045 }, "if condition must be bool", .{});
         try bc.warnConstIfCond(n.lhs);
         const h = Ast.ifHeaderAt(bc.tree, (n.rhs).int());
@@ -4619,7 +4629,12 @@ pub const BodyChecker = struct {
     /// and `rt`, reporting at `blame`. `site` is where a structural derive request is
     /// recorded. Shared by `a op b` and the compound `place op= v`, so the two forms
     /// type and diagnose alike.
-    fn binaryResult(bc: *BodyChecker, site: Ast.Index, blame: Blame, op: TokenTag, op_text: []const u8, lt: Type, rt: Type) error{OutOfMemory}!Type {
+    fn binaryResult(bc: *BodyChecker, site: Ast.Index, blame: Blame, op: TokenTag, op_text: []const u8, lt0: Type, rt0: Type) error{OutOfMemory}!Type {
+        // A `never` operand fits whatever its sibling is, as in `merge`, so only the
+        // sibling's type is judged. Both `never` is `never`: no value is ever made.
+        if (lt0.kind == .never and rt0.kind == .never) return Type.never;
+        const lt = if (lt0.kind == .never) rt0 else lt0;
+        const rt = if (rt0.kind == .never) lt0 else rt0;
         switch (op) {
             .plus, .minus, .star, .slash => {
                 // `+`/`-`/`*`/`/` desugar to the arithmetic protocols Add/Sub/Mul/Div

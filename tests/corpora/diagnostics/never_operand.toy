@@ -1,0 +1,9 @@
+# A `never` operand fits whatever its sibling is, so only the sibling's type is judged:
+# an operator its sibling does not support is still rejected, as is a non-bool condition.
+fn main() -> int {
+    x := 1 + "a"  #~ ERROR [T0044] operands of '+' must have the same type
+    _s := "a" - panic("x")  #~ ERROR [T0028] '-' requires an 'Sub' impl for type 'str'
+    _b := 1 && panic("x")  #~ ERROR [T0044] operands of '&&' must be bool
+    if 1 { }  #~ ERROR [T0045] if condition must be bool
+    return x
+}

@@ -1,0 +1,7 @@
+# expect: exit 1
+# expect: stderr "operand"
+# Feature: a `panic(..)` operand runs when its operator is reached, and exits 1.
+fn main() -> int {
+    x := 1 + panic("operand")
+    return x
+}

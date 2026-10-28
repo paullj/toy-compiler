@@ -1,0 +1,7 @@
+# expect: exit 1
+# expect: stderr "condition"
+# Feature: a `panic(..)` condition runs before either branch is taken, and exits 1.
+fn main() -> int {
+    if panic("condition") { return 2 }
+    return 3
+}

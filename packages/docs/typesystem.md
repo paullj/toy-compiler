@@ -31,10 +31,12 @@ Two special types are not ordinary value types:
 * **`never`** is **bottom**. A `never` expression (a break-less `loop`, a
   `panic(..)` call, a call to a `-> never` fn) never yields a value, so it
   fits wherever a value of a known type is wanted: a fn tail, a `return`, an
-  `if` or `match` arm, a binding, an assignment or a call argument. A fn that
-  ends in `panic("bad")` needs no dead `return`, and an arm may panic while
-  the others yield the value. An operator operand or a condition does not yet
-  accept `never`. It is the *identity* of the `merge` join.
+  `if` or `match` arm, a binding, an assignment, a call argument, an operator
+  operand or a condition. A fn that ends in `panic("bad")` needs no dead
+  `return`, and an arm may panic while the others yield the value. An operator
+  judges only the sibling of a `never` operand (`1 + panic("x")` is `int`,
+  `"a" - panic("x")` is still T0028); a unary operator over `never` is `never`.
+  It is the *identity* of the `merge` join.
 
   `never` is spelled only as a return type: of a fn, method, protocol method,
   local fn, lambda, `extern` or fn type (`fn fail(m: str) -> never { panic(m) }`,
