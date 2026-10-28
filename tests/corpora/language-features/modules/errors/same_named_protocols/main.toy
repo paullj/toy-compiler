@@ -1,0 +1,20 @@
+# Feature: P conforms to two protocols named Q from different modules. A direct p.q()
+# is ambiguous, and the error spells each protocol as this module qualifies it.
+# expect: compile-error "(a.Q and b.Q); call it through a fn bounded by 'a.Q', e.g. 'fn q_via[T has a.Q]"
+import a
+import b
+
+struct P { v: int }
+
+impl P has a.Q {
+    fn q(self) -> int { 1 }
+}
+
+impl P has b.Q {
+    fn q(self) -> int { 2 }
+}
+
+fn main() -> int {
+    p := P { v: 0 }
+    return p.q()
+}

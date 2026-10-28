@@ -230,6 +230,20 @@ const GraphResolve = struct {
     fn nameText(g: *GraphResolve, tok: u32) []const u8 {
         return g.nameOf(g.cur_mod, tok);
     }
+    /// The tokens of the subtree at `idx`, joined with no spacing: `a.K`, `Option[int]`.
+    fn appendSpelling(g: *GraphResolve, mod: u32, idx: Ast.Index, out: *std.ArrayList(u8)) !void {
+        const m = &g.graph.modules[mod];
+        const span = g.nodeSpan(mod, idx);
+        const first = std.sort.lowerBound(Token, m.tokens, span.start, struct {
+            fn order(start: u32, tok: Token) std.math.Order {
+                return std.math.order(start, tok.start);
+            }
+        }.order);
+        for (m.tokens[first..]) |tok| {
+            if (tok.start >= span.end) break;
+            try out.appendSlice(g.gpa, tok.text(m.source));
+        }
+    }
     fn nodeSpan(g: *GraphResolve, mod: u32, idx: Ast.Index) Span {
         const m = &g.graph.modules[mod];
         return Walk.nodeSpan(.{ .tree = g.tree(mod), .tokens = m.tokens, .source = m.source }, idx);
@@ -300,12 +314,14 @@ const GraphResolve = struct {
     /// order. The synthetic builtins are seeded last (see `seeded_builtins`).
     fn collectGlobals(g: *GraphResolve) !void {
         const entry = g.graph.entry_index;
-        // Scratch set of minted method symbol names, to reject a duplicate `(Receiver,
-        // method)` (two `impl P { fn m }`) — which would otherwise be a linker duplicate
-        // symbol. Keyed by the mangled qname (owned by `g.fns` once appended); the map's
-        // own storage is freed here, the borrowed keys are not.
+        // Scratch set of minted method keys, to reject a duplicate `(Receiver, method)`
+        // (two `impl P { fn m }`) — which would otherwise be a linker duplicate symbol.
         var method_names: std.StringHashMapUnmanaged(void) = .empty;
-        defer method_names.deinit(g.gpa);
+        defer {
+            var it = method_names.keyIterator();
+            while (it.next()) |k| g.gpa.free(k.*);
+            method_names.deinit(g.gpa);
+        }
         for (g.graph.modules, 0..) |m, mi| {
             const mod: u32 = @intCast(mi);
             if (m.nodes.len == 0) continue;
@@ -396,7 +412,15 @@ const GraphResolve = struct {
                         // protocol-method dispatch is indistinguishable from an inherent one
                         // — but its symbol carries a protocol suffix (see below).
                         // `Ast.implMethods` yields the method run for either shape.
+                        // A symbol must tell apart what only a module qualifier tells apart
+                        // (`Conv[a.K]` and `Conv[b.K]`, `impl a.T` and `impl b.T`), so each
+                        // type-ref part is its whole spelling, not its last name.
+                        const recv_ref = decl.lhs;
                         const recv_name = g.nameOf(mod, decl.main_token);
+                        const recv_base = if (m.nodes[recv_ref.int()].tag == .type_app) m.nodes[recv_ref.int()].lhs else recv_ref;
+                        var recv_sb: std.ArrayList(u8) = .empty;
+                        defer recv_sb.deinit(g.gpa);
+                        try g.appendSpelling(mod, recv_base, &recv_sb);
                         // A conformance method (`impl P has Q`) mangles its symbol +
                         // duplicate-check key with the protocol identity (its name, plus any
                         // type-args), so two conformances sharing a method name on one receiver
@@ -405,19 +429,34 @@ const GraphResolve = struct {
                         // resolver. Generic protocols additionally distinguish `Into[int]` from
                         // `Into[bool]` by their type-args. An inherent impl (`impl P`) keeps the
                         // bare `<recv>.<method>` name.
+                        //
+                        // The duplicate key of a conformance also spells the receiver's type
+                        // args, so `impl Box[int] has Q` beside `impl Box[bool] has Q` reaches
+                        // the checker's T0013; a real repeat (`Box[T]` beside `Box[U]`) is still
+                        // caught there, as T0020. The symbol leaves them out: only one pattern
+                        // impl per (receiver, protocol) survives the checker. An inherent key
+                        // leaves them out too, as nothing else would catch `Box[T]` beside `Box[U]`.
                         var proto_suffix: []const u8 = "";
                         defer if (proto_suffix.len > 0) g.gpa.free(proto_suffix);
+                        var recv_args: []const u8 = "";
+                        defer if (recv_args.len > 0) g.gpa.free(recv_args);
                         if (decl.tag == .impl_has_decl) {
                             if (Ast.implProtocol(t, decl)) |proto_ref| {
                                 var sb: std.ArrayList(u8) = .empty;
                                 errdefer sb.deinit(g.gpa);
                                 try sb.append(g.gpa, '$');
-                                try sb.appendSlice(g.gpa, g.nameOf(mod, m.nodes[Ast.protocolRefBase(t, proto_ref).int()].main_token));
+                                try g.appendSpelling(mod, Ast.protocolRefBase(t, proto_ref), &sb);
                                 for (Ast.protocolRefArgs(t, proto_ref)) |an| {
                                     try sb.append(g.gpa, '$');
-                                    try sb.appendSlice(g.gpa, g.nameOf(mod, m.nodes[an.int()].main_token));
+                                    try g.appendSpelling(mod, an, &sb);
                                 }
                                 proto_suffix = try sb.toOwnedSlice(g.gpa);
+                            }
+                            if (recv_base != recv_ref) {
+                                var sb: std.ArrayList(u8) = .empty;
+                                errdefer sb.deinit(g.gpa);
+                                try g.appendSpelling(mod, recv_ref, &sb);
+                                recv_args = try sb.toOwnedSlice(g.gpa);
                             }
                         }
                         for (Ast.implMethods(t, decl)) |method_idx| {
@@ -425,9 +464,15 @@ const GraphResolve = struct {
                             if (method.tag != .fn_decl) continue;
                             const mname = g.nameOf(mod, method.main_token);
                             try g.bound_names.put(g.gpa, mname, {});
-                            const qname = try std.fmt.allocPrint(g.gpa, "{s}.{s}.{s}{s}", .{ m.path, recv_name, mname, proto_suffix });
-                            const gop = try method_names.getOrPut(g.gpa, qname);
+                            const qname = try std.fmt.allocPrint(g.gpa, "{s}.{s}.{s}{s}", .{ m.path, recv_sb.items, mname, proto_suffix });
+                            errdefer g.gpa.free(qname);
+                            const key = try std.fmt.allocPrint(g.gpa, "{s}#{s}", .{ qname, recv_args });
+                            const gop = method_names.getOrPut(g.gpa, key) catch |err| {
+                                g.gpa.free(key);
+                                return err;
+                            };
                             if (gop.found_existing) {
+                                g.gpa.free(key);
                                 try g.sink.report(.{ .span = g.tokSpan(mod, method.main_token), .code = .R0002, .scope = mod }, "duplicate method '{s}.{s}'", .{ recv_name, mname });
                                 g.gpa.free(qname);
                                 continue;
@@ -2939,6 +2984,70 @@ test "two modules with same-named fn get distinct qualified global ids" {
         }
     };
     try withResolvedGraph(".toy-test-res-2area", files, "main.toy", Check.run);
+}
+
+test "conformance symbols spell each protocol arg and receiver whole, so a module qualifier tells them apart" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import a
+        \\import b
+        \\protocol Conv[X] { fn conv(self) -> X }
+        \\protocol Q { fn q(self) -> int }
+        \\struct P { v: int }
+        \\struct Box[T] { v: T }
+        \\impl P has Conv[a.K] { fn conv(self) -> a.K { return a.K { v: 1 } } }
+        \\impl P has Conv[b.K] { fn conv(self) -> b.K { return b.K { v: 2 } } }
+        \\impl P has Conv[Option[int]] { fn conv(self) -> Option[int] { return Option.none } }
+        \\impl P has Conv[Option[bool]] { fn conv(self) -> Option[bool] { return Option.none } }
+        \\impl Box[int] has Q { fn q(self) -> int { return 1 } }
+        \\impl Box[bool] has Q { fn q(self) -> int { return 2 } }
+        \\impl a.K has Q { fn q(self) -> int { return 1 } }
+        \\impl b.K has Q { fn q(self) -> int { return 2 } }
+        \\fn main() -> int { return 0 }
+        \\
+        },
+        .{ .path = "a.toy", .source = "pub struct K { v: int }\n" },
+        .{ .path = "b.toy", .source = "pub struct K { v: int }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), countCode(r, .R0002));
+            const want = [_][]const u8{
+                "main.P.conv$Conv$a.K",         "main.P.conv$Conv$b.K",
+                "main.P.conv$Conv$Option[int]", "main.P.conv$Conv$Option[bool]",
+                "main.a.K.q$Q",                 "main.b.K.q$Q",
+            };
+            for (want) |w| {
+                var seen = false;
+                for (r.fns) |f| if (std.mem.eql(u8, f.name, w)) {
+                    seen = true;
+                };
+                try testing.expect(seen);
+            }
+        }
+    };
+    try withResolvedGraph(".toy-test-res-conf-qual", files, "main.toy", Check.run);
+}
+
+test "two conformances with the same protocol args are still a duplicate method" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\protocol Conv[X] { fn conv(self) -> X }
+        \\struct P { v: int }
+        \\impl P has Conv[int] { fn conv(self) -> int { return 1 } }
+        \\impl P has Conv[ int ] { fn conv(self) -> int { return 2 } }
+        \\fn main() -> int { return 0 }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), countCode(r, .R0002));
+        }
+    };
+    try withResolvedGraph(".toy-test-res-conf-dup", files, "main.toy", Check.run);
 }
 
 test "referencing a non-pub fn cross-module is a visibility error" {

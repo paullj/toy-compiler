@@ -1,0 +1,33 @@
+# Conformances that differ only in a composite protocol arg or in the receiver's type
+# args are not a duplicate method: each meets the checker's limit on its own.
+protocol Conv[X] {
+    fn conv(self) -> X
+}
+
+protocol Q {
+    fn q(self) -> int
+}
+
+struct P { v: int }
+
+struct Box[T] { v: T }
+
+impl P has Conv[Option[int]] {  #~ ERROR [T0013] a generic-protocol argument must be a concrete non-composite value type
+    fn conv(self) -> Option[int] { Option.none }
+}
+
+impl P has Conv[Option[bool]] {  #~ ERROR [T0013] a generic-protocol argument must be a concrete non-composite value type
+    fn conv(self) -> Option[bool] { Option.none }
+}
+
+impl Box[int] has Q {  #~ ERROR [T0013] a conformance 'impl' on a concrete type instance is not yet supported (use 'impl Box[T]')
+    fn q(self) -> int { 1 }
+}
+
+impl Box[bool] has Q {  #~ ERROR [T0013] a conformance 'impl' on a concrete type instance is not yet supported (use 'impl Box[T]')
+    fn q(self) -> int { 2 }
+}
+
+fn main() -> int {
+    return 0
+}

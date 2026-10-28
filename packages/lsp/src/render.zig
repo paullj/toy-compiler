@@ -16,9 +16,11 @@ pub fn isRenderable(t: Type) bool {
 
 /// A symbol name minus its leading module qualifier. The qualifier is the entry file's
 /// stem, which the user never wrote at the declaration. Toy identifiers contain no '.', so
-/// the last '.' is the module separator.
+/// the last '.' before the first '$' is the module separator; a mangled suffix after '$'
+/// can spell a qualified type (`next$iter.Iterator$int`).
 pub fn bareName(name: []const u8) []const u8 {
-    return if (std.mem.lastIndexOfScalar(u8, name, '.')) |dot| name[dot + 1 ..] else name;
+    const head = name[0 .. std.mem.indexOfScalar(u8, name, '$') orelse name.len];
+    return if (std.mem.lastIndexOfScalar(u8, head, '.')) |dot| name[dot + 1 ..] else name;
 }
 
 /// Render a type as the compiler names it elsewhere. `layouts`/`enum_layouts` supply the
@@ -237,4 +239,12 @@ test "renders a fn-pair struct as fn(A) -> R and inside Vec[..]" {
         try testing.expectEqualStrings(c.want, buf.items);
     }
     try testing.expect(!isRenderable(Type.func(0)));
+}
+
+test "bareName drops only the module qualifier, not a '.' in a conformance suffix" {
+    try std.testing.expectEqualStrings("add", bareName("main.add"));
+    try std.testing.expectEqualStrings("next$iter.Iterator$int", bareName("main.C.next$iter.Iterator$int"));
+    try std.testing.expectEqualStrings("conv$Conv$a.K", bareName("main.P.conv$Conv$a.K"));
+    try std.testing.expectEqualStrings("Box$s3", bareName("lib.Box$s3"));
+    try std.testing.expectEqualStrings("conv", unmangled(bareName("main.P.conv$Conv$a.K")));
 }
