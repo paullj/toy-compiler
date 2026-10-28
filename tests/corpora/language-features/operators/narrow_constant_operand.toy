@@ -1,0 +1,17 @@
+# Feature: a constant integer operand (a literal, a negated or complemented one, or an
+# operator over such) takes the width of the narrow place or sibling it meets, as a
+# bare literal does: `b += -1` and `b = b + (1 + 2)` with `b: int8` stay `int8`.
+fn main() -> int {
+    b: int8 = 5
+    b += -1
+    b = b + -1
+    b = -1 + b
+    b = b * -(1)
+    b += 1 + 2
+    b = b + (1 + 2)
+    u: uint8 = 3
+    u = u & ~1
+    c: int8 = 1 + 2 + 3
+    return if b == 4 && u == 2 && c == 6 { 42 } else { 0 }
+}
+# expect: exit 42

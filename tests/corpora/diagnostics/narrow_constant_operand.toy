@@ -1,0 +1,14 @@
+# A constant integer operand takes the narrow width it meets, so its value is range-
+# checked at that width once; a typed operand of another width keeps T0044, as does a
+# shift, which does not fold and so could not be range-checked.
+fn main() -> int {
+    b: int8 = 5
+    x: int = 1
+    b += -200  #~ ERROR [T0034] literal out of range for type 'int8'
+    b = b + (100 + 100)  #~ ERROR [T0034] literal out of range for type 'int8'
+    c: int8 = 100 + 100  #~ ERROR [T0034] literal out of range for type 'int8'
+    d: uint8 = 1 - 2  #~ ERROR [T0034] literal out of range for type 'uint8'
+    b = b + x  #~ ERROR [T0044] operands of '+' must have the same type
+    b = b + (1 << 10)  #~ ERROR [T0044] operands of '+' must have the same type
+    return if c == 0 && d == 0 { 1 } else { 0 }
+}
