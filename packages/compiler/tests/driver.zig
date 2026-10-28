@@ -1416,6 +1416,39 @@ test "build -o into a missing directory or onto a directory is one error line, n
     try testing.expectError(error.FileNotFound, Io.Dir.cwd().access(io, dir_name ++ "/nodir", .{}));
 }
 
+test "a missing entry file exits 2 and a missing import exits 1 on build, run and check (#130)" {
+    if (builtin.os.tag != .macos) return error.SkipZigTest;
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.requireToy(io);
+
+    const dir_name = ".toy-test-driver-missing-entry";
+    Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir_name);
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const importer = dir_name ++ "/main.toy";
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = importer, .data = "import nosuch\n\nfn main() -> int {\n    return 3\n}\n" });
+    const absent = dir_name ++ "/nofile.toy";
+
+    const cases = [_]struct { argv: []const []const u8, code: u8 }{
+        .{ .argv = &.{ "build", absent, "-o", dir_name ++ "/a" }, .code = 2 },
+        .{ .argv = &.{ "run", absent, "-o", dir_name ++ "/b" }, .code = 2 },
+        .{ .argv = &.{ "check", absent }, .code = 2 },
+        .{ .argv = &.{ "build", importer, "-o", dir_name ++ "/c" }, .code = 1 },
+        .{ .argv = &.{ "run", importer, "-o", dir_name ++ "/d" }, .code = 1 },
+        .{ .argv = &.{ "check", importer }, .code = 1 },
+    };
+    for (cases) |c| {
+        const r = try spawnToyBoth(gpa, io, c.argv);
+        defer gpa.free(r.out);
+        defer gpa.free(r.err);
+        try testing.expectEqual(std.process.Child.Term{ .exited = c.code }, r.term);
+        try testing.expect(std.mem.indexOf(u8, r.out, "error[R000") != null);
+    }
+}
+
 /// Spawn `toy` with `args` over a one-file fixture (the `return nope` R0001 program),
 /// capturing stdout and the exit code. Returns the captured bytes (the caller frees) and
 /// the term. Stderr (usage errors) is dropped: inherited, it reaches the build runner,
