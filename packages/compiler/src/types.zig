@@ -6112,6 +6112,8 @@ test "an associated fn called on a value, or a method on a type, is T0018 naming
         \\ fn get(self) -> int { self.n }
         \\}
         \\enum E { A }
+        \\struct Box[T] { v: T }
+        \\impl Box[T] { fn render(self) -> int { 1 } }
         \\
     ;
     const cases = [_]struct { stmt: []const u8, code: codes.Code, message: []const u8 }{
@@ -6122,6 +6124,8 @@ test "an associated fn called on a value, or a method on a type, is T0018 naming
         .{ .stmt = "_d := H.nope(1)", .code = .T0018, .message = "'H' has no associated function 'nope'" },
         .{ .stmt = "_e := H.make(1, 2)", .code = .T0039, .message = "expected 1 argument(s), got 2; 'make' takes (int)" },
         .{ .stmt = "_f := E.nope()", .code = .T0061, .message = "enum 'E' has no variant 'nope'" },
+        .{ .stmt = "_g := Box.render(Box { v: 7 })", .code = .T0018, .message = "'render' is an instance method, not an associated function; call it on a value" },
+        .{ .stmt = "_h := Box[int].render(Box { v: 7 })", .code = .T0018, .message = "'render' is an instance method, not an associated function; call it on a value" },
     };
     for (cases) |case| {
         const src = try std.mem.concat(gpa, u8, &.{ decls, "fn main() -> int {\n h := H.make(1)\n ", case.stmt, "\n return h.n\n}\n" });

@@ -13,6 +13,7 @@ struct Box[T] { v: T, mk: fn() -> T }
 
 impl Box[T] {
     fn mk(v: T) -> Box[T] { Box[T] { v: v, mk: fn() { v } } }
+    fn render(self) -> int { 1 }
 }
 
 enum E { A }
@@ -29,6 +30,8 @@ fn main() -> int {
     _d := H.nope()  #~ ERROR [T0018] 'H' has no associated function 'nope'
     b := Box[int].mk(4)
     _e := b.mk()  #~ ERROR [T0018] 'mk' is both an associated function of 'Box' and a field of fn type: 'Box[..].mk(..)' calls the function and 'b.mk' reads the field
+    _g := Box.render(b)  #~ ERROR [T0018] 'render' is an instance method, not an associated function; call it on a value
+    _h := Box[int].render(b)  #~ ERROR [T0018] 'render' is an instance method, not an associated function; call it on a value
     _f := E.second()  #~ ERROR [T0061] enum 'E' has no variant 'second'
     f := h.run
     return f(1) + E.first().to_string().len()
