@@ -1,0 +1,33 @@
+# Feature: a function value renders as <fn>, whatever made it and wherever it sits
+# expect: stdout "<fn>\n<fn>\n<fn>\n<fn>\nButton{label: ok, on_click: <fn>}\n[<fn>, <fn>]\n<fn>\n<fn>\nsome(<fn>)\n"
+# expect: exit 0
+import std/io
+import std/vec
+
+struct Button { label: str, on_click: fn() }
+struct Acc { n: int }
+
+impl Acc {
+    fn plus(self, x: int) -> int { self.n + x }
+}
+
+fn inc(x: int) -> int { x + 1 }
+fn hi() {}
+
+fn show[T has Display](x: T) -> str { x.to_string() }
+
+fn main() {
+    io.println(inc)
+    io.println(fn(x: int) -> int { x * 2 })
+    k := 3
+    io.println(fn(x: int) -> int { x + k })
+    acc := Acc { n: 1 }
+    io.println(acc.plus)
+    io.println(Button { label: "ok", on_click: hi })
+    fs: Vec[fn(int) -> int] = [inc, acc.plus]
+    io.println(fs)
+    io.println(show(inc))
+    f := acc.plus
+    io.println(f.to_string())
+    io.println(Option.some(hi))
+}

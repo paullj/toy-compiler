@@ -1137,7 +1137,7 @@ test "push on a captured Vec is not a mutation" {
     }.check);
 }
 
-test "fn values in std containers and sinks: Map key and Display are T0023; fs[i](x) calls the element" {
+test "fn values in std containers and sinks: a Map key is T0023, Display renders; fs[i](x) calls the element" {
     try withCheckedGraph(".toy-test-fn-std", &.{
         .{ .path = "main.toy", .source =
         \\import std/vec
@@ -1167,7 +1167,7 @@ test "fn values in std containers and sinks: Map key and Display are T0023; fs[i
                 if (std.mem.indexOf(u8, d.message, "'Display'") != null) display += 1;
             }
             try testing.expect(hashable >= 1);
-            try testing.expectEqual(@as(usize, 1), display);
+            try testing.expectEqual(@as(usize, 0), display);
             const m = &g.modules[g.entry_index];
             var calls: usize = 0;
             for (m.nodes, 0..) |n, k| {

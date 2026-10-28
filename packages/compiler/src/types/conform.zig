@@ -33,7 +33,17 @@ const eqlTypeVec = Typecheck.eqlTypeVec;
 /// receiver misses here: a generic `impl Box[T] has P` is a template row, which
 /// `generic` matches.
 pub fn existence(model: *const Model, pid: u32, recv: Type, protocol_args: []const Type) bool {
+    if (protocol_args.len == 0 and fnDisplays(model.structs, .of(model), recv, pid)) return true;
     return existsIn(model.conformances, pid, recv, protocol_args);
+}
+
+/// Whether `recv` is a function type (or the pair it reifies to) asked for Display. A
+/// function value renders as `<fn>` without a witness, since no impl can be written for a
+/// function type. Display is its only protocol: identity is all it has to compare or hash.
+fn fnDisplays(structs: []const StructSym, gen: Generic, recv: Type, pid: u32) bool {
+    const pre = gen.prelude orelse return false;
+    if (pre.protocols.display != pid) return false;
+    return recv.isFunc() or LayoutEngine.isFnStruct(recv, structs);
 }
 
 pub fn existsIn(conformances: []const Conformance, pid: u32, recv: Type, protocol_args: []const Type) bool {
@@ -425,6 +435,7 @@ fn conformsRec(
             // for top-level scalar operators (they resolve via `existence` before ever
             // reaching `structural`), but the correct recursive answer for a future struct/enum
             // field of a width type deriving Eq/Ord.
+            if (fnDisplays(structs, gen, recv, pid)) return .{ .ok = true, .low = no_assumption };
             for (conformances) |c| {
                 if (c.protocol == pid and Type.eql(c.recv, recv) and c.protocol_args.len == 0) return .{ .ok = true, .low = no_assumption };
                 if (intMatchesPlatformRow(recv, c.recv) and c.protocol == pid and c.protocol_args.len == 0) return .{ .ok = true, .low = no_assumption };
@@ -446,9 +457,10 @@ fn conformsRec(
             ok = true;
             break :find;
         };
-        // A function value conforms to nothing (no Eq/Hash/Display/Ord), so neither does an
-        // aggregate holding one.
-        if (LayoutEngine.isFnStruct(recv, structs)) break :find;
+        if (LayoutEngine.isFnStruct(recv, structs)) {
+            ok = fnDisplays(structs, gen, recv, pid);
+            break :find;
+        }
         if (neverDerives(structs, composite, gen, recv, pid)) break :find;
         if (recv.kind == .@"struct") {
             if (recv.struct_id < structs.len) {
@@ -572,7 +584,7 @@ fn isManagedBox(structs: []const StructSym, composite: *Composite, recv: Type, r
 /// its cell pointer, so a derive would print an address: a nondeterministic render that
 /// leaks the private `gc_array` storage of every collection. Eq and Hash keep their own
 /// rules (identity `==`, the `containsManaged` key guard). Needs `gen.prelude` to name
-/// Display; the derive synthesis, which passes none, skips boxes itself.
+/// Display.
 fn neverDerives(structs: []const StructSym, composite: *Composite, gen: Generic, recv: Type, pid: u32) bool {
     const pre = gen.prelude orelse return false;
     if (pre.protocols.display != pid) return false;
@@ -1077,4 +1089,29 @@ test "a Ref field blocks the Display derive but not Eq" {
     var memo2: std.AutoHashMapUnmanaged(u64, bool) = .empty;
     defer memo2.deinit(gpa);
     try testing.expect(try structural(&structs, &.{}, &with_impl, gen, Type.structT(1), disp_pid, &memo2, gpa, &co, &.{}));
+}
+
+test "a function value conforms to Display, and to no other protocol" {
+    const gpa = testing.allocator;
+    const eq_pid: u32 = 0;
+    const disp_pid: u32 = 1;
+    const pair_ft = [_]Type{ Type.int, Type.int };
+    const pair_fn = [_][]const u8{ "code", "env" };
+    const b_ft = [_]Type{ Type.int, Type.structT(0) };
+    const b_fn = [_][]const u8{ "n", "f" };
+    const structs = [_]StructSym{
+        .{ .decl_node = Ast.none, .name = "fn()", .field_types = @constCast(&pair_ft), .field_names = @constCast(&pair_fn), .fn_sig = .{ .params = &.{}, .ret = Type.unit } },
+        .{ .decl_node = Ast.none, .name = "B", .field_types = @constCast(&b_ft), .field_names = @constCast(&b_fn) },
+    };
+    const confs = [_]Conformance{ .{ .protocol = eq_pid, .recv = Type.int }, .{ .protocol = disp_pid, .recv = Type.int } };
+    const gen: Generic = .{ .prelude = .{ .protocols = .{ .eq = eq_pid, .display = disp_pid } } };
+
+    var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer memo.deinit(gpa);
+    var co: Composite = .{};
+    defer co.deinit(gpa);
+    try testing.expect(try structural(&structs, &.{}, &confs, gen, Type.structT(0), disp_pid, &memo, gpa, &co, &.{}));
+    try testing.expect(try structural(&structs, &.{}, &confs, gen, Type.structT(1), disp_pid, &memo, gpa, &co, &.{}));
+    try testing.expect(!try structural(&structs, &.{}, &confs, gen, Type.structT(0), eq_pid, &memo, gpa, &co, &.{}));
+    try testing.expect(!try structural(&structs, &.{}, &confs, gen, Type.structT(1), eq_pid, &memo, gpa, &co, &.{}));
 }

@@ -38,7 +38,14 @@ impl Cell[T] has Conv[T] {
 
 fn go[T has Conv[int]](t: T) -> int { t.conv() }
 
-struct NoShow { f: fn(int) -> int }
+# A fn value renders but is not Ord, so a Gate of one has no Display, and no Eq either.
+struct Gate[T] { v: T }
+
+impl Gate[T has Ord] has Display {
+    fn display(self) -> str { "gate" }
+}
+
+struct NoShow { g: Gate[fn(int) -> int] }
 
 struct Pt { x: int }
 
@@ -46,14 +53,14 @@ fn inc(x: int) -> int { x + 1 }
 
 fn main() -> int {
     io.println(Pair { k: 1, v: true })
-    io.println(Pair { k: 1, v: NoShow { f: inc } })  #~ ERROR [T0023] type 'Pair' does not conform to protocol 'Display'; its generic impl needs type argument 'NoShow' to conform to 'Display'
-    io.println(Pair { k: NoShow { f: inc }, v: 1 })  #~ ERROR [T0023] its generic impl needs type argument 'NoShow' to conform to 'Display'
+    io.println(Pair { k: 1, v: NoShow { g: Gate { v: inc } } })  #~ ERROR [T0023] type 'Pair' does not conform to protocol 'Display'; its generic impl needs type argument 'NoShow' to conform to 'Display'
+    io.println(Pair { k: NoShow { g: Gate { v: inc } }, v: 1 })  #~ ERROR [T0023] its generic impl needs type argument 'NoShow' to conform to 'Display'
     io.println(Box { v: Pt { x: 1 } })
-    io.println(Box { v: NoShow { f: inc } })  #~ ERROR [T0023] type 'Box' does not conform to protocol 'Display'; its generic impl needs type argument 'NoShow' to conform to 'Eq'
-    b := Box { v: NoShow { f: inc } }
+    io.println(Box { v: NoShow { g: Gate { v: inc } } })  #~ ERROR [T0023] type 'Box' does not conform to protocol 'Display'; its generic impl needs type argument 'NoShow' to conform to 'Eq'
+    b := Box { v: NoShow { g: Gate { v: inc } } }
     io.println(b == b)  #~ ERROR [T0026] '==' requires an 'Eq' impl for type 'Box'; its generic impl needs type argument 'NoShow' to conform to 'Display'
     io.println(b < b)  #~ ERROR [T0027] '<' requires an 'Ord' impl for type 'Box'; its generic impl needs type argument 'NoShow' to conform to 'Display'
-    c := Cell { v: NoShow { f: inc } }
+    c := Cell { v: NoShow { g: Gate { v: inc } } }
     s := c.to_string()  #~ ERROR [T0018] no method 'to_string' on type 'Cell'; its generic impl of 'Display' needs type argument 'NoShow' to conform to 'Eq'
     return go(Cell { v: true }) + s.len()  #~ ERROR [T0023] type 'Cell' does not conform to protocol 'Conv[int]'; its generic impl gives 'Conv[bool]'
 }
