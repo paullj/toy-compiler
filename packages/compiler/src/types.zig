@@ -7766,7 +7766,7 @@ test "every T0025 hint compiles when it is followed literally" {
             .bounded = false,
         },
         .{
-            .decls = "struct Box[T] { v: T }\nimpl Box[T] has Into[T] { fn into(self) -> T { self.v } }\nimpl Box[T] has Into[bool] { fn into(self) -> bool { true } }\n",
+            .decls = "struct Box[T] { v: T }\nimpl Box[T] has Into[T] { fn into(self) -> T { self.v } }\nimpl Box[T] has Into[Option[T]] { fn into(self) -> Option[T] { .some(self.v) } }\n",
             .p = "Box { v: Box { v: 1 } }",
             .call = "p.into()",
             .explicit = 2,
@@ -7875,14 +7875,14 @@ test "every T0025 hint at a method value compiles when it is followed literally"
 
 test "an unbounded template's per-instance T0025 and T0016 hints read as the template does" {
     const gpa = testing.allocator;
-    const box = "struct Box[T] { v: T }\nimpl Box[T] has Into[T] { fn into(self) -> T { self.v } }\nimpl Box[T] has Into[bool] { fn into(self) -> bool { true } }\n";
+    const box = "struct Box[T] { v: T }\nimpl Box[T] has Into[T] { fn into(self) -> T { self.v } }\nimpl Box[T] has Into[Option[T]] { fn into(self) -> Option[T] { .some(self.v) } }\n";
     const pick = "fn pick[A, B](a: A) -> A { a }\n";
     const Case = struct { src: []const u8, code: codes.Code, hint: []const u8, fixed: []const u8 };
     const cases = [_]Case{
         .{
             .src = box ++ "fn h[T](b: Box[T]) -> int {\n _x := b.into()\n 0\n}\nfn main() -> int { return h(Box { v: 1 }) + h(Box { v: \"s\" }) }\n",
             .code = .T0025,
-            .hint = "(Into[T] and Into[bool]); add explicit protocol type arguments, e.g. .into[T]() or .into[bool]()",
+            .hint = "(Into[T] and Into[Option[T]]); add explicit protocol type arguments, e.g. .into[T]() or .into[Option[T]]()",
             .fixed = box ++ "fn h[T](b: Box[T]) -> int {\n _x := b.into[T]()\n 0\n}\nfn main() -> int { return h(Box { v: 1 }) + h(Box { v: \"s\" }) }\n",
         },
         .{

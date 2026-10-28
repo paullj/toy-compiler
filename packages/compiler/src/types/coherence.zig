@@ -12,6 +12,7 @@ const Conformance = Typecheck.Conformance;
 const FnSym = Typecheck.FnSym;
 const GraphModuleInput = Typecheck.GraphModuleInput;
 const Span = @import("../diagnostics/model.zig").Span;
+const Infer = @import("../symbols/Infer.zig");
 
 const testing = std.testing;
 
@@ -100,7 +101,7 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
             // `receiverTypeFromNode` returns null for a `type_app`, so the concrete path
             // below never handles this shape.
             if (t.tree.nodes[decl.lhs.int()].tag == .type_app) {
-                try recordGenericConformance(t, &seen, &keybuf, mod, decl, proto_ref, pid, prot, provided);
+                try recordGenericConformance(t, mod, decl, proto_ref, pid, prot, provided);
                 continue;
             }
 
@@ -224,12 +225,10 @@ pub fn checkCoherence(t: *Typecheck, mods: []const GraphModuleInput) !void {
 /// and validate its method signatures
 /// (T0024) monomorphized per the receiver's own type-params. The impl's methods live in
 /// `t.templates`, so there is no `t.methods` witness to stamp (the `for x in xs` desugar
-/// dispatches structurally on the reified receiver). Duplicate detection keys on the
+/// dispatches structurally on the reified receiver). Overlap detection compares the
 /// receiver CTOR int (the App index is interning-order dependent — would break `-jN`).
 fn recordGenericConformance(
     t: *Typecheck,
-    seen: *std.StringHashMapUnmanaged(?ImplAt),
-    keybuf: *std.ArrayList(u8),
     mod: u32,
     decl: Ast.Node,
     proto_ref: Ast.Index,
@@ -322,21 +321,17 @@ fn recordGenericConformance(
         try checkReceiverMode(t, prot, j, method_node);
     }
 
-    // Duplicate detection: a 'G'-tagged key so it never aliases a concrete
-    // `writeCoherenceKey`; keyed on the receiver CTOR (deterministic at any `-jN`).
-    keybuf.clearRetainingCapacity();
-    try keybuf.append(t.gpa, 'G');
-    try appendKeyU32(t.gpa, keybuf, pid);
-    try appendKeyU32(t.gpa, keybuf, e.ctor);
-    try keybuf.append(t.gpa, @intFromBool(e.ctor_is_enum));
-    for (pargs) |a| try appendKeyType(t.gpa, keybuf, a);
-    const gop = try seen.getOrPut(t.gpa, keybuf.items);
-    if (gop.found_existing) {
-        try t.sink.report(.{ .span = implHeaderSpan(t, decl, proto_ref), .code = .T0020 }, "overlapping impl of protocol '{s}' for type '{s}'", .{ prot.name, t.nameText(decl.main_token) });
+    // Every impl pattern is the receiver's own params in order, so `type_var(k)` names
+    // the same receiver arg in both impls and one substitution grounds both patterns.
+    // Two raw patterns that differ (`Conv[T]`, `Conv[int]`) can still both apply at one
+    // instance (`Box[int]`), where no call could choose between them.
+    const n_vars = Typecheck.implParamCount(t.composite, impl_fn0);
+    for (t.template_conformances.items) |tc| {
+        if (tc.protocol_id != pid or tc.recv_ctor != e.ctor or tc.recv_is_enum != e.ctor_is_enum) continue;
+        if (!try patternsOverlap(t.gpa, @max(n_vars, tc.n_params), tc.protocol_args, pargs, t.composite.decomposer())) continue;
+        try t.sink.report(.{ .span = implHeaderSpan(t, decl, proto_ref), .code = .T0020 }, "overlapping impl of protocol '{s}' for type '{s}': an earlier impl's protocol arguments can equal these at one instance", .{ prot.name, t.nameText(decl.main_token) });
         return;
     }
-    gop.key_ptr.* = try t.gpa.dupe(u8, keybuf.items);
-    gop.value_ptr.* = null;
     const owned_pargs = try t.gpa.dupe(Type, pargs);
     t.template_conformances.append(t.gpa, .{
         .protocol_id = pid,
@@ -344,7 +339,7 @@ fn recordGenericConformance(
         .recv_is_enum = e.ctor_is_enum,
         .protocol_args = owned_pargs,
         .recv = recv_app,
-        .n_params = Typecheck.implParamCount(t.composite, impl_fn0),
+        .n_params = n_vars,
         .bounds = impl_fn0.generic_bounds,
         .bound_args = impl_fn0.generic_bound_args,
     }) catch |err| {
@@ -364,6 +359,56 @@ fn recordGenericConformance(
             break;
         }
     }
+}
+
+/// Whether one substitution of the receiver's `n_vars` params makes the protocol-arg
+/// patterns `a` and `b` equal: two-sided unification over one shared variable space.
+/// An `invalid` arg was already reported, so it overlaps nothing.
+fn patternsOverlap(gpa: std.mem.Allocator, n_vars: u32, a: []const Type, b: []const Type, dec: Infer.Decomposer) !bool {
+    if (a.len != b.len) return false;
+    const sub = try gpa.alloc(?Type, n_vars);
+    defer gpa.free(sub);
+    @memset(sub, null);
+    for (a, b) |x, y| if (!unifyPattern(sub, x, y, dec)) return false;
+    return true;
+}
+
+fn resolvePattern(sub: []const ?Type, ty: Type) Type {
+    var cur = ty;
+    while (cur.isTypeVar() and cur.typeVarOrd() < sub.len) {
+        cur = sub[cur.typeVarOrd()] orelse break;
+    }
+    return cur;
+}
+
+fn unifyPattern(sub: []?Type, x0: Type, y0: Type, dec: Infer.Decomposer) bool {
+    const x = resolvePattern(sub, x0);
+    const y = resolvePattern(sub, y0);
+    if (x.kind == .invalid or y.kind == .invalid) return false;
+    if (x.isTypeVar() and y.isTypeVar() and x.typeVarOrd() == y.typeVarOrd()) return true;
+    if (x.isTypeVar()) return bindPattern(sub, x.typeVarOrd(), y, dec);
+    if (y.isTypeVar()) return bindPattern(sub, y.typeVarOrd(), x, dec);
+    const xe = dec.func(dec.ctx, x) orelse return Type.eql(x, y);
+    const ye = dec.func(dec.ctx, y) orelse return false;
+    if (xe.is_fn != ye.is_fn or xe.ctor != ye.ctor or xe.is_enum != ye.is_enum or xe.args.len != ye.args.len) return false;
+    for (xe.args, ye.args) |xa, ya| if (!unifyPattern(sub, xa, ya, dec)) return false;
+    return true;
+}
+
+fn bindPattern(sub: []?Type, ord: u32, ty: Type, dec: Infer.Decomposer) bool {
+    if (ord >= sub.len) return false;
+    // A var bound to a type that contains it has only infinite solutions.
+    if (occursIn(sub, ord, ty, dec)) return false;
+    sub[ord] = ty;
+    return true;
+}
+
+fn occursIn(sub: []const ?Type, ord: u32, ty0: Type, dec: Infer.Decomposer) bool {
+    const ty = resolvePattern(sub, ty0);
+    if (ty.isTypeVar()) return ty.typeVarOrd() == ord;
+    const e = dec.func(dec.ctx, ty) orelse return false;
+    for (e.args) |arg| if (occursIn(sub, ord, arg, dec)) return true;
+    return false;
 }
 
 /// T0076: the conformance method at `fn_idx` must take its receiver the way protocol
@@ -621,4 +666,24 @@ test "a conformance method's receiver mode must be its protocol's (T0076)" {
         .{ .src = "protocol Step { fn step(mut self) -> int }\nstruct B[T] { x: int }\nimpl B[T] has Step { fn step(mut self) -> int { self.x } }\n", .t0076 = 0 },
         .{ .src = "protocol Step { fn step(self) -> int }\nstruct B[T] { x: int }\nimpl B[T] has Step { fn step(mut self) -> int { self.x } }\n", .t0076 = 1 },
     }) |c| try Typecheck.expectCodeCount(c.src, .T0076, c.t0076);
+}
+
+test "generic conformances whose protocol args meet at one instance overlap (T0020)" {
+    const Case = struct { src: []const u8, t0020: usize };
+    const conv = "protocol Conv[X] { fn conv(self) -> X }\n";
+    const conv2 = "protocol Conv2[X, Y] { fn conv2(self) -> int }\n";
+    for ([_]Case{
+        .{ .src = conv ++ "struct Box[T] { v: T }\nimpl Box[T] has Conv[T] { fn conv(self) -> T { self.v } }\nimpl Box[T] has Conv[int] { fn conv(self) -> int { 99 } }\n", .t0020 = 1 },
+        .{ .src = conv ++ "struct Box[T] { v: T }\nimpl Box[T] has Conv[int] { fn conv(self) -> int { 99 } }\nimpl Box[T] has Conv[T] { fn conv(self) -> T { self.v } }\n", .t0020 = 1 },
+        .{ .src = conv ++ "struct Box[T] { v: T }\nimpl Box[T] has Conv[int] { fn conv(self) -> int { 99 } }\nimpl Box[T] has Conv[bool] { fn conv(self) -> bool { true } }\n", .t0020 = 0 },
+        .{ .src = conv ++ "struct Pair[A, B] { a: A, b: B }\nimpl Pair[A, B] has Conv[A] { fn conv(self) -> A { self.a } }\nimpl Pair[A, B] has Conv[B] { fn conv(self) -> B { self.b } }\n", .t0020 = 1 },
+        .{ .src = conv2 ++ "struct Pair[A, B] { a: A, b: B }\nimpl Pair[A, B] has Conv2[A, int] { fn conv2(self) -> int { 1 } }\nimpl Pair[A, B] has Conv2[bool, B] { fn conv2(self) -> int { 2 } }\n", .t0020 = 1 },
+        .{ .src = conv2 ++ "struct Pair[A, B] { a: A, b: B }\nimpl Pair[A, B] has Conv2[A, int] { fn conv2(self) -> int { 1 } }\nimpl Pair[A, B] has Conv2[A, bool] { fn conv2(self) -> int { 2 } }\n", .t0020 = 0 },
+        .{ .src = conv2 ++ "struct Box[T] { v: T }\nimpl Box[T] has Conv2[Option[T], T] { fn conv2(self) -> int { 1 } }\nimpl Box[T] has Conv2[Option[int], int] { fn conv2(self) -> int { 2 } }\n", .t0020 = 1 },
+        // `T` binds to `bool` inside `Option`, so the second arg asks `int` == `bool`.
+        .{ .src = conv2 ++ "struct Box[T] { v: T }\nimpl Box[T] has Conv2[Option[T], int] { fn conv2(self) -> int { 1 } }\nimpl Box[T] has Conv2[Option[bool], T] { fn conv2(self) -> int { 2 } }\n", .t0020 = 0 },
+        .{ .src = conv ++ "struct Box[T] { v: T }\nimpl Box[T] has Conv[Option[T]] { fn conv(self) -> Option[T] { .some(self.v) } }\nimpl Box[T] has Conv[Result[T, int]] { fn conv(self) -> Result[T, int] { .ok(self.v) } }\n", .t0020 = 0 },
+        // `T` against `Option[T]` would need an infinite type, so no instance has both.
+        .{ .src = conv ++ "struct Box[T] { v: T }\nimpl Box[T] has Conv[T] { fn conv(self) -> T { self.v } }\nimpl Box[T] has Conv[Option[T]] { fn conv(self) -> Option[T] { .some(self.v) } }\n", .t0020 = 0 },
+    }) |c| try Typecheck.expectCodeCount(c.src, .T0020, c.t0020);
 }
