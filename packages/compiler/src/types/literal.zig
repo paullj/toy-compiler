@@ -70,10 +70,11 @@ pub fn floatValue(raw: []const u8) ?f64 {
 /// Per-width range verdict for a numeric-literal token against integer type `t`. A
 /// literal wider than u64 never fits any width. `negated and t.isSigned()` grants the
 /// +1 signed-min allowance (`-128: int8`, `-9223372036854775808: int`), whose magnitude
-/// is one past the positive max.
+/// is one past the positive max; negated into an unsigned width only zero fits.
 pub fn fitsWidth(raw: []const u8, t: Type, negated: bool) bool {
     const v = magnitude(raw) orelse return false;
-    const max = maxMagnitude(t) + @intFromBool(negated and t.isSigned());
+    if (negated and !t.isSigned()) return v == 0;
+    const max = maxMagnitude(t) + @intFromBool(negated);
     return v <= max;
 }
 
@@ -296,6 +297,11 @@ test "fitsWidth: per-width range verdict, base-aware, with the negated signed-mi
     try testing.expect(!fitsWidth("129", Type.int8, true));
     // The negated allowance only applies to signed types.
     try testing.expect(!fitsWidth("256", Type.uint8, true));
+    // Negated into an unsigned width, only zero fits: `-1` is not a `uint8`.
+    try testing.expect(!fitsWidth("1", Type.uint8, true));
+    try testing.expect(!fitsWidth("1", Type.uint64, true));
+    try testing.expect(fitsWidth("0", Type.uint8, true));
+    try testing.expect(fitsWidth("0x0", Type.uint, true));
     // Upper boundary of the unsigned widths — the [2^63, 2^64) band where the
     // signed/unsigned max split and the u128-vs-u64 decode actually differ.
     try testing.expect(fitsWidth("9223372036854775808", Type.uint64, false));

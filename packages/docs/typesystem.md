@@ -54,6 +54,15 @@ protocol or a type parameter named where a value is wanted (`x := Color`,
 `id(Color)`, `Color |> id`, `lib.Shape`) is **T0056**, and the hint for an enum names
 one of its variants (`Color.red`).
 
+## Integer widths: literals fit, operators wrap
+
+An integer literal takes the width it is expected to have and must fit it (**T0034**).
+A negated literal is checked as the negative value it denotes: `-128` fits an `int8`,
+and `-1` fits no unsigned width (`v: uint8 = -1`, `id(-1)` with `fn id(x: uint8)` and
+`v: uint = -1` are T0034); only `-0` does. Operators on values never check at run time:
+they wrap at the operand width, so two `int8` 100s add to -56, and unary `-` on an
+unsigned value is `0 - u` (`u: uint8 = 1` then `-u` is 255).
+
 ## Bidirectional checking: synth / check
 
 Checking is two cooperating modes over a known, concrete world:

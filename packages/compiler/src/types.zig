@@ -12844,6 +12844,14 @@ fn expectSoleDiagAt(src: []const u8, code: codes.Code, message: []const u8, at: 
     try testing.expectEqualStrings(at, src[sp.start..sp.end]);
 }
 
+test "a negative literal into an unsigned width is one T0034 at the whole literal" {
+    try expectSoleDiagAt("fn main() -> int {\n v: uint8 = -1\n return if v == 255 { 7 } else { 0 }\n}\n", .T0034, "literal out of range for type 'uint8'", "-1");
+    try expectSoleDiagAt("fn id(x: uint8) -> uint8 { x }\nfn main() -> int {\n v := id(-1)\n return if v == 255 { 7 } else { 0 }\n}\n", .T0034, "literal out of range for type 'uint8'", "-1");
+    try expectSoleDiagAt("fn main() -> int {\n _v: uint = -1\n return 0\n}\n", .T0034, "literal out of range for type 'uint'", "-1");
+    try expectSoleDiagAt("fn main() -> int {\n _v: uint8 = -300\n return 0\n}\n", .T0034, "literal out of range for type 'uint8'", "-300");
+    try expectChecksClean("fn main() -> int {\n _a: uint8 = -0\n _b: int8 = -128\n _c: uint = -0x0\n return 0\n}\n");
+}
+
 test "a body ending in a value of the wrong type is T0042 at that value, not a missing return" {
     // A lambda held to an expected type it does not declare names the type it really has.
     try expectSoleDiagAt(
