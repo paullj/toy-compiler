@@ -1,0 +1,8 @@
+# A list whose element failed to check reports that error alone, not a cascade about
+# rendering the poisoned Vec.
+import std/io
+import std/vec
+
+fn main() {
+    io.println([1.0 / 0.0])  #~ ERROR [T0028] '/' requires an 'Div' impl for type 'float'
+}

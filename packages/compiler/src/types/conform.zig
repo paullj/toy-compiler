@@ -382,7 +382,9 @@ fn conformsRec(
                     break :blk true;
                 },
             };
-            if (covered) {} else if (e.ctor_is_enum) {
+            if (covered) {} else if (neverDerives(structs, composite, gen, recv, pid)) {
+                aok = false;
+            } else if (e.ctor_is_enum) {
                 if (e.ctor < enums.len) {
                     outer: for (enums[e.ctor].variants) |v| {
                         for (v.field_types) |ft| {
@@ -447,6 +449,7 @@ fn conformsRec(
         // A function value conforms to nothing (no Eq/Hash/Display/Ord), so neither does an
         // aggregate holding one.
         if (LayoutEngine.isFnStruct(recv, structs)) break :find;
+        if (neverDerives(structs, composite, gen, recv, pid)) break :find;
         if (recv.kind == .@"struct") {
             if (recv.struct_id < structs.len) {
                 ok = true;
@@ -561,6 +564,43 @@ fn isManagedBox(structs: []const StructSym, composite: *Composite, recv: Type, r
         if (e.ctor_is_enum) return false;
         if (ref_ctor) |rc| if (e.ctor == rc) return true;
         if (gc_array_ctor) |gc| if (e.ctor == gc) return true;
+    }
+    return false;
+}
+
+/// Whether `recv` is a managed box asked for a derived `Display`. A box's only field is
+/// its cell pointer, so a derive would print an address: a nondeterministic render that
+/// leaks the private `gc_array` storage of every collection. Eq and Hash keep their own
+/// rules (identity `==`, the `containsManaged` key guard). Needs `gen.prelude` to name
+/// Display; the derive synthesis, which passes none, skips boxes itself.
+fn neverDerives(structs: []const StructSym, composite: *Composite, gen: Generic, recv: Type, pid: u32) bool {
+    const pre = gen.prelude orelse return false;
+    if (pre.protocols.display != pid) return false;
+    return isManagedBox(structs, composite, recv, pre.ref_struct, pre.gc_array_struct);
+}
+
+/// Whether a managed box is what keeps `recv` from deriving Display: `recv` is a box, or
+/// a field (or variant payload) that fails Display is, down the by-value chain. Lets the
+/// T0023 hint stop telling the user to make a collection's private `gc_array` conform.
+pub fn boxBlocksDisplay(structs: []const StructSym, enums: []const EnumSym, conformances: []const Conformance, gen: Generic, composite: *Composite, recv: Type, pid: u32, memo: *std.AutoHashMapUnmanaged(u64, bool), gpa: std.mem.Allocator) error{OutOfMemory}!bool {
+    if (neverDerives(structs, composite, gen, recv, pid)) return true;
+    var comps: std.ArrayList(Type) = .empty;
+    defer comps.deinit(gpa);
+    switch (recv.kind) {
+        .@"struct" => if (recv.struct_id < structs.len) try comps.appendSlice(gpa, structs[recv.struct_id].field_types),
+        .@"enum" => if (recv.enum_id < enums.len) for (enums[recv.enum_id].variants) |v| try comps.appendSlice(gpa, v.field_types),
+        .app => {
+            const e = composite.at(recv.appIdx());
+            if (e.ctor_is_enum) {
+                if (e.ctor < enums.len) for (enums[e.ctor].variants) |v| for (v.field_types) |ft| try comps.append(gpa, try substPattern(composite, gpa, ft, e.args));
+            } else if (e.ctor < structs.len) for (structs[e.ctor].field_types) |ft| try comps.append(gpa, try substPattern(composite, gpa, ft, e.args));
+        },
+        else => return false,
+    }
+    // Terminates: a box is a leaf (answered above) and by-value cycles are a compile error.
+    for (comps.items) |ft| {
+        if (try structural(structs, enums, conformances, gen, ft, pid, memo, gpa, composite, &.{})) continue;
+        if (try boxBlocksDisplay(structs, enums, conformances, gen, composite, ft, pid, memo, gpa)) return true;
     }
     return false;
 }
@@ -993,4 +1033,35 @@ test "generic: a template row meets, fails or misses by its impl-param bounds an
     try testing.expect(ax == .met);
     ax.met.deinit(gpa);
     try testing.expect((try generic(tb, &memo, box_t, show, &.{})) == .unmet);
+}
+
+test "a Ref field blocks the Display derive but not Eq" {
+    const gpa = testing.allocator;
+    const eq_pid: u32 = 0;
+    const disp_pid: u32 = 1;
+    const box_ft = [_]Type{Type.int};
+    const box_fn = [_][]const u8{"0"};
+    const h_ft = [_]Type{Type.structT(0)};
+    const h_fn = [_][]const u8{"r"};
+    const structs = [_]StructSym{
+        .{ .decl_node = Ast.none, .name = "Ref", .field_types = @constCast(&box_ft), .field_names = @constCast(&box_fn), .native_family = .ref },
+        .{ .decl_node = Ast.none, .name = "H", .field_types = @constCast(&h_ft), .field_names = @constCast(&h_fn) },
+    };
+    const confs = [_]Conformance{ .{ .protocol = eq_pid, .recv = Type.int }, .{ .protocol = disp_pid, .recv = Type.int } };
+    const gen: Generic = .{ .prelude = .{ .protocols = .{ .eq = eq_pid, .display = disp_pid } } };
+
+    var memo: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer memo.deinit(gpa);
+    var co: Composite = .{};
+    defer co.deinit(gpa);
+    try testing.expect(try structural(&structs, &.{}, &confs, gen, Type.structT(1), eq_pid, &memo, gpa, &co, &.{}));
+    try testing.expect(!try structural(&structs, &.{}, &confs, gen, Type.structT(1), disp_pid, &memo, gpa, &co, &.{}));
+    try testing.expect(!try structural(&structs, &.{}, &confs, gen, Type.structT(0), disp_pid, &memo, gpa, &co, &.{}));
+    try testing.expect(try boxBlocksDisplay(&structs, &.{}, &confs, gen, &co, Type.structT(1), disp_pid, &memo, gpa));
+
+    // An explicit impl on the box wins, as it will for std's `impl Ref[T has Display]`.
+    const with_impl = confs ++ [_]Conformance{.{ .protocol = disp_pid, .recv = Type.structT(0) }};
+    var memo2: std.AutoHashMapUnmanaged(u64, bool) = .empty;
+    defer memo2.deinit(gpa);
+    try testing.expect(try structural(&structs, &.{}, &with_impl, gen, Type.structT(1), disp_pid, &memo2, gpa, &co, &.{}));
 }

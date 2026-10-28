@@ -1372,6 +1372,14 @@ fn isAggregate(t: Type) bool {
     return t.kind == .@"struct" or t.kind == .@"enum" or t.isApp();
 }
 
+/// Whether `ty` is or holds the poison type `.invalid`.
+fn holdsPoison(composite: *Composite, ty: Type) bool {
+    if (ty.kind == .invalid) return true;
+    if (!ty.isApp() and !ty.isFunc()) return false;
+    for (composite.at(ty.struct_id).args) |a| if (holdsPoison(composite, a)) return true;
+    return false;
+}
+
 /// The std module whose `impl` makes the scalar named `tname` conform to protocol `pid`, or
 /// null. Only a prelude protocol qualifies: a program's own protocol may reuse a prelude
 /// name, and no std import satisfies it.
@@ -3594,6 +3602,8 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
             try conform.structural(model.structs, model.enums, model.conformances, .of(model), args[ord], pid, &cmemo, t.gpa, t.composite, &.{}))
             continue;
         if (rejectedConformance(model.rejected_impls, t.composite, args[ord], pid)) return;
+        // A poisoned arg was reported where it failed; its conformance is no new error.
+        if (holdsPoison(t.composite, args[ord])) return;
         _ = t.gphSelect(mod);
         const tname = t.typeName(args[ord]);
         const pname = model.protocols[pid].name;
@@ -3617,6 +3627,8 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
             try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "function type '{s}' does not conform to protocol '{s}'; function values support only '==' (identity)", .{ tname, pname });
         } else if (scalarImplModule(model, tname, pid)) |m| {
             try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; its impl is in std/{s}: " ++ StdNames.add_import, .{ tname, pname, m, m });
+        } else if (try conform.boxBlocksDisplay(model.structs, model.enums, model.conformances, .of(model), t.composite, args[ord], pid, &cmemo, t.gpa)) {
+            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; it is or holds a managed box (a 'Ref' or a collection), which never derives '{s}': add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, pname, tname, pname });
         } else if (isDerivableProtocol(model, pid) and isAggregate(args[ord])) {
             try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; make every field of '{s}' conform to '{s}' (it then derives automatically), or add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname, tname, pname });
         } else {
