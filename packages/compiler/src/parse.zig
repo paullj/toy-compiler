@@ -628,7 +628,7 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
             const recv_ref = if (self_type_ref != Ast.none) self_type_ref else try p.addNode(.{ .tag = .identifier, .main_token = recv_tok, .lhs = Ast.none, .rhs = Ast.none });
             const self_param = try p.addNode(.{ .tag = .param, .main_token = self_tok, .lhs = recv_ref, .rhs = Ast.none });
             try params.append(p.gpa, self_param);
-            _ = p.eat(.comma); // separator before the next param, if any
+            _ = try p.listSep(.r_paren, param_recovery, "expected ',' or ')' after a parameter");
         } else if (!has_mut and !self_optional) {
             // `has_mut`: a protocol sig's `fn q(mut a: int)` gets only the param loop's
             // "'mut' may only qualify the 'self' receiver" P0006, not this one as well.
@@ -651,9 +651,7 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
             const type_node = try p.parseType();
             const param = try p.addNode(.{ .tag = .param, .main_token = param_name, .lhs = type_node, .rhs = Ast.none });
             try params.append(p.gpa, param);
-            if (!p.eat(.comma)) {
-                if (p.at(.r_paren)) break;
-            }
+            if (try p.listSep(.r_paren, param_recovery, "expected ',' or ')' after a parameter")) break;
         } else if (param_recovery.contains(p.peek().tag)) {
             break;
         } else {
@@ -878,9 +876,7 @@ fn parseStructDecl(p: *Parser) Error!Ast.Index {
             const t_entry = p.index;
             if (p.startsType()) {
                 try types.append(p.gpa, try p.parseType());
-                if (!p.eat(.comma)) {
-                    if (p.at(.r_paren)) break;
-                }
+                if (try p.listSep(.r_paren, tuple_recovery, "expected ',' or ')' after a type")) break;
             } else if (tuple_recovery.contains(p.peek().tag)) {
                 break;
             } else {
@@ -981,9 +977,7 @@ fn parseEnumDecl(p: *Parser) Error!Ast.Index {
                     const t_entry = p.index;
                     if (p.startsType()) {
                         try types.append(p.gpa, try p.parseType());
-                        if (!p.eat(.comma)) {
-                            if (p.at(.r_paren)) break;
-                        }
+                        if (try p.listSep(.r_paren, tuple_recovery, "expected ',' or ')' after a type")) break;
                     } else if (tuple_recovery.contains(p.peek().tag)) {
                         break;
                     } else {
@@ -1176,9 +1170,7 @@ fn parseSubPattern(p: *Parser) Error!Ast.Index {
                     // Each tuple element is an arbitrary sub-pattern (literal,
                     // binding, wildcard, nested variant, or-pattern).
                     try binds.append(p.gpa, try p.parsePattern());
-                    if (!p.eat(.comma)) {
-                        if (p.at(.r_paren)) break;
-                    }
+                    if (try p.listSep(.r_paren, tuple_recovery, "expected ',' or ')' after a pattern")) break;
                 } else if (tuple_recovery.contains(p.peek().tag)) {
                     break;
                 } else {
@@ -1315,9 +1307,7 @@ fn parseGenericParams(p: *Parser, out: *std.ArrayList(Ast.Index)) Error!void {
             const bound: Ast.Index = if (p.eat(.kw_has)) try p.parseProtocolRef() else Ast.none;
             const gp = try p.addNode(.{ .tag = .generic_param, .main_token = name_tok, .lhs = bound, .rhs = Ast.none });
             try out.append(p.gpa, gp);
-            if (!p.eat(.comma)) {
-                if (p.at(.r_bracket)) break;
-            }
+            if (try p.listSep(.r_bracket, generic_recovery, "expected ',' or ']' after a type parameter")) break;
         } else if (generic_recovery.contains(p.peek().tag)) {
             break;
         } else {
@@ -1343,9 +1333,7 @@ fn parseTypeApp(p: *Parser, base: Ast.Index) Error!Ast.Index {
         const entry = p.index;
         if (p.startsType()) {
             try args.append(p.gpa, try p.parseType());
-            if (!p.eat(.comma)) {
-                if (p.at(.r_bracket)) break;
-            }
+            if (try p.listSep(.r_bracket, generic_recovery, "expected ',' or ']' after a type")) break;
         } else if (generic_recovery.contains(p.peek().tag)) {
             break;
         } else {
@@ -1558,11 +1546,7 @@ fn parseLambda(p: *Parser) Error!Ast.Index {
             p.bump(.identifier);
             const type_node: Ast.Index = if (p.eat(.colon)) try p.parseType() else Ast.none;
             try params.append(p.gpa, try p.addNode(.{ .tag = .param, .main_token = param_name, .lhs = type_node, .rhs = Ast.none }));
-            if (!p.eat(.comma)) {
-                if (p.at(.r_paren)) break;
-                // Without this, `fn(x int)` would silently read `int` as a second param.
-                if (!param_recovery.contains(p.peek().tag)) try p.warn(p.peek(), .P0001, "expected ',' or ')' after a lambda parameter");
-            }
+            if (try p.listSep(.r_paren, param_recovery, "expected ',' or ')' after a lambda parameter")) break;
         } else if (param_recovery.contains(p.peek().tag)) {
             break;
         } else if (p.index == entry) {
@@ -1590,9 +1574,7 @@ fn parseFnType(p: *Parser) Error!Ast.Index {
         const entry = p.index;
         if (p.startsType()) {
             try params.append(p.gpa, try p.parseType());
-            if (!p.eat(.comma)) {
-                if (p.at(.r_paren)) break;
-            }
+            if (try p.listSep(.r_paren, tuple_recovery, "expected ',' or ')' after a type")) break;
         } else if (tuple_recovery.contains(p.peek().tag)) {
             break;
         } else {
@@ -2220,9 +2202,7 @@ fn parsePrefix(p: *Parser) Error!Ast.Index {
                 const entry = p.index;
                 if (p.startsExpr()) {
                     try elems.append(p.gpa, try p.parseExpr(0));
-                    if (!p.eat(.comma)) {
-                        if (p.at(.r_bracket)) break;
-                    }
+                    if (try p.listSep(.r_bracket, tuple_recovery, "expected ',' or ']' after a list element")) break;
                 } else if (tuple_recovery.contains(p.peek().tag)) {
                     break;
                 } else {
@@ -2358,9 +2338,7 @@ fn upgradeTupleInit(p: *Parser, node: Ast.Index, type_name: Ast.Index) Error!Ast
         const entry = p.index;
         if (p.startsExpr()) {
             try args.append(p.gpa, try p.parseExpr(0));
-            if (!p.eat(.comma)) {
-                if (p.at(.r_paren)) break;
-            }
+            if (try p.listSep(.r_paren, tuple_recovery, "expected ',' or ')' after an argument")) break;
         } else if (tuple_recovery.contains(p.peek().tag)) {
             break;
         } else {
@@ -2482,12 +2460,10 @@ fn parseCallArgs(p: *Parser, args: *std.ArrayList(Ast.Index), holes: Holes) Erro
                     else => try args.append(p.gpa, try p.leaf(.identifier, tok)),
                 }
             }
-            _ = p.eat(.comma);
+            if (try p.listSep(.r_paren, tuple_recovery, "expected ',' or ')' after an argument")) break;
         } else if (p.startsExpr()) {
             try args.append(p.gpa, try p.parseExpr(0));
-            if (!p.eat(.comma)) {
-                if (p.at(.r_paren)) break;
-            }
+            if (try p.listSep(.r_paren, tuple_recovery, "expected ',' or ')' after an argument")) break;
         } else if (tuple_recovery.contains(p.peek().tag)) {
             break;
         } else {
@@ -2806,6 +2782,18 @@ fn expect(p: *Parser, tag: token.Tag, message: []const u8) Error!void {
     // expect() hardcodes P0001 — leaving all 49 call sites unchanged.
     if (tok.tag != tag) return p.fail(tok, .P0001, message);
     p.advance();
+}
+
+/// The separator after an item of a comma list closed by `close`; true ends the loop.
+/// A missing comma is reported but the next item still parses, so `add(1 2)` keeps
+/// both args for the checker instead of cascading. A recovery token is left for the
+/// loop to break on and its closing `expect` to report.
+fn listSep(p: *Parser, comptime close: token.Tag, comptime recovery: TagSet, message: []const u8) error{OutOfMemory}!bool {
+    if (p.eat(.comma)) return false;
+    if (p.at(close)) return true;
+    // `fn` is a decl anchor, but `fn (` is a lambda or fn-type item, never a decl.
+    if (p.atLambda() or !recovery.contains(p.peek().tag)) try p.warn(p.peek(), .P0001, message);
+    return false;
 }
 
 /// Append a diagnostic WITHOUT unwinding. Marks the parse as tainted. Used by the
@@ -5233,6 +5221,56 @@ test "decl resync after a broken region skips the lambdas in it" {
     var buf: [512]u8 = undefined;
     const rendered = try renderResult(res, src, &buf);
     try testing.expect(std.mem.indexOf(u8, rendered, "(fn h () int (block 2))") != null);
+}
+
+test "every comma list reports one P0001 at an item with no ',' before it" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { src: []const u8, at: []const u8 }{
+        .{ .src = "fn main() { f(1 2) }\n", .at = "2)" },
+        .{ .src = "fn main() { g := f(_ 2) }\n", .at = "2)" },
+        .{ .src = "fn main() { xs := [10 20 30] }\n", .at = "20" },
+        .{ .src = "fn add(a: int b: int) {}\n", .at = "b:" },
+        .{ .src = "struct S {}\nimpl S { fn m(self x: int) {} }\n", .at = "x:" },
+        .{ .src = "struct S(int bool)\n", .at = "bool" },
+        .{ .src = "enum E { A(int bool) }\n", .at = "bool" },
+        .{ .src = "fn main() { match e { .a(x y) -> 0 } }\n", .at = "y)" },
+        .{ .src = "fn id[T U](x: T) -> T { x }\n", .at = "U]" },
+        .{ .src = "fn f(x: Map[int str]) {}\n", .at = "str" },
+        .{ .src = "fn main() { h := fn(a: int b: int) { a } }\n", .at = "b:" },
+        .{ .src = "fn f(g: fn(int bool) -> int) {}\n", .at = "bool" },
+        .{ .src = "fn main() { x := .a(1 2) }\n", .at = "2)" },
+        .{ .src = "fn main() { ap(1 fn(x: int) -> int { x }) }\n", .at = "fn(x" },
+        .{ .src = "fn main() { gs := [fn() {} fn() {}] }\n", .at = "fn() {}]" },
+        .{ .src = "fn f(g: fn(int fn(int) -> int) -> int) {}\n", .at = "fn(int) ->" },
+    };
+    for (cases) |c| {
+        const res = try parseResult(gpa, c.src);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        errdefer std.debug.print("source: {s}", .{c.src});
+        try testing.expectEqual(@as(usize, 1), res.diags.len);
+        try testing.expectEqual(codes.Code.P0001, res.diags[0].code);
+        try testing.expectEqual(@as(u32, @intCast(std.mem.indexOf(u8, c.src, c.at).?)), res.diags[0].byte_offset);
+    }
+}
+
+test "trailing commas and one item per line still parse clean" {
+    const gpa = testing.allocator;
+    const sources = [_][]const u8{
+        "fn main() { f(1, 2,) }\n",
+        "fn main() { xs := [\n    10,\n    20,\n    30,\n] }\n",
+        "fn add(\n    a: int,\n    b: int,\n) {}\n",
+        "fn main() { f(\n    1,\n    2,\n) }\n",
+        "fn id[T, U,](x: Map[T, U,]) {}\n",
+        "struct S(int, bool,)\n",
+    };
+    for (sources) |src| {
+        const res = try parseResult(gpa, src);
+        defer gpa.free(@constCast(res.diags));
+        defer freeTree(gpa, res.tree);
+        errdefer std.debug.print("source: {s}", .{src});
+        try testing.expectEqual(@as(usize, 0), res.diags.len);
+    }
 }
 
 test "a lambda param without ',' or ')' after it is P0001" {
