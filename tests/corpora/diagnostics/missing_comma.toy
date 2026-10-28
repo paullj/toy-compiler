@@ -1,0 +1,8 @@
+import std/vec
+
+fn add(a: int b: int) -> int { a + b }  #~ ERROR [P0001] expected ',' or ')' after a parameter
+
+fn main() -> int {
+    xs := [10 20 30]  #~ ERROR [P0001] expected ',' or ']' after a list element
+    return add(1 2) + xs.len()  #~ ERROR [P0001] expected ',' or ')' after an argument
+}

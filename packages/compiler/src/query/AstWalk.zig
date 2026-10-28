@@ -1627,7 +1627,7 @@ test "a WIDENING `?` folds the resolved `From` witness; the identity `?` folds n
 
 test "nodeSpan covers a subtree from its first token through the brackets it closes" {
     const gpa = std.testing.allocator;
-    const src_text = "fn f(a: int, b: int) -> int { return a }\nfn main() -> int {\n    x: int = f(1, [2][0]) + 3\n    return x\n}\n";
+    const src_text = "fn f(a: int, b: int) -> int { return a }\nfn main() -> int {\n    x: int = f(1, [2, 0]) + 3\n    return x\n}\n";
     var b = try build(gpa, src_text);
     defer b.deinit(gpa);
     const src: Walk.Source = .{ .tree = b.tree, .tokens = b.tokens, .source = b.source };
@@ -1637,15 +1637,15 @@ test "nodeSpan covers a subtree from its first token through the brackets it clo
         const text = src_text[sp.start..sp.end];
         switch (n.tag) {
             .call => {
-                try std.testing.expectEqualStrings("f(1, [2][0])", text);
+                try std.testing.expectEqualStrings("f(1, [2, 0])", text);
                 saw[0] = true;
             },
             .binary => {
-                try std.testing.expectEqualStrings("f(1, [2][0]) + 3", text);
+                try std.testing.expectEqualStrings("f(1, [2, 0]) + 3", text);
                 saw[1] = true;
             },
             .var_decl => {
-                try std.testing.expectEqualStrings("x: int = f(1, [2][0]) + 3", text);
+                try std.testing.expectEqualStrings("x: int = f(1, [2, 0]) + 3", text);
                 saw[2] = true;
             },
             else => {},
