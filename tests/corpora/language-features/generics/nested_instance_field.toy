@@ -1,0 +1,17 @@
+# expect: stdout "W{b: B(B(1))}\n"
+# expect: exit 0
+# W[Box[int]]'s field is Box[Box[int]], spelled through T: it is the same instance as the
+# written Box[Box[int]], so it renders through the explicit impl, not a structural derive.
+import std/io
+
+struct Box[T] { v: T }
+
+impl Box[T has Display] has Display {
+    fn display(self) -> str { "B(".concat(self.v.to_string()).concat(")") }
+}
+
+struct W[T] { b: Box[T] }
+
+fn main() {
+    io.println(W { b: Box { v: Box { v: 1 } } })
+}

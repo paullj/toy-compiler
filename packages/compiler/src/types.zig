@@ -1764,6 +1764,10 @@ reify_depth: u32 = 0,
 /// grounded `params ++ [ret]` key bytes (owned) -> struct id. Freed at teardown.
 fn_struct_dedup: std.StringHashMapUnmanaged(u32) = .empty,
 
+/// The instance minted for each generic ctor over grounded args (`reify.claimGrounded`):
+/// owned key bytes -> its reified `structT`/`enumT`. Freed at teardown.
+app_reify_dedup: std.StringHashMapUnmanaged(Type) = .empty,
+
 /// OWNS the mangled names minted for reified generic-struct instances. A reified
 /// `StructSym.name` is a view into one of these; `snapshotLayouts` dupes it, so these
 /// are freed wholesale at teardown (the struct teardown frees `field_*`/`offsets` but
@@ -2178,6 +2182,9 @@ pub fn checkGraph(
         var fdk = t.fn_struct_dedup.keyIterator();
         while (fdk.next()) |k| gpa.free(k.*);
         t.fn_struct_dedup.deinit(gpa);
+        var adk = t.app_reify_dedup.keyIterator();
+        while (adk.next()) |k| gpa.free(k.*);
+        t.app_reify_dedup.deinit(gpa);
         for (t.reified_names.items) |nm| gpa.free(nm);
         t.reified_names.deinit(gpa);
         for (t.instance_hints.items) |h| gpa.free(h.template);
@@ -2858,13 +2865,6 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     // which is what `sealCallees` keys off to resolve a pending method call, and what
     // lower's desugar lookups (`[]`, `for`-in) key off.
     if (t.templates.items.len > 0) {
-        // Invert `reify_map` (App index -> reified `structT`/`enumT`) once, so an
-        // associated fn's receiver whose type-args are generic instances can map each
-        // reified arg back to the App form `reify_map` is keyed by (see `reifiedStaticRecv`).
-        var app_of_reified: std.AutoHashMapUnmanaged(u64, u32) = .empty;
-        defer app_of_reified.deinit(t.gpa);
-        var rit = t.reify_map.iterator();
-        while (rit.next()) |kv| try app_of_reified.put(t.gpa, reifiedKey(kv.value_ptr.*), kv.key_ptr.*);
         for (t.mono.items, 0..) |inst, i| {
             for (t.templates.items) |tmpl| {
                 if (tmpl.fn_id != inst.template_gid) continue;
@@ -2875,7 +2875,7 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
                 const recv: Type = if (tmpl.has_self)
                     inst.params[0]
                 else
-                    (t.reifiedStaticRecv(model.fns[tmpl.fn_id].self_type, inst.args, &app_of_reified) orelse continue);
+                    (try t.reifiedStaticRecv(model.fns[tmpl.fn_id].self_type, inst.args) orelse continue);
                 const pargs = if (tmpl.protocol_id != null) try t.groundProtocolArgs(tmpl.protocol_args, inst.args) else null;
                 errdefer if (pargs) |a| t.gpa.free(a);
                 try t.methods.append(t.gpa, .{
@@ -3083,27 +3083,11 @@ fn importerImports(importer: *const GraphCtx.ModuleCtx, target: u32) bool {
     return false;
 }
 
-/// Pack a reified `structT`/`enumT` into the reverse-map key: the kind's id-space bit
-/// plus the nominal id, so a struct id and an enum id with the same number never alias.
-fn reifiedKey(ty: Type) u64 {
-    return (@as(u64, @intFromBool(ty.kind == .@"enum")) << 32) | ty.nominalId();
-}
-
 /// The reified concrete receiver an ASSOCIATED function dispatches off: the template's
-/// `self_type` App (`Vec[T]`) substituted through the instance's type-args (`[int]`) to a
-/// ground `Vec[int]` App, then mapped to the `structT`/`enumT` it reified to. Returns null
-/// when `self_type` is not an App or the ground App was never reified (defensive — an
-/// instance's own signature keeps its receiver reachable, so the memo normally hits).
-///
-/// `app_of_reified` inverts `reify_map` (reified `structT`/`enumT` -> the App index it
-/// reified from). Post-reify the instance args are already REIFIED, but `reify_map` is
-/// keyed by the App-form composite index reify recorded, so re-interning with a
-/// reified-struct/enum type-arg (`Vec[Ref[int]]`, `Vec[Vec[int]]`) would form a DIFFERENT
-/// composite index and miss. Mapping each reified type-arg back to its App form
-/// reconstructs the exact key `reify_map` holds. A scalar / non-generic-struct arg
-/// (`Vec[int]`, `Vec[P]`) is not in the inverse, so it is interned unchanged — byte-
-/// identical to interning the reified args directly.
-fn reifiedStaticRecv(t: *Typecheck, self_type: Type, args: []const Type, app_of_reified: *const std.AutoHashMapUnmanaged(u64, u32)) ?Type {
+/// `self_type` App (`Vec[T]`) over the instance's already-reified type-args, looked up by
+/// its grounded key. Returns null when `self_type` is not an App or that instance was
+/// never reified (defensive: an instance's own signature keeps its receiver reachable).
+fn reifiedStaticRecv(t: *Typecheck, self_type: Type, args: []const Type) error{OutOfMemory}!?Type {
     if (!self_type.isApp()) return null;
     const e = t.composite.at(self_type.appIdx());
     var abuf: [8]Type = undefined;
@@ -3113,15 +3097,14 @@ fn reifiedStaticRecv(t: *Typecheck, self_type: Type, args: []const Type, app_of_
         if (a.isTypeVar()) {
             const ord = a.typeVarOrd();
             if (ord >= args.len) return null;
-            var s = args[ord];
-            if (s.kind == .@"struct" or s.kind == .@"enum") {
-                if (app_of_reified.get(reifiedKey(s))) |ai| s = t.composite.typeAt(ai);
-            }
-            sub[i] = s;
+            sub[i] = args[ord];
+        } else if (a.isApp() or a.isFunc()) {
+            sub[i] = t.reify_map.get(a.struct_id) orelse return null;
         } else sub[i] = a;
     }
-    const idx = t.composite.intern(t.gpa, e.ctor, sub, e.ctor_is_enum) catch return null;
-    return t.reify_map.get(idx);
+    const key = try reify.groundedAppKey(t, e.ctor, e.ctor_is_enum, sub);
+    defer t.gpa.free(key);
+    return t.app_reify_dedup.get(key);
 }
 
 /// Bind an impl's type-params by matching the template method `mf`'s `Self` pattern
