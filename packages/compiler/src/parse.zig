@@ -1381,9 +1381,9 @@ fn turbofishFollows(p: *const Parser) bool {
 /// (`xs[i+1]`) cannot be a real type-app and is a value index, even when a `.`/`(`
 /// follower would otherwise look like a turbofish. A lambda in an index has a `{` body,
 /// which is outside the alphabet, so it stays an index.
-/// Parens are admitted for the unit type `()`, which leaves a value index whose content is
-/// a call or a parenthesized expr (`xs[f()]`, `xs[(i)]`) still read as type-shaped; that
-/// case is later rejected cleanly by the checker rather than miscompiled. Unbalanced/eof
+/// A `(` is admitted only where a type can open one: a function type's parameter list
+/// (`fn(`) or the unit type `()` in a type-argument slot. Anywhere else it is a call
+/// (`xs[f()]`) or a grouping (`xs[(i)]`), so the run is a value index. Unbalanced/eof
 /// reads as not type-shaped so `parseIndex` reports the missing `]`.
 fn bracketIsTypeShaped(p: *const Parser) bool {
     var depth: usize = 0;
@@ -1395,7 +1395,16 @@ fn bracketIsTypeShaped(p: *const Parser) bool {
                 depth -= 1;
                 if (depth == 0) return true;
             },
-            .identifier, .dot, .comma, .l_paren, .r_paren, .kw_fn, .arrow => {},
+            .l_paren => {
+                const prev = p.tokens[i - 1].tag;
+                const next: token.Tag = if (i + 1 < p.tokens.len) p.tokens[i + 1].tag else .eof;
+                const unit_slot = next == .r_paren and switch (prev) {
+                    .l_bracket, .comma, .l_paren, .arrow => true,
+                    else => false,
+                };
+                if (prev != .kw_fn and !unit_slot) return false;
+            },
+            .identifier, .dot, .comma, .r_paren, .kw_fn, .arrow => {},
             .eof => return false,
             else => return false,
         }
@@ -3173,6 +3182,17 @@ test "bracketed postfix: a value index disambiguates from a turbofish type-app" 
         try testing.expectEqual(Ast.Node.Tag.type_app, app.tag);
         try testing.expectEqual(Ast.Node.Tag.identifier, tree.nodes[app.lhs.int()].tag);
     }
+}
+
+test "a call or parenthesized index before a field stays a value index" {
+    try expectSexpr("ps[f()].x", "(. (index ps (call f)) x)");
+    try expectSexpr("ps[(i)].x", "(. (index ps i) x)");
+    try expectSexpr("ps[m.f()].x", "(. (index ps (call (. m f))) x)");
+    try expectSexpr("ps[f()](1)", "(call (index ps (call f)) 1)");
+    try expectSexpr("Box[()].new()", "(call (. (tyapp Box ()) new))");
+    try expectSexpr("Vec[int].new()", "(call (. (tyapp Vec int) new))");
+    try expectSexpr("id[fn(int) -> int](g)", "(call (tyapp id (fnty (int) int)) g)");
+    try expectSexpr("id[fn((), int) -> ()](g)", "(call (tyapp id (fnty (() int) ())) g)");
 }
 
 test "a function type is a turbofish type argument in expression position" {

@@ -1,0 +1,15 @@
+# Regression: an index holding a call or parens, followed by a field, parsed as a
+# type-app (`ps[f()]` read `f` and `()` as type args) and failed to check.
+# expect: exit 4
+import std/vec
+
+struct P { x: int }
+
+fn f() -> int { 1 }
+
+fn main() -> int {
+    ps := [P { x: 3 }, P { x: 4 }]
+    i := 1
+    if ps[(i)].x != 4 { return 1 }
+    return ps[f()].x
+}
