@@ -52,7 +52,7 @@ core is the private layer between the compiler and std. It is the only place whe
 | `core/fs` | the `open` (two arguments, never `O_CREAT`), `creat`, `close`, `unlink` and `access` externs: `open_read`, `open_append`, `create`, `close_fd`, `remove`, `exists`, `write_all`, `read_some` and `read_all`, each failure as a negated errno |
 | `core/mem` | the growable `gc_array` and the hash table behind Vec, Map and Set |
 | `core/fmt` | the Darwin-private `__dtoa`/`__freedtoa` and the `strtod` externs: `shortest(f)` (the shortest round-trip digits, their decimal point and sign) and `parse(s)` |
-| `core/text` | raw `str` parts: `slice`, and the `alloc`/`put`/`window`/`take` buffer that builds a str once |
+| `core/text` | raw `str` parts: `slice`, the `alloc`/`put`/`window`/`take` buffer that builds a str once, and `join` over it |
 | `core/mem_selftest`, `core/desc_selftest` | heap and descriptor self-checks |
 
 ## std
@@ -64,10 +64,10 @@ and never names a `.core` intrinsic.
 |--------|-------|
 | `std/io` | `print`, `println`, `eprint` and `eprintln` over `T has Display`; `read_line` and `read_all` on stdin. It imports std/float, so a printing program can print a float |
 | `std/float` | `impl float has Display` and `parse(s) -> Option[float]`, over core/fmt |
-| `std/vec`, `std/map`, `std/set` | the collections, over core/mem |
+| `std/vec`, `std/map`, `std/set` | the collections, over core/mem, each with a `Display` (`[1, 2]`, `{1: a}`, `{1, 2}`) where its elements have one |
 | `std/str` | methods on `str`, including `parse_int`, over core/text |
 | `std/option` | the closure methods of `Option` and `Result` |
-| `std/ref` | `Ref.new`, `get` and `set` |
+| `std/ref` | `Ref.new`, `get` and `set`; `Ref(42)` is its `Display` |
 | `std/iter` | the `Iterator` protocol that `for`-in desugars to |
 | `std/math` | integer and float math, over core/ffi |
 | `std/gc` | `collect()` and `collections()` |

@@ -1,3 +1,5 @@
+import core/mem
+
 # Raw `str` parts for std/str. A str is a `{ptr, len}` pair, so a substring is a new pair
 # into its parent's bytes: no copy. A str built from parts is written into one buffer of
 # its final length, so building it copies each byte once. Each part checks its range
@@ -66,4 +68,34 @@ pub fn take(buf: rawptr, n: int) -> str {
     }
     r: str = unsafe { load(cell) }
     return r
+}
+
+# `parts` between `open` and `close`, split by `sep`, written into one buffer of its final
+# length: a collection's render copies each byte once, where a chain of `concat`s would
+# copy the prefix again for every element.
+pub fn join(parts: gc_array[str], open: str, sep: str, close: str) -> str {
+    k := mem.ga_len[str](parts)
+    n := open.len() + close.len()
+    if k > 1 { n = n + (k - 1) * sep.len() }
+    i := 0
+    while i < k {
+        n = n + mem.ga_get[str](parts, i).len()
+        i = i + 1
+    }
+    buf := alloc(n)
+    put(buf, 0, open)
+    at := open.len()
+    i = 0
+    while i < k {
+        if i > 0 {
+            put(buf, at, sep)
+            at = at + sep.len()
+        }
+        p := mem.ga_get[str](parts, i)
+        put(buf, at, p)
+        at = at + p.len()
+        i = i + 1
+    }
+    put(buf, at, close)
+    return take(buf, n)
 }

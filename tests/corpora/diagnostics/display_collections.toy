@@ -1,0 +1,19 @@
+# std renders Ref, Vec, Map and Set only where every type argument conforms to Display:
+# the T0023 names the argument that fails the impl's bound. A struct holding such a box
+# gets the plain field hint, not the managed-box one, since the box has an impl.
+import std/io
+import std/map
+import std/ref
+import std/vec
+
+struct Holder { r: Ref[fn()] }
+
+fn hi() {}
+
+fn main() {
+    fs: Vec[fn()] = [hi]
+    io.println(fs)  #~ ERROR [T0023] type 'Vec' does not conform to protocol 'Display'; its generic impl needs type argument 'fn()' to conform to 'Display'
+    io.println(Ref.new(hi))  #~ ERROR [T0023] type 'Ref' does not conform to protocol 'Display'; its generic impl needs type argument 'fn()' to conform to 'Display'
+    io.println(Map[int, fn()].new())  #~ ERROR [T0023] type 'Map' does not conform to protocol 'Display'; its generic impl needs type argument 'fn()' to conform to 'Display'
+    io.println(Holder { r: Ref.new(hi) })  #~ ERROR [T0023] type 'Holder' does not conform to protocol 'Display'; make every field of 'Holder' conform to 'Display'
+}

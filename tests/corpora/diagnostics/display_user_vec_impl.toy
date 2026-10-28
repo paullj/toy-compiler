@@ -1,0 +1,12 @@
+# A program's own generic Display for Vec overlaps std's, so it is T0020. This pins
+# today's behavior; #98 decides the coherence rule.
+import std/io
+import std/vec
+
+impl Vec[T] has Display {  #~ ERROR [T0020] overlapping impl of protocol 'Display' for type 'Vec': std/vec already provides one
+    fn display(self) -> str { return "mine" }
+}
+
+fn main() {
+    io.println([1, 2])
+}

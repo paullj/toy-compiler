@@ -7,3 +7,11 @@ impl Ref[T] {
     fn get(self) -> T { ref_get(self) }
     fn set(self, v: T) { ref_set(self, v) }
 }
+
+# A Ref renders the value in its cell, not the cell's address, so a print is the same on
+# every run. A cycle through Refs does not terminate.
+impl Ref[T has Display] has Display {
+    fn display(self) -> str {
+        return "Ref(".concat(ref_get(self).to_string()).concat(")")
+    }
+}
