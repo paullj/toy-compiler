@@ -6758,7 +6758,7 @@ test "lowerCall dispatches through the Callee table" {
 
 test "a protocol callee reaching lower is a note, not UB" {
     const gpa = testing.allocator;
-    const lowered = try lowerMainWithCallee(gpa, acc_plus_src, "plus", Callee.protocolMethod(0, 0));
+    const lowered = try lowerMainWithCallee(gpa, acc_plus_src, "plus", Callee.protocolMethod(0, 0, 0));
     defer lowered.deinit(gpa);
     try testing.expectEqual(@as(usize, 1), lowered.notes.len);
     try testing.expectEqualStrings("protocol callee in lower", lowered.notes[0]);
