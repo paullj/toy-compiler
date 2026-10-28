@@ -931,7 +931,11 @@ fn emitExecutable(
     );
     defer gpa.free(image);
 
-    try writeExecutable(io, resolved_out, image);
+    writeExecutable(io, resolved_out, image) catch |e| {
+        try writeFailLine(out, level, resolved_out, e);
+        try out.flush();
+        return 1;
+    };
     ns_image = lapNs(io, timings, &last_ns);
     const elapsed = nowNs(io) - build_start;
     try printBuildTime(out, level, threads, if (elapsed > 0) @intCast(elapsed) else 0);
@@ -1109,6 +1113,24 @@ fn writeExecutable(io: Io, path: []const u8, image: []const u8) !void {
     defer file.close(io);
     try file.writeStreamingAll(io, image);
     try file.setPermissions(io, exec_perms);
+}
+
+/// The one `error:` line for an output path that cannot be written. The parent
+/// directory is never created on the user's behalf, matching `cc -o`.
+fn writeFailLine(out: *Io.Writer, level: Style.ColorLevel, path: []const u8, e: anyerror) !void {
+    try sty_err.styled(out, level, "error");
+    try out.print(": cannot write '{s}': ", .{path});
+    switch (e) {
+        // A path with no file name (empty, or ending in a separator) has no parent to blame.
+        error.FileNotFound => if (path.len == 0 or std.fs.path.isSep(path[path.len - 1]))
+            try out.writeAll("no such file or directory\n")
+        else
+            try out.print("directory '{s}' does not exist\n", .{std.fs.path.dirname(path) orelse "."}),
+        error.IsDir, error.PathAlreadyExists => try out.writeAll("it is a directory\n"),
+        error.NotDir => try out.writeAll("a parent of it is not a directory\n"),
+        error.AccessDenied, error.PermissionDenied => try out.writeAll("permission denied\n"),
+        else => try out.print("{t}\n", .{e}),
+    }
 }
 
 /// Emit one `error: <message>` line styled at `sty_err` (the `error` word coloured,
