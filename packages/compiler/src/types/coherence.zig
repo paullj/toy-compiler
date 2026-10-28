@@ -236,23 +236,11 @@ fn recordGenericConformance(
     prot: Typecheck.ProtocolSym,
     provided: []const Ast.Index,
 ) !void {
-    // A representative impl-method FnSym carries the impl's generic-param NAMES and the
-    // receiver App (the `Self` pattern) — shared by every method, so the first that
-    // resolved in Phase A suffices; none means every method errored (nothing to record).
-    var rep: ?FnSym = null;
-    outer: for (provided) |pn| {
-        for (t.fns.items) |f| {
-            if (f.mod == mod and f.decl_node == pn) {
-                rep = f;
-                break :outer;
-            }
-        }
-    }
-    const impl_fn0 = rep orelse return;
-    if (!impl_fn0.self_type.isApp()) return;
-    const recv_app = impl_fn0.self_type;
+    // No head: the receiver did not resolve, which Phase A reported.
+    const head = t.implHead(mod, decl.lhs) orelse return;
+    const recv_app = head.recv;
     const e = t.composite.at(recv_app.appIdx());
-    const gnames = impl_fn0.generic_params;
+    const gnames = head.gnames;
 
     const arg_nodes = Ast.protocolRefArgs(t.tree, proto_ref);
     if (arg_nodes.len != prot.generic_params.len) {
@@ -325,7 +313,7 @@ fn recordGenericConformance(
     // the same receiver arg in both impls and one substitution grounds both patterns.
     // Two raw patterns that differ (`Conv[T]`, `Conv[int]`) can still both apply at one
     // instance (`Box[int]`), where no call could choose between them.
-    const n_vars = Typecheck.implParamCount(t.composite, impl_fn0);
+    const n_vars: u32 = @intCast(e.args.len);
     for (t.template_conformances.items) |tc| {
         if (tc.protocol_id != pid or tc.recv_ctor != e.ctor or tc.recv_is_enum != e.ctor_is_enum) continue;
         if (!try patternsOverlap(t.gpa, @max(n_vars, tc.n_params), tc.protocol_args, pargs, t.composite.decomposer())) continue;
@@ -340,8 +328,8 @@ fn recordGenericConformance(
         .protocol_args = owned_pargs,
         .recv = recv_app,
         .n_params = n_vars,
-        .bounds = impl_fn0.generic_bounds,
-        .bound_args = impl_fn0.generic_bound_args,
+        .bounds = head.bounds,
+        .bound_args = head.bound_args,
     }) catch |err| {
         t.gpa.free(owned_pargs);
         return err;

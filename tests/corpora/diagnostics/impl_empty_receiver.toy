@@ -1,0 +1,24 @@
+# An impl with no methods still has its receiver resolved (#101): a bare generic type,
+# an unknown type, a protocol or a wrong arity is T0001 at the receiver, as it is with
+# methods, and the rejected conformance adds no T0023 at a bounded call.
+protocol Marker {}
+
+struct Box[T] { v: T }
+
+impl Box has Marker {}  #~ ERROR [T0001] generic type 'Box' requires type arguments, e.g. Box[int]
+
+impl Box[T, U] has Marker {}  #~ ERROR [T0001] 'Box' expects 1 type argument(s), got 2
+
+impl Nope has Marker {}  #~ ERROR [T0001] unknown type 'Nope'
+
+impl Nope {}  #~ ERROR [T0001] unknown type 'Nope'
+
+impl Box {}  #~ ERROR [T0001] generic type 'Box' requires type arguments, e.g. Box[int]
+
+impl Marker has Marker {}  #~ ERROR [T0001] unknown type 'Marker'
+
+fn mark[T has Marker](_t: T) -> int { 1 }
+
+fn main() -> int {
+    return mark(Box { v: 1 })
+}
