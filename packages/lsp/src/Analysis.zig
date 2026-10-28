@@ -743,6 +743,7 @@ fn selectFrom(an: *const Analysis, a: std.mem.Allocator, fa: u32, c: Callee, nod
             const shape: struct { params: []const Type, ret: Type, names: []const []const u8 } = switch (k) {
                 .scalar_eq => .{ .params = try a.dupe(Type, &.{ recv, recv }), .ret = Type.bool, .names = &.{ "self", "other" } },
                 .scalar_hash => .{ .params = try a.dupe(Type, &.{recv}), .ret = Type.int, .names = &.{"self"} },
+                .scalar_cmp => .{ .params = try a.dupe(Type, &.{ recv, recv }), .ret = call_ty, .names = &.{ "self", "other" } },
                 .str_concat => .{ .params = &.{ Type.str, Type.str }, .ret = Type.str, .names = &.{ "self", "other" } },
                 .str_len => .{ .params = &.{Type.str}, .ret = Type.int, .names = &.{"self"} },
                 .str_byte_at => .{ .params = &.{ Type.str, Type.int }, .ret = Type.int, .names = &.{ "self", "i" } },

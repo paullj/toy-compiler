@@ -233,21 +233,6 @@ fn emitVariantPayloadEq(b: *L.Builder, e: Typecheck.EnumLayout, vi: usize, self_
     try L.brTo(b, join, .{ .value = res });
 }
 
-/// The branch-free 3-way discriminant (0=lt/1=eq/2=gt) of two int/bool VALUES:
-/// `(lhs > rhs) - (lhs < rhs) + 1`. `unsigned` selects the unsigned magnitude conds:
-/// a derived `Ord` on a `uint64` field must compare unsigned or a high-bit-set value
-/// mis-orders as negative. Signed conds are correct for signed ints, bools (0/1), and
-/// the small non-negative enum tags.
-fn threeWayInt(b: *L.Builder, lv: Ir.ValueId, rv: Ir.ValueId, unsigned: bool) error{OutOfMemory}!Ir.ValueId {
-    const int_ty = Typecheck.Type.int;
-    const bool_ty = Typecheck.Type.bool;
-    const gt = try b.emit(.{ .icmp = .{ .cc = if (unsigned) .ugt else .gt, .lhs = lv, .rhs = rv } }, bool_ty);
-    const lt = try b.emit(.{ .icmp = .{ .cc = if (unsigned) .ult else .lt, .lhs = lv, .rhs = rv } }, bool_ty);
-    const diff = try b.emit(.{ .sub = .{ .lhs = gt, .rhs = lt } }, int_ty);
-    const one = try b.emit(.{ .iconst = 1 }, int_ty);
-    return try b.emit(.{ .add = .{ .lhs = diff, .rhs = one } }, int_ty);
-}
-
 /// The int 3-way `Ord` discriminant (0=lt/1=eq/2=gt) of field `i` (at byte `off`, type
 /// `fty`) between the two receiver bases: int/bool via the branch-free `threeWayInt`;
 /// `str` via the `{ptr,len}` lexicographic byte-loop (`strCmpAtPtrs`); a struct/enum field is
@@ -261,7 +246,7 @@ fn deriveFieldCmp(b: *L.Builder, fty: Typecheck.Type, off: u32, self_base: Ir.Va
             const lv = try b.emit(.{ .load = .{ .addr = la, .ty = fty } }, fty);
             const ra = try b.emit(.{ .field_addr = .{ .base = other_base, .off = off, .ty = fty } }, int_ty);
             const rv = try b.emit(.{ .load = .{ .addr = ra, .ty = fty } }, fty);
-            return try threeWayInt(b, lv, rv, fty.isUnsignedInt());
+            return try L.threeWayInt(b, lv, rv, fty.isUnsignedInt());
         },
         .str => {
             const la = try b.emit(.{ .field_addr = .{ .base = self_base, .off = off, .ty = fty } }, int_ty);
@@ -362,7 +347,7 @@ fn deriveEnumCmp(b: *L.Builder, cty: Typecheck.Type, self_base: Ir.ValueId, othe
 
     const st = try b.emit(.{ .get_tag = self_base }, int_ty);
     const ot = try b.emit(.{ .get_tag = other_base }, int_ty);
-    const tag_disc = try threeWayInt(b, st, ot, false);
+    const tag_disc = try L.threeWayInt(b, st, ot, false);
     const tags_eq = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = st, .rhs = ot } }, bool_ty);
 
     const dispatch = try b.addBlock();

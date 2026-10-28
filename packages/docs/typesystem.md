@@ -839,6 +839,12 @@ extension, equal spans are equal — no witness call. A struct/enum resolves its
 witness, calls it into a fresh return slot, and reads `Ordering`'s tag with the proven
 `get_tag` match-dispatch idiom.
 
+**Direct `cmp`.** `a.cmp(b)` is accepted wherever `a < b` is, from the same conformance.
+On a builtin `Ord` scalar (`int` of any width, `bool`, `str`) it is a builtin method with
+no `methods` row: `lower` computes the same discriminant `<` does and stores it as the
+`Ordering` tag. On a struct/enum with no explicit impl it records the structural derive
+(below) and calls its witness; a type that does not conform is T0027.
+
 **`Ord` refines `Eq`, recorded as exactly one `(Eq, T)` entry.** After coherence, a
 serial pass appends **one** `(Eq, recv)` conformance for each `Ord` receiver that lacks
 an existing `(Eq, recv)` — adding **no** `eq` method — so `==`/`!=` on an Ord-only type
@@ -861,7 +867,8 @@ example/fixture defines a conflicting `Ordering`).
 
 ## Structural `Ord` auto-derive
 
-Structural `Ord` is synthesized on demand at a `<`/`>`/`<=`/`>=` use site — the same
+Structural `Ord` is synthesized on demand at a `<`/`>`/`<=`/`>=` use site, or at a direct
+`a.cmp(b)` call — the same
 source-less synthetic-codegen-unit channel introduced for `Eq`, keyed on a non-AST
 `(kind, layout, resolved-field-witnesses)` fingerprint. It fires iff every field/payload
 conforms to `Ord` (recursively, via the shared ground `conforms` query) and no explicit

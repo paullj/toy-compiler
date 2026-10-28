@@ -64,6 +64,7 @@ pub const Callee = extern struct {
         opt_is_tag1,
         opt_unwrap,
         opt_unwrap_or,
+        scalar_cmp,
     };
 
     pub const ProtocolMethod = struct { protocol: u32, method: u16, bound: u8 };
