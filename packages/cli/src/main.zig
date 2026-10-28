@@ -321,6 +321,13 @@ pub fn main(init: std.process.Init) !void {
 /// from "your program is wrong".
 const usage_exit: u8 = 2;
 
+/// The exit code for a discovery failure, shared by `check` and the building paths so
+/// they cannot drift: an entry file that cannot be read is a bad input argument, while
+/// a missing import (or any other structural error) is a fault in the program.
+fn graphErrorExit(ge: Graph.Error) u8 {
+    return if (ge.kind == .missing and ge.module == null) usage_exit else 1;
+}
+
 /// The optional leading subcommand: `build` (compile to an executable, the default)
 /// or `run` (build, then execute the produced binary and report how it ended).
 const Command = enum { build, run };
@@ -708,7 +715,7 @@ fn probeSubs(probe: *const Engine.StageProbe) [3]TimingSub {
 /// Run lex→parse→check→codegen→link→sign for a single input and write the signed
 /// executable to `out_path` (mode 0o755). Returns the process exit code: 0 on
 /// success, 1 on any failure (front-end errors, no `main`, unsupported node), and
-/// `usage_exit` for more than one input.
+/// `usage_exit` for more than one input or an entry file that cannot be read.
 fn emitExecutable(
     gpa: std.mem.Allocator,
     out: *Io.Writer,
@@ -871,7 +878,7 @@ fn emitExecutable(
     };
 
     const engine = Engine.initProbe(cache, mode, probe_ptr);
-    if (!try runPipeline(out, gpa, level, engine, &orch, sev)) return 1;
+    if (try runPipeline(out, gpa, level, engine, &orch, sev)) |code| return code;
 
     // The interpreter ran every stage clean: `lowered` is `.ok` with no EFFECTIVE error.
     const lp = &lowered.?.ok;
@@ -965,18 +972,22 @@ fn emitExecutable(
 /// `StageGraph.interpret` and render any stage's diagnostics. This is the ONE
 /// sequencer every program-producing build runs — `-o` and `--emit ir` both call it,
 /// differing only in the codegen `tail` and the post-pipeline output.
-/// Returns `true` on clean completion (the caller reads the result slots), `false`
-/// when a stage produced diagnostics (already rendered; the caller returns exit 1).
+/// Returns `null` on clean completion (the caller reads the result slots), else the
+/// exit code when a stage produced diagnostics (already rendered).
 /// Each stage's diagnostics route through the pretty `Renderer` (snippet + caret)
 /// against the owning module's source, styled at `level` (gate-safe at `.none`).
-fn runPipeline(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, engine: Engine, orch: *const Orchestrator, cfg: SevCfg.SeverityConfig) !bool {
+fn runPipeline(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel, engine: Engine, orch: *const Orchestrator, cfg: SevCfg.SeverityConfig) !?u8 {
     toyc.StageGraph.interpret(&toyc.StageGraph.pipeline, engine, gpa, orch.*) catch |e| switch (e) {
         // A stage produced diagnostics: render them against the owning module and tell
         // the caller to exit non-zero. `failed_stage` says which stage's diagnostics.
         error.StageDiagnostics => {
             const g = &orch.graph.*.?;
+            var code: u8 = 1;
             switch (orch.failed_stage.*.?) {
-                .discover => try DiagRender.renderGraphError(gpa, out, level, g, g.err.?, cfg),
+                .discover => {
+                    try DiagRender.renderGraphError(gpa, out, level, g, g.err.?, cfg);
+                    code = graphErrorExit(g.err.?);
+                },
                 .resolve => try DiagRender.renderScopedDiags(gpa, out, level, g, orch.res.*.?.diags, cfg),
                 .typecheck => try DiagRender.renderScopedDiags(gpa, out, level, g, orch.tc.*.?.diags, cfg),
                 .codegen => switch (orch.tail) {
@@ -998,11 +1009,11 @@ fn runPipeline(out: *Io.Writer, gpa: std.mem.Allocator, level: Style.ColorLevel,
                 },
             }
             try out.flush();
-            return false;
+            return code;
         },
         else => return e,
     };
-    return true;
+    return null;
 }
 
 /// `--emit ir`: run the SAME front-end StageGraph the `-o` build drives, with the
@@ -1097,7 +1108,7 @@ fn emitIr(
     };
 
     const engine = Engine.init(cache, .normal);
-    if (!try runPipeline(out, gpa, level, engine, &orch, sev)) return 1;
+    if (try runPipeline(out, gpa, level, engine, &orch, sev)) |code| return code;
 
     try out.writeAll(ir.?.ok);
     try out.flush();
@@ -1253,15 +1264,10 @@ fn runCheck(
         // `build` — discovery never enters an import past a broken one).
         const parse_in_entry = ge.kind == .parse and (ge.module == null or ge.module == graph.entry_index);
         if (parse_in_entry) return reportEntryFile(gpa, out, level, graph, ndjson, ge.parse_diags, &.{}, &.{}, sev, exit_zero);
-        // A missing/unreadable ENTRY file (kind=.missing, module=null) is a hard CLI/IO
-        // failure -> exit 2, matching `check`'s single-file missing-input contract. Every
-        // OTHER structural error (a real missing/mis-cased IMPORT, a path escape, an import
-        // cycle, a tainted parse in a discovered import) is a compile-level error `build`
-        // reports too -> render it against its owning module and exit 1.
         try DiagRender.renderGraphError(gpa, out, level, graph, ge, sev);
         try out.flush();
         if (exit_zero) return 0;
-        return if (ge.kind == .missing and ge.module == null) 2 else 1;
+        return graphErrorExit(ge);
     }
 
     // RESOLVE the whole graph. Report ALL resolve diagnostics; only when resolve is clean
