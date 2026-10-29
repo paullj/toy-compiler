@@ -147,6 +147,7 @@ pub const Code = enum(u16) {
     W0011, // shadows-std-or-builtin-method (a method named like a std method or a builtin of the same type)
     W0012, // uncalled-function (an expression statement drops a function value it never calls)
     W0013, // fn-field-method-clash (a method shares its name with a fn-typed field of its receiver)
+    W0014, // shared-element-mut-args (two `mut` places of one call copy one Vec element)
 
     _,
 };
@@ -288,6 +289,7 @@ pub const table = [_]Entry{
     .{ .code = .W0011, .str = "W0011", .slug = "shadows-std-or-builtin-method", .default_severity = .warning },
     .{ .code = .W0012, .str = "W0012", .slug = "uncalled-function", .default_severity = .warning },
     .{ .code = .W0013, .str = "W0013", .slug = "fn-field-method-clash", .default_severity = .warning, .related = "field declared here" },
+    .{ .code = .W0014, .str = "W0014", .slug = "shared-element-mut-args", .default_severity = .warning, .related = "earlier copy of the element" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -639,6 +641,11 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("fn-field-method-clash", slug(.W0013).?);
     try testing.expectEqual(Severity.warning, defaultSeverity(.W0013));
     try testing.expectEqual(Code.W0013, fromStr("W0013").?);
+
+    try testing.expectEqualStrings("W0014", str(.W0014).?);
+    try testing.expectEqualStrings("shared-element-mut-args", slug(.W0014).?);
+    try testing.expectEqual(Severity.warning, defaultSeverity(.W0014));
+    try testing.expectEqual(Code.W0014, fromStr("W0014").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {
@@ -676,6 +683,7 @@ test "relatedLabel names what each code's related location is" {
     try testing.expectEqualStrings("defined here", relatedLabel(.T0039));
     try testing.expectEqualStrings("outer binding declared here", relatedLabel(.W0009));
     try testing.expectEqualStrings("field declared here", relatedLabel(.W0013));
+    try testing.expectEqualStrings("earlier copy of the element", relatedLabel(.W0014));
     try testing.expectEqualStrings("first declared here", relatedLabel(.R0011));
 }
 

@@ -93,4 +93,7 @@ test "docForStr resolves a known code and rejects garbage" {
 
     const w13 = docForStr("W0013") orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.indexOf(u8, w13, "field of function type") != null);
+
+    const w14 = docForStr("W0014") orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, w14, "copies of one element") != null);
 }

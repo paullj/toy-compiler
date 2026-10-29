@@ -1,0 +1,63 @@
+# Each 'mut' argument rooted at a Vec element is a copy of that element, written back
+# after the call in argument order, the receiver first. Two copies of one element keep
+# only the last write-back, even when they name different fields, so it warns W0014 at
+# the later one. Indexes that cannot be shown equal, other elements, other Vecs and
+# local places do not warn, nor does a pair with an argument between them that can
+# write a local (bump(i) moves the second ps[i] to another element).
+import std/vec
+
+struct P { x: int, y: int }
+struct B { ps: Vec[P] }
+
+impl P {
+    fn take(mut self, mut d: int) {
+        self.x = self.x + d
+        d = 0
+    }
+}
+
+fn swap(mut a: int, mut b: int) {
+    t := a
+    a = b
+    b = t
+}
+
+fn swap_p(mut a: P, mut b: P) {
+    t := a
+    a = b
+    b = t
+}
+
+fn bump(mut k: int) -> int {
+    k = k + 1
+    return 0
+}
+
+fn three(mut a: int, b: int, mut c: int, mut d: int) {
+    a = b
+    c = b
+    d = b
+}
+
+fn main() -> int {
+    ps := [P { x: 1, y: 2 }, P { x: 3, y: 4 }]
+    qs := [P { x: 5, y: 6 }]
+    i := 0
+    j := 1
+    b := B { ps: [P { x: 7, y: 8 }] }
+    p := P { x: 9, y: 10 }
+    swap(ps[0].x, ps[0].y)  #~ WARN [W0014] arguments 1 and 2 are copies of one element 'ps[0]'; only the last write-back is kept, so copy the element into a local, call, then store it back
+    swap_p(ps[1], ps[1])  #~ WARN [W0014] arguments 1 and 2 are copies of one element 'ps[1]'
+    swap(ps[i].x, ps[i].y)  #~ WARN [W0014] arguments 1 and 2 are copies of one element 'ps[i]'
+    swap(b.ps[0].x, b.ps[0].y)  #~ WARN [W0014] arguments 1 and 2 are copies of one element 'b.ps[0]'
+    ps[0].take(ps[0].y)  #~ WARN [W0014] the receiver and argument 1 are copies of one element 'ps[0]'
+    three(ps[0].x, ps[0].y, qs[0].x, ps[0].y)  #~ WARN [W0014] arguments 1 and 4 are copies of one element 'ps[0]'
+    swap(ps[0].x, ps[1].y)
+    swap(ps[i].x, ps[j].y)
+    swap(ps[0].x, qs[0].y)
+    swap(p.x, p.y)
+    ps[0].take(ps[1].y)
+    ps[0].take(p.y)
+    three(ps[i].x, bump(i), ps[i].y, p.y)
+    return ps[0].x + ps[1].x + qs[0].x + b.ps[0].x + p.x
+}

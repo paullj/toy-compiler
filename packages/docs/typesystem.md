@@ -242,7 +242,11 @@ from two angles — assignability is directional (want ← got), join is symmetr
   is written back with `xs.set(i, ..)`, in argument order (the receiver first). Two
   arguments rooted at one element are two copies, and the last write-back wins, even
   when they name different fields of it: `swap(ps[0].x, ps[0].y)` sets only `y`,
-  since the copy written back last still holds the old `x`. A write the callee makes
+  since the copy written back last still holds the old `x`. When both places name one
+  `Vec` and one index (the same literal, local, or field, tuple-field or element chain
+  of them), the later one is warning **W0014**; indexes that may differ (`ps[i]`,
+  `ps[j]`) stay silent, and so does a pair with an argument between them that may write
+  (a call, as in `f(ps[i].x, bump(i), ps[i].y)`). A write the callee makes
   to the element through another handle is overwritten. Allowed on top-level fns and
   inherent-impl methods (associated fns included); a lambda's, local fn's, extern's or non-self protocol / conformance
   param, or a param past the 64th, is **P0006**. A fn with a `mut` param, or a method
