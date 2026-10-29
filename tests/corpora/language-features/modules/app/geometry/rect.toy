@@ -5,7 +5,7 @@ import geometry/vec
 
 # A qualified type (`vec.Vec`) in a pub field forces `vec.Vec` to be pub too,
 # else an importer naming `Rect` could not name the field's type.
-pub struct Rect { origin: vec.Vec, w: int, h: int }
+pub struct Rect { pub origin: vec.Vec, pub w: int, pub h: int }
 
 pub fn make(x: int, y: int, w: int, h: int) -> Rect {
     Rect { origin: vec.new(x, y), w: w, h: h }

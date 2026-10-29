@@ -1,5 +1,5 @@
 # Module `a`: a `K` with the same name and shape as module `b`'s.
-pub struct K { v: int }
+pub struct K { pub v: int }
 
 pub fn make(v: int) -> K {
     return K { v: v }

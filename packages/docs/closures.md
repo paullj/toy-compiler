@@ -159,7 +159,7 @@ There is one sharing model, so the `&x` / `*r` operators were removed.
 - For a `mut self` method, the receiver is assigned through the closure, so it is boxed.
 - On a `mut` parameter (`mut self` included), the receiver is held by address, like a lambda's capture of it.
 - `c.bump` alone as a statement is the bound method, dropped before it runs, so it is W0012 ("did you mean 'c.bump()'?"); before bound methods it was T0046, no field.
-- **A field of the same name:** the value `h.run` reads a field named `run` when there is one, and is the bound method only when there is none; a call `h.run(1)` selects the method first and only then a field of function type. With both, `h.run(1)` and `f := h.run; f(1)` call different functions, so a method named like a fn-typed field of its struct is warning W0013 at the method ("'h.run(..)' calls the method and 'h.run' reads the field; rename one"), generic structs and conformance methods included. A field of another type does not warn.
+- **A field of the same name:** the value `h.run` reads a field named `run` when there is one, and is the bound method only when there is none; a call `h.run(1)` selects the method first and only then a field of function type. From another module a field without `pub` is hidden: `h.run` is then the bound method when there is one, and reading or calling the field is T0078 otherwise. With both, `h.run(1)` and `f := h.run; f(1)` call different functions, so a method named like a fn-typed field of its struct is warning W0013 at the method ("'h.run(..)' calls the method and 'h.run' reads the field; rename one"), generic structs and conformance methods included. A field of another type does not warn.
 
 ## `_` capture expressions
 
@@ -206,7 +206,7 @@ There is one sharing model, so the `&x` / `*r` operators were removed.
 - **Sorting:** `sort` and `sort_by` sort in place and are stable; `less(a, b)` is true when `a` goes first. A method takes one arity per name, so the comparator form has its own name.
 - **Walks:** they visit the elements present when the call starts, in index order. A callback that pushes onto the same `Vec`, or sets a new key in the same `Map`, does not extend the walk.
 - **Order:** a `Map` or `Set` iterates in insertion order: the order keys were first added. Setting an existing key keeps its place, and there is no removal. `for`, `each`, `keys`, `values`, `filter` and `map` all follow it, and the maps and sets that `filter` and `map` return keep it. `Set.map` keeps one of two elements that map to one value, at the first one's place.
-- **`keys` and `values`:** they return a `Vec`, so `std/map` imports `std/vec`. A program that imports `std/map` (or `std/set`) can call them, and the methods of the `Vec` they return, with no import of `std/vec`; naming the type `Vec` still needs one.
+- **`keys` and `values`:** they return a `Vec`, so `std/map` imports `std/vec`. A program that imports `std/map` can call them, and the methods of the `Vec` they return, with no import of `std/vec`; naming the type `Vec` still needs one.
 - **Escapes:** a std method only calls the functions passed to it, so they never escape (see Escape analysis).
 - **Option and Result:** the methods are in `std/option` (`import std/option`), as `Ref`'s methods are in `std/ref`. Without the import, a call is T0018 "add 'import std/option'". `is_some`, `unwrap`, `unwrap_or` and the other built-in methods need no import.
 - **`or_else(f)`** is the lazy `unwrap_or`: `f` runs only on `none` or `err`.

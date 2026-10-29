@@ -1595,6 +1595,7 @@ pub const BodyChecker = struct {
                     try bc.sink.report(.{ .span = bc.tokSpan(fi.main_token), .code = .T0064 }, "duplicate field '{s}' in '{s}'", .{ fname, disp_name });
                 }
                 seen[j] = true;
+                try bc.checkFieldVisible(sym, j, bc.tokSpan(fi.main_token));
                 const fty = want.?;
                 if (!Type.assignable(fty, vt)) {
                     try bc.sink.report(.{ .span = bc.spanOf(fi.lhs), .code = .T0041 }, "field '{s}': expected {s}, got {s}", .{ fname, bc.typeName(fty), bc.typeName(vt) });
@@ -1603,8 +1604,16 @@ pub const BodyChecker = struct {
                 try bc.sink.report(.{ .span = bc.tokSpan(fi.main_token), .code = .T0046 }, "unknown field '{s}' in '{s}'", .{ fname, disp_name });
             }
         }
+        var private_missing = false;
         for (sym.field_names, 0..) |dn, j| {
-            if (!seen[j]) try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0047 }, "missing field '{s}' in '{s}'", .{ dn, disp_name });
+            if (seen[j]) continue;
+            // Naming the field would be T0078 too, so the fix is a constructor, not the field.
+            if (!bc.fieldVisible(sym, j)) {
+                if (!private_missing) try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0078 }, "'{s}' has private field '{s}', so only module '{s}' can build it; use a constructor", .{ disp_name, dn, bc.model.graph.mods[sym.mod].path });
+                private_missing = true;
+                continue;
+            }
+            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0047 }, "missing field '{s}' in '{s}'", .{ dn, disp_name });
         }
         return result;
     }
@@ -1678,7 +1687,10 @@ pub const BodyChecker = struct {
             const sym = bc.model.structs[e.ctor];
             const fname = bc.nameText(n.main_token);
             for (sym.field_names, 0..) |dn, j| {
-                if (std.mem.eql(u8, dn, fname)) return substTy(bc, sym.field_types[j], e.args);
+                if (!std.mem.eql(u8, dn, fname)) continue;
+                if (!bc.fieldVisible(sym, j)) if (try bc.tryBoundMethod(node_idx, n, base)) |t| return t;
+                try bc.checkFieldVisible(sym, j, bc.tokSpan(n.main_token));
+                return substTy(bc, sym.field_types[j], e.args);
             }
             if (try bc.tryBoundMethod(node_idx, n, base)) |t| return t;
             if (bc.rejectedMethod(base, fname)) return .invalid;
@@ -1693,7 +1705,11 @@ pub const BodyChecker = struct {
         const sym = bc.model.structs[base.struct_id];
         const fname = bc.nameText(n.main_token);
         for (sym.field_names, 0..) |dn, j| {
-            if (std.mem.eql(u8, dn, fname)) return sym.field_types[j];
+            if (!std.mem.eql(u8, dn, fname)) continue;
+            // A field hidden here is no field here: a method of its name binds instead.
+            if (!bc.fieldVisible(sym, j)) if (try bc.tryBoundMethod(node_idx, n, base)) |t| return t;
+            try bc.checkFieldVisible(sym, j, bc.tokSpan(n.main_token));
+            return sym.field_types[j];
         }
         if (try bc.tryBoundMethod(node_idx, n, base)) |t| return t;
         try bc.emitNoField(bc.tokSpan(n.main_token), fname, sym.name, sym.field_names);
@@ -1839,8 +1855,10 @@ pub const BodyChecker = struct {
         // non-canonical spelling (`p.01`, `p.0_1`) is rejected here rather than type-checking
         // as index N while lower — which string-matches — resolves it to field 0.
         const name = bc.nameText(n.main_token);
-        for (sym.field_names, sym.field_types) |fname, fty| {
-            if (std.mem.eql(u8, fname, name)) return fty;
+        for (sym.field_names, sym.field_types, 0..) |fname, fty, j| {
+            if (!std.mem.eql(u8, fname, name)) continue;
+            try bc.checkFieldVisible(sym, j, bc.tokSpan(n.main_token));
+            return fty;
         }
         try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0046 }, "tuple struct '{s}' has no field .{s}", .{ sym.name, name });
         return .invalid;
@@ -2180,7 +2198,8 @@ pub const BodyChecker = struct {
             try bc.sink.report(.{ .span = bc.argsSpan(call), .code = .T0039 }, "tuple struct '{s}' expects {d} value(s), got {d}{s}", .{ sym.name, sym.field_types.len, elems.len, bc.pipedArityHint(call) });
             return result;
         }
-        for (elems, sym.field_types) |a, fty| {
+        for (elems, sym.field_types, 0..) |a, fty, j| {
+            try bc.checkFieldVisible(sym, j, bc.spanOf(a));
             const at = try bc.typeOfExpected(a, fty); // expected type drives literal narrowing (integer widths)
             if (!Type.assignable(fty, at)) {
                 var hint: std.ArrayList(u8) = .empty;
@@ -2871,9 +2890,12 @@ pub const BodyChecker = struct {
     }
 
     /// `recv.member(..)` where `member` names no method but a fn-typed field of the
-    /// struct receiver: a call of the field's value. `field_ty` is the field's type,
+    /// struct receiver `sid`: a call of the field's value. `field_ty` is the field's type,
     /// already substituted through an App receiver's args.
-    fn typeOfFieldCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, field_ty: Type) error{OutOfMemory}!Type {
+    fn typeOfFieldCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, sid: u32, field_ty: Type) error{OutOfMemory}!Type {
+        const fa = bc.tree.nodes[n.lhs.int()];
+        const sym = bc.model.structs[sid];
+        if (fieldIndex(sym.field_names, bc.nameText(fa.main_token))) |j| try bc.checkFieldVisible(sym, j, bc.tokSpan(fa.main_token));
         bc.node_types[(n.lhs).int()] = field_ty;
         return bc.typeOfValueCall(node_idx, n, field_ty);
     }
@@ -4312,7 +4334,7 @@ pub const BodyChecker = struct {
         }
         // No method: a fn-typed field of that name is called as a value (`h.run(4)`).
         if (recv_ty.kind == .@"struct") if (bc.fnField(recv_ty.struct_id, member, &.{})) |fty|
-            return bc.typeOfFieldCall(node_idx, n, fty);
+            return bc.typeOfFieldCall(node_idx, n, recv_ty.struct_id, fty);
         // A concrete struct/enum/scalar value with no such method.
         try bc.drainArgs(args);
         try bc.emitNoMethod(bc.tokSpan(callee.main_token), member, recv_ty);
@@ -4492,7 +4514,7 @@ pub const BodyChecker = struct {
         }
         // No method: a fn-typed field of that name, its type substituted through the args.
         if (!e.ctor_is_enum) if (bc.fnField(e.ctor, member, e.args)) |fty|
-            return bc.typeOfFieldCall(node_idx, n, fty);
+            return bc.typeOfFieldCall(node_idx, n, e.ctor, fty);
         // A generic-type value with no such method.
         try bc.drainArgs(args);
         try bc.emitNoMethod(bc.tokSpan(callee.main_token), member, recv_ty);
@@ -5160,6 +5182,26 @@ pub const BodyChecker = struct {
 
     fn typeFromQualified(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) Type {
         return refs.typeFromQualified(bc, node_idx, n);
+    }
+
+    /// Whether field `j` of `sym` may be used from the module being checked: a field is
+    /// private to its struct's module unless declared `pub`, by the same `pub_bits` that
+    /// export decls. A compiler-made struct has no decl and hides nothing. `pub` so the
+    /// LSP marks a private field the way the checker rejects it.
+    pub fn fieldVisible(bc: *const BodyChecker, sym: StructSym, j: usize) bool {
+        if (sym.mod == bc.graph_mod or sym.decl_node == Ast.none) return true;
+        const tree = bc.model.graph.mods[sym.mod].tree;
+        const fields = Ast.rangeSlice(tree, tree.nodes[sym.decl_node.int()].lhs.int());
+        return j >= fields.len or tree.isPub(fields[j]);
+    }
+
+    /// T0078 at `at` when field `j` of `sym` is private to another module.
+    fn checkFieldVisible(bc: *BodyChecker, sym: StructSym, j: usize, at: Span) error{OutOfMemory}!void {
+        if (bc.fieldVisible(sym, j)) return;
+        const mod = bc.model.graph.mods[sym.mod];
+        // A program cannot edit std or core, so it is not told to mark their fields pub.
+        const hint = if (mod.bundled) "" else "; mark it pub or use a constructor";
+        try bc.sink.report(.{ .span = at, .code = .T0078 }, "field '{s}' of '{s}' is private to module '{s}'{s}", .{ sym.field_names[j], sym.source_name orelse sym.name, mod.path, hint });
     }
 
     /// Emit "no field '{s}' in struct '{s}'", enriched with a "did you mean" hint when a

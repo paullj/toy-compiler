@@ -1,4 +1,4 @@
-pub struct Acc { n: int }
+pub struct Acc { pub n: int }
 
 impl Acc {
     fn add(mut self, mut carry: int) {

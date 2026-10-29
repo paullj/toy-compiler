@@ -4029,17 +4029,19 @@ fn checkPubSignatures(t: *Typecheck, fns: []const GraphFnInput) !void {
             try t.checkPubType(f.ret, t.spanOf(proto.ret_type), "function", gf.name);
     }
 
-    // A `pub` struct FIELD or `pub` enum variant PAYLOAD that names a non-pub type
-    // leaks it across the boundary exactly as a fn param/return would (an importer
-    // can read the field / destructure the variant but cannot name the type): the
-    // locked rule "a pub signature naming a type forces that type pub" applies to
-    // FIELD types too. Per-type checking makes this transitive: a pub type embedded in
-    // another pub type is itself checked.
+    // A `pub` FIELD of a `pub` struct or a `pub` enum variant PAYLOAD that names a
+    // non-pub type leaks it across the boundary exactly as a fn param/return would (an
+    // importer can read the field / destructure the variant but cannot name the type):
+    // the locked rule "a pub signature naming a type forces that type pub" applies to
+    // FIELD types too. A private field is unreachable outside, so it leaks nothing.
+    // Per-type checking makes this transitive: a pub type embedded in another pub type
+    // is itself checked.
     for (t.structs.items) |s| {
         if (s.decl_node == Ast.none or !s.pub_export or s.poisoned) continue;
         _ = t.gphSelect(s.mod);
         const field_nodes = Ast.rangeSlice(t.tree, t.tree.nodes[s.decl_node.int()].lhs.int());
         for (s.field_types, 0..) |fty, fi| {
+            if (fi < field_nodes.len and !t.tree.isPub(field_nodes[fi])) continue;
             const at = if (fi < field_nodes.len) t.fieldTypeSpan(field_nodes[fi]) else t.tokSpan(t.tree.nodes[s.decl_node.int()].main_token);
             try t.checkPubType(fty, at, "struct", s.name);
         }
@@ -10742,7 +10744,7 @@ test "declaration and instantiation diagnostics span their subject" {
         .{ .src = "struct A { x: int }\nfn g(_a: A[int]) -> int { return 0 }\n", .key = "is not generic", .want = "A[int]" },
         .{ .src = "struct Box[T] { v: T }\nfn g(_b: Box[int, bool]) -> int { return 0 }\n", .key = "expects 1 type argument", .want = "[int, bool]" },
         .{ .src = "struct P { x: int }\npub fn mk(p: P) -> int { return p.x }\n", .key = "exposes non-pub", .want = "P" },
-        .{ .src = "struct P { x: int }\npub struct S { f: P }\n", .key = "exposes non-pub", .want = "P" },
+        .{ .src = "struct P { x: int }\npub struct S { pub f: P }\n", .key = "exposes non-pub", .want = "P" },
         .{ .src = "struct P { x: int }\npub enum E { v(int, P) }\n", .key = "exposes non-pub", .want = "P" },
         .{ .src = "fn main() -> bool { return true }\n", .key = "main must return", .want = "bool" },
         .{ .src = "protocol Show { fn show(self) -> int }\nfn h[T has Show](_t: T) -> int { return 0 }\nfn main() -> int { return h(3) }\n", .key = "does not conform", .want = "h(3)" },

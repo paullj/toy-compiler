@@ -1,4 +1,4 @@
-pub struct Rect { w: int, h: int }
+pub struct Rect { pub w: int, pub h: int }
 
 impl Rect {
     fn square(side: int) -> Rect { Rect { w: side, h: side } }

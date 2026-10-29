@@ -116,14 +116,14 @@ impl Map[K has Display, V has Display] has Display {
 # The (key, value) pair a `for k, v in m` loop binds. Field order (key first, val second)
 # is load-bearing: the two-binding loop lowers field 0 -> the first name, field 1 -> the
 # second.
-pub struct Entry[K, V] { key: K, val: V }
+pub struct Entry[K, V] { pub key: K, pub val: V }
 
 # A by-value cursor. `m` copies the 8-byte handle, so it observes the SAME live table; `i`
 # starts at -1 so the first `next` reads entry 0 and the loop ends once `i >= len`. `mut
 # self` writes `i` back across iterations. Reading entries in [0,len) order yields INSERTION
 # order. No Hashable bound: `next` calls only the unbounded length/positional readers. Those
-# readers do no bounds check, and user code can build a cursor with any `i` (#132), so
-# `next` rejects a negative `i` too.
+# readers do no bounds check, so `next` rejects a negative `i` too, though only this module
+# can set the private cursor (#132).
 pub struct MapIter[K, V] { m: Map[K, V], i: int }
 
 impl MapIter[K, V] has iter.Iterator[Entry[K, V]] {

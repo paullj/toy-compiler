@@ -1,6 +1,7 @@
-# `Inner` is module-private; exposing it as a FIELD of a `pub` struct is a leak.
+# `Inner` is module-private; exposing it as a `pub` FIELD of a `pub` struct is a leak.
+# A private field of that type would leak nothing.
 struct Inner { v: int }
 
-pub struct Outer { i: Inner }
+pub struct Outer { pub i: Inner, j: Inner }
 
 pub fn ok() -> int { 0 }

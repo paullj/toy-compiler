@@ -364,6 +364,12 @@ Every std and core module follows these rules.
   `StdNames.core_replacements`, and a unit test walks the bundle so a new core module
   cannot ship without one. The self-check modules map to `std/gc`. The dev-only
   `--dev-core-imports` flag lifts the rule.
+- **A std type's fields are private unless it is a plain record (T0078).** `Vec`, `Map`
+  and `Set` keep their storage handle private and the iterators keep their cursor
+  private, so a program reaches them only through their methods and cannot build one
+  over the wrong memory (#132). A record such as `Entry` marks its fields `pub`. A std
+  module gets no access to another module's private fields either: `Set` holds its own
+  table handle rather than reading a `Map`'s.
 - **Tests force a collection through `std/gc`.** No test or fixture imports core: a test
   that must observe a collection calls `gc.collect()` and reads `gc.collections()`, which
   also counts collections an allocation triggered.
