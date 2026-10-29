@@ -1889,6 +1889,10 @@ pub const GraphCtx = struct {
         bundled: bool = false,
         /// The import path (`std/vec`), for diagnostics that name a module.
         path: []const u8 = "",
+        /// The name a diagnostic location shows (`Graph.Module.displayName`).
+        file: []const u8 = "",
+        /// The modules this one imports directly (graph module ids).
+        imports: []const u32 = &.{},
     };
 
     /// Resolve an import namespace receiver name in module `mod` to the imported

@@ -271,6 +271,96 @@ test "coherence: overlapping cross-module impls with a mismatched sig report T00
     try testing.expectEqual(@as(usize, 1), n_t0020);
 }
 
+// #133: `lib` sorts after `main`, so plain module order would put the error on lib's
+// impl, which the user usually cannot change.
+test "coherence: an importer's duplicate impl gets the T0020 and names the imported one" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-diff-coherence-importer";
+    try writeFixture(io, dir, &.{
+        .{ "lib.toy", "pub protocol Show {\n    fn show(self) -> int\n}\n\npub struct W { n: int }\n\nimpl W has Show {\n    fn show(self) -> int { self.n }\n}\n" },
+        .{ "main.toy", "import lib\n\nimpl lib.W has lib.Show {\n    fn show(self) -> int { 0 }\n}\n\nfn main() -> int {\n    return lib.W { n: 3 }.show()\n}\n" },
+    });
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
+    const cache = try Driver.openCache(io, &dir_buf);
+    var graph = try Graph.discover(gpa, io, cache, Driver.default_target, dir ++ "/main.toy", .{});
+    defer graph.deinit(gpa);
+    try testing.expect(graph.err == null);
+
+    var res = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), countErrors(res.diags));
+
+    var tc = try TypecheckGraph.checkGraph(gpa, &graph, &res, io, 0);
+    defer tc.deinit(gpa);
+
+    var n_err: usize = 0;
+    for (tc.diags) |d| {
+        if (d.severity != .err) continue;
+        n_err += 1;
+        try testing.expect(d.code == .T0020);
+        try testing.expectEqualStrings("main", graph.modules[d.scope].path);
+        try testing.expect(std.mem.indexOf(u8, d.message, "lib.toy:7 already provides one") != null);
+    }
+    try testing.expectEqual(@as(usize, 1), n_err);
+}
+
+// #133: neither sibling reaches the other, so the tie falls to module order, which must
+// not depend on the worker count.
+test "coherence: sibling modules' duplicate impls get the same T0020s at -j1 and -jN" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-diff-coherence-siblings";
+    const dup = "import lib\n\nimpl lib.W has lib.Show {\n    fn show(self) -> int { 0 }\n}\n\npub fn f() -> int { 1 }\n";
+    try writeFixture(io, dir, &.{
+        .{ "lib.toy", "pub protocol Show {\n    fn show(self) -> int\n}\n\npub struct W { n: int }\n\nimpl W has Show {\n    fn show(self) -> int { self.n }\n}\n" },
+        .{ "x.toy", dup },
+        .{ "y.toy", dup },
+        .{ "main.toy", "import x\nimport y\n\nfn main() -> int {\n    return x.f() + y.f()\n}\n" },
+    });
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+
+    var dir_buf: [Driver.cache_dir_buf_len]u8 = undefined;
+    const cache = try Driver.openCache(io, &dir_buf);
+    var graph = try Graph.discover(gpa, io, cache, Driver.default_target, dir ++ "/main.toy", .{});
+    defer graph.deinit(gpa);
+    try testing.expect(graph.err == null);
+
+    var res = try ResolveGraph.resolveGraph(gpa, &graph);
+    defer res.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), countErrors(res.diags));
+
+    var serial = try TypecheckGraph.checkGraphWith(gpa, &graph, &res, .{ .io = io, .ncpu = 1, .threshold = 0 });
+    defer serial.deinit(gpa);
+    var wide = try TypecheckGraph.checkGraphWith(gpa, &graph, &res, .{ .io = io, .ncpu = 8, .threshold = 0 });
+    defer wide.deinit(gpa);
+
+    const want = [_]struct { mod: []const u8, msg: []const u8 }{
+        .{ .mod = "x", .msg = "lib.toy:7 already provides one" },
+        .{ .mod = "y", .msg = "x.toy:3 already provides one" },
+    };
+    for ([_][]const Diagnostic{ serial.diags, wide.diags }) |diags| {
+        var n_err: usize = 0;
+        for (diags) |d| {
+            if (d.severity != .err) continue;
+            try testing.expect(n_err < want.len);
+            try testing.expect(d.code == .T0020);
+            try testing.expectEqualStrings(want[n_err].mod, graph.modules[d.scope].path);
+            try testing.expect(std.mem.indexOf(u8, d.message, want[n_err].msg) != null);
+            n_err += 1;
+        }
+        try testing.expectEqual(want.len, n_err);
+    }
+}
+
 /// Spawn the built `toy` with `argv_tail`, returning the exit code (or an error).
 fn spawnExit(gpa: std.mem.Allocator, io: Io, argv_tail: []const []const u8) !std.process.Child.Term {
     const bin_abs = harness.toy_exe;

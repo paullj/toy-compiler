@@ -19,8 +19,8 @@ const testing = std.testing;
 /// Whole-program conformance coherence. Walks every `impl .. has ..` in
 /// module-then-decl order (SERIAL, before Pass C) and enforces:
 ///   * exactly one impl per (protocol, receiver type-ctor) — a duplicate (INCLUDING a
-///     retroactive one in a SIBLING module: no orphan rule) is T0020 at the second impl,
-///     or at the program's impl when the other is in bundled std;
+///     retroactive one in a SIBLING module: no orphan rule) is T0020 at the impl
+///     `reportOverlap` picks to drop;
 ///   * `has P` names a declared protocol AND provides every method P requires — an
 ///     undeclared protocol OR a missing method is T0021.
 /// Accepted conformances are recorded onto `t.conformances`. The
@@ -319,7 +319,7 @@ fn recordGenericConformance(
     for (t.template_conformances.items) |*tc| {
         if (tc.protocol_id != pid or tc.recv_ctor != e.ctor or tc.recv_is_enum != e.ctor_is_enum) continue;
         if (!try patternsOverlap(t.gpa, @max(n_vars, tc.n_params), tc.protocol_args, pargs, t.composite.decomposer())) continue;
-        const loser = try reportOverlap(t, pid, .{ .mod = tc.impl_mod, .decl = tc.impl_decl }, here, ": an earlier impl's protocol arguments can equal these at one instance");
+        const loser = try reportOverlap(t, pid, .{ .mod = tc.impl_mod, .decl = tc.impl_decl }, here, ", and its protocol arguments can equal these at one instance");
         if (loser.mod == here.mod and loser.decl == here.decl) return;
         replaces = tc;
         break;
@@ -435,21 +435,26 @@ fn checkReceiverMode(t: *Typecheck, prot: Typecheck.ProtocolSym, j: usize, fn_id
 /// An `impl .. has ..` decl: its module and its node there.
 const ImplAt = struct { mod: u32, decl: Ast.Index };
 
-/// T0020 for the impl `second`, which repeats the conformance `first` claimed. When one of
-/// the two is in bundled std the program's impl is the one to remove, so the error sits on
-/// it and names std's module, whichever came first in module order. The losing impl's
-/// method rows and templates are dropped, so its calls neither shadow std's (W0011) nor
-/// look ambiguous between two witnesses (T0025): this error is the only one the overlap
+/// T0020 for the impl `second`, which repeats the conformance `first` claimed. The error
+/// sits on the impl whose author can drop it: the program's when the other is in bundled
+/// std, the importer's when one module reaches the other through its imports, else the
+/// later one in module order (so `-jN` reports the same). The message names where the
+/// other impl is, since the user may not see it otherwise. The losing impl's method rows
+/// and templates are dropped, so its calls neither shadow std's (W0011) nor look
+/// ambiguous between two witnesses (T0025): this error is the only one the overlap
 /// gives. Returns the loser.
 fn reportOverlap(t: *Typecheck, pid: u32, first: ?ImplAt, second: ImplAt, detail: []const u8) !ImplAt {
     const mods = t.graph.mods;
     var loser = second;
-    var std_mod: ?u32 = null;
+    var keeper: ?ImplAt = first;
     if (first) |f| {
-        if (mods[f.mod].bundled and !mods[second.mod].bundled) std_mod = f.mod;
-        if (!mods[f.mod].bundled and mods[second.mod].bundled) {
+        const swap = if (mods[f.mod].bundled != mods[second.mod].bundled)
+            mods[second.mod].bundled
+        else
+            f.mod != second.mod and try imports(t.gpa, mods, f.mod, second.mod);
+        if (swap) {
             loser = f;
-            std_mod = second.mod;
+            keeper = second;
         }
     }
     const prev = t.gphSelect(loser.mod);
@@ -458,10 +463,13 @@ fn reportOverlap(t: *Typecheck, pid: u32, first: ?ImplAt, second: ImplAt, detail
     const proto_ref = Ast.implProtocol(t.tree, decl).?;
     const span = implHeaderSpan(t, decl, proto_ref);
     const pname = t.protocols.items[pid].name;
-    if (std_mod) |sm|
-        try t.sink.report(.{ .span = span, .code = .T0020 }, "overlapping impl of protocol '{s}' for type '{s}': {s} already provides one; remove this impl", .{ pname, t.nameText(decl.main_token), mods[sm].path })
-    else
-        try t.sink.report(.{ .span = span, .code = .T0020 }, "overlapping impl of protocol '{s}' for type '{s}'{s}", .{ pname, t.nameText(decl.main_token), detail });
+    const tname = t.nameText(decl.main_token);
+    if (keeper) |k| {
+        if (mods[k.mod].bundled)
+            try t.sink.report(.{ .span = span, .code = .T0020 }, "overlapping impl of protocol '{s}' for type '{s}': {s} already provides one; remove this impl", .{ pname, tname, mods[k.mod].path })
+        else
+            try t.sink.report(.{ .span = span, .code = .T0020 }, "overlapping impl of protocol '{s}' for type '{s}': {s}:{d} already provides one{s}", .{ pname, tname, mods[k.mod].file, implLine(t, k), detail });
+    } else try t.sink.report(.{ .span = span, .code = .T0020 }, "overlapping impl of protocol '{s}' for type '{s}'", .{ pname, tname });
     for (Ast.implMethods(t.tree, decl)) |pn| {
         const fid = for (t.fns.items, 0..) |f, fi| {
             if (f.mod == loser.mod and f.decl_node == pn) break fi;
@@ -483,6 +491,32 @@ fn reportOverlap(t: *Typecheck, pid: u32, first: ?ImplAt, second: ImplAt, detail
         }
     }
     return loser;
+}
+
+/// Whether module `from` reaches module `to` through its imports.
+fn imports(gpa: std.mem.Allocator, mods: []const Typecheck.GraphCtx.ModuleCtx, from: u32, to: u32) !bool {
+    const seen = try gpa.alloc(bool, mods.len);
+    defer gpa.free(seen);
+    @memset(seen, false);
+    var stack: std.ArrayList(u32) = .empty;
+    defer stack.deinit(gpa);
+    try stack.append(gpa, from);
+    while (stack.pop()) |m| {
+        if (m == to) return true;
+        if (seen[m]) continue;
+        seen[m] = true;
+        try stack.appendSlice(gpa, mods[m].imports);
+    }
+    return false;
+}
+
+/// The 1-based line of `at`'s `impl` keyword.
+fn implLine(t: *Typecheck, at: ImplAt) u32 {
+    const prev = t.gphSelect(at.mod);
+    defer _ = t.gphSelect(prev);
+    const decl = t.tree.nodes[at.decl.int()];
+    const start = implHeaderSpan(t, decl, Ast.implProtocol(t.tree, decl).?).start;
+    return @intCast(std.mem.count(u8, t.source[0..start], "\n") + 1);
 }
 
 fn implHeaderSpan(t: *const Typecheck, decl: Ast.Node, proto_ref: Ast.Index) Span {

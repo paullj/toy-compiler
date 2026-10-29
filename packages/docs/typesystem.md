@@ -664,7 +664,10 @@ parallel body pass): exactly one impl per `(protocol, type)`, no orphan rules â€
 duplicate (even in a sibling module) is **T0020**, a missing method or undeclared
 protocol is **T0021**. When one of the two impls is in bundled std (std/float's
 `impl float has Display`, say) the T0020 sits on the program's impl and names std's
-module, and the program's impl methods are dropped so its calls give no further error. A protocol stores its method NAMES only; the per-impl
+module, and the program's impl methods are dropped so its calls give no further error.
+Between two user modules the T0020 sits on the importer's impl when one module imports
+the other (directly or not), else on the later one in module order, and the message
+names the other impl's `file:line`. A protocol stores its method NAMES only; the per-impl
 signature-compatibility check (params/return vs the protocol) is **deferred**
 (the builtin `Eq` below is signature-correct by construction).
 

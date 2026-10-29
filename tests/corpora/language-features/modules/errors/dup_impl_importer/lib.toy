@@ -1,0 +1,9 @@
+pub protocol Show {
+    fn show(self) -> int
+}
+
+pub struct W { n: int }
+
+impl W has Show {
+    fn show(self) -> int { self.n }
+}

@@ -1,0 +1,12 @@
+# Feature: coherence reports an overlap on the importer's impl. `lib` already conforms
+# W to Show, so this impl is the one to drop, though `lib` comes later in module order.
+# expect: compile-error "lib.toy:7 already provides one"
+import lib
+
+impl lib.W has lib.Show {
+    fn show(self) -> int { 0 }
+}
+
+fn main() -> int {
+    return lib.W { n: 3 }.show()
+}
