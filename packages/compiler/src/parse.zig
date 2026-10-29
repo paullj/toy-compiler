@@ -39,7 +39,7 @@ src: []const u8,
 /// Cursor into `tokens`.
 index: u32,
 nodes: std.ArrayList(Node),
-/// Node indices of top-level decls that carried a `pub` modifier. Packed
+/// Node indices of top-level decls and struct fields that carried a `pub` modifier. Packed
 /// into the `Tree.pub_bits` bitset after the `.program` node is appended.
 pub_decls: std.ArrayList(Ast.Index),
 /// Variable-arity child runs and range/proto headers (the "extra_data" side
@@ -858,6 +858,8 @@ fn parseProtocolDecl(p: *Parser) Error!Ast.Index {
 
 /// `struct Name { x: int, y: int }`. Fields are `name: Type`, comma-separated,
 /// with newlines insignificant inside `{}`. Reuses the `.param` node for fields.
+/// A field (or tuple-struct field type) may lead with `pub`; its node then joins
+/// `pub_decls`, so field visibility rides the same bitset as decl exports.
 fn parseStructDecl(p: *Parser) Error!Ast.Index {
     try p.expect(.kw_struct, "expected 'struct'");
     const name_tok = p.index;
@@ -874,8 +876,13 @@ fn parseStructDecl(p: *Parser) Error!Ast.Index {
         defer types.deinit(p.gpa);
         while (!p.at(.r_paren) and !p.at(.eof)) {
             const t_entry = p.index;
+            const is_pub = p.eat(.kw_pub);
+            // A `pub` with no type after it is a decl anchor (recovery), not a field.
+            if (is_pub and !p.startsType()) p.index = t_entry;
             if (p.startsType()) {
-                try types.append(p.gpa, try p.parseType());
+                const ty = try p.parseType();
+                if (is_pub) try p.pub_decls.append(p.gpa, ty);
+                try types.append(p.gpa, ty);
                 if (try p.listSep(.r_paren, tuple_recovery, "expected ',' or ')' after a type")) break;
             } else if (tuple_recovery.contains(p.peek().tag)) {
                 break;
@@ -897,6 +904,8 @@ fn parseStructDecl(p: *Parser) Error!Ast.Index {
     while (!p.at(.eof)) {
         p.skipNewlines();
         if (p.at(.r_brace)) break;
+        const is_pub = p.at(.kw_pub) and p.peek2().tag == .identifier;
+        if (is_pub) p.bump(.kw_pub);
         if (decl_anchors.contains(p.peek().tag)) break;
         const entry = p.index;
         if (p.at(.identifier)) {
@@ -905,6 +914,7 @@ fn parseStructDecl(p: *Parser) Error!Ast.Index {
             try p.expect(.colon, "expected ':' after field name");
             const type_node = try p.parseType();
             const field = try p.addNode(.{ .tag = .param, .main_token = field_name, .lhs = type_node, .rhs = Ast.none });
+            if (is_pub) try p.pub_decls.append(p.gpa, field);
             try fields.append(p.gpa, field);
             // A field is separated by a comma OR a newline (both insignificant
             // inside `{}`); a `}` ends the list. The comma is optional; the loop
@@ -4425,6 +4435,53 @@ test "non-pub decl stays bare among pub decls" {
         "pub fn a() -> int { 0 }\nfn b() -> int { 1 }\n",
         "(program (pub (fn a () int (block 0))) (fn b () int (block 1)))",
     );
+}
+
+test "pub struct fields and pub tuple-struct fields render with a pub wrapper" {
+    try expectProgram(
+        "struct P { pub x: int, y: int }\n",
+        "(program (struct P (pub (param x int)) (param y int)))",
+    );
+    try expectProgram(
+        "pub struct W(pub int, int)\n",
+        "(program (pub (struct.tuple W (pub int) int)))",
+    );
+    try expectProgram(
+        "struct T(pub fn() -> int)\n",
+        "(program (struct.tuple T (pub (fnty () int))))",
+    );
+    try expectProgram(
+        "struct B[T] {\n  pub val: T\n  n: int\n}\n",
+        "(program (struct B [T] (pub (param val T)) (param n int)))",
+    );
+}
+
+test "a pub that starts no field is not taken as a field" {
+    const gpa = testing.allocator;
+    const source = "struct S { x: int\npub fn g() -> int { 0 }\n";
+    const res = try parseResult(gpa, source);
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+
+    var buf: [512]u8 = undefined;
+    const rendered = try renderResult(res, source, &buf);
+    try testing.expect(std.mem.indexOf(u8, rendered, "(fn g") != null);
+    try testing.expectEqual(@as(usize, 1), res.diags.len);
+    try testing.expectEqualStrings("expected '}' to close struct body", res.diags[0].message);
+}
+
+test "a pub field sets its own node's pub bit, not the struct's" {
+    const gpa = testing.allocator;
+    const res = try parseResult(gpa, "struct P { pub x: int, y: int }\n");
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expectEqual(@as(usize, 0), res.diags.len);
+    const prog = res.tree.nodes[Ast.root(res.tree.nodes).int()];
+    const decl = Ast.rangeSlice(res.tree, prog.lhs.int())[0];
+    try testing.expect(!res.tree.isPub(decl));
+    const fields = Ast.rangeSlice(res.tree, res.tree.nodes[decl.int()].lhs.int());
+    try testing.expect(res.tree.isPub(fields[0]));
+    try testing.expect(!res.tree.isPub(fields[1]));
 }
 
 test "qualified member call parses via field_access" {

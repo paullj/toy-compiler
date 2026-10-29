@@ -473,7 +473,8 @@ comptime {
 /// together and (de)serialize together via `pack`/`unpack`.
 ///
 /// `pub_bits` is a packed bitset (one bit per node index) marking which decl
-/// nodes carry the `pub` modifier (export visibility). It is memcpy-trivial
+/// and struct-field nodes carry the `pub` modifier (visibility outside the
+/// module). A tuple-struct field's bit sits on its type node. It is memcpy-trivial
 /// like `nodes`/`extra` and round-trips through `pack`/`unpack`. It defaults to
 /// the empty slice so the many partial `Tree` views built across the driver
 /// (`.{ .nodes = ..., .extra = ... }`) keep compiling; `isPub` treats an absent
@@ -483,7 +484,7 @@ pub const Tree = struct {
     extra: []u32,
     pub_bits: []const u32 = &.{},
 
-    /// Whether the decl node at `idx` carries `pub`. Out-of-range (or an empty
+    /// Whether the decl or field node at `idx` carries `pub`. Out-of-range (or an empty
     /// bitset) reads as `false`.
     pub fn isPub(tree: Tree, idx: Index) bool {
         const i = idx.int();
@@ -902,6 +903,15 @@ pub fn render(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
     try renderNode(out, tree, tokens, source, root(tree.nodes));
 }
 
+/// A `pub` node renders as `(pub <node>)` so the visibility surface shows in
+/// the S-expression (and is asserted by parse tests).
+fn renderVisible(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []const u8, idx: Index) std.Io.Writer.Error!void {
+    if (!tree.isPub(idx)) return renderNode(out, tree, tokens, source, idx);
+    try out.writeAll("(pub ");
+    try renderNode(out, tree, tokens, source, idx);
+    try out.writeByte(')');
+}
+
 /// Render a ` [X Y]` generic-parameter list, or nothing when empty, so non-generic
 /// decls stay byte-identical. Shared by the struct/enum/protocol/fn render arms.
 fn renderGenericParams(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []const u8, gps: []const Index) std.Io.Writer.Error!void {
@@ -1141,15 +1151,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             try out.writeAll("(program");
             for (rangeSlice(tree, n.lhs.int())) |decl_idx| {
                 try out.writeByte(' ');
-                // A `pub` decl renders as `(pub <decl>)` so the visibility surface
-                // is visible in the S-expression (and asserted by parse tests).
-                if (tree.isPub(decl_idx)) {
-                    try out.writeAll("(pub ");
-                    try renderNode(out, tree, tokens, source, decl_idx);
-                    try out.writeByte(')');
-                } else {
-                    try renderNode(out, tree, tokens, source, decl_idx);
-                }
+                try renderVisible(out, tree, tokens, source, decl_idx);
             }
             try out.writeByte(')');
         },
@@ -1242,7 +1244,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             try renderGenericParams(out, tree, tokens, source, if (n.rhs == none) &.{} else rangeSlice(tree, n.rhs.int()));
             for (rangeSlice(tree, n.lhs.int())) |field| {
                 try out.writeByte(' ');
-                try renderNode(out, tree, tokens, source, field);
+                try renderVisible(out, tree, tokens, source, field);
             }
             try out.writeByte(')');
         },
@@ -1270,7 +1272,7 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
             try renderGenericParams(out, tree, tokens, source, if (n.rhs == none) &.{} else rangeSlice(tree, n.rhs.int()));
             for (rangeSlice(tree, n.lhs.int())) |ty| {
                 try out.writeByte(' ');
-                try renderNode(out, tree, tokens, source, ty);
+                try renderVisible(out, tree, tokens, source, ty);
             }
             try out.writeByte(')');
         },
