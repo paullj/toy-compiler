@@ -8,7 +8,7 @@ pub extern fn strtod(s: rawptr, end: rawptr) -> float
 
 # The shortest digits that read back as the value: it is `0.<digits> * 10^point`, negative
 # when `neg`. Infinity and NaN come back as the digits "Infinity" and "NaN" with point 9999.
-pub struct Shortest { digits: str, point: int, neg: bool }
+pub struct Shortest { pub digits: str, pub point: int, pub neg: bool }
 
 # A C `int` is 4 bytes and `load` reads 8; `point` can be negative, so the sign is extended.
 fn load_i32(p: rawptr) -> int {

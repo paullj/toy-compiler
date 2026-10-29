@@ -1,0 +1,9 @@
+# Feature: a field without `pub` is private to its struct's module, so another module
+# cannot read it (nor write it or set it in a literal).
+# expect: compile-error "field 'balance' of 'Account' is private to module 'lib'; mark it pub or use a constructor"
+import lib
+
+fn main() -> int {
+    a := lib.open("ann")
+    return a.owner.len() + a.balance
+}

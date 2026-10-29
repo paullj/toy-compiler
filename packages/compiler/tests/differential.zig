@@ -281,7 +281,7 @@ test "coherence: an importer's duplicate impl gets the T0020 and names the impor
 
     const dir = ".toy-test-diff-coherence-importer";
     try writeFixture(io, dir, &.{
-        .{ "lib.toy", "pub protocol Show {\n    fn show(self) -> int\n}\n\npub struct W { n: int }\n\nimpl W has Show {\n    fn show(self) -> int { self.n }\n}\n" },
+        .{ "lib.toy", "pub protocol Show {\n    fn show(self) -> int\n}\n\npub struct W { pub n: int }\n\nimpl W has Show {\n    fn show(self) -> int { self.n }\n}\n" },
         .{ "main.toy", "import lib\n\nimpl lib.W has lib.Show {\n    fn show(self) -> int { 0 }\n}\n\nfn main() -> int {\n    return lib.W { n: 3 }.show()\n}\n" },
     });
     defer Io.Dir.cwd().deleteTree(io, dir) catch {};
@@ -321,7 +321,7 @@ test "coherence: sibling modules' duplicate impls get the same T0020s at -j1 and
     const dir = ".toy-test-diff-coherence-siblings";
     const dup = "import lib\n\nimpl lib.W has lib.Show {\n    fn show(self) -> int { 0 }\n}\n\npub fn f() -> int { 1 }\n";
     try writeFixture(io, dir, &.{
-        .{ "lib.toy", "pub protocol Show {\n    fn show(self) -> int\n}\n\npub struct W { n: int }\n\nimpl W has Show {\n    fn show(self) -> int { self.n }\n}\n" },
+        .{ "lib.toy", "pub protocol Show {\n    fn show(self) -> int\n}\n\npub struct W { pub n: int }\n\nimpl W has Show {\n    fn show(self) -> int { self.n }\n}\n" },
         .{ "x.toy", dup },
         .{ "y.toy", dup },
         .{ "main.toy", "import x\nimport y\n\nfn main() -> int {\n    return x.f() + y.f()\n}\n" },

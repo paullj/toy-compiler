@@ -409,7 +409,7 @@ test "qualified pub type in a signature resolves to the owning module's layout" 
         \\
         },
         .{ .path = "geometry/rect.toy", .source =
-        \\pub struct Rect { w: int, h: int }
+        \\pub struct Rect { pub w: int, pub h: int }
         \\
         },
     };
@@ -435,6 +435,165 @@ test "qualified pub type in a signature resolves to the owning module's layout" 
         }
     };
     try withCheckedGraph(".toy-test-typ-qtype", files, "main.toy", Check.run);
+}
+
+test "a private field is T0078 at each read, write, literal and call outside its module" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import lib
+        \\fn main() -> int {
+        \\ p := lib.mk()
+        \\ p.y = 3
+        \\ p.y += 1
+        \\ q := lib.P { x: 1, y: 2 }
+        \\ w := lib.w()
+        \\ r := w.0 + w.1
+        \\ h := lib.h()
+        \\ r += h.f() + h.g()
+        \\ b := lib.B { v: 1, n: 2 }
+        \\ r += b.v + b.n
+        \\ return p.x + q.x + r
+        \\}
+        \\
+        },
+        .{ .path = "lib.toy", .source =
+        \\pub struct P { pub x: int, y: int }
+        \\pub struct W(pub int, int)
+        \\pub struct H { f: fn() -> int, pub g: fn() -> int }
+        \\pub struct B[T] { pub v: T, n: int }
+        \\pub fn mk() -> P { P { x: 1, y: 2 } }
+        \\pub fn w() -> W { W(1, 2) }
+        \\fn one() -> int { 1 }
+        \\pub fn h() -> H { H { f: one, g: one } }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = r;
+            errdefer for (tr.diags) |d| std.debug.print("got: {s}\n", .{d.message});
+            const want = [_][]const u8{
+                "field 'y' of 'P' is private to module 'lib'; mark it pub or use a constructor",
+                "field 'y' of 'P' is private to module 'lib'; mark it pub or use a constructor",
+                "field 'y' of 'P' is private to module 'lib'; mark it pub or use a constructor",
+                "field '1' of 'W' is private to module 'lib'; mark it pub or use a constructor",
+                "field 'f' of 'H' is private to module 'lib'; mark it pub or use a constructor",
+                "field 'n' of 'B' is private to module 'lib'; mark it pub or use a constructor",
+                "field 'n' of 'B' is private to module 'lib'; mark it pub or use a constructor",
+            };
+            try testing.expectEqual(want.len, tr.diags.len);
+            const main_mod = modId(g, "main");
+            for (want, tr.diags) |w, d| {
+                try testing.expectEqual(codes.Code.T0078, d.code);
+                try testing.expectEqual(main_mod, d.scope);
+                try testing.expectEqualStrings(w, d.message);
+            }
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-privfield", files, "main.toy", Check.run);
+}
+
+test "outside its module a private field is hidden, so a method of its name binds as a value" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import lib
+        \\fn main() -> int {
+        \\ h := lib.mk()
+        \\ f := h.len
+        \\ b := lib.box(2)
+        \\ g := b.v
+        \\ return f() + g()
+        \\}
+        \\
+        },
+        .{ .path = "lib.toy", .source =
+        \\pub struct H { len: int }
+        \\impl H { fn len(self) -> int { self.len * 10 } }
+        \\pub fn mk() -> H { H { len: 4 } }
+        \\pub struct B[T] { v: T }
+        \\impl B[T] { fn v(self) -> T { self.v } }
+        \\pub fn box(v: int) -> B[int] { B { v: v } }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            _ = r;
+            errdefer for (tr.diags) |d| std.debug.print("got: {s}\n", .{d.message});
+            try testing.expectEqual(@as(usize, 0), tr.diags.len);
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-privfield-method", files, "main.toy", Check.run);
+}
+
+test "a literal leaving out a private field asks for a constructor, and std's say only private" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import lib
+        \\import std/map
+        \\fn main() -> int {
+        \\ p := lib.P { x: 1 }
+        \\ m := Map[int, int].new()
+        \\ _h := m.h
+        \\ return p.x
+        \\}
+        \\
+        },
+        .{ .path = "lib.toy", .source =
+        \\pub struct P { pub x: int, y: int, z: int }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            _ = r;
+            errdefer for (tr.diags) |d| std.debug.print("got: {s}\n", .{d.message});
+            const want = [_][]const u8{
+                "'P' has private field 'y', so only module 'lib' can build it; use a constructor",
+                "field 'h' of 'Map' is private to module 'std/map'",
+            };
+            try testing.expectEqual(want.len, tr.diags.len);
+            for (want, tr.diags) |w, d| {
+                try testing.expectEqual(codes.Code.T0078, d.code);
+                try testing.expectEqualStrings(w, d.message);
+            }
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-privfield-missing", files, "main.toy", Check.run);
+}
+
+test "a struct's own module, its methods and its derives see every field" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import lib
+        \\fn main() -> int {
+        \\ a := lib.mk(1)
+        \\ b := lib.mk(1)
+        \\ s := a.to_string()
+        \\ return if a == b && a.hidden() == 2 { s.len() } else { 0 }
+        \\}
+        \\
+        },
+        .{ .path = "lib.toy", .source =
+        \\struct Inner { v: int }
+        \\pub struct P { x: int, i: Inner }
+        \\impl P { fn hidden(self) -> int { self.x + self.i.v } }
+        \\pub fn mk(x: int) -> P { P { x: x, i: Inner { v: 1 } } }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            _ = r;
+            errdefer for (tr.diags) |d| std.debug.print("got: {s}\n", .{d.message});
+            // No T0078, and a private field of non-pub `Inner` is no coherence leak.
+            try testing.expectEqual(@as(usize, 0), tr.diags.len);
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-privfield-own", files, "main.toy", Check.run);
 }
 
 test "pub fn exposing a non-pub return type is a coherence error" {

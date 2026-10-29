@@ -1,0 +1,5 @@
+pub struct Account { pub owner: str, balance: int }
+
+pub fn open(owner: str) -> Account {
+    Account { owner: owner, balance: 0 }
+}

@@ -1,55 +1,55 @@
 import core/mem
 import core/text
-import std/map
 import std/iter
 
-# A thin `Set[T]` face over an erased `Map[T, ()]`. The sole field `m` is itself a
-# single 8-byte handle, so `n := s` shares the SAME table (an add through one is seen through
-# the other). The value column is the zero-sized `()`: the key's PRESENCE is the payload, so
-# a cell is `size_of[T] + 0` bytes and the value store/load are no-ops. The `[T has Hashable]`
-# bound mirrors `Map`'s: it makes a non-Hashable element a clean T0023 at the user's `Set[..]`
-# call, naming the type and `Hashable`, instead of pointing inside this file. `new` is an
-# ASSOCIATED function, called `Set[int].new()`. Every walk (`for x`, `each`, `filter`, `map`)
-# visits elements in insertion order: the order they were first added; adding one again keeps
-# its place.
-pub struct Set[T] { m: Map[T, ()] }
+# A `Set[T]` over `core/mem`'s erased table, keyed by the element with the zero-sized `()`
+# as the value column: the key's PRESENCE is the payload, so a cell is `size_of[T] + 0`
+# bytes and the value store/load are no-ops. It holds the table handle itself, as `Map`
+# does, because another module cannot reach a Map's private handle. The sole field `h` is
+# the 8-byte handle, so `n := s` shares the SAME table (an add through one is seen through
+# the other). The `[T has Hashable]` bound mirrors `Map`'s: it makes a non-Hashable element
+# a clean T0023 at the user's `Set[..]` call, naming the type and `Hashable`, instead of
+# pointing inside this file. `new` is an ASSOCIATED function, called `Set[int].new()`.
+# Every walk (`for x`, `each`, `filter`, `map`) visits elements in insertion order: the
+# order they were first added; adding one again keeps its place.
+pub struct Set[T] { h: gc_array[int] }
 
 impl Set[T has Hashable] {
     fn new() -> Set[T] {
-        return Set[T] { m: Map[T, ()].new() }
+        return Set[T] { h: mem.mp_new[T, ()]() }
     }
 
     fn add(self, x: T) {
-        self.m.set(x, ())
+        mem.mp_set[T, ()](self.h, x, ())
     }
 
     fn contains(self, x: T) -> bool {
-        return self.m.get(x).is_some()
+        return mem.mp_find[T, ()](self.h, x) >= 0
     }
 
     fn len(self) -> int {
-        return self.m.len()
+        return mem.mp_len[T, ()](self.h)
     }
 
     fn iter(self) -> SetIter[T] {
-        return SetIter[T] { m: self.m, i: -1 }
+        return SetIter[T] { s: self, i: -1 }
     }
 
     fn each(self, f: fn(T)) {
-        n := mem.mp_len[T, ()](self.m.h)
+        n := mem.mp_len[T, ()](self.h)
         i := 0
         while i < n {
-            f(mem.mp_key_at[T, ()](self.m.h, i))
+            f(mem.mp_key_at[T, ()](self.h, i))
             i += 1
         }
     }
 
     fn filter(self, f: fn(T) -> bool) -> Set[T] {
-        n := mem.mp_len[T, ()](self.m.h)
+        n := mem.mp_len[T, ()](self.h)
         out := Set[T].new()
         i := 0
         while i < n {
-            x := mem.mp_key_at[T, ()](self.m.h, i)
+            x := mem.mp_key_at[T, ()](self.h, i)
             if f(x) { out.add(x) }
             i += 1
         }
@@ -58,11 +58,11 @@ impl Set[T has Hashable] {
 
     # Two elements that map to one value leave one, at the first one's place.
     fn map[U has Hashable](self, f: fn(T) -> U) -> Set[U] {
-        n := mem.mp_len[T, ()](self.m.h)
+        n := mem.mp_len[T, ()](self.h)
         out := Set[U].new()
         i := 0
         while i < n {
-            out.add(f(mem.mp_key_at[T, ()](self.m.h, i)))
+            out.add(f(mem.mp_key_at[T, ()](self.h, i)))
             i += 1
         }
         return out
@@ -73,11 +73,11 @@ impl Set[T has Hashable] {
 # terminate.
 impl Set[T has Display] has Display {
     fn display(self) -> str {
-        n := mem.mp_len[T, ()](self.m.h)
+        n := mem.mp_len[T, ()](self.h)
         parts := mem.ga_new[str]()
         i := 0
         while i < n {
-            mem.ga_push[str](parts, mem.mp_key_at[T, ()](self.m.h, i).to_string())
+            mem.ga_push[str](parts, mem.mp_key_at[T, ()](self.h, i).to_string())
             i += 1
         }
         return text.join(parts, "{", ", ", "}")
@@ -86,20 +86,20 @@ impl Set[T has Display] has Display {
 
 # A by-value key cursor over the backing table, mirroring `MapIter` but yielding the KEY via
 # `Iterator[T]` (so single-binding `for x in s` binds the key, and a two-binding `for k, v`
-# is correctly rejected — a Set has no `Entry`). `m` copies the 8-byte handle so it observes
+# is correctly rejected — a Set has no `Entry`). `s` copies the 8-byte handle so it observes
 # the SAME live table; `i` starts at -1 so the first `next` reads entry 0 and the loop ends
 # once `i >= len`. Reading entries in [0,len) order yields INSERTION order. No Hashable bound:
 # `next` calls only the unbounded length/positional readers. Those readers do no bounds
-# check, and user code can build a cursor with any `i` (#132), so, as in `MapIter`, `next`
-# rejects a negative `i` too.
-pub struct SetIter[T] { m: Map[T, ()], i: int }
+# check, so, as in `MapIter`, `next` rejects a negative `i` too, though only this module
+# can set the private cursor (#132).
+pub struct SetIter[T] { s: Set[T], i: int }
 
 impl SetIter[T] has iter.Iterator[T] {
     fn next(mut self) -> Option[T] {
         self.i += 1
-        if self.i < 0 || self.i >= mem.mp_len[T, ()](self.m.h) {
+        if self.i < 0 || self.i >= mem.mp_len[T, ()](self.s.h) {
             return Option[T].none
         }
-        return Option.some(mem.mp_key_at[T, ()](self.m.h, self.i))
+        return Option.some(mem.mp_key_at[T, ()](self.s.h, self.i))
     }
 }

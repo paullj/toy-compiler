@@ -2,7 +2,7 @@ pub protocol Show {
     fn show(self) -> int
 }
 
-pub struct W { n: int }
+pub struct W { pub n: int }
 
 impl W has Show {
     fn show(self) -> int { self.n }

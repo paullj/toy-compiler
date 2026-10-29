@@ -1,0 +1,23 @@
+# `balance` is private: only this module's fns and methods touch it, so it can never go
+# negative. `owner` is pub.
+pub struct Account { pub owner: str, balance: int }
+
+pub fn open(owner: str) -> Account {
+    Account { owner: owner, balance: 0 }
+}
+
+impl Account {
+    fn deposit(mut self, n: int) {
+        if n > 0 { self.balance += n }
+    }
+
+    fn withdraw(mut self, n: int) -> bool {
+        if n > self.balance { return false }
+        self.balance -= n
+        return true
+    }
+
+    fn balance(self) -> int {
+        self.balance
+    }
+}

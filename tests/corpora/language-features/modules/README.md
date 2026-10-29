@@ -22,7 +22,9 @@ on each `main.toy` entry.
 | `associated_fn/`              | an imported non-generic struct's and enum's associated fns, called through the module (`shapes.Rect.square(3)`) |
 | `qualified_literal/`          | `lib.Pt { .. }`, inferred `lib.Pair { .. }` and `shapes.Shape.sq { .. }` beside same-named local types |
 | `errors/private_ref/`         | referencing a non-`pub` decl across modules                    |
+| `private_fields/`             | `pub` fields used from another module; private ones only through the owner's methods and derives |
 | `errors/private_literal/`     | a module-qualified literal of a non-`pub` struct                |
+| `errors/private_field/`       | reading a field without `pub` from another module               |
 | `errors/cycle/`               | an import cycle (graph must be a DAG)                           |
 | `errors/missing/`             | importing a module file that does not exist                    |
 | `errors/main_not_in_entry/`   | `main` defined only in an imported module                      |

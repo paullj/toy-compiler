@@ -1,7 +1,7 @@
 # Feature: a leaf module — a pub struct + pub constructors, no imports of its own.
 # This is the shared bottom of the diamond: both `main` and `geometry/rect`
 # import it, yet the discovery interns it ONCE (one set of layout ids).
-pub struct Vec { x: int, y: int }
+pub struct Vec { pub x: int, pub y: int }
 
 # A cross-module struct is built by a pub constructor, never by `mod.Type { .. }`
 # at the call site (qualified struct-literals are outside the module surface).

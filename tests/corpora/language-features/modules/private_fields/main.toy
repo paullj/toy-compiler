@@ -1,0 +1,22 @@
+# Feature: a struct's pub fields are read and written from another module; its private
+# fields are reached only through its own module's methods, and the derived Eq and Display
+# still cover every field. Outside its module a private field is hidden, so 'a.balance' is
+# the bound method of that name.
+# expect: stdout "Account{owner: bo, balance: 5}\n"
+# expect: exit 15
+import bank
+import std/io
+
+fn main() -> int {
+    a := bank.open("ann")
+    a.deposit(10)
+    ok := a.withdraw(25)
+    a.owner = "bo"
+    b := bank.open("bo")
+    b.deposit(10)
+    same := a == b
+    _w := a.withdraw(5)
+    io.println(a)
+    get := a.balance
+    return get() + (if same { 10 } else { 0 }) + (if ok { 100 } else { 0 })
+}

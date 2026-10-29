@@ -270,6 +270,33 @@ from two angles — assignability is directional (want ← got), join is symmetr
 A function whose return type is `()` is checked in statement context (its body
 need not supply a trailing value).
 
+## Field visibility
+
+A struct field is private to the module that declares the struct unless it is written
+`pub` (`pub struct P { pub x: int, y: int }`, `pub struct W(pub int, int)`). This is the
+same rule as for decls: `pub` exports, and everything else stays in its module.
+
+Outside the defining module a private field cannot be read (`p.y`), written (`p.y = v`,
+`p.y += v`, or as the base of a deeper place such as `p.y.z = v` or `p.v[i] = e`), called
+when it holds a fn (`h.f()`) or set in a struct literal (`lib.P { x: 1, y: 2 }`). Each is
+**T0078** at the field's name: "field 'y' of 'P' is private to module 'lib'; mark it pub
+or use a constructor" (a `std` or `core` field drops the "mark it pub" hint). A literal
+that leaves a private field out is T0078 at the literal ("'P' has private field 'y', so
+only module 'lib' can build it; use a constructor"), not a missing field. A private
+field is hidden outside, so a method of its name binds there: `a.balance` is the bound
+method `balance`. The check reads the struct's declaring module, so a generic struct's
+instance and its template agree, and a method, conformance or derive written in that
+module sees every field: the derived `Eq`, `Hash`, `Ord` and `Display` compare, hash and
+print private fields too. A conformance written in another module does not. Enum payloads have no visibility of their own. A field type
+named by a private field may be non-pub; only a `pub` field's type must be `pub` (see
+pub-signature coherence below).
+
+std relies on it: `Vec`, `Map` and `Set` keep their storage handle `h` private, and the
+iterators `VecIter`, `MapIter`, `SetIter` and `Chars` keep their cursor private, so a
+program cannot build a collection over another one's storage or a cursor that reads
+outside its entries (#132). A record std hands out, such as `Entry`'s `key` and `val`,
+has `pub` fields.
+
 ## Kept-unchanged rules
 
 These rules are unchanged by the formalization and remain authoritative:
@@ -281,7 +308,8 @@ These rules are unchanged by the formalization and remain authoritative:
 * **definite return** — a non-unit fn returns on every path or supplies a typed
   trailing expression;
 * **pub-signature coherence** — a `pub` symbol's signature is consistent across
-  the program.
+  the program. A `pub` field of a `pub` struct counts as part of its signature; a
+  private field does not.
 
 ## Generics syntax reservation
 

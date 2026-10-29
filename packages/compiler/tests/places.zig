@@ -86,7 +86,7 @@ test "warm cache: an imported method's self->mut self flip rebuilds its caller (
         \\
     ;
     const v1 =
-        \\pub struct P { x: int }
+        \\pub struct P { pub x: int }
         \\impl P {
         \\    fn show(self) -> str { "pee" }
         \\}
@@ -94,7 +94,7 @@ test "warm cache: an imported method's self->mut self flip rebuilds its caller (
         \\
     ;
     const v2 =
-        \\pub struct P { x: int }
+        \\pub struct P { pub x: int }
         \\impl P {
         \\    fn show(mut self) -> str {
         \\        self.x = 5
@@ -149,7 +149,7 @@ test "warm cache: an instance whose type param no value param names flips its ca
 
 test "warm cache: a mode flip with an unchanged body plus a caller edit serves no stale callee (#25 callee half)" {
     const lib_v1 =
-        \\pub struct P { x: int }
+        \\pub struct P { pub x: int }
         \\impl P {
         \\    fn show(self) -> int { self.x }
         \\}
@@ -157,7 +157,7 @@ test "warm cache: a mode flip with an unchanged body plus a caller edit serves n
         \\
     ;
     const lib_v2 =
-        \\pub struct P { x: int }
+        \\pub struct P { pub x: int }
         \\impl P {
         \\    fn show(mut self) -> int { self.x }
         \\}
@@ -421,7 +421,7 @@ test "warm: a callee flip makes a bound method on a mut param T0052 and back" {
         \\}
         \\
     ;
-    const head = "import std/vec\npub struct P { x: int }\nimpl P {\n    fn get(self) -> int { self.x }\n}\npub fn mk(x: int) -> P { P { x: x } }\n";
+    const head = "import std/vec\npub struct P { pub x: int }\nimpl P {\n    fn get(self) -> int { self.x }\n}\npub fn mk(x: int) -> P { P { x: x } }\n";
     const calls = head ++ "pub fn run(f: fn() -> int, keep: Vec[fn() -> int]) -> int { f() }\n";
     const keeps = head ++ "pub fn run(f: fn() -> int, keep: Vec[fn() -> int]) -> int {\n    keep.push(f)\n    f()\n}\n";
     for ([_][]const u8{ "-O0", "-O1" }) |lvl| {
