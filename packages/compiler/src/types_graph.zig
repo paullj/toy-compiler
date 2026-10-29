@@ -80,6 +80,8 @@ pub fn checkGraphWith(
             .closures = if (i < res.closures.len) res.closures[i] else &.{},
             .bundled = m.bundled,
             .path = m.path,
+            .file = m.displayName(),
+            .imports = m.imports,
         };
     }
 

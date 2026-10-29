@@ -2,7 +2,7 @@
 # conforms W to Show) and `dup` (which conforms lib.W to lib.Show a second time), so the
 # graph carries two impls of the same (protocol, type) — a compile-error, even though
 # neither impl lives in `main` itself (no orphan rule; coherence is whole-program).
-# expect: compile-error "overlapping impl"
+# expect: compile-error "lib.toy:11 already provides one"
 import lib
 import dup
 
