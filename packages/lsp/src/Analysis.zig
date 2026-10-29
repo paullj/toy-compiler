@@ -470,11 +470,114 @@ pub fn declOf(an: *const Analysis, a: std.mem.Allocator, tok: u32) !?Site {
             return an.sourceSite(decl.module, Ast.Index.from(decl.node));
         },
     };
+    // Visibility only gates use: a private field navigates like any other.
+    if (an.fieldAt(tok)) |f| return an.sourceSite(f.module, an.fieldNode(f));
     // A type name is left unresolved by the resolver.
     const m = an.module();
     if (m.tokens[tok].tag != .identifier) return null;
     const td = an.typeDecl(m.tokens[tok].text(m.source)) orelse return null;
     return an.sourceSite(td.module, Ast.Index.from(td.node));
+}
+
+/// A declared struct field: the module and struct (or tuple-struct) decl that declare it,
+/// and its index among the decl's fields.
+pub const Field = struct { module: u32, decl: u32, index: u32 };
+
+/// Field `j` of struct `struct_id` as declared, or null for a compiler-made struct.
+pub fn fieldOf(an: *const Analysis, struct_id: u32, j: usize) ?Field {
+    const layouts = an.tc().layouts;
+    if (struct_id >= layouts.len) return null;
+    const l = layouts[struct_id];
+    if (l.decl_node == Ast.none or l.mod >= an.graph.modules.len) return null;
+    return .{ .module = l.mod, .decl = l.decl_node.int(), .index = @intCast(j) };
+}
+
+/// The struct field token `tok` names: the member of a `recv.f` or `recv.0` whose receiver
+/// is a struct with that field, a field set in a struct literal, or a field of a struct
+/// declared in the entry module.
+pub fn fieldAt(an: *const Analysis, tok: u32) ?Field {
+    const m = an.module();
+    for (an.nodesAt(tok)) |i| switch (m.nodes[i].tag) {
+        .field_access, .tuple_field => if (an.namedField(m.nodes[i].lhs.int(), tok)) |f| return f,
+        .field_init => if (an.literalOf(tok, i)) |lit| if (an.namedField(lit, tok)) |f| return f,
+        .param => if (an.declaredField(i)) |f| return f,
+        else => {},
+    };
+    return null;
+}
+
+/// The field token `tok` names of the struct node `typed` types as.
+fn namedField(an: *const Analysis, typed: u32, tok: u32) ?Field {
+    const nts = an.nodeTypes();
+    if (typed >= nts.len or nts[typed].kind != .@"struct") return null;
+    const sid = nts[typed].struct_id;
+    if (sid >= an.tc().layouts.len) return null;
+    const m = an.module();
+    const name = m.tokens[tok].text(m.source);
+    for (an.tc().layouts[sid].field_names, 0..) |fname, j|
+        if (std.mem.eql(u8, fname, name)) return an.fieldOf(sid, j);
+    return null;
+}
+
+/// The literal that lists `field_init` node `fi`, whose name is token `tok`. A field_init
+/// has no link to its literal, so this finds the `{` that encloses `tok`: a `struct_init`
+/// heads it, and a qualified `lib.P { .. }` parses as the `enum_init_struct` its name
+/// heads, typed as the struct.
+fn literalOf(an: *const Analysis, tok: u32, fi: u32) ?u32 {
+    const m = an.module();
+    var depth: u32 = 0;
+    var t = tok;
+    while (t > 0) {
+        t -= 1;
+        switch (m.tokens[t].tag) {
+            .r_brace => depth += 1,
+            .l_brace => {
+                if (depth > 0) {
+                    depth -= 1;
+                    continue;
+                }
+                for ([_]u32{ t, t -| 1 }) |head| for (an.nodesAt(head)) |s| {
+                    if (m.nodes[s].tag != .struct_init and m.nodes[s].tag != .enum_init_struct) continue;
+                    for (Ast.rangeSlice(m.tree(), m.nodes[s].rhs.int())) |f|
+                        if (f.int() == fi) return s;
+                };
+                return null;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+/// The entry-module struct field that `param` node `node` declares, if it is one.
+fn declaredField(an: *const Analysis, node: u32) ?Field {
+    const m = an.module();
+    if (m.nodes.len == 0) return null;
+    const prog = m.nodes[Ast.root(m.nodes).int()];
+    if (prog.tag != .program) return null;
+    for (Ast.rangeSlice(m.tree(), prog.lhs.int())) |d| {
+        const decl = m.nodes[d.int()];
+        if (decl.tag != .struct_decl) continue;
+        for (Ast.rangeSlice(m.tree(), decl.lhs.int()), 0..) |f, j|
+            if (f.int() == node) return .{ .module = an.entry(), .decl = d.int(), .index = @intCast(j) };
+    }
+    return null;
+}
+
+/// The node that declares field `f`: a field, or a tuple-struct field's type.
+pub fn fieldNode(an: *const Analysis, f: Field) Ast.Index {
+    const tree = an.graph.modules[f.module].tree();
+    return Ast.rangeSlice(tree, tree.nodes[f.decl].lhs.int())[f.index];
+}
+
+/// Whether field `f` is `pub`.
+pub fn fieldIsPub(an: *const Analysis, f: Field) bool {
+    return an.graph.modules[f.module].tree().fieldIsPub(Ast.Index.from(f.decl), f.index);
+}
+
+/// Whether the entry module may use field `f`, by the rule the checker's T0078 applies.
+pub fn fieldVisible(an: *const Analysis, f: Field) bool {
+    return an.graph.modules[f.module].tree().fieldVisibleFrom(Ast.Index.from(f.decl), f.index, f.module, an.entry());
 }
 
 /// A type's declaration: its module and its decl node.

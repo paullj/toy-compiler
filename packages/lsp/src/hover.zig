@@ -28,8 +28,23 @@ pub fn at(a: std.mem.Allocator, an: *Analysis, line: u32, character: u32) !?[]co
     // Fenced so the client highlights it as toy source.
     try value.print(a, "```toy\n{s}\n```", .{d.buf.items});
     try appendValueNotes(a, &value, an, tok);
+    try appendFieldNote(a, &value, an, tok);
     try appendPlaceNotes(a, &value, an, tok);
     return value.items;
+}
+
+/// A field of another module's visibility and that module, as prose after the fence: the
+/// fence shows its type, and a use never spells whether it may be made. In its own module
+/// every field may be used, so the note would say nothing.
+fn appendFieldNote(a: std.mem.Allocator, buf: *std.ArrayList(u8), an: *const Analysis, tok: u32) !void {
+    const f = an.fieldAt(tok) orelse return;
+    if (f.module == an.entry()) return;
+    const path = an.graph.modules[f.module].path;
+    if (an.fieldIsPub(f)) {
+        try buf.print(a, "\n\npub field of module {s}", .{path});
+    } else {
+        try buf.print(a, "\n\nprivate to module {s}", .{path});
+    }
 }
 
 /// Which function value `tok` makes, as prose after the fence: the member of a bound method
@@ -835,4 +850,53 @@ test "hover on the struct of 'lib.S { .. }' never shows a same-named variant" {
     var h = (try hoverAt(gpa, ws, src, pos.line, pos.character, "file:///q/main.toy")) orelse return error.NoHover;
     defer h.deinit();
     try testing.expectEqualStrings("```toy\nPt\n```", h.value);
+}
+
+test "hover on a field of another module names its visibility and that module" {
+    const gpa = testing.allocator;
+    const tu = @import("test_util.zig");
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws = try tu.privacyWorkspace(gpa, &docs);
+    const src = tu.privacy_main;
+    const ret = std.mem.indexOf(u8, src, "return").?;
+    const cases = [_]struct { at: usize, want: []const u8 }{
+        .{ .at = ret + std.mem.indexOf(u8, src[ret..], "x +").?, .want = "int\n```\n\npub field of module lib" },
+        // The read T0078 rejects still hovers.
+        .{ .at = ret + std.mem.indexOf(u8, src[ret..], "y +").?, .want = "int\n```\n\nprivate to module lib" },
+        // In its own module a field's visibility changes nothing, so no note.
+        .{ .at = ret + std.mem.indexOf(u8, src[ret..], "b\n").?, .want = "int\n```" },
+        .{ .at = std.mem.indexOf(u8, src, "b: int").?, .want = "b: int\n```" },
+        .{ .at = std.mem.indexOf(u8, src, "a: int").?, .want = "a: int\n```" },
+    };
+    for (cases) |c| {
+        const pos = tu.posAt(src, c.at);
+        var h = (try hoverAt(gpa, ws, src, pos.line, pos.character, tu.privacy_main_uri)) orelse return error.NoHover;
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}
+
+test "hover on a struct literal's field names its visibility" {
+    const gpa = testing.allocator;
+    const tu = @import("test_util.zig");
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws = try tu.privacyWorkspace(gpa, &docs);
+    const src = tu.privacy_literal;
+    const cases = [_]struct { use: []const u8, want: []const u8 }{
+        // The one place a private field can be set from outside is where T0078 lands.
+        .{ .use = "y: 3", .want = "y: int\n```\n\nprivate to module lib" },
+        .{ .use = "x: 4", .want = "x: int\n```\n\npub field of module lib" },
+    };
+    for (cases) |c| {
+        const pos = tu.posOf(src, c.use);
+        var h = (try hoverAt(gpa, ws, src, pos.line, pos.character, tu.privacy_main_uri)) orelse return error.NoHover;
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
 }

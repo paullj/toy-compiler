@@ -492,6 +492,21 @@ pub const Tree = struct {
         if (word >= tree.pub_bits.len) return false;
         return (tree.pub_bits[word] >> @intCast(i & 31)) & 1 != 0;
     }
+
+    /// Whether field `j` of the struct or tuple-struct decl `decl` is `pub`. A field past
+    /// the declared ones is compiler-made and reads as `pub`.
+    pub fn fieldIsPub(tree: Tree, decl: Index, j: usize) bool {
+        const fields = rangeSlice(tree, tree.nodes[decl.int()].lhs.int());
+        return j >= fields.len or tree.isPub(fields[j]);
+    }
+
+    /// Whether module `from_mod` may use field `j` of `decl`, declared in this tree's
+    /// module `decl_mod`: its own module sees every field, others only `pub` ones, and a
+    /// compiler-made struct (no decl) hides nothing. The checker and the LSP both ask
+    /// here, so an editor marks exactly what T0078 rejects.
+    pub fn fieldVisibleFrom(tree: Tree, decl: Index, j: usize, decl_mod: u32, from_mod: u32) bool {
+        return decl_mod == from_mod or decl == none or tree.fieldIsPub(decl, j);
+    }
 };
 
 /// The number of `u32` words needed to hold one bit per node.

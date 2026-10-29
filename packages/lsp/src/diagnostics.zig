@@ -255,3 +255,21 @@ fn expectWarningsOnAnnotatedLines(path: []const u8, code: []const u8) !void {
     }
     try testing.expectEqual(std.mem.count(u8, src, marker), seen);
 }
+
+test "checkBuffer publishes a private field read from another module as a T0078 error at the field" {
+    const gpa = testing.allocator;
+    const tu = @import("test_util.zig");
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const ws = try tu.privacyWorkspace(gpa, &docs);
+    const an = try tu.analyzeIn(gpa, ws, tu.privacy_main_uri, tu.privacy_main);
+    defer an.deinit();
+    try testing.expectEqual(@as(usize, 1), an.diagnostics.len);
+    const d = an.diagnostics[0];
+    try testing.expectEqualStrings("T0078", d.code.?);
+    try testing.expectEqual(protocol.severity.err, d.severity);
+    try testing.expectEqualStrings("field 'y' of 'P' is private to module 'lib'; mark it pub or use a constructor", d.message);
+    const at = tu.posOf(tu.privacy_main, "y + q");
+    try testing.expectEqual(at, d.range.start);
+    try testing.expectEqual(at.character + 1, d.range.end.character);
+}

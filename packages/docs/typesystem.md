@@ -291,6 +291,12 @@ print private fields too. A conformance written in another module does not. Enum
 named by a private field may be non-pub; only a `pub` field's type must be `pub` (see
 pub-signature coherence below).
 
+The editor still shows private fields. Completion after `p.` in another module lists
+them after the pub ones, with "private to module lib" after the type. Hover on a field
+of another module, read or set in a struct literal, adds "pub field of module lib" or
+"private to module lib". Go-to-definition works on any field. A wrong use is the T0078
+error above.
+
 std relies on it: `Vec`, `Map` and `Set` keep their storage handle `h` private, and the
 iterators `VecIter`, `MapIter`, `SetIter` and `Chars` keep their cursor private, so a
 program cannot build a collection over another one's storage or a cursor that reads
