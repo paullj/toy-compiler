@@ -2475,6 +2475,8 @@ pub const BodyChecker = struct {
         pretyped: ?[]const Type = null,
         /// Bit i: value arg i binds a `mut` param.
         mut_mask: u64 = 0,
+        /// The call's receiver binds a `mut self`.
+        mut_recv: bool = false,
 
         pub fn substituted(s: CallSig, targs: ?[]const Type) CallSig {
             var out = s;
@@ -2488,7 +2490,7 @@ pub const BodyChecker = struct {
     }
 
     pub fn methodSig(bc: *const BodyChecker, f: FnSym, name: []const u8) CallSig {
-        return .{ .params = f.params[@min(f.params.len, 1)..], .name = name, .decl = bc.calleeDeclSite(f), .generic_names = f.generic_params, .mut_mask = f.mut_mask >> 1 };
+        return .{ .params = f.params[@min(f.params.len, 1)..], .name = name, .decl = bc.calleeDeclSite(f), .generic_names = f.generic_params, .mut_mask = f.mut_mask >> 1, .mut_recv = Modes.isMut(f.mut_mask, 0) };
     }
 
     fn paramWant(bc: *BodyChecker, sig: CallSig, p: Type) Type {
@@ -2548,7 +2550,97 @@ pub const BodyChecker = struct {
             }
             if (Modes.isMut(sig.mut_mask, i)) try bc.checkMutArg(call, a, i, sig);
         }
+        // An unbound call failed to bind its generics, an error reported elsewhere; like
+        // the mut-arg checks above, the lint stays off rather than pile onto it.
+        if (sig.map != .unbound) try bc.warnSharedElements(call, args, sig);
         return true;
+    }
+
+    /// W0014 at each `mut` place of a call that copies an element an earlier one (the
+    /// receiver first) already copies: `lower` writes each copy back whole, in that order,
+    /// so the earlier write is lost. Indexes that cannot be shown equal, and pairs with an
+    /// argument between them that may write, stay silent, so the lint has no false
+    /// positives.
+    fn warnSharedElements(bc: *BodyChecker, call: Ast.Index, args: []const Ast.Index, sig: CallSig) error{OutOfMemory}!void {
+        const recv: Ast.Index = if (!sig.mut_recv) Ast.none else if (Callee.memberNode(bc.tree, bc.tree.nodes[call.int()])) |fa| bc.tree.nodes[fa.int()].lhs else Ast.none;
+        for (args, 0..) |a, j| {
+            if (!Modes.isMut(sig.mut_mask, j)) continue;
+            const root = bc.elementRoot(a) orelse continue;
+            const earlier: Ast.Index, const pos: usize = blk: {
+                if (recv != Ast.none) if (bc.elementRoot(recv)) |r| if (bc.sameElement(r, root) and bc.allReadOnly(args[0..j])) break :blk .{ recv, 0 };
+                for (args[0..j], 0..) |e, i| {
+                    if (!Modes.isMut(sig.mut_mask, i)) continue;
+                    const r = bc.elementRoot(e) orelse continue;
+                    if (bc.sameElement(r, root) and bc.allReadOnly(args[i + 1 .. j])) break :blk .{ e, i + 1 };
+                }
+                continue;
+            };
+            const sp = bc.spanOf(root);
+            const elem = bc.source[sp.start..sp.end];
+            const tail = "; only the last write-back is kept, so copy the element into a local, call, then store it back";
+            if (pos == 0) {
+                try bc.sink.report(.{ .span = bc.spanOf(a), .code = .W0014, .related = bc.spanOf(earlier) }, "the receiver and argument {d} are copies of one element '{s}'" ++ tail, .{ j + 1, elem });
+            } else {
+                try bc.sink.report(.{ .span = bc.spanOf(a), .code = .W0014, .related = bc.spanOf(earlier) }, "arguments {d} and {d} are copies of one element '{s}'" ++ tail, .{ pos, j + 1, elem });
+            }
+        }
+    }
+
+    /// Whether evaluating each of `nodes` only reads. An argument evaluated between two
+    /// element places can otherwise move the later one: `bump(i)` writes `i` through its
+    /// own `mut` param, and a call of a closure can write a captured local.
+    fn allReadOnly(bc: *const BodyChecker, nodes: []const Ast.Index) bool {
+        for (nodes) |nd| if (!bc.readOnly(nd)) return false;
+        return true;
+    }
+
+    fn readOnly(bc: *const BodyChecker, idx: Ast.Index) bool {
+        const n = bc.tree.nodes[idx.int()];
+        return switch (n.tag) {
+            .identifier, .literal_number, .literal_string, .literal_bool, .literal_unit => true,
+            .unary, .field_access, .tuple_field => bc.readOnly(n.lhs),
+            .binary, .index => bc.readOnly(n.lhs) and bc.readOnly(n.rhs),
+            else => false,
+        };
+    }
+
+    /// Whether the element roots `a` and `b` provably name one element: the same handle
+    /// and the same index, each the same local, literal, or field chain of them.
+    fn sameElement(bc: *const BodyChecker, a: Ast.Index, b: Ast.Index) bool {
+        const ea = bc.elementParts(a) orelse return false;
+        const eb = bc.elementParts(b) orelse return false;
+        return bc.sameRead(ea[0], eb[0]) and bc.sameRead(ea[1], eb[1]);
+    }
+
+    /// The handle and the index of an element root (`.index`, or a value-headed
+    /// `type_app` the parser could not tell from a turbofish).
+    fn elementParts(bc: *const BodyChecker, root: Ast.Index) ?[2]Ast.Index {
+        const n = bc.tree.nodes[root.int()];
+        if (n.tag == .index) return .{ n.lhs, n.rhs };
+        const targs = Ast.rangeSlice(bc.tree, n.rhs.int());
+        if (targs.len != 1) return null;
+        return .{ n.lhs, targs[0] };
+    }
+
+    /// Whether `a` and `b` read one value: the same local, the same integer literal, or
+    /// the same field, tuple-field or element chain over them.
+    fn sameRead(bc: *const BodyChecker, a: Ast.Index, b: Ast.Index) bool {
+        const na = bc.tree.nodes[a.int()];
+        const nb = bc.tree.nodes[b.int()];
+        if (na.tag != nb.tag) return false;
+        return switch (na.tag) {
+            .identifier => switch (bc.resolutions[a.int()]) {
+                .local => |slot| switch (bc.resolutions[b.int()]) {
+                    .local => |other| slot == other,
+                    else => false,
+                },
+                else => false,
+            },
+            .literal_number => std.mem.eql(u8, bc.nameText(na.main_token), bc.nameText(nb.main_token)),
+            .field_access, .tuple_field => std.mem.eql(u8, bc.nameText(na.main_token), bc.nameText(nb.main_token)) and bc.sameRead(na.lhs, nb.lhs),
+            .index => bc.sameRead(na.lhs, nb.lhs) and bc.sameRead(na.rhs, nb.rhs),
+            else => false,
+        };
     }
 
     /// The hint for a `_` capture `a` passed where `want`, a non-function, is wanted: the

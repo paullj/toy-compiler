@@ -1101,6 +1101,38 @@ test "a bare `Option.none` with no inferable target reports T0016" {
     try testing.expect(std.mem.indexOf(u8, res.out, "T0016") != null);
 }
 
+test "two mut arguments rooted at one Vec element are W0014: check exits 0, and 1 under --deny-warnings" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-shared-element";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src =
+        \\import std/vec
+        \\struct P { x: int, y: int }
+        \\fn swap(mut a: int, mut b: int) {
+        \\    t := a
+        \\    a = b
+        \\    b = t
+        \\}
+        \\fn main() -> int {
+        \\    ps := [P { x: 1, y: 2 }]
+        \\    swap(ps[0].x, ps[0].y)
+        \\    return ps[0].x * 10 + ps[0].y
+        \\}
+        \\
+    ;
+    const warned = try runToyOnFixture(gpa, io, dir_name, src, &.{"check"});
+    defer gpa.free(warned.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, warned.term);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, warned.out, "warning[W0014]: arguments 1 and 2 are copies of one element 'ps[0]'"));
+    try testing.expect(std.mem.indexOf(u8, warned.out, "one.toy:10:19") != null);
+    const denied = try runToyOnFixture(gpa, io, dir_name, src, &.{ "check", "--deny-warnings" });
+    defer gpa.free(denied.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, denied.term);
+}
+
 test "a trailing else-less `if` in a nested block is an effect statement (compiles and runs)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});

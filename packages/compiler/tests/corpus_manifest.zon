@@ -1,5 +1,5 @@
 .{
-    .{ .path = "tests/corpora/diagnostics", .mode = .diagnostics, .unit = .single_file, .count = 164 },
+    .{ .path = "tests/corpora/diagnostics", .mode = .diagnostics, .unit = .single_file, .count = 165 },
     .{ .path = "tests/corpora/language-features", .mode = .expect, .unit = .single_file, .prune = .{"modules"}, .count = 510 },
     .{ .path = "tests/corpora/language-features/modules", .mode = .expect, .unit = .module_dir, .count = 25 },
     .{ .path = "tests/corpora/regression", .mode = .expect, .unit = .single_file, .count = 9 },
