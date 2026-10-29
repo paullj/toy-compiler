@@ -1,0 +1,14 @@
+# Feature: `pub` marks a struct field or a tuple-struct field as visible outside its module
+# expect: exit 42
+struct Point {
+    pub x: int,
+    y: int
+}
+
+pub struct Meters(pub int, int)
+
+fn main() -> int {
+    p := Point { x: 30, y: 2 }
+    m := Meters(8, 2)
+    return p.x + p.y + m.0 + m.1    # 42
+}

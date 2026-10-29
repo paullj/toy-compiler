@@ -137,9 +137,11 @@ module.exports = grammar({
     struct_field_block: ($) =>
       seq("{", optional(commaList($.struct_field)), "}"),
 
-    struct_field: ($) => seq($.identifier, ":", field("type", $._type)),
+    // `pub` is accepted on enum-variant fields too (they share these rules); the
+    // compiler rejects it there.
+    struct_field: ($) => seq(optional("pub"), $.identifier, ":", field("type", $._type)),
 
-    tuple_field_list: ($) => seq("(", optional(commaList($._type)), ")"),
+    tuple_field_list: ($) => seq("(", optional(commaList(seq(optional("pub"), $._type))), ")"),
 
     enum_declaration: ($) =>
       seq(

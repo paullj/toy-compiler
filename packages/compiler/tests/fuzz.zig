@@ -320,16 +320,20 @@ fn genStruct(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random) 
     if (rand.boolean()) try out.appendSlice(gpa, "pub ");
     try out.appendSlice(gpa, "struct ");
     try out.appendSlice(gpa, pick(idents, rand));
-    try out.appendSlice(gpa, " { ");
+    const tuple = rand.boolean();
+    try out.appendSlice(gpa, if (tuple) "(" else " { ");
     const fields = rand.intRangeAtMost(usize, 0, 3);
     var f: usize = 0;
     while (f < fields) : (f += 1) {
         if (f > 0) try out.appendSlice(gpa, ", ");
-        try out.appendSlice(gpa, pick(idents, rand));
-        try out.appendSlice(gpa, ": ");
+        if (rand.boolean()) try out.appendSlice(gpa, "pub ");
+        if (!tuple) {
+            try out.appendSlice(gpa, pick(idents, rand));
+            try out.appendSlice(gpa, ": ");
+        }
         try out.appendSlice(gpa, pick(types, rand));
     }
-    try out.appendSlice(gpa, " }");
+    try out.appendSlice(gpa, if (tuple) ")" else " }");
 }
 
 fn genEnum(gpa: std.mem.Allocator, out: *std.ArrayList(u8), rand: std.Random) error{OutOfMemory}!void {
