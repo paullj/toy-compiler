@@ -121,13 +121,15 @@ pub struct Entry[K, V] { key: K, val: V }
 # A by-value cursor. `m` copies the 8-byte handle, so it observes the SAME live table; `i`
 # starts at -1 so the first `next` reads entry 0 and the loop ends once `i >= len`. `mut
 # self` writes `i` back across iterations. Reading entries in [0,len) order yields INSERTION
-# order. No Hashable bound: `next` calls only the unbounded length/positional readers.
+# order. No Hashable bound: `next` calls only the unbounded length/positional readers. Those
+# readers do no bounds check, and user code can build a cursor with any `i` (#132), so
+# `next` rejects a negative `i` too.
 pub struct MapIter[K, V] { m: Map[K, V], i: int }
 
 impl MapIter[K, V] has iter.Iterator[Entry[K, V]] {
     fn next(mut self) -> Option[Entry[K, V]] {
         self.i += 1
-        if self.i >= mem.mp_len[K, V](self.m.h) {
+        if self.i < 0 || self.i >= mem.mp_len[K, V](self.m.h) {
             return Option[Entry[K, V]].none
         }
         return Option.some(Entry[K, V] {
