@@ -89,7 +89,7 @@ pub const InlayHint = struct {
 };
 
 /// One completion candidate. `detail` (a type / signature) is omitted when absent.
-pub const CompletionItem = struct { label: []const u8, kind: u8, detail: ?[]const u8 = null };
+pub const CompletionItem = struct { label: []const u8, kind: u8, detail: ?[]const u8 = null, sortText: ?[]const u8 = null };
 
 pub const LspDiagnostic = struct {
     range: Range,

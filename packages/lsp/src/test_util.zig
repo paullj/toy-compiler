@@ -4,7 +4,7 @@
 const std = @import("std");
 const protocol = @import("protocol.zig");
 
-fn posAt(src: []const u8, idx: usize) protocol.Position {
+pub fn posAt(src: []const u8, idx: usize) protocol.Position {
     var line: u32 = 0;
     var col: u32 = 0;
     for (src[0..idx]) |ch| {
@@ -105,3 +105,42 @@ pub const generic_body_fixture =
     \\}
     \\
 ;
+
+/// Field privacy across modules: the entry `privacy_main` (at `privacy_main_uri`) reads a
+/// pub and a private field of `lib.P` and its own struct's fields; `privacy_lib` is open
+/// beside it at `privacy_lib_uri`. The private field comes first so an order by visibility
+/// differs from declaration order. `p.y` is the one T0078.
+pub const privacy_lib_uri = "file:///priv/lib.toy";
+pub const privacy_main_uri = "file:///priv/main.toy";
+pub const privacy_lib =
+    \\pub struct P { y: int, pub x: int }
+    \\pub fn mk() -> P { P { y: 2, x: 1 } }
+    \\
+;
+pub const privacy_main =
+    \\import lib
+    \\struct Q { b: int, pub a: int }
+    \\fn main() -> int {
+    \\    p := lib.mk()
+    \\    q := Q { b: 2, a: 1 }
+    \\    return p.x + p.y + q.b
+    \\}
+    \\
+;
+
+/// An entry that sets a private field of `lib.P` in a struct literal: T0078 at `y`.
+pub const privacy_literal =
+    \\import lib
+    \\fn main() -> int {
+    \\    r := lib.P { y: 3, x: 4 }
+    \\    return r.x
+    \\}
+    \\
+;
+
+/// A workspace with only `privacy_lib` open, disk off; free `docs` after every analysis
+/// made in it.
+pub fn privacyWorkspace(gpa: std.mem.Allocator, docs: *Documents) !Workspace {
+    try docs.put(gpa, privacy_lib_uri, privacy_lib, 1);
+    return .{ .io = std.Io.failing, .docs = docs, .disk = false };
+}

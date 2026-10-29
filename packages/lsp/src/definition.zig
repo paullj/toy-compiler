@@ -341,3 +341,46 @@ test "definition on method calls inside generic bodies (#33)" {
         try testing.expectEqual(want.character, d.range.start.character);
     }
 }
+
+test "definition: a field read jumps to the field, a private one across modules too" {
+    const gpa = testing.allocator;
+    const tu = @import("test_util.zig");
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const ws = try tu.privacyWorkspace(gpa, &docs);
+    const src = tu.privacy_main;
+    const ret = std.mem.indexOf(u8, src, "return").?;
+    const cases = [_]struct { use: []const u8, uri: []const u8, target: []const u8, decl: []const u8 }{
+        .{ .use = "x +", .uri = tu.privacy_lib_uri, .target = tu.privacy_lib, .decl = "x: int" },
+        .{ .use = "y +", .uri = tu.privacy_lib_uri, .target = tu.privacy_lib, .decl = "y: int" },
+        .{ .use = "b\n", .uri = tu.privacy_main_uri, .target = src, .decl = "b: int" },
+    };
+    for (cases) |c| {
+        const use = tu.posAt(src, ret + std.mem.indexOf(u8, src[ret..], c.use).?);
+        const d = (try definitionAt(gpa, ws, src, use.line, use.character, tu.privacy_main_uri)) orelse {
+            std.debug.print("no definition for '{s}'\n", .{c.use});
+            return error.NoDefinition;
+        };
+        defer gpa.free(d.uri);
+        try testing.expectEqualStrings(c.uri, d.uri);
+        const want = tu.posOf(c.target, c.decl);
+        try testing.expectEqual(want, d.range.start);
+        try testing.expectEqual(want.character + 1, d.range.end.character);
+    }
+}
+
+test "definition: a struct literal's field jumps to the field in its module" {
+    const gpa = testing.allocator;
+    const tu = @import("test_util.zig");
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const ws = try tu.privacyWorkspace(gpa, &docs);
+    const src = tu.privacy_literal;
+    for ([_][2][]const u8{ .{ "y: 3", "y: int" }, .{ "x: 4", "x: int" } }) |c| {
+        const use = tu.posOf(src, c[0]);
+        const d = (try definitionAt(gpa, ws, src, use.line, use.character, tu.privacy_main_uri)) orelse return error.NoDefinition;
+        defer gpa.free(d.uri);
+        try testing.expectEqualStrings(tu.privacy_lib_uri, d.uri);
+        try testing.expectEqual(tu.posOf(tu.privacy_lib, c[1]), d.range.start);
+    }
+}

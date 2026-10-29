@@ -54,6 +54,10 @@ pub const Layout = struct {
     native_family: NativeStructFamily = .none,
     /// Set on the `{code, env}` pair a function type reifies to; `params` owned.
     fn_sig: ?FnSig = null,
+    /// Copied from `StructSym`: the declaring module and decl (a generic instance's is its
+    /// template's; `Ast.none` for a compiler-made struct), where field visibility is read.
+    mod: u32 = 0,
+    decl_node: Ast.Index = Ast.none,
 
     /// The name a value of this struct renders under: the mangled instance name carries
     /// its type arguments as ids (`Pair$int`, `Box$s3`), which are not source syntax.
@@ -793,6 +797,8 @@ pub fn snapshotLayouts(gpa: std.mem.Allocator, structs: []const StructSym) ![]La
             .source_name = if (s.source_name) |sn| try gpa.dupe(u8, sn) else null,
             .native_family = s.native_family,
             .fn_sig = if (s.fn_sig) |fs| .{ .params = try gpa.dupe(Type, fs.params), .ret = fs.ret } else null,
+            .mod = s.mod,
+            .decl_node = s.decl_node,
         };
         built += 1;
     }

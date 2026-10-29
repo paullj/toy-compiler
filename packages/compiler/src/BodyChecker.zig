@@ -5185,14 +5185,10 @@ pub const BodyChecker = struct {
     }
 
     /// Whether field `j` of `sym` may be used from the module being checked: a field is
-    /// private to its struct's module unless declared `pub`, by the same `pub_bits` that
-    /// export decls. A compiler-made struct has no decl and hides nothing. `pub` so the
-    /// LSP marks a private field the way the checker rejects it.
-    pub fn fieldVisible(bc: *const BodyChecker, sym: StructSym, j: usize) bool {
-        if (sym.mod == bc.graph_mod or sym.decl_node == Ast.none) return true;
-        const tree = bc.model.graph.mods[sym.mod].tree;
-        const fields = Ast.rangeSlice(tree, tree.nodes[sym.decl_node.int()].lhs.int());
-        return j >= fields.len or tree.isPub(fields[j]);
+    /// private to its struct's module unless declared `pub`. A compiler-made struct has no
+    /// decl and hides nothing.
+    fn fieldVisible(bc: *const BodyChecker, sym: StructSym, j: usize) bool {
+        return bc.model.graph.mods[sym.mod].tree.fieldVisibleFrom(sym.decl_node, j, sym.mod, bc.graph_mod);
     }
 
     /// T0078 at `at` when field `j` of `sym` is private to another module.

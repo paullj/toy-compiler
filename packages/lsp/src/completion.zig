@@ -110,6 +110,10 @@ const Collector = struct {
     items: std.ArrayList(protocol.CompletionItem) = .empty,
 
     fn add(c: *Collector, label: []const u8, k: u8, detail: ?[]const u8) !void {
+        return c.addSorted(label, k, detail, null);
+    }
+
+    fn addSorted(c: *Collector, label: []const u8, k: u8, detail: ?[]const u8, sort_text: ?[]const u8) !void {
         for (c.items.items) |it| {
             if (it.kind == k and std.mem.eql(u8, it.label, label)) return;
         }
@@ -117,6 +121,7 @@ const Collector = struct {
             .label = try c.a.dupe(u8, label),
             .kind = k,
             .detail = if (detail) |d| try c.a.dupe(u8, d) else null,
+            .sortText = if (sort_text) |t| try c.a.dupe(u8, t) else null,
         });
     }
 };
@@ -208,12 +213,26 @@ fn collectMember(col: *Collector, an: *const Analysis, recv: u32, methods_only: 
     const rt = node_types[recv];
     if (rt.kind != .@"struct" and rt.kind != .@"enum") return;
 
+    // A field private to another module is still offered, so the user learns it exists,
+    // but marked and sorted after the rest: T0078 rejects its use.
     if (!methods_only and rt.kind == .@"struct" and rt.struct_id < tc.layouts.len) {
         const layout = tc.layouts[rt.struct_id];
-        for (layout.field_names, layout.field_types) |fname, fty| {
-            var buf: std.ArrayList(u8) = .empty;
-            try render.renderType(col.a, &buf, fty, tc.layouts, tc.enum_layouts);
-            try col.add(render.bareName(fname), kind.field, buf.items);
+        for ([_]bool{ false, true }) |want_hidden| {
+            for (layout.field_names, layout.field_types, 0..) |fname, fty, j| {
+                const f = an.fieldOf(rt.struct_id, j);
+                const hidden = if (f) |fd| !an.fieldVisible(fd) else false;
+                if (hidden != want_hidden) continue;
+                var buf: std.ArrayList(u8) = .empty;
+                try render.renderType(col.a, &buf, fty, tc.layouts, tc.enum_layouts);
+                const label = render.bareName(fname);
+                if (!hidden) {
+                    try col.add(label, kind.field, buf.items);
+                    continue;
+                }
+                try buf.print(col.a, " (private to module {s})", .{an.graph.modules[f.?.module].path});
+                // `~` orders after every identifier, as a client sorts by sortText, else label.
+                try col.addSorted(label, kind.field, buf.items, try std.mem.concat(col.a, u8, &.{ "~", label }));
+            }
         }
     }
 
@@ -619,4 +638,49 @@ test "completion names a protocol witness as written" {
     var got = try completeAt(gpa, src);
     defer got.deinit();
     try testing.expectEqualStrings("fn area(Sq) -> int", detailOf(got.items, "area").?);
+}
+
+test "completion outside a struct's module lists its private fields after its pub ones, marked private" {
+    const gpa = testing.allocator;
+    const tu = @import("test_util.zig");
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws = try tu.privacyWorkspace(gpa, &docs);
+    const Want = struct { label: []const u8, detail: []const u8, last: bool };
+    const cases = [_]struct { recv: []const u8, fields: []const Want }{
+        .{ .recv = "p", .fields = &.{
+            .{ .label = "x", .detail = "int", .last = false },
+            .{ .label = "y", .detail = "int (private to module lib)", .last = true },
+        } },
+        // In its own module every field is visible: declaration order, no mark.
+        .{ .recv = "q", .fields = &.{
+            .{ .label = "b", .detail = "int", .last = false },
+            .{ .label = "a", .detail = "int", .last = false },
+        } },
+    };
+    const ret = std.mem.indexOf(u8, tu.privacy_main, "    return").?;
+    for (cases) |c| {
+        const line = try std.fmt.allocPrint(gpa, "    k := {s}.", .{c.recv});
+        defer gpa.free(line);
+        const src = try std.mem.concat(gpa, u8, &.{ tu.privacy_main[0..ret], line, "\n", tu.privacy_main[ret..] });
+        defer gpa.free(src);
+        const p = tu.posAfterLast(src, line);
+        var got = try completionsAt(gpa, ws, src, p.line, p.character, tu.privacy_main_uri);
+        defer got.deinit();
+        var fields: std.ArrayList(protocol.CompletionItem) = .empty;
+        defer fields.deinit(gpa);
+        for (got.items) |it| if (it.kind == kind.field) try fields.append(gpa, it);
+        try testing.expectEqual(c.fields.len, fields.items.len);
+        for (c.fields, fields.items) |w, it| {
+            try testing.expectEqualStrings(w.label, it.label);
+            try testing.expectEqualStrings(w.detail, it.detail.?);
+            if (!w.last) {
+                try testing.expect(it.sortText == null);
+                continue;
+            }
+            // A client orders by sortText, else by label: this one sorts after every other.
+            for (got.items) |o| if (o.kind != it.kind or !std.mem.eql(u8, o.label, it.label))
+                try testing.expect(std.mem.order(u8, o.sortText orelse o.label, it.sortText.?) == .lt);
+        }
+    }
 }
