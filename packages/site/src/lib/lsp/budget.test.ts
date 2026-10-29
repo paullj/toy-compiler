@@ -3,11 +3,11 @@ import { expect, it } from 'vitest';
 import { loadServer, WASM } from './rpc.test-util';
 
 // Budgets for what the docs site ships and how fast a check answers. They leave headroom
-// over today's numbers (~464 KB with runtime safety on, up from ~326 KB before the closures
-// roadmap's compiler and std; well under 1 ms per check of a std-free document, about 1 ms
-// for an edit of a std/vec one and every request that follows it, on an M-series laptop)
-// so only a real regression trips.
-const MAX_BROTLI_BYTES = 500_000;
+// over today's numbers (~525 KB with runtime safety on after the Usable language milestone's
+// std and checker work, up from ~464 KB before it and ~326 KB before the closures roadmap;
+// well under 1 ms per check of a std-free document, about 1 ms for an edit of a std/vec one
+// and every request that follows it, on an M-series laptop) so only a real regression trips.
+const MAX_BROTLI_BYTES = 600_000;
 const MAX_MEDIAN_CHECK_MS = 25;
 
 const doc = `pub protocol Area {
@@ -58,7 +58,8 @@ fn main() -> int {
 }
 `;
 
-it('the shipped server stays under its brotli size budget', () => {
+// Quality-11 brotli of the whole server takes about 5 s on a CI runner, past vitest's default.
+it('the shipped server stays under its brotli size budget', { timeout: 60_000 }, () => {
 	const size = brotliCompressSync(WASM, { params: { [constants.BROTLI_PARAM_QUALITY]: 11 } }).length;
 	expect(size).toBeLessThan(MAX_BROTLI_BYTES);
 });
