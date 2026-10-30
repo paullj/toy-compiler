@@ -1,0 +1,25 @@
+# Feature: adjacent local fns that never name each other keep their own envs, so a capture-free fn escapes even next to a fn that captures a mut param
+# expect: exit 17
+fn make(mut n: int) -> fn() -> int {
+    fn bump() -> int {
+        n = n + 1
+        n
+    }
+    fn seven() -> int { 7 }
+    _x := bump()
+    seven
+}
+
+fn keep(k: int) -> fn() -> int {
+    x := k
+    fn use_x() -> int { x }
+    fn ten() -> int { 10 }
+    _r := use_x()
+    ten
+}
+
+fn main() -> int {
+    k := 1
+    f := make(k)
+    return f() + keep(3)()
+}

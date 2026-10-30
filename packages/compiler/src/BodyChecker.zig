@@ -558,6 +558,7 @@ pub const BodyChecker = struct {
         const block_expected = bc.body.expected;
         bc.body.expected = null;
         defer bc.body.expected = block_expected;
+        try bc.declareLocalFnGroups(stmts);
         for (stmts[0 .. stmts.len - 1]) |s| {
             try bc.checkStmt(s); // effect only
             const sn = bc.tree.nodes[(s).int()];
@@ -592,6 +593,19 @@ pub const BodyChecker = struct {
         bc.node_types[(block_idx).int()] = bt;
         try bc.warnUnreachable(stmts);
         return bt;
+    }
+
+    /// Type the fns of each group of two or more adjacent local fns in `stmts` before any
+    /// statement, so each body can call the fns declared after it in its group.
+    fn declareLocalFnGroups(bc: *BodyChecker, stmts: []const Ast.Index) error{OutOfMemory}!void {
+        var i: usize = 0;
+        while (i < stmts.len) {
+            const end = Ast.localFnRunEnd(bc.tree, stmts, i);
+            if (end - i > 1) for (stmts[i..end]) |s| {
+                _ = try LambdaChecker.declareLocalFn(bc, s, bc.tree.nodes[s.int()]);
+            };
+            i = end;
+        }
     }
 
     /// Emit W0005 on the first statement made unreachable by a preceding always-

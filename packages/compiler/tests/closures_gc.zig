@@ -379,6 +379,32 @@ test "gc: per-iteration boxes survive" {
     );
 }
 
+test "gc: a group of local fns keeps its one shared env, and the cell of its mut capture, across collections" {
+    try expectClosureGc(".toy-test-gc-local-fn-group",
+        \\fn make(start: int, tag: str) -> Vec[fn(int) -> int] {
+        \\    n := start
+        \\    fn even(k: int) -> int { if k == 0 { n + tag.len() } else { odd(k - 1) } }
+        \\    fn odd(k: int) -> int {
+        \\        n = n + 1
+        \\        if k == 0 { 0 } else { even(k - 1) }
+        \\    }
+        \\    fs: Vec[fn(int) -> int] = []
+        \\    fs.push(odd)
+        \\    fs.push(even)
+        \\    fs
+        \\}
+        \\fn main() -> int {
+        \\    fs := make(10, "abcd")
+        \\    if !collect() { return 1 }
+        \\    a := fs[0](3)
+        \\    if !collect() { return 2 }
+        \\    # odd(3): n = 12, then even(0) = 16; even(2): n = 13, then even(0) = 17
+        \\    return a + fs[1](2) + 9
+        \\}
+        \\
+    );
+}
+
 test "gc: a box whose closures are gone is kept by its owner" {
     try expectClosureGc(".toy-test-gc-box-owner",
         \\fn main() -> int {

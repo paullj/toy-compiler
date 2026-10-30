@@ -73,7 +73,21 @@ fn main() -> int {
 ```
 
 - It can call itself, and it captures like a lambda.
-- It is named only after its declaration, so two local fns cannot call each other: the earlier one's use of the later one is R0001, which says the later one is declared further down. Make them top-level fns instead ([#47](https://github.com/paullj/toy-compiler/issues/47)).
+- **Groups:** a run of local fns with no other statement between them is one group, and each fn in a group can call the others, before or after it ([#47](https://github.com/paullj/toy-compiler/issues/47)):
+
+  ```toy
+  fn main() -> int {
+      fn is_even(n: int) -> bool { if n == 0 { true } else { is_odd(n - 1) } }
+      fn is_odd(n: int) -> bool { if n == 0 { false } else { is_even(n - 1) } }
+      return if is_even(10) { 1 } else { 0 }
+  }
+  ```
+
+  - Only the group's names are known before their declarations. So every local a group fn captures is declared before the group, and no fn of the group can run before a local it captures exists. A local declared after the group is R0001 in the group's bodies.
+  - Fns of a group that name each other, directly or through other fns of the group, share **one env**, which holds every capture of each of them. Each fn's value is its own code with that env, so a fn names the others without capturing them, and the envs never point at each other.
+  - A fn of the group that names no other keeps its own env. So it never carries, or keeps alive, the captures of its neighbours, and it can escape even when a neighbour captures a `mut` param (T0052 only applies to the fns that share that capture).
+  - Since every name of the group is known from its start, a group fn that names a sibling gets the sibling, even where an outer binding of the same name is in scope before the sibling's declaration. The outer binding is shadowed in the whole group (W0009).
+  - A fn outside the group is named only after its declaration: a use before it is R0001, which says that only the local fns next to it can name it earlier.
 - **Recovery:** inside a block, `fn name(` is a nested declaration, so it is no longer a place where a broken block stops.
   - `pub`, `struct`, `enum`, `impl` and `import` still stop a broken block.
   - To make up for this, when EOF is reached inside a function, the "missing `}`" error is reported at the first nested function written no further right than that function (a sibling declaration it swallowed), with the enclosing function as a secondary label. With no such function, the error is the plain "expected '}' to close block" at EOF.

@@ -349,16 +349,27 @@ pub fn analyzeEscapes(
         var budget: u32 = Escape.frame_budget;
         for (by_rank) |bi| {
             const b = fcl.boundaries[bi];
+            // Linked local fns share one env, made at their leader, so its unit decides for all.
+            if (b.self_slot) |ss| if (ss != b.group.leader) continue;
             const k = Closure.findUnit(run, owner, b.node) orelse continue;
             const lu = run[k];
             if (lu.env_size == 0 or lu.env_size > budget) continue;
-            if (sol.siteEscapes(f, @intCast(u), f.siteUse(b.node) orelse .escapes)) continue;
+            const escapes = if (b.self_slot != null) groupEscapes(sol, f, @intCast(u), fcl, b.group) else sol.siteEscapes(f, @intCast(u), f.siteUse(b.node) orelse .escapes);
+            if (escapes) continue;
             frame[lo + k] = true;
             budget -= lu.env_size;
         }
     }
     t.sink.sort();
     return .{ .unboxable = unboxable, .frame = frame };
+}
+
+/// Whether any local fn sharing the env of `g` may outlive body `u`, taking that env along.
+fn groupEscapes(sol: Escape.Solution, f: Escape.Facts, u: u32, fc: *const Closure.FnClosures, g: Closure.Group) bool {
+    return for (fc.boundaries) |b| {
+        if (b.self_slot == null) continue;
+        if (std.meta.eql(b.group, g) and sol.siteEscapes(f, u, f.siteUse(b.node) orelse .escapes)) break true;
+    } else false;
 }
 
 /// T0052 for the capture of a `mut` param (or `mut self`) at `use`, by a closure that
@@ -442,6 +453,7 @@ fn appendLambdaUnits(
             .sig = .{ .params = params, .ret = fs.ret },
             .param_slots = slots,
             .self_slot = bd.self_slot,
+            .group = bd.group,
             .env = env,
             .env_size = env_size,
         });

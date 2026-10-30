@@ -1,0 +1,9 @@
+# A group of adjacent local fns may capture only locals declared before the group: a
+# local declared after it is not in scope in the group's bodies, so the capture is R0001,
+# and a group fn cannot run before a local it captures exists.
+fn main() -> int {
+    fn f() -> int { g() }
+    fn g() -> int { y }  #~ ERROR [R0001] undeclared identifier 'y'
+    y := 5
+    return f() + y
+}
