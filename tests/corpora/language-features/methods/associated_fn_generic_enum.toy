@@ -1,0 +1,36 @@
+# Feature: an associated fn of a generic enum is called on its type, as on a generic struct: with its type args (`O[int].mk(1)`) or inferred from the value args (`O.mk(2)`); a variant keeps its name when an associated fn has the same one
+# expect: stdout "1 2 7 100 3"
+# expect: exit 0
+import std/io
+
+enum O[T] { a(T), b, both(T, T) }
+
+impl O[T] {
+    fn mk(v: T) -> O[T] { O.a(v) }
+    fn none() -> O[T] { O.b }
+    fn both(v: T) -> O[T] { O.a(v) }
+}
+
+fn val(o: O[int]) -> int {
+    match o {
+        O.a(v) -> v,
+        O.b -> 100,
+        O.both(x, y) -> x + y,
+    }
+}
+
+fn put(acc: str, n: int) -> str { acc.concat(" ").concat(n.to_string()) }
+
+fn main() -> int {
+    x := O[int].mk(1)
+    y := O.mk(2)
+    s := O.mk("seven")
+    z := O[int].none()
+    w := O.both(1, 2)
+    n := match s {
+        O.a(t) -> t.len(),
+        _ -> 0,
+    }
+    io.println(val(x).to_string() |> put(val(y)) |> put(n + 2) |> put(val(z)) |> put(val(w)))
+    return 0
+}

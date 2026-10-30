@@ -60,7 +60,7 @@ pub fn buildAdapters(
     };
     // Whether a bound value boxes depends on its owner's boxed list, so bound values are
     // found per owner, by walking the owner's body.
-    if (any_bound) for (bodies.items) |b| try collectBound(gpa, &graph.mods[b.mod], b, &keys);
+    if (any_bound) for (bodies.items) |b| try collectBound(gpa, &graph.mods[b.mod], b, methods, &keys);
     std.mem.sort(Key, keys.items, {}, struct {
         fn lt(_: void, a: Key, b: Key) bool {
             if (a.kind != b.kind) return @intFromEnum(a.kind) < @intFromEnum(b.kind);
@@ -88,7 +88,7 @@ pub fn buildAdapters(
                 .target = .{ .kind = fns[k.key].kind, .name = fns[k.key].name },
                 .sig = .{ .params = sigs[k.key].params, .ret = sigs[k.key].ret },
             },
-            .bound_copy, .bound_box, .bound_ref => {
+            .bound_copy, .bound_box, .bound_ref, .assoc_value => {
                 const m = methods[k.key];
                 const target = Typecheck.witnessSym(m, derives, instances, fns).?;
                 const sig = Typecheck.witnessSig(m, derives, instances, sigs).?;
@@ -97,7 +97,7 @@ pub fn buildAdapters(
                     .key = k.key,
                     .name = try Mangle.adapter(gpa, target.name, k.kind),
                     .target = target,
-                    .sig = .{ .params = sig.params[@min(sig.params.len, 1)..], .ret = sig.ret },
+                    .sig = .{ .params = if (m.is_static) sig.params else sig.params[@min(sig.params.len, 1)..], .ret = sig.ret },
                     .recv = m.recv,
                     .mut_self = m.mut_self,
                 };
@@ -114,6 +114,7 @@ fn collectBound(
     gpa: std.mem.Allocator,
     mc: *const Typecheck.GraphCtx.ModuleCtx,
     b: Body,
+    methods: []const Typecheck.Method,
     keys: anytype,
 ) error{OutOfMemory}!void {
     const V = struct {
@@ -121,6 +122,7 @@ fn collectBound(
         tree: Ast.Tree,
         resolutions: []const Resolution,
         body: Body,
+        methods: []const Typecheck.Method,
         keys: @TypeOf(keys),
         pub fn on(self: *@This(), ev: Walk.Event) error{OutOfMemory}!void {
             const e = switch (ev) {
@@ -130,14 +132,14 @@ fn collectBound(
             if (!self.body.nodes.has(e.idx)) return;
             switch (self.body.nodes.callee(e.idx).view()) {
                 .bound_method => |mi| try self.keys.append(self.gpa, .{
-                    .kind = Closure.boundKind(Closure.boundRecvLocal(self.tree, self.resolutions, e.idx), Closure.heapStorage(self.body)),
+                    .kind = Closure.methodValueKind(self.methods[mi].is_static, Closure.boundRecvLocal(self.tree, self.resolutions, e.idx), Closure.heapStorage(self.body)),
                     .key = mi,
                 }),
                 .none, .method, .protocol, .builtin, .value, .fn_ref, .direct, .instance, .generic => {},
             }
         }
     };
-    var v: V = .{ .gpa = gpa, .tree = mc.tree, .resolutions = mc.resolutions, .body = b, .keys = keys };
+    var v: V = .{ .gpa = gpa, .tree = mc.tree, .resolutions = mc.resolutions, .body = b, .methods = methods, .keys = keys };
     try Walk.walk(.{ .tree = mc.tree, .tokens = mc.tokens, .source = mc.source }, b.decl, &v);
 }
 

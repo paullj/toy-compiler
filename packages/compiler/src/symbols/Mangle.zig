@@ -45,7 +45,7 @@ pub fn lambda(gpa: std.mem.Allocator, owner_sym: []const u8, rank: u32) ![]u8 {
 /// `$boundbox` or `$boundref` as `kind` says.
 pub fn adapter(gpa: std.mem.Allocator, target_sym: []const u8, kind: Closure.AdapterKind) ![]u8 {
     const suffix = switch (kind) {
-        .fn_value => "$fnval",
+        .fn_value, .assoc_value => "$fnval",
         .bound_copy => "$bound",
         .bound_box => "$boundbox",
         .bound_ref => "$boundref",

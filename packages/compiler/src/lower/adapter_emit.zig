@@ -14,8 +14,8 @@ const Closure = @import("../symbols/Closure.zig");
 const Diagnostic = @import("../diagnostics/Diagnostic.zig").Diagnostic;
 
 /// Lower adapter `a` to `sym`: param 0 is the env, the rest are the value signature's
-/// params, forwarded to a direct call of `a.target`. A `.fn_value` thunk ignores the env;
-/// a bound adapter first passes the receiver the env holds as `self`.
+/// params, forwarded to a direct call of `a.target`. A `.fn_value` or `.assoc_value` thunk
+/// ignores the env; a bound adapter first passes the receiver the env holds as `self`.
 pub fn lowerAdapter(
     gpa: std.mem.Allocator,
     in: L.Inputs,
@@ -34,7 +34,7 @@ pub fn lowerAdapter(
     const blocks = try L.openBodyBlocks(&b, a.sig.ret);
 
     const self_n: usize = switch (a.kind) {
-        .fn_value => 0,
+        .fn_value, .assoc_value => 0,
         .bound_copy, .bound_box, .bound_ref => 1,
     };
     const args = try gpa.alloc(Ir.Operand, self_n + a.sig.params.len);

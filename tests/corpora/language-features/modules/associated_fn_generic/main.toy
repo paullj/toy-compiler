@@ -1,0 +1,12 @@
+# Feature: an associated fn of a generic enum or struct declared in another module,
+# named through the module with its type args inferred: called, `shapes.O.mk(4)`, or
+# as a value bound by its expected fn type, `f: fn(int) -> shapes.S[int] = shapes.S.mk`.
+# 4 + 5 + 30 = 39.
+# expect: exit 39
+import shapes
+
+fn main() -> int {
+    x := shapes.O.mk(4)
+    f: fn(int) -> shapes.S[int] = shapes.S.mk
+    return x.get(0) + shapes.S.mk(5).v + f(30).v
+}

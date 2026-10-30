@@ -337,6 +337,42 @@ test "another module's struct or enum named as a value is T0056 at the qualified
     try withCheckedGraph(".toy-test-typ-modtype", files, "main.toy", Check.run);
 }
 
+test "another module's bare generic type names its associated fns, which T0016 spells qualified" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import lib as l
+        \\fn main() -> int {
+        \\ a := l.O.mk(4)
+        \\ f: fn(int) -> l.S[int] = l.S.mk
+        \\ _g := l.S.mk
+        \\ return a.get(0) + f(1).v + l.S.mk(2).v
+        \\}
+        \\
+        },
+        .{ .path = "lib.toy", .source =
+        \\pub enum O[T] { a(T), b }
+        \\impl O[T] {
+        \\ fn mk(v: T) -> O[T] { O.a(v) }
+        \\ fn get(self, d: T) -> T { match self { O.a(v) -> v, O.b -> d } }
+        \\}
+        \\pub struct S[T] { pub v: T }
+        \\impl S[T] { fn mk(v: T) -> S[T] { S { v: v } } }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            _ = r;
+            errdefer for (tr.diags) |d| std.debug.print("got: {s}\n", .{d.message});
+            try testing.expectEqual(@as(usize, 1), tr.diags.len);
+            try testing.expectEqual(codes.Code.T0016, tr.diags[0].code);
+            try testing.expectEqualStrings("cannot infer type parameter 'T' for 'l.S.mk'; add explicit type arguments, e.g. l.S[int].mk", tr.diags[0].message);
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-modgeneric", files, "main.toy", Check.run);
+}
+
 test "cross-module call typechecks clean and yields the callee return type" {
     const files = &[_]FixtureFile{
         .{ .path = "main.toy", .source =

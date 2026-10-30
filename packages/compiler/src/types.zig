@@ -11883,10 +11883,10 @@ test "an impl rejected for its pattern is its only error: no conformance check, 
     try testing.expectEqual(codes.Code.T0018, c.result.diags[1].code);
 }
 
-test "an associated fn named through a type is not a value" {
+test "an associated fn with type params of its own is not a value" {
     const src = own_box_pre ++ "fn main() -> int {\n h := Box[int].with\n return 0\n}\n";
     try expectOnlyDiag(src, .T0049);
-    try expectOneDiag(src, .T0049, "'with' is an associated function and cannot be used as a value; wrap the call in a lambda");
+    try expectOneDiag(src, .T0049, "'with' is a generic function and cannot be used as a value; wrap the call in a lambda");
 }
 
 test "a struct or enum name used as a value is T0056, an enum's with a hint, wherever it stands" {
@@ -13268,6 +13268,106 @@ test "acc.plus as a value types fn(int) -> int and records bound_method" {
     try testing.expectEqual(@as(usize, 1), a.sig.params.len);
     try testing.expectEqualStrings("Acc", c.result.layouts[a.recv.struct_id].name);
     try testing.expect(!a.mut_self);
+}
+
+test "K.make as a value is the null-env thunk of the associated fn" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct K { v: int }
+        \\impl K { fn make(v: int) -> K { K { v: v } } }
+        \\fn main() -> int {
+        \\ f := K.make
+        \\ return f(2).v
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const fa = try valueMember(&c, "make", 0);
+    const mi = c.result.callees[0][fa.int()].view().bound_method;
+    try testing.expect(c.result.methods[mi].is_static);
+    try testing.expectEqual(@as(usize, 1), c.result.adapters.len);
+    const a = c.result.adapters[0];
+    try testing.expectEqual(Closure.AdapterKind.assoc_value, a.kind);
+    try testing.expectEqualStrings("main.K.make$fnval", a.name);
+    try testing.expectEqualStrings("main.K.make", a.target.name);
+    try testing.expectEqual(@as(usize, 1), a.sig.params.len);
+}
+
+test "S[int].mk and a bare S.mk with an expected fn type seal to one instance" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct S[T] { v: T }
+        \\impl S[T] { fn mk(v: T) -> S[T] { S { v: v } } }
+        \\fn main() -> int {
+        \\ f := S[int].mk
+        \\ g: fn(int) -> S[int] = S.mk
+        \\ return f(2).v + g(3).v
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const f = c.result.callees[0][(try valueMember(&c, "mk", 0)).int()].view().bound_method;
+    const g = c.result.callees[0][(try valueMember(&c, "mk", 1)).int()].view().bound_method;
+    try testing.expectEqual(f, g);
+    try testing.expect(c.result.methods[f].is_static and c.result.methods[f].instance != null);
+    try testing.expectEqual(@as(usize, 1), c.result.adapters.len);
+    try testing.expectEqual(Closure.AdapterKind.assoc_value, c.result.adapters[0].kind);
+    for (c.result.callees[0]) |x| try testing.expect(!x.isPending());
+}
+
+test "a bare generic S.mk as a value with no expected fn type is T0016" {
+    try expectOneDiag(
+        \\struct S[T] { v: T }
+        \\impl S[T] { fn mk(v: T) -> S[T] { S { v: v } } }
+        \\fn main() -> int {
+        \\ _f := S.mk
+        \\ return 0
+        \\}
+        \\
+    , .T0016, "cannot infer type parameter 'T' for 'S.mk'; add explicit type arguments, e.g. S[int].mk");
+}
+
+test "an associated fn with a mut param is not a value" {
+    try expectOneDiag(
+        \\struct K { v: int }
+        \\impl K { fn add(mut t: int, x: int) { t += x } }
+        \\fn main() -> int {
+        \\ _f := K.add
+        \\ return 0
+        \\}
+        \\
+    , .T0049, "'add' is a function with 'mut' parameters and cannot be used as a value; wrap the call in a lambda");
+}
+
+test "an associated fn of a generic enum is called on its type; a variant keeps its name" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum O[T] { a(T), b(int) }
+        \\impl O[T] {
+        \\ fn mk(v: T) -> O[T] { O.a(v) }
+        \\ fn b(v: int) -> O[T] { O.b(v + 1) }
+        \\}
+        \\fn main() -> int {
+        \\ _x := O[int].mk(1)
+        \\ _y := O.mk(true)
+        \\ _z: O[int] = O.b(2)
+        \\ return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    var calls: usize = 0;
+    for (c.result.callees[0]) |x| switch (x.view()) {
+        .method => |mi| {
+            if (std.mem.eql(u8, c.result.methods[mi].name, "mk")) calls += 1;
+            try testing.expect(!std.mem.eql(u8, c.result.methods[mi].name, "b"));
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 2), calls);
 }
 
 test "b.get on Box[int] seals to the instance method" {

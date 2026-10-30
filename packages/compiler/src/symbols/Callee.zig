@@ -31,7 +31,9 @@ pub const Callee = extern struct {
     /// type params), which the arg types alone cannot tell apart; the seal clears it.
     /// `.value`: a call of a function-typed value (`f(1)`, `h.run(4)`, `fs[i](x)`).
     /// `.fn_ref`: a named function used as a value (`f := add`), on the name's node.
-    /// `.bound_method`: a method used as a value (`f := acc.plus`), on the `field_access`.
+    /// `.bound_method`: a method used as a value (`f := acc.plus`), on the `field_access`;
+    /// also an associated fn named through its type (`K.make`, `S[int].mk`), which binds
+    /// no receiver and so has a null env: its row's `is_static` tells the two apart.
     /// `.template`: a call of a method with its own type params that selected no instance
     /// (its args did not check). It views as `.none`; only `templateFn` reads it, so the
     /// LSP can still show the method a half-typed `xs.map(` names.

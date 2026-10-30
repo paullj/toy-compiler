@@ -25,6 +25,6 @@ fn main() -> int {
     _m := b.map(fn(x, y) { x + y })  #~ ERROR [T0039] the expected type fn(int) -> U takes 1
     _n := b.map(fn(x: int, y: int) { x + y })  #~ ERROR [T0040] expected fn(int) -> U, got fn(int, int) -> int
     _a := b.map()  #~ ERROR [T0039] 'map' takes (fn(int) -> U)
-    _w := Box[int].with  #~ ERROR [T0049] associated function
+    _w := Box[int].with  #~ ERROR [T0049] a generic function
     return 0
 }

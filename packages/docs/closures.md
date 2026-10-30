@@ -98,7 +98,7 @@ fn main() -> int {
   - `env` is null for a named function and for a lambda that captures nothing, so a named function as a value costs no allocation.
   - At `-O1`, a closure that does not escape keeps its env in a slot of the frame that makes it (see Escape analysis).
 - **Calling a function value** is a `call_indirect`, with `env` as a hidden first argument.
-- **Units:** each lambda and local fn is its own function, `<owner>$l<rank>`. A named function used as a value gets a thunk `<fn>$fnval` that drops the env, and a bound method an adapter (`$bound`, `$boundbox`). A specialized call (see Generics) gets a copy of its instance, `<instance>$sp<p>$<target>`.
+- **Units:** each lambda and local fn is its own function, `<owner>$l<rank>`. A named function used as a value gets a thunk `<fn>$fnval` that drops the env, as does an associated fn named through its type (`K.make`, `Box[int].new`), and a bound method an adapter (`$bound`, `$boundbox`). A specialized call (see Generics) gets a copy of its instance, `<instance>$sp<p>$<target>`.
 - **Incremental builds:** lambda units, specialized copies and adapters are never cached; every build lowers them again, while the other units are reused by their content fingerprint.
   - A lambda's body is part of its owner's fingerprint, so a changed lambda already makes its owner's key change. Its own unit is lowered under the owner's tables (its captures, boxes and storage), and it has no key of its own.
   - A specialized copy is its instance's body with some value calls made direct. Each caller's key folds the copy's name.
@@ -149,7 +149,7 @@ There is one sharing model, so the `&x` / `*r` operators were removed.
 - **Handles:** every copy of a `Ref` names the same cell, so a `set` through one copy is seen through all of them. `==` compares cells (identity). A `Ref` has no `Hash`, so a type that holds one has no automatic `Hash` either.
 - **The type itself** stays a prelude type: `Ref[int]` is nameable in a type with no import, and so is `Ref` in value position. Its methods, like every impl's, are there when std/ref is part of the program: one module's `import std/ref` serves every module. In a program without it, a call of `new`, `get` or `set` is T0018 with the hint "add 'import std/ref'".
 - **Old syntax:** P0015, a parse error whose message names the replacement: "'&x' was removed; make a shared cell with 'Ref.new(x)' (import std/ref)", and "'*r' was removed; read a Ref with 'r.get()' and write one with 'r.set(v)' (import std/ref)". A module with a parse error is not checked further, so P0015 is the only error it reports. Infix `a & b` and `a * b` are unchanged.
-- **Associated-fn inference** is general: a bare `Box.new(5)` on any generic struct infers its type params from the value args, as a generic fn call does. A param-less associated fn (`Vec.new()`) still needs them written (`Vec[int].new()`, T0016).
+- **Associated-fn inference** is general: a bare `Box.new(5)` on any generic struct or enum infers its type params from the value args, as a generic fn call does. A param-less associated fn (`Vec.new()`) still needs them written (`Vec[int].new()`, T0016).
 
 ## Bound methods
 

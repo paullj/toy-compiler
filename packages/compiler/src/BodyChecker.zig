@@ -1640,6 +1640,7 @@ pub const BodyChecker = struct {
             else => {},
         }
         if (try bc.reportTypeNotValue(node_idx)) return bc.poison();
+        if (try bc.tryAssociatedValue(node_idx, n)) |t| return t;
         // A qualified UNIT-variant reference `N.V`: the receiver is an enum type-name
         // identifier (resolved quietly to .unresolved). Treat it as construction.
         const recv = bc.tree.nodes[(n.lhs).int()];
@@ -1667,13 +1668,7 @@ pub const BodyChecker = struct {
                 bc.node_types[(node_idx).int()] = ty;
                 return ty;
             }
-            // `Box[int]` names a type, not a value: an associated fn of it is reached by a
-            // call only.
             if (app_ty.isApp()) {
-                const e = bc.composite.at(app_ty.appIdx());
-                const member = bc.nameText(n.main_token);
-                if (Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, member, bc.methodSite())) |m| if (!m.has_self)
-                    return try bc.reportNotAValue(n, member, "an associated function");
                 try bc.report(.{ .span = bc.spanOf(n.lhs), .code = .T0056 }, "type '{f}' is not a value", .{bc.fmtType(app_ty)});
                 return bc.poison();
             }
@@ -1769,12 +1764,7 @@ pub const BodyChecker = struct {
                 defer bc.gpa.free(targs);
                 if (mf.mut_mask >> 1 != 0) return try bc.reportNotAValue(fa, member, "a method with 'mut' parameters");
                 if (!try bc.bindReceiver(node_idx, fa, recv_ty, member, m.mut_self)) return bc.poison();
-                const ps = mf.params[@min(mf.params.len, 1)..];
-                const sub = try bc.gpa.alloc(Type, ps.len);
-                defer bc.gpa.free(sub);
-                for (ps, sub) |p, *o| o.* = substTy(bc, p, targs);
-                const ty = refs.internFn(bc, sub, substTy(bc, mf.ret, targs));
-                if (ty.kind == .invalid) return error.OutOfMemory;
+                const ty = try bc.instanceFnTy(mf.params[@min(mf.params.len, 1)..], mf.ret, targs);
                 bc.setCalleeAt(node_idx, Callee.pending_bound);
                 return ty;
             }
@@ -1805,6 +1795,115 @@ pub const BodyChecker = struct {
         const pp = bc.model.preludeProtocols();
         return (std.mem.eql(u8, member, "hash") and pp.hash != null) or (std.mem.eql(u8, member, "to_string") and pp.display != null) or
             (std.mem.eql(u8, member, "cmp") and pp.ord != null);
+    }
+
+    /// `K.make`, `S[int].mk` or `S.mk` in value position: an associated fn named through
+    /// its type, the null-env thunk of the method row the seal picks, as a named fn's
+    /// `$fnval`. A bare generic type takes its args from the expected fn type. Null when
+    /// the member names no associated fn, so a variant or a type used as a value is
+    /// reported as before.
+    fn tryAssociatedValue(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!?Type {
+        if (node_idx == bc.place_target) return null;
+        const member = bc.nameText(n.main_token);
+        if (bc.concreteTypeNamed(n.lhs)) |ty| {
+            if (ty.kind == .@"enum" and !bc.isAssociatedFnOfEnum(ty.enum_id, n.main_token)) return null;
+            const mi = switch (Typecheck.pickMethodIndex(bc.model.methods, ty, member, null, null, bc.methodSite())) {
+                .one => |mi| mi,
+                .none, .ambiguous => return null,
+            };
+            const m = bc.model.methods[mi];
+            if (!m.is_static) return null;
+            const mf = bc.model.fns[m.fn_id];
+            if (mf.isGeneric()) return try bc.reportNotAValue(n, member, "a generic function");
+            if (mf.mut_mask != 0) return try bc.reportNotAValue(n, member, "a function with 'mut' parameters");
+            const fty = refs.internFn(bc, mf.params, mf.ret);
+            if (fty.kind == .invalid) return error.OutOfMemory;
+            bc.setCalleeAt(node_idx, Callee.boundMethod(mi));
+            return fty;
+        }
+        const recv = bc.tree.nodes[n.lhs.int()];
+        var app_ty: Type = undefined;
+        var m: Typecheck.TemplateMethod = undefined;
+        if (recv.tag == .type_app and !bc.appHeadIsValue(n.lhs)) {
+            app_ty = bc.typeFromNode(n.lhs);
+            if (!app_ty.isApp()) return null;
+            const e = bc.composite.at(app_ty.appIdx());
+            if (e.ctor_is_enum and !bc.isAssociatedFnOfEnum(e.ctor, n.main_token)) return null;
+            m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite()) orelse return null;
+            if (m.has_self) return null;
+        } else if (bc.genericTypeNamed(n.lhs)) |g| {
+            if (g.is_enum and !bc.isAssociatedFnOfEnum(g.ctor, n.main_token)) return null;
+            m = Typecheck.findGenericMethod(bc.model.templates, g.ctor, g.is_enum, member, bc.methodSite()) orelse return null;
+            if (m.has_self) return null;
+            app_ty = (try bc.associatedAppFromExpected(node_idx, recv, member, g, bc.model.fns[m.fn_id])) orelse return bc.poison();
+        } else return null;
+        const mf = bc.model.fns[m.fn_id];
+        // A fn's own `[U]` is fixed per call, which a value could not do.
+        if (Typecheck.hasOwnTypeParams(bc.composite, mf)) return try bc.reportNotAValue(n, member, "a generic function");
+        if (mf.mut_mask != 0) return try bc.reportNotAValue(n, member, "a function with 'mut' parameters");
+        const targs = (try Typecheck.bindImplParams(bc.gpa, bc.composite, mf, bc.composite.at(app_ty.appIdx()).args)) orelse
+            return try bc.reportNotAValue(n, member, "a generic function");
+        defer bc.gpa.free(targs);
+        const fty = try bc.instanceFnTy(mf.params, mf.ret, targs);
+        // Load-bearing, as for an associated call: discovery and the seal read the
+        // receiver off this node.
+        bc.node_types[n.lhs.int()] = app_ty;
+        bc.setCalleeAt(node_idx, Callee.pending_bound);
+        return fty;
+    }
+
+    /// A template method's fn type at the impl's type args `targs`, over `params` (its
+    /// own, less `self` for a bound receiver).
+    fn instanceFnTy(bc: *BodyChecker, params: []const Type, ret: Type, targs: []const Type) error{OutOfMemory}!Type {
+        const sub = try bc.gpa.alloc(Type, params.len);
+        defer bc.gpa.free(sub);
+        for (params, sub) |p, *o| o.* = substTy(bc, p, targs);
+        const ty = refs.internFn(bc, sub, substTy(bc, ret, targs));
+        return if (ty.kind == .invalid) error.OutOfMemory else ty;
+    }
+
+    /// The instance a bare generic type names in `S.mk` as a value, its args bound by
+    /// matching `mf`'s signature against the expected fn type. Null after a T0016 when no
+    /// expected type binds them all. A conflicting binding keeps the first, so the value's
+    /// type mismatches the expected one where the caller reports it.
+    fn associatedAppFromExpected(bc: *BodyChecker, node_idx: Ast.Index, recv: Ast.Node, member: []const u8, g: GenericCtor, mf: FnSym) error{OutOfMemory}!?Type {
+        const n_gp: u32 = @intCast(mf.generic_params.len);
+        const out = try bc.gpa.alloc(Type, n_gp);
+        defer bc.gpa.free(out);
+        const bnd = try bc.gpa.alloc(bool, n_gp);
+        defer bc.gpa.free(bnd);
+        @memset(bnd, false);
+        const fp = try bc.gpa.alloc(usize, n_gp);
+        defer bc.gpa.free(fp);
+        if (bc.expectedTy()) |exp| if (exp.isFunc()) {
+            const parts = Composite.fnParts(bc.composite.at(exp.funcIdx()));
+            // No instance fits, so a T0016 hint would name one that fails the same way.
+            if (parts.params.len != mf.params.len) {
+                try bc.report(.{ .span = bc.tokSpan(recv.main_token), .code = .T0039 }, "'{s}.{s}' takes {d} parameter(s), but the expected type {f} takes {d}", .{ bc.typeRefText(recv), member, mf.params.len, bc.fmtType(exp), parts.params.len });
+                return null;
+            }
+            const pats = try std.mem.concat(bc.gpa, Type, &.{ mf.params, &.{mf.ret} });
+            defer bc.gpa.free(pats);
+            const acts = try std.mem.concat(bc.gpa, Type, &.{ parts.params, &.{parts.ret} });
+            defer bc.gpa.free(acts);
+            _ = Infer.match(n_gp, pats, acts, out, bnd, fp, bc.composite.decomposer());
+        };
+        for (out, bnd) |*o, b| if (!b) {
+            o.* = .invalid;
+        };
+        if (std.mem.indexOfScalar(bool, bnd, false)) |ord| {
+            try CallInfer.reportUninferableAssociated(bc, recv, member, g, mf, out, @intCast(ord));
+            return null;
+        }
+        if (!try CallInfer.concreteTargs(bc, node_idx, out)) return null;
+        return try CallInfer.receiverApp(bc, mf, out);
+    }
+
+    /// A type reference as its source spells it: `S`, or `lib.S` through a module.
+    pub fn typeRefText(bc: *const BodyChecker, n: Ast.Node) []const u8 {
+        if (n.tag != .field_access) return bc.nameText(n.main_token);
+        const head = bc.tokSpan(bc.tree.nodes[n.lhs.int()].main_token);
+        return bc.source[head.start..bc.tokSpan(n.main_token).end];
     }
 
     fn reportNotAValue(bc: *BodyChecker, fa: Ast.Node, member: []const u8, what: []const u8) error{OutOfMemory}!Type {
@@ -3390,15 +3489,11 @@ pub const BodyChecker = struct {
             }
         }
         // A bare generic type: its own args come from nowhere once the method's are given.
-        if (recv.tag == .identifier and bc.resolutions[(fa.lhs).int()] == .unresolved) {
-            if (bc.activeStructMap().get(bc.nameText(recv.main_token))) |sid| {
-                if (sid < bc.structSyms().len and bc.structSyms()[sid].is_generic) {
-                    if (Typecheck.findGenericMethod(bc.model.templates, sid, false, member, bc.methodSite()) != null) {
-                        try bc.drainArgs(args);
-                        try CallInfer.reportUninferableAssociated(bc, recv, member, sid, null, &.{}, null);
-                        return .invalid;
-                    }
-                }
+        if (bc.genericTypeNamed(fa.lhs)) |g| {
+            if (Typecheck.findGenericMethod(bc.model.templates, g.ctor, g.is_enum, member, bc.methodSite()) != null) {
+                try bc.drainArgs(args);
+                try CallInfer.reportUninferableAssociated(bc, recv, member, g, null, &.{}, null);
+                return .invalid;
             }
         }
         // A non-generic type's associated fn or variant takes no type args: neither has
@@ -3536,6 +3631,7 @@ pub const BodyChecker = struct {
             const app_ty = bc.typeFromNode(callee.lhs);
             if (app_ty.isApp() and bc.composite.at(app_ty.appIdx()).ctor_is_enum) {
                 const e = bc.composite.at(app_ty.appIdx());
+                if (bc.isAssociatedFnOfEnum(e.ctor, callee.main_token)) return null;
                 const ty = try bc.checkVariantPayloads(node_idx, e.ctor, callee.main_token, .tuple, n.rhs, e.args, null);
                 bc.node_types[(node_idx).int()] = ty;
                 return ty;
@@ -3559,14 +3655,29 @@ pub const BodyChecker = struct {
         return null;
     }
 
-    /// `E.m(..)` names an associated fn rather than a variant: a non-generic enum `E` with
-    /// no variant `m` and a method `m` (a variant keeps the name when both exist).
+    /// `E.m(..)` or `O[int].m(..)` names a method rather than a variant: an enum with no
+    /// variant `m` and a method `m` (a variant keeps the name when both exist).
     fn isAssociatedFnOfEnum(bc: *BodyChecker, enum_id: u32, member_tok: u32) bool {
         const e = bc.model.enums[enum_id];
-        if (e.is_generic) return false;
         const member = bc.nameText(member_tok);
         for (e.variants) |v| if (std.mem.eql(u8, v.name, member)) return false;
+        if (e.is_generic) return Typecheck.findGenericMethod(bc.model.templates, enum_id, true, member, bc.methodSite()) != null;
         return Typecheck.pickMethodIndex(bc.model.methods, Type.enumT(enum_id), member, null, null, bc.methodSite()) != .none;
+    }
+
+    pub const GenericCtor = struct { ctor: u32, is_enum: bool };
+
+    /// The generic struct or enum a bare type name names (`Box` in `Box.new(5)`), or null
+    /// when the node is anything else.
+    fn genericTypeNamed(bc: *const BodyChecker, idx: Ast.Index) ?GenericCtor {
+        const ids = bc.typeIdsNamed(idx);
+        if (ids.s) |sid| return if (sid < bc.structSyms().len and bc.structSyms()[sid].is_generic) .{ .ctor = sid, .is_enum = false } else null;
+        if (ids.e) |eid| return if (bc.model.enums[eid].is_generic) .{ .ctor = eid, .is_enum = true } else null;
+        return null;
+    }
+
+    pub fn genericParamCount(bc: *const BodyChecker, g: GenericCtor) usize {
+        return if (g.is_enum) bc.model.enums[g.ctor].generic_params.len else bc.structSyms()[g.ctor].generic_params.len;
     }
 
     /// The non-generic struct or enum a call's receiver names as a type (`K` in `K.make()`,
@@ -3626,8 +3737,7 @@ pub const BodyChecker = struct {
             const app_ty = bc.typeFromNode(callee.lhs);
             if (!app_ty.isApp()) return null; // typeFromNode already diagnosed
             const e = bc.composite.at(app_ty.appIdx());
-            if (e.ctor_is_enum) return null; // an enum type_app is variant construction
-            const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, false, member, bc.methodSite()) orelse {
+            const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite()) orelse {
                 // An instance has no methods of its own (`impl Box[int]` is rejected), so a
                 // member no template declares names nothing.
                 try bc.drainArgs(args);
@@ -3655,18 +3765,20 @@ pub const BodyChecker = struct {
         if (bc.concreteTypeNamed(callee.lhs)) |ty| return try bc.checkConcreteAssociatedCall(node_idx, n, callee, ty);
         // A bare `Box.new(5)` (no turbofish) naming a generic struct with an associated fn:
         // its type params come from the value args, or the call needs explicit ones.
+        if (bc.genericTypeNamed(callee.lhs)) |g| {
+            if (Typecheck.findGenericMethod(bc.model.templates, g.ctor, g.is_enum, member, bc.methodSite())) |m| {
+                // Before inference: its T0016 hint would name `Box[int].m`, which is this same error.
+                if (m.has_self) return try bc.reportInstanceMethodOnType(args, callee.main_token);
+                if (try CallInfer.inferAssociatedCall(bc, node_idx, n, callee, m, args)) |t| return t;
+                try bc.drainArgs(args);
+                try CallInfer.reportUninferableAssociated(bc, recv, member, g, null, &.{}, null);
+                return .invalid;
+            }
+        }
         if (recv.tag == .identifier and bc.resolutions[(callee.lhs).int()] != .module) {
             const name = bc.nameText(recv.main_token);
             if (bc.activeStructMap().get(name)) |sid| {
                 if (sid < bc.structSyms().len and bc.structSyms()[sid].is_generic) {
-                    if (Typecheck.findGenericMethod(bc.model.templates, sid, false, member, bc.methodSite())) |m| {
-                        // Before inference: its T0016 hint would name `Box[int].m`, which is this same error.
-                        if (m.has_self) return try bc.reportInstanceMethodOnType(args, callee.main_token);
-                        if (try CallInfer.inferAssociatedCall(bc, node_idx, n, callee, m, args)) |t| return t;
-                        try bc.drainArgs(args);
-                        try CallInfer.reportUninferableAssociated(bc, recv, member, sid, null, &.{}, null);
-                        return .invalid;
-                    }
                     if (bc.rejectedOnType(sid, false, member)) {
                         try bc.drainArgs(args);
                         return .invalid;

@@ -448,12 +448,15 @@ composite protocol argument (`impl P has Into[Option[int]]`).
 
 An `impl` fn without `self` is an associated function, called on its type: `K.make(1)`
 on a struct or enum `K`, `lib.K.make(1)` through a module, `Box[int].new()` on a generic
-struct (or `Box.new(5)`, inferred as above). The call selects it like a method and
+struct or enum (or `Box.new(5)`, inferred as above). The call selects it like a method and
 passes no receiver. It is never called on a value (`k.make(1)` is **T0018**), an instance
 method is never called on a type (`K.get()` is **T0018**), and on an enum a variant keeps
-its name: `E.A(1)` constructs the variant `A` even when an associated fn `A` exists. An
-associated fn of a generic enum is not callable yet (the call reads as a variant,
-**T0061**), and an associated fn is not a value (`f := K.make` is **T0056**).
+its name: `E.A(1)` constructs the variant `A` even when an associated fn `A` exists.
+
+Named through its type, an associated fn is a function value, as a named fn is:
+`f := K.make`, `apply(K.make)`, `f := Box[int].new`. A bare generic type takes its
+args from the expected fn type (`f: fn(int) -> Box[int] = Box.mk`); with none it is
+**T0016**. One with type params of its own or a `mut` param is not a value (**T0049**).
 
 ## Same-named methods
 

@@ -339,7 +339,10 @@ test "hover on a bound method value shows its method and names the receiver's ty
         \\    fn bump(mut self) { self.n = self.n + 1 }
         \\}
         \\struct Box[T] { v: T }
-        \\impl Box[T] { fn get(self) -> T { self.v } }
+        \\impl Box[T] {
+        \\    fn get(self) -> T { self.v }
+        \\    fn mk(v: T) -> Box[T] { Box { v: v } }
+        \\}
         \\fn main() -> int {
         \\    acc := Acc { n: 1 }
         \\    g := acc.plus
@@ -347,7 +350,8 @@ test "hover on a bound method value shows its method and names the receiver's ty
         \\    bg := b.get
         \\    up := acc.bump
         \\    up()
-        \\    return g(1) + bg().len() + acc.plus(2)
+        \\    mk := Box[int].mk
+        \\    return g(1) + bg().len() + acc.plus(2) + mk(3).v
         \\}
         \\
     ;
@@ -358,6 +362,8 @@ test "hover on a bound method value shows its method and names the receiver's ty
         .{ .at = test_util.posOf(src, "bump\n"), .want = "fn bump(mut self: Acc) -> ()\n```\n\nbound method of Acc" },
         // A call of the method is not a value.
         .{ .at = test_util.posOf(src, "plus(2)"), .want = "fn plus(self: Acc, k: int) -> int\n```" },
+        // An associated fn as a value binds no receiver.
+        .{ .at = test_util.posOf(src, "mk\n"), .want = "fn mk(v: int) -> Box[int]\n```" },
     };
     for (cases) |c| {
         var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse return error.NoHover;
