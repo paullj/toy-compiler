@@ -1,0 +1,10 @@
+# Feature: outside its module, naming a private field that shares its name with a method
+# is T0078, whose hint points at the method call; the call itself stays valid.
+# expect: compile-error "field 'balance' of 'Account' is private to module 'lib'; call 'a.balance()' to use the method"
+import lib
+
+fn main() -> int {
+    a := lib.open("ann")
+    get := a.balance
+    return a.balance() + lib.peek(a) + get()
+}

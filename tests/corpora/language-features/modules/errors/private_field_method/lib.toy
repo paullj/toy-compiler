@@ -1,0 +1,12 @@
+# `balance` is both a private field and a method: only this module reads the field.
+pub struct Account { pub owner: str, balance: int }
+
+pub fn open(owner: str) -> Account {
+    Account { owner: owner, balance: 7 }
+}
+
+pub fn peek(a: Account) -> int { a.balance }
+
+impl Account {
+    fn balance(self) -> int { self.balance }
+}

@@ -1,6 +1,7 @@
 # A std collection hides its storage handle and its iterators hide their cursor (T0078), so
 # no other module can forge one that points at the wrong memory (#132). Public methods and
-# the pub fields of a record such as `Entry` stay usable.
+# the pub fields of a record such as `Entry` stay usable. A program cannot edit std, so the
+# hint points at the type's methods rather than at `pub` (#141).
 import std/vec
 import std/map
 import std/set
@@ -8,12 +9,12 @@ import std/set
 fn main() -> int {
     m := Map[int, int].new()
     m.set(1, 2)
-    h := m.h  #~ ERROR [T0078] field 'h' of 'Map' is private to module 'std/map'
+    h := m.h  #~ ERROR [T0078] field 'h' of 'Map' is private to module 'std/map'; use the methods of 'Map' instead
     v := Vec[int] {
-        h: h,  #~ ERROR [T0078] field 'h' of 'Vec' is private to module 'std/vec'
+        h: h,  #~ ERROR [T0078] field 'h' of 'Vec' is private to module 'std/vec'; use the methods of 'Vec' instead
     }
     it := m.iter()
-    it.i = -1000001  #~ ERROR [T0078] field 'i' of 'MapIter' is private to module 'std/map'
+    it.i = -1000001  #~ ERROR [T0078] field 'i' of 'MapIter' is private to module 'std/map'; use the methods of 'MapIter' instead
     it.i += 1  #~ ERROR [T0078] field 'i' of 'MapIter'
     s := Set[int].new()
     si := SetIter[int] {

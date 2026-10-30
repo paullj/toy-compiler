@@ -1688,7 +1688,7 @@ pub const BodyChecker = struct {
             const fname = bc.nameText(n.main_token);
             for (sym.field_names, 0..) |dn, j| {
                 if (!std.mem.eql(u8, dn, fname)) continue;
-                if (!bc.fieldVisible(sym, j)) if (try bc.tryBoundMethod(node_idx, n, base)) |t| return t;
+                if (try bc.privateFieldNamesMethod(node_idx, n, base, sym, j)) return bc.poison();
                 try bc.checkFieldVisible(sym, j, bc.tokSpan(n.main_token));
                 return substTy(bc, sym.field_types[j], e.args);
             }
@@ -1706,8 +1706,7 @@ pub const BodyChecker = struct {
         const fname = bc.nameText(n.main_token);
         for (sym.field_names, 0..) |dn, j| {
             if (!std.mem.eql(u8, dn, fname)) continue;
-            // A field hidden here is no field here: a method of its name binds instead.
-            if (!bc.fieldVisible(sym, j)) if (try bc.tryBoundMethod(node_idx, n, base)) |t| return t;
+            if (try bc.privateFieldNamesMethod(node_idx, n, base, sym, j)) return bc.poison();
             try bc.checkFieldVisible(sym, j, bc.tokSpan(n.main_token));
             return sym.field_types[j];
         }
@@ -5190,10 +5189,70 @@ pub const BodyChecker = struct {
     fn checkFieldVisible(bc: *BodyChecker, sym: StructSym, j: usize, at: Span) error{OutOfMemory}!void {
         if (bc.fieldVisible(sym, j)) return;
         const mod = bc.model.graph.mods[sym.mod];
-        // A program cannot edit std or core, so it is not told to mark their fields pub.
-        const hint = if (mod.bundled) "" else "; mark it pub or use a constructor";
-        try bc.sink.report(.{ .span = at, .code = .T0078 }, "field '{s}' of '{s}' is private to module '{s}'{s}", .{ sym.field_names[j], sym.source_name orelse sym.name, mod.path, hint });
+        const ty_name = sym.source_name orelse sym.name;
+        const msg = "field '{s}' of '{s}' is private to module '{s}'; ";
+        const args = .{ sym.field_names[j], ty_name, mod.path };
+        // A program cannot edit std or core, so it is pointed at the type's methods, not at `pub`.
+        if (mod.bundled)
+            try bc.sink.report(.{ .span = at, .code = .T0078 }, msg ++ "use the methods of '{s}' instead", args ++ .{ty_name})
+        else
+            try bc.sink.report(.{ .span = at, .code = .T0078 }, msg ++ "mark it pub or use a constructor", args);
     }
+
+    /// `recv.f` read outside `sym`'s module where `f` is a private field and also a method:
+    /// T0078 that points at the method call, and true. Binding the method silently would
+    /// hide that the field was named (#140). A call `recv.f()` resolves the method before
+    /// it reaches here, and a write keeps the plain T0078.
+    fn privateFieldNamesMethod(bc: *BodyChecker, node_idx: Ast.Index, fa: Ast.Node, recv_ty: Type, sym: StructSym, j: usize) error{OutOfMemory}!bool {
+        if (node_idx == bc.place_target or bc.fieldVisible(sym, j)) return false;
+        const member = sym.field_names[j];
+        const is_method = if (recv_ty.isApp()) blk: {
+            const e = bc.composite.at(recv_ty.appIdx());
+            const display = std.mem.eql(u8, member, "to_string") and bc.model.preludeProtocols().display != null;
+            break :blk display or Typecheck.pickGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite()) != .none;
+        } else Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, null, bc.methodSite()) != .none or bc.isBuiltinMethod(recv_ty, member);
+        if (!is_method) return false;
+        const recv = bc.spanOf(fa.lhs);
+        const msg = "field '{s}' of '{s}' is private to module '{s}'; ";
+        const args = .{ member, sym.source_name orelse sym.name, bc.model.graph.mods[sym.mod].path };
+        const call: LambdaCall = .{ .recv = bc.source[recv.start..recv.end], .member = member, .arity = bc.expectedFnArity() };
+        // Where a fn value is expected, the call alone would not fit, so the hint wraps it.
+        if (call.arity != null)
+            try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0078 }, msg ++ "call the method in a lambda, as in '{f}'", args ++ .{call})
+        else
+            try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0078 }, msg ++ "call '{s}.{s}()' to use the method", args ++ .{ call.recv, member });
+        return true;
+    }
+
+    /// The param count of the fn type this node is expected to be, if it is one.
+    fn expectedFnArity(bc: *const BodyChecker) ?usize {
+        const e = bc.body.expected orelse return null;
+        if (!e.ty.isFunc()) return null;
+        return Composite.fnParts(bc.composite.at(e.ty.funcIdx())).params.len;
+    }
+
+    /// `fn(a, b) { recv.m(a, b) }`, a lambda that calls the method.
+    const LambdaCall = struct {
+        recv: []const u8,
+        member: []const u8,
+        arity: ?usize,
+
+        pub fn format(c: LambdaCall, w: *std.Io.Writer) std.Io.Writer.Error!void {
+            const n = c.arity orelse 0;
+            try w.writeAll("fn(");
+            try writeParamNames(w, n);
+            try w.print(") {{ {s}.{s}(", .{ c.recv, c.member });
+            try writeParamNames(w, n);
+            try w.writeAll(") }");
+        }
+
+        fn writeParamNames(w: *std.Io.Writer, n: usize) std.Io.Writer.Error!void {
+            for (0..n) |i| {
+                if (i != 0) try w.writeAll(", ");
+                if (i < 26) try w.writeByte('a' + @as(u8, @intCast(i))) else try w.print("a{d}", .{i});
+            }
+        }
+    };
 
     /// Emit "no field '{s}' in struct '{s}'", enriched with a "did you mean" hint when a
     /// declared field name is a close, unambiguous typo of `fname`.

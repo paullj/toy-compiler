@@ -493,23 +493,30 @@ test "a private field is T0078 at each read, write, literal and call outside its
     try withCheckedGraph(".toy-test-typ-privfield", files, "main.toy", Check.run);
 }
 
-test "outside its module a private field is hidden, so a method of its name binds as a value" {
+test "outside its module a private field named like a method is T0078 that points at the call" {
     const files = &[_]FixtureFile{
         .{ .path = "main.toy", .source =
         \\import lib
+        \\fn take(f: fn() -> int) -> int { f() }
+        \\fn apply(f: fn(int, bool) -> int) -> int { f(1, true) }
         \\fn main() -> int {
         \\ h := lib.mk()
         \\ f := h.len
         \\ b := lib.box(2)
         \\ g := b.v
-        \\ return f() + g()
+        \\ t := take(h.len) + apply(h.add)
+        \\ return h.len() + b.v() + lib.peek(h) + t
         \\}
         \\
         },
         .{ .path = "lib.toy", .source =
-        \\pub struct H { len: int }
-        \\impl H { fn len(self) -> int { self.len * 10 } }
-        \\pub fn mk() -> H { H { len: 4 } }
+        \\pub struct H { len: int, add: int }
+        \\impl H {
+        \\ fn len(self) -> int { self.len * 10 }
+        \\ fn add(self, n: int, _b: bool) -> int { self.add + n }
+        \\}
+        \\pub fn mk() -> H { H { len: 4, add: 1 } }
+        \\pub fn peek(h: H) -> int { h.len }
         \\pub struct B[T] { v: T }
         \\impl B[T] { fn v(self) -> T { self.v } }
         \\pub fn box(v: int) -> B[int] { B { v: v } }
@@ -518,10 +525,21 @@ test "outside its module a private field is hidden, so a method of its name bind
     };
     const Check = struct {
         fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
-            _ = g;
             _ = r;
             errdefer for (tr.diags) |d| std.debug.print("got: {s}\n", .{d.message});
-            try testing.expectEqual(@as(usize, 0), tr.diags.len);
+            const want = [_][]const u8{
+                "field 'len' of 'H' is private to module 'lib'; call 'h.len()' to use the method",
+                "field 'v' of 'B' is private to module 'lib'; call 'b.v()' to use the method",
+                "field 'len' of 'H' is private to module 'lib'; call the method in a lambda, as in 'fn() { h.len() }'",
+                "field 'add' of 'H' is private to module 'lib'; call the method in a lambda, as in 'fn(a, b) { h.add(a, b) }'",
+            };
+            try testing.expectEqual(want.len, tr.diags.len);
+            const main_mod = modId(g, "main");
+            for (want, tr.diags) |w, d| {
+                try testing.expectEqual(codes.Code.T0078, d.code);
+                try testing.expectEqual(main_mod, d.scope);
+                try testing.expectEqualStrings(w, d.message);
+            }
         }
     };
     try withCheckedGraph(".toy-test-typ-privfield-method", files, "main.toy", Check.run);
@@ -552,7 +570,7 @@ test "a literal leaving out a private field asks for a constructor, and std's sa
             errdefer for (tr.diags) |d| std.debug.print("got: {s}\n", .{d.message});
             const want = [_][]const u8{
                 "'P' has private field 'y', so only module 'lib' can build it; use a constructor",
-                "field 'h' of 'Map' is private to module 'std/map'",
+                "field 'h' of 'Map' is private to module 'std/map'; use the methods of 'Map' instead",
             };
             try testing.expectEqual(want.len, tr.diags.len);
             for (want, tr.diags) |w, d| {

@@ -280,11 +280,12 @@ Outside the defining module a private field cannot be read (`p.y`), written (`p.
 `p.y += v`, or as the base of a deeper place such as `p.y.z = v` or `p.v[i] = e`), called
 when it holds a fn (`h.f()`) or set in a struct literal (`lib.P { x: 1, y: 2 }`). Each is
 **T0078** at the field's name: "field 'y' of 'P' is private to module 'lib'; mark it pub
-or use a constructor" (a `std` or `core` field drops the "mark it pub" hint). A literal
+or use a constructor" (a `std` or `core` field says "use the methods of 'Vec' instead",
+since a program cannot edit those modules). A literal
 that leaves a private field out is T0078 at the literal ("'P' has private field 'y', so
-only module 'lib' can build it; use a constructor"), not a missing field. A private
-field is hidden outside, so a method of its name binds there: `a.balance` is the bound
-method `balance`. The check reads the struct's declaring module, so a generic struct's
+only module 'lib' can build it; use a constructor"), not a missing field. When a
+private field shares its name with a method, `a.balance()` outside calls the method, but
+`a.balance` uncalled is T0078 with "call 'a.balance()' to use the method". The check reads the struct's declaring module, so a generic struct's
 instance and its template agree, and a method, conformance or derive written in that
 module sees every field: the derived `Eq`, `Hash`, `Ord` and `Display` compare, hash and
 print private fields too. A conformance written in another module does not. Enum payloads have no visibility of their own. A field type
