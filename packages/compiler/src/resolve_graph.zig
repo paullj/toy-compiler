@@ -46,6 +46,7 @@ const nearmiss = @import("diagnostics/nearmiss.zig");
 const codes = @import("diagnostics/codes.zig");
 const Span = @import("diagnostics/model.zig").Span;
 const Walk = @import("ast/Walk.zig");
+const angle_args = @import("ast/angle_args.zig");
 
 pub const Resolution = @import("symbols/Resolution.zig").Resolution;
 const symbols_res = @import("symbols/Resolution.zig");
@@ -1878,6 +1879,9 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
     }
     for (closures, out_closures) |*c, *o| o.* = try c.toOwnedSlice(gpa);
 
+    for (g.sink.diags.items) |*d| {
+        if (d.scope != DiagnosticSink.NO_SCOPE) angle_args.claim(d, graph.modules[d.scope].tokens);
+    }
     g.sink.sort();
     const owned = try g.sink.toOwned();
     return GraphResult{
@@ -4050,6 +4054,28 @@ test "a type-level name used as a value is T0056, not undeclared (R0001)" {
                 try testing.expectEqualStrings(case[1], d.message);
                 const want: codes.Code = if (std.mem.startsWith(u8, case[1], "undeclared")) .R0001 else .T0056;
                 try testing.expectEqual(want, d.code);
+            }
+        }.run);
+    }
+}
+
+test "expression-position '<...>' type arguments are one P0010, not T0056/R0001" {
+    const cases = .{
+        "struct Box[T] { v: T }\nfn main() -> int {\n _v := Box<int>.new()\n return 0\n}\n",
+        "fn id[T](x: T) -> T { x }\nfn main() -> int {\n return id<int>(3)\n}\n",
+        "struct Pair[A, B] { a: A, b: B }\nfn g(_a: bool, _b: bool) -> int { 0 }\nfn main() -> int {\n return g(Pair<str, int>.new())\n}\n",
+    };
+    inline for (cases) |src| {
+        try withResolvedSource(src, struct {
+            fn run(_: Ast.Tree, _: []const Token, s: []const u8, r: *GraphResult) anyerror!void {
+                var errs: usize = 0;
+                for (r.diags) |d| {
+                    if (d.severity == .warning) continue;
+                    errs += 1;
+                    try testing.expectEqual(codes.Code.P0010, d.code);
+                    try testing.expectEqual(@as(u8, '<'), s[d.byte_offset]);
+                }
+                try testing.expectEqual(@as(usize, 1), errs);
             }
         }.run);
     }

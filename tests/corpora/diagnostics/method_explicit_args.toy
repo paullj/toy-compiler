@@ -26,8 +26,8 @@ impl K {
 fn main() -> int {
     b := Box { v: 2 }
     _a := b.none[int, bool]()  #~ ERROR [T0054] 'none' takes 1 type argument(s) of its own, got 2
-    _b := b.into[str]()  #~ ERROR [T0018] no method 'into' on type 'Box' for the given protocol type arguments
-    _c := b.get[int]()  #~ ERROR [T0018] no method 'get' on type 'Box' for the given protocol type arguments
+    _b := b.into[str]()  #~ ERROR [T0018] no method 'into' on type 'Box[int]' for the given protocol type arguments
+    _c := b.get[int]()  #~ ERROR [T0018] no method 'get' on type 'Box[int]' for the given protocol type arguments
     _d := b.none()  #~ ERROR [T0016] add explicit type arguments, e.g. none[int](..)
     _e := b.with[int](1, 2)  #~ ERROR [T0018] 'with' is an associated function
     _f := Box.with[bool](1, true)  #~ ERROR [T0016] e.g. Box[int].with

@@ -1,0 +1,8 @@
+# Two '<...>' type arguments: the comma breaks the comparison parse, and that parse
+# error is reported as P0010 too.
+import std/map
+
+fn main() -> int {
+    _m := Map<str, int>.new()  #~ ERROR [P0010] type arguments use '[]', not '<>'
+    return 0
+}

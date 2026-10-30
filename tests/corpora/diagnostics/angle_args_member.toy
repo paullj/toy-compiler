@@ -1,0 +1,8 @@
+# '<...>' type arguments before a member access in an expression are P0010: toy spells
+# them with '[]', as in 'Vec[int].new()'. They would otherwise read as comparisons.
+import std/vec
+
+fn main() -> int {
+    _v := Vec<int>.new()  #~ ERROR [P0010] type arguments use '[]', not '<>'
+    return 0
+}

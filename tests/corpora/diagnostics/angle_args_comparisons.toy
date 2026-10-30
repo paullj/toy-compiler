@@ -1,0 +1,11 @@
+# Two comparisons as call arguments look like '<...>' type arguments. A typo inside
+# them is a real undeclared name either way, so it stays R0001, not P0010.
+fn g(a: bool, b: bool) -> int { if a && b { 1 } else { 0 } }
+
+fn main() -> int {
+    lo := 1
+    x := 3
+    y := 2
+    if lo < bb > (y) { return 1 }  #~ ERROR [R0001] undeclared identifier 'bb'
+    return g(lo < hii, x > (y))  #~ ERROR [R0001] undeclared identifier 'hii'
+}

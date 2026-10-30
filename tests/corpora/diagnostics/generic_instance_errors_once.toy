@@ -1,0 +1,18 @@
+# A site in a generic body that fails in every instance reports once, even where each
+# instance spells the types differently (#21). Polymorphic recursion makes one instance
+# per nesting depth, and must not report once per depth.
+struct Box[T] { v: T }
+
+fn f[T](x: T) -> int {
+    _y: int = Box { v: x }  #~ ERROR [T0041] cannot bind Box[
+    g: fn(T) -> int = fn(_v) { true }  #~ ERROR [T0042] lambda has type fn(int) -> bool
+    g(x)
+}
+
+fn grow[T](x: T, n: int) -> int {
+    if n == 0 { return 0 }
+    _bad: int = Box { v: x }  #~ ERROR [T0041] cannot bind Box[
+    grow(Box { v: x }, n - 1)  #~ ERROR [T0017] instantiation too deep
+}
+
+fn main() -> int { return f(1) + f(true) + grow(1, 3) }

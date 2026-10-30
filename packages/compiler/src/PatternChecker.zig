@@ -56,7 +56,7 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
     const enum_id = bc.scrutEnumId(st);
     if (enum_id == null and st.kind != .int and st.kind != .bool) {
         for (arms) |arm_idx| _ = try bc.typeOf(Ast.armHeaderAt(bc.tree, (bc.tree.nodes[(arm_idx).int()].rhs).int()).body);
-        try bc.sink.report(.{ .span = bc.spanOf(n.lhs), .code = .T0067 }, "match scrutinee must be an enum, int, or bool, got {s}", .{bc.typeName(st)});
+        try bc.report(.{ .span = bc.spanOf(n.lhs), .code = .T0067 }, "match scrutinee must be an enum, int, or bool, got {f}", .{bc.fmtType(st)});
         bc.node_types[(node_idx).int()] = .invalid;
         return .invalid;
     }
@@ -94,7 +94,7 @@ pub fn typeOfMatch(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Out
             // for it (the scrutinee keeps it: `match n.try_into() { .ok(c) -> c, .. }`).
             const gt = try bc.typeOfExpected(h.guard, null);
             if (!BodyChecker.condFits(gt))
-                try bc.sink.report(.{ .span = bc.spanOf(h.guard), .code = .T0045 }, "match guard must be bool, got {s}", .{bc.typeName(gt)});
+                try bc.report(.{ .span = bc.spanOf(h.guard), .code = .T0045 }, "match guard must be bool, got {f}", .{bc.fmtType(gt)});
         }
         const body_ty0 = try bc.typeOfArm(h.body, bc.body.expected, result);
         const body_ty: Type = if (armDiverges(bc, h.body)) Type.never else body_ty0;
@@ -182,7 +182,7 @@ fn checkPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov: *Cov,
             else
                 Type.bool;
             if (expected.kind != .invalid and !Type.eql(lt, expected))
-                try bc.sink.report(.{ .span = bc.tokSpan(pat.main_token), .code = .T0067 }, "literal pattern type {s} does not match scrutinee {s}", .{ bc.typeName(lt), bc.typeName(expected) });
+                try bc.report(.{ .span = bc.tokSpan(pat.main_token), .code = .T0067 }, "literal pattern type {f} does not match scrutinee {f}", .{ bc.fmtType(lt), bc.fmtType(expected) });
             // A bool literal records its case toward coverage; int never covers.
             if (count_cov) switch (cov.*) {
                 .bool => |bcov| {
@@ -209,7 +209,7 @@ fn checkVariantPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov
     // `substTy(..., &.{})` below is the identity — byte-identical to the earlier behavior.
     const enum_id = bc.scrutEnumId(expected) orelse {
         if (expected.kind != .invalid)
-            try bc.sink.report(.{ .span = bc.spanOf(pat_idx), .code = .T0067 }, "variant pattern on a non-enum scrutinee {s}", .{bc.typeName(expected)});
+            try bc.report(.{ .span = bc.spanOf(pat_idx), .code = .T0067 }, "variant pattern on a non-enum scrutinee {f}", .{bc.fmtType(expected)});
         return;
     };
     const targs: []const Type = if (expected.isApp()) bc.composite.at(expected.appIdx()).args else &.{};

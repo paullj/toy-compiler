@@ -25,6 +25,7 @@ const std = @import("std");
 const token = @import("ast/Token.zig");
 const Token = token.Token;
 const Ast = @import("ast/Ast.zig");
+const angle_args = @import("ast/angle_args.zig");
 const Node = Ast.Node;
 const Code = @import("diagnostics/codes.zig").Code;
 const Modes = @import("symbols/Modes.zig");
@@ -313,6 +314,7 @@ pub fn parse(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8) 
     // corpus at zero ReleaseFast cost. It asserts (panics) on a violation — a
     // sanity check on the parser itself, not a user-facing diagnostic.
     if (std.debug.runtime_safety) checkInvariants(tree, p.tokens, p.src, p.diags.items);
+    p.claimAngleArgs();
     // The diagnostics list is handed to the caller; everything else is either
     // moved into `tree` or already released inside `parseProgram`.
     const diags = p.diags.toOwnedSlice(p.gpa) catch |err| switch (err) {
@@ -2809,6 +2811,20 @@ fn warnSpan(p: *Parser, start: u32, end: u32, code: Code, message: []const u8) e
     if (p.in_error) return;
     p.in_error = true;
     try p.diags.append(p.gpa, .{ .byte_offset = start, .end = end, .message = message, .code = code });
+}
+
+/// Rewrite errors inside an expression-position `Name<T, U>.m` as P0010, folding the
+/// ones that land on the same `<...>`.
+fn claimAngleArgs(p: *Parser) void {
+    var w: usize = 0;
+    for (p.diags.items) |d| {
+        var cur = d;
+        angle_args.claim(&cur, p.tokens);
+        if (w > 0 and cur.code == .P0010 and p.diags.items[w - 1].code == .P0010 and p.diags.items[w - 1].byte_offset == cur.byte_offset) continue;
+        p.diags.items[w] = cur;
+        w += 1;
+    }
+    p.diags.shrinkRetainingCapacity(w);
 }
 
 /// The end of the token just consumed: where a span over the run the parser has
@@ -5560,6 +5576,7 @@ test "fix-suggesting parse codes: category, count, and hint text" {
     const cases = [_]Case{
         .{ .src = "fn a() -> int {\n  x := match 0 {\n    0 => 0\n    _ -> 1\n  }\n  return x\n}\n", .code = .P0009, .hint = "'->'" },
         .{ .src = "fn id(x: Vec<int>) -> int {\n  return 0\n}\n", .code = .P0010, .hint = "'[]'" },
+        .{ .src = "fn a() {\n  m := Map<str, int>.new()\n}\n", .code = .P0010, .hint = "'f[int](x)'" },
         .{ .src = "fn a() -> int {\n  for (i := 0; i < 3; i = i + 1) {\n  }\n  return 0\n}\n", .code = .P0011, .hint = "for x in xs" },
         .{ .src = "fn f(): int {\n  return 0\n}\n", .code = .P0012, .hint = "'-> T'" },
         .{ .src = "fn a() -> int {\n  x := 1;\n  return x\n}\n", .code = .P0013, .hint = "remove the ';'" },

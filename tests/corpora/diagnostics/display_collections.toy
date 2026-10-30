@@ -20,9 +20,9 @@ fn hi() {}
 
 fn main() {
     fs: Vec[Sorted[fn()]] = [Sorted { v: hi }]
-    io.println(fs)  #~ ERROR [T0023] type 'Vec' does not conform to protocol 'Display'; its generic impl needs type argument 'Sorted' to conform to 'Display'
-    io.println(Ref.new(Sorted { v: hi }))  #~ ERROR [T0023] type 'Ref' does not conform to protocol 'Display'; its generic impl needs type argument 'Sorted' to conform to 'Display'
-    io.println(Map[int, Sorted[fn()]].new())  #~ ERROR [T0023] type 'Map' does not conform to protocol 'Display'; its generic impl needs type argument 'Sorted' to conform to 'Display'
+    io.println(fs)  #~ ERROR [T0023] type 'Vec[Sorted[fn()]]' does not conform to protocol 'Display'; its generic impl needs type argument 'Sorted[fn()]' to conform to 'Display'
+    io.println(Ref.new(Sorted { v: hi }))  #~ ERROR [T0023] type 'Ref[Sorted[fn()]]' does not conform to protocol 'Display'; its generic impl needs type argument 'Sorted[fn()]' to conform to 'Display'
+    io.println(Map[int, Sorted[fn()]].new())  #~ ERROR [T0023] type 'Map[int, Sorted[fn()]]' does not conform to protocol 'Display'; its generic impl needs type argument 'Sorted[fn()]' to conform to 'Display'
     io.println(Holder { r: Ref.new(Sorted { v: hi }) })  #~ ERROR [T0023] type 'Holder' does not conform to protocol 'Display'; make every field of 'Holder' conform to 'Display'
     io.println(Map[fn(int) -> int, int].new())  #~ ERROR [T0023] function type 'fn(int) -> int' does not conform to protocol 'Hashable'
 }
