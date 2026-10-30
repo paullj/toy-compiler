@@ -452,6 +452,11 @@ struct or enum (or `Box.new(5)`, inferred as above). The call selects it like a 
 passes no receiver. It is never called on a value (`k.make(1)` is **T0018**), an instance
 method is never called on a type (`K.get()` is **T0018**), and on an enum a variant keeps
 its name: `E.A(1)` constructs the variant `A` even when an associated fn `A` exists.
+That fn can never be called, so it is warning **W0015** at its name ("associated fn 'A'
+of 'E' can never be called: 'E.A' always names the variant 'A'; rename the function").
+A `self` method named like a variant is reached through a value, but `e.B()` and `E.B`
+then mean different things, so it is the softer warning **W0016**. Both hold for a
+generic enum; a struct, or a fn named unlike every variant, does not warn.
 
 Named through its type, an associated fn is a function value, as a named fn is:
 `f := K.make`, `apply(K.make)`, `f := Box[int].new`. A bare generic type takes its

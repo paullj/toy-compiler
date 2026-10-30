@@ -373,6 +373,30 @@ test "another module's bare generic type names its associated fns, which T0016 s
     try withCheckedGraph(".toy-test-typ-modgeneric", files, "main.toy", Check.run);
 }
 
+test "an enum fn named like a variant of another module's enum names the enum qualified" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import a as m
+        \\protocol Q { fn B(self) -> int }
+        \\impl m.E has Q { fn B(self) -> int { 5 } }
+        \\fn main() -> int { m.E.A(1).B() }
+        \\
+        },
+        .{ .path = "a.toy", .source = "pub enum E { A(int), B }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            _ = r;
+            errdefer for (tr.diags) |d| std.debug.print("got: {s}\n", .{d.message});
+            try testing.expectEqual(@as(usize, 1), tr.diags.len);
+            try testing.expectEqual(codes.Code.W0016, tr.diags[0].code);
+            try testing.expectEqualStrings("method 'B' on 'm.E' has the name of its variant 'B': '.B(..)' on a value calls the method and 'm.E.B' is the variant; rename one", tr.diags[0].message);
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-modvariantfn", files, "main.toy", Check.run);
+}
+
 test "cross-module call typechecks clean and yields the callee return type" {
     const files = &[_]FixtureFile{
         .{ .path = "main.toy", .source =

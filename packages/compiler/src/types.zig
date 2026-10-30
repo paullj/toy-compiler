@@ -2726,6 +2726,7 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // derive barrier and the mono tail append method rows no source declares.
     try t.checkStdShadows();
     try t.checkFnFieldMethods();
+    try t.checkVariantNamedFns();
 
     // Ord-refines-Eq: after coherence, append exactly one `(Eq, recv)` conformance
     // per `Ord` receiver that lacks an existing `(Eq, recv)` entry — so `==`/`!=` on an
@@ -4241,6 +4242,54 @@ fn reportFnFieldMethod(t: *Typecheck, fn_id: u32, struct_id: u32) !void {
         "method '{s}' on '{s}' has the same name as its field '{s}' of fn type: '{c}.{s}(..)' calls the method and '{c}.{s}' reads the field; rename one",
         .{ name, s.name, name, recv, name, recv, name },
     );
+}
+
+/// W0015 at each associated fn of an enum named like one of its variants, and the softer
+/// W0016 at each such `self` method. A variant keeps its name (`E.A(..)` builds it), so the
+/// associated fn is unreachable, while the method is reached only through a value.
+fn checkVariantNamedFns(t: *Typecheck) !void {
+    for (t.methods.items) |m| {
+        if (m.recv.kind != .@"enum") continue;
+        try t.reportVariantNamedFn(m.fn_id, m.recv.enum_id, m.is_static);
+    }
+    for (t.templates.items) |m| {
+        if (!m.recv_is_enum) continue;
+        try t.reportVariantNamedFn(m.fn_id, m.recv_ctor, !m.has_self);
+    }
+}
+
+fn reportVariantNamedFn(t: *Typecheck, fn_id: u32, enum_id: u32, is_static: bool) !void {
+    const e = t.enums.items[enum_id];
+    const f = t.fns.items[fn_id];
+    _ = t.gphSelect(f.mod);
+    const name_tok = t.tree.nodes[f.decl_node.int()].main_token;
+    const name = t.nameText(name_tok);
+    const vi = for (e.variants, 0..) |v, i| {
+        if (std.mem.eql(u8, v.name, name)) break i;
+    } else return;
+    // A related span indexes the diagnostic's own module, so a variant declared in another
+    // module goes unlabelled.
+    const related: ?Span = if (e.decl_node != Ast.none and e.mod == f.mod) blk: {
+        const variant_nodes = Ast.rangeSlice(t.tree, t.tree.nodes[e.decl_node.int()].lhs.int());
+        break :blk if (vi < variant_nodes.len) t.tokSpan(t.tree.nodes[variant_nodes[vi].int()].main_token) else null;
+    } else null;
+    const at: DiagnosticSink.Report = .{ .span = t.tokSpan(name_tok), .code = if (is_static) .W0015 else .W0016, .related = related };
+    // Another module's enum is spelled as the impl's module imports it, so the hint names
+    // the variant as the reader can write it.
+    var qual: []const u8 = "";
+    if (e.mod != f.mod) {
+        var it = t.graph.mods[f.mod].namespaces.iterator();
+        while (it.next()) |ns| if (ns.value_ptr.* == e.mod) {
+            qual = ns.key_ptr.*;
+            break;
+        };
+    }
+    const dot: []const u8 = if (qual.len > 0) "." else "";
+    if (is_static) {
+        try t.sink.report(at, "associated fn '{s}' of '{s}{s}{s}' can never be called: '{s}{s}{s}.{s}' always names the variant '{s}'; rename the function", .{ name, qual, dot, e.name, qual, dot, e.name, name, name });
+    } else {
+        try t.sink.report(at, "method '{s}' on '{s}{s}{s}' has the name of its variant '{s}': '.{s}(..)' on a value calls the method and '{s}{s}{s}.{s}' is the variant; rename one", .{ name, qual, dot, e.name, name, name, qual, dot, e.name, name });
+    }
 }
 
 /// Emit a coherence error if `ty` is a struct/enum whose declaration is not pub.
@@ -6328,7 +6377,9 @@ test "an associated fn of a non-generic struct or enum is called on its type as 
         \\
     );
     defer c.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // The variant keeps its name, which W0015 points out at `fn Mk`.
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.W0015, c.result.diags[0].code);
     const make = try calleeMethod(&c, "make", 0);
     try testing.expect(make.is_static and make.instance == null and make.recv.kind == .@"struct");
     const first = try calleeMethod(&c, "first", 0);
@@ -12183,6 +12234,71 @@ test "a method beside a field of another type, or an associated fn beside a fn f
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
+test "an enum fn named like a variant is W0015 when associated and W0016 when a method, at the fn" {
+    const gpa = testing.allocator;
+    const Case = struct { src: []const u8, code: codes.Code, want: []const u8 };
+    const cases = [_]Case{
+        .{
+            .src = "enum E { A(int), B }\nimpl E {\n fn A(n: int) -> E { E.A(n + 1) }\n}\nfn main() -> int {\n e := E.A(1)\n return match e {\n  E.A(v) -> v,\n  E.B -> 99,\n }\n}\n",
+            .code = .W0015,
+            .want = "associated fn 'A' of 'E' can never be called: 'E.A' always names the variant 'A'; rename the function",
+        },
+        .{
+            .src = "enum O[T] { S(T), N }\nimpl O[T] {\n fn N() -> O[T] { O.N }\n}\nfn main() -> int {\n o: O[int] = O.S(3)\n return match o {\n  O.S(v) -> v,\n  O.N -> 0,\n }\n}\n",
+            .code = .W0015,
+            .want = "associated fn 'N' of 'O' can never be called: 'O.N' always names the variant 'N'; rename the function",
+        },
+        .{
+            .src = "enum E { A(int), B }\nimpl E {\n fn B(self) -> int { 7 }\n}\nfn main() -> int {\n e := E.B\n return e.B()\n}\n",
+            .code = .W0016,
+            .want = "method 'B' on 'E' has the name of its variant 'B': '.B(..)' on a value calls the method and 'E.B' is the variant; rename one",
+        },
+        .{
+            .src = "enum O[T] { S(T), N }\nimpl O[T] {\n fn S(self) -> int { 1 }\n}\nfn main() -> int {\n o: O[int] = O.N\n return o.S()\n}\n",
+            .code = .W0016,
+            .want = "method 'S' on 'O' has the name of its variant 'S': '.S(..)' on a value calls the method and 'O.S' is the variant; rename one",
+        },
+    };
+    for (cases) |cs| {
+        try expectOnlyDiag(cs.src, cs.code);
+        try expectOneDiag(cs.src, cs.code, cs.want);
+        var c = try checkSource(cs.src);
+        defer c.deinit(gpa);
+        const d = c.result.diags[0];
+        const sp = d.span();
+        const rel = d.relatedSpan().?;
+        try testing.expectEqualStrings(cs.src[sp.start..sp.end], cs.src[rel.start..rel.end]);
+        try testing.expect(rel.start < sp.start);
+    }
+}
+
+test "an enum fn named unlike its variants, or a struct fn, is not W0015 or W0016" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum E { A(int), B }
+        \\impl E {
+        \\ fn a(n: int) -> E { E.A(n) }
+        \\ fn b(self) -> int { 2 }
+        \\}
+        \\enum O[T] { S(T), N }
+        \\impl O[T] {
+        \\ fn s(v: T) -> O[T] { O.S(v) }
+        \\}
+        \\struct A { n: int }
+        \\impl A {
+        \\ fn A() -> A { A { n: 1 } }
+        \\ fn B(self) -> int { self.n }
+        \\}
+        \\fn main() -> int {
+        \\ o: O[int] = O.s(1)
+        \\ return E.a(1).b() + A.A().B() + match o { O.S(v) -> v, O.N -> 0 }
+        \\}
+    );
+    defer c.deinit(gpa);
+    for (c.result.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+}
+
 test "W0012 is reported once for a generic fn, and not under a poison return type" {
     try expectOnlyDiag("fn gen[T](f: fn(T) -> T, x: T) -> T {\n f\n x\n}\nfn main() -> int { gen(fn(x: int) { x }, 0) + gen(fn(s: str) { s }, \"a\").len() }\n", .W0012);
     try expectOnlyDiag("fn one() -> int { 1 }\nfn f() -> Nope {\n one\n}\nfn main() -> int { 0 }\n", .T0001);
@@ -13358,7 +13474,8 @@ test "an associated fn of a generic enum is called on its type; a variant keeps 
         \\
     );
     defer c.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.W0015, c.result.diags[0].code);
     var calls: usize = 0;
     for (c.result.callees[0]) |x| switch (x.view()) {
         .method => |mi| {

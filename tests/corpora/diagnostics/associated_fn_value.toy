@@ -1,6 +1,6 @@
 enum O[T] { a(T), b, mk(int) }
 impl O[T] {
-    fn mk(v: T) -> O[T] { O.a(v) }
+    fn mk(v: T) -> O[T] { O.a(v) }  #~ WARN [W0015] associated fn 'mk' of 'O' can never be called
     fn make(v: T) -> O[T] { O.a(v) }
     fn get(self) -> int { 7 }
 }
