@@ -13426,7 +13426,7 @@ fn valueMember(c: *const Checked, member: []const u8, nth: usize) !Ast.Index {
     return error.TestMemberNotFound;
 }
 
-fn expectOneDiag(src: []const u8, code: codes.Code, message: []const u8) !void {
+pub fn expectOneDiag(src: []const u8, code: codes.Code, message: []const u8) !void {
     const gpa = testing.allocator;
     var c = try checkSource(src);
     defer c.deinit(gpa);

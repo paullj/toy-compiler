@@ -299,7 +299,7 @@ fn earlierWant(bc: *BodyChecker, params: []const Type, earlier: []const Type, n_
 /// Whether `got` can stand where `want` is wanted once `want`'s type vars are bound: a
 /// type var fits anything, a fn or a generic type fits part by part, and anything else
 /// by assignability.
-fn fitsShape(bc: *BodyChecker, want: Type, got: Type) bool {
+pub fn fitsShape(bc: *BodyChecker, want: Type, got: Type) bool {
     if (got.kind == .invalid or got.kind == .never or want.isTypeVar()) return true;
     if (want.isFunc() or want.isApp()) {
         if (want.isFunc() != got.isFunc() or want.isApp() != got.isApp()) return false;

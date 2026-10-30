@@ -142,12 +142,14 @@ pub const FillOutcome = union(enum) {
 /// Precedence (locked): arg-derived bindings are authoritative. A bound var whose
 /// `exp_args` entry disagrees is a `.conflict` (arg wins, but the disagreement is a
 /// hard error); an open var with `exp_args` present is filled; `exp_args == null` (no
-/// usable target) or an arity mismatch leaves everything as-is. Two passes so the
-/// reported `.unbound` is the LOWEST still-open ordinal AFTER all fills, matching
+/// usable target) or an arity mismatch leaves everything as-is, and so does an entry
+/// that `known.givesType` rejects, an arg the target does not know yet. Two passes so
+/// the reported `.unbound` is the LOWEST still-open ordinal AFTER all fills, matching
 /// `match`'s contract. Allocation-free.
-pub fn fillExpected(out: []Type, bound: []bool, exp_args: ?[]const Type) FillOutcome {
+pub fn fillExpected(out: []Type, bound: []bool, exp_args: ?[]const Type, known: anytype) FillOutcome {
     if (exp_args) |ea| if (ea.len == out.len) {
         for (0..out.len) |i| {
+            if (!known.givesType(ea[i])) continue;
             if (bound[i]) {
                 if (!Type.eql(out[i], ea[i]))
                     return .{ .conflict = .{ .ord = @intCast(i), .arg = out[i], .expected = ea[i] } };
@@ -466,14 +468,27 @@ test "infer returns null on arity mismatch and on conflict" {
     try testing.expectEqual(@as(?[]Type, null), try infer(gpa, 1, &.{ Type.typeVar(0), Type.typeVar(0) }, &.{ Type.int, Type.bool }, null));
 }
 
+/// A `fillExpected` target whose every arg is known.
+pub const all_known = struct {
+    pub fn givesType(_: @This(), _: Type) bool {
+        return true;
+    }
+}{};
+
+const Filled = struct { out: FillOutcome, args: [4]Type };
+
 /// Run `fillExpected` over stack scratch seeded from `out_init`/`bound_init`.
-fn runFill(out_init: []const Type, bound_init: []const bool, exp: ?[]const Type) struct { out: FillOutcome, args: [4]Type } {
+fn runFill(out_init: []const Type, bound_init: []const bool, exp: ?[]const Type) Filled {
+    return runFillKnown(out_init, bound_init, exp, all_known);
+}
+
+fn runFillKnown(out_init: []const Type, bound_init: []const bool, exp: ?[]const Type, known: anytype) Filled {
     var out_args: [4]Type = undefined;
     var bnd: [4]bool = undefined;
     for (out_init, 0..) |t, i| out_args[i] = t;
     for (bound_init, 0..) |b, i| bnd[i] = b;
     const n = out_init.len;
-    const o = fillExpected(out_args[0..n], bnd[0..n], exp);
+    const o = fillExpected(out_args[0..n], bnd[0..n], exp, known);
     return .{ .out = o, .args = out_args };
 }
 
@@ -498,6 +513,21 @@ test "fillExpected: an arg-bound var that DISAGREES with the target is a conflic
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "fillExpected: a target arg it does not know neither fills nor conflicts" {
+    const no_vars = struct {
+        pub fn givesType(_: @This(), t: Type) bool {
+            return !t.isTypeVar();
+        }
+    }{};
+    const r = runFillKnown(&.{ Type.bool, Type.invalid }, &.{ true, false }, &.{ Type.typeVar(0), Type.typeVar(1) }, no_vars);
+    switch (r.out) {
+        .unbound => |u| try testing.expectEqual(@as(u32, 1), u.ord),
+        else => return error.TestUnexpectedResult,
+    }
+    const p = runFillKnown(&.{Type.invalid}, &.{false}, &.{Type.invalid}, no_vars);
+    try testing.expectEqual(FillOutcome.ok, p.out);
 }
 
 test "fillExpected: null target leaves an open var unbound" {
