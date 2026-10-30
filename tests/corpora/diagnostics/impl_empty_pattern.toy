@@ -19,6 +19,6 @@ impl Box[T has Tag] has Marker {}
 fn mark[T has Marker](_t: T) -> int { 1 }
 
 fn main() -> int {
-    n := mark(Box { v: true })  #~ ERROR [T0023] type 'Box' does not conform to protocol 'Marker'; its generic impl needs type argument 'bool' to conform to 'Tag'
+    n := mark(Box { v: true })  #~ ERROR [T0023] type 'Box[bool]' does not conform to protocol 'Marker'; its generic impl needs type argument 'bool' to conform to 'Tag'
     return mark(Cell { v: 7 }) + n
 }

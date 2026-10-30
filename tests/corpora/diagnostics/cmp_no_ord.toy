@@ -7,7 +7,7 @@ fn main() -> int {
     a := F { x: 1.0 }
     _o := a.cmp(a)  #~ ERROR [T0027] 'cmp' requires an 'Ord' impl for type 'F'
     g := G[float] { v: 1.0 }
-    _q := g.cmp(g)  #~ ERROR [T0027] 'cmp' requires an 'Ord' impl for type 'G'
+    _q := g.cmp(g)  #~ ERROR [T0027] 'cmp' requires an 'Ord' impl for type 'G[float]'
     _p := 1.5.cmp(2.5)  #~ ERROR [T0018] no method 'cmp'
     return 0
 }

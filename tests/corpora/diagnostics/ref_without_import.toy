@@ -5,7 +5,7 @@ impl Ref[T] {
 }
 
 pub fn read(r: Ref[int]) -> int {
-    r.get() + r.tag()  #~ ERROR [T0018] no method 'get' on type 'Ref'; add 'import std/ref'
+    r.get() + r.tag()  #~ ERROR [T0018] no method 'get' on type 'Ref[int]'; add 'import std/ref'
 }
 
 fn main() -> int {

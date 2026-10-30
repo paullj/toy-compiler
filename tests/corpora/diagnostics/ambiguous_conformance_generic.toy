@@ -47,27 +47,27 @@ impl Bag[T] has Stroll {
 }
 
 fn generic(b: Box[int]) -> int {
-    return b.into()  #~ ERROR [T0025] 'into' on 'Box' matches multiple conformances (Into[int] and Into[bool]); add explicit protocol type arguments, e.g. .into[int]() or .into[bool]()
+    return b.into()  #~ ERROR [T0025] 'into' on 'Box[int]' matches multiple conformances (Into[int] and Into[bool]); add explicit protocol type arguments, e.g. .into[int]() or .into[bool]()
 }
 
 # The expected type does not choose a conformance.
 fn swapped(s: Swapped[int]) -> int {
-    n: int = s.into()  #~ ERROR [T0025] 'into' on 'Swapped' matches multiple conformances (Into[bool] and Into[int])
+    n: int = s.into()  #~ ERROR [T0025] 'into' on 'Swapped[int]' matches multiple conformances (Into[bool] and Into[int])
     return n
 }
 
 fn shown(s: Shown[int]) -> int {
-    return s.render()  #~ ERROR [T0025] 'render' on 'Shown' matches multiple conformances (Show and Debug); call it through a fn bounded by 'Show'
+    return s.render()  #~ ERROR [T0025] 'render' on 'Shown[int]' matches multiple conformances (Show and Debug); call it through a fn bounded by 'Show'
 }
 
 fn bound(b: Box[int]) -> int {
-    f := b.into  #~ ERROR [T0025] 'into' on 'Box' matches multiple conformances
+    f := b.into  #~ ERROR [T0025] 'into' on 'Box[int]' matches multiple conformances
     return f()
 }
 
 fn walk(b: Bag[int]) -> int {
     t := 0
-    for x in b {  #~ ERROR [T0025] 'iter' on 'Bag' matches multiple conformances (Walk and Stroll)
+    for x in b {  #~ ERROR [T0025] 'iter' on 'Bag[int]' matches multiple conformances (Walk and Stroll)
         t = t + x
     }
     return t

@@ -604,7 +604,7 @@ fn emitRefHash(t: *Typecheck, site: ?Typecheck.DeriveSite, container: Type, ft: 
         Walk.nodeSpan(.{ .tree = m.tree, .tokens = m.tokens, .source = m.source }, s.node)
     else
         Typecheck.refs.tokSpan(m, m.tree.nodes[sym.decl_node.int()].main_token);
-    try t.sink.report(.{ .span = span, .code = .T0030, .scope = scope }, "cannot derive 'Hash' for '{s}': Ref-containing type has no auto Hash", .{t.typeName(container)});
+    try t.sink.report(.{ .span = span, .code = .T0030, .scope = scope }, "cannot derive 'Hash' for '{f}': Ref-containing type has no auto Hash", .{t.fmtType(container)});
 }
 
 /// One derive fixpoint's queue: each `(protocol, kind, type)` enters once (deduped on the

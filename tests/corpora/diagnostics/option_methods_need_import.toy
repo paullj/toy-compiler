@@ -5,6 +5,6 @@ fn main() -> int {
     r: Result[int, str] = Result.err("bad")
     _a := o.map(fn(v: int) { v + 1 })  #~ ERROR [T0018] add 'import std/option'
     _b := r.map_error(fn(e: str) { e.len() })  #~ ERROR [T0018] add 'import std/option'
-    _c := o.or_else(fn() { 0 })  #~ ERROR [T0018] no method 'or_else' on type 'Option'; add 'import std/option'
+    _c := o.or_else(fn() { 0 })  #~ ERROR [T0018] no method 'or_else' on type 'Option[int]'; add 'import std/option'
     return o.or(0) + r.or(0)
 }

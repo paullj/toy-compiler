@@ -22,19 +22,30 @@ fn reportExpectedTailMismatch(bc: *BodyChecker, block_idx: Ast.Index, params: []
     if (body_ty.kind == .unit or body_ty.kind == .never or body_ty.kind == .invalid) return false;
     const tail = bc.blockTail(block_idx) orelse return false;
     const parts = Composite.fnParts(bc.composite.at(exp.funcIdx()));
-    var real: std.ArrayList(u8) = .empty;
-    defer real.deinit(bc.gpa);
-    try real.appendSlice(bc.gpa, "fn(");
-    for (params, 0..) |p, i| {
-        if (i != 0) try real.appendSlice(bc.gpa, ", ");
-        // An open `_` param has no type of its own yet; the expected one stands in.
-        const shown = if (p.kind == .invalid and i < parts.params.len) parts.params[i] else p;
-        try real.appendSlice(bc.gpa, if (shown.kind == .unit) "()" else bc.typeName(shown));
-    }
-    try real.print(bc.gpa, ") -> {s}", .{bc.typeName(body_ty)});
-    try bc.sink.report(.{ .span = bc.spanOf(tail), .code = .T0042 }, "lambda has type {s}, but {s} is expected: its value is {s}, not {s}", .{ real.items, bc.typeName(exp), bc.typeName(body_ty), bc.typeName(parts.ret) });
+    const real: LambdaSig = .{ .bc = bc, .params = params, .expected = parts.params, .ret = body_ty };
+    try bc.report(.{ .span = bc.spanOf(tail), .code = .T0042 }, "lambda has type {f}, but {f} is expected: its value is {f}, not {f}", .{ real, bc.fmtType(exp), bc.fmtType(body_ty), bc.fmtType(parts.ret) });
     return true;
 }
+
+/// A lambda's signature as a `{f}` argument, so a report written as its template spells
+/// it spells these types that way too.
+const LambdaSig = struct {
+    bc: *const BodyChecker,
+    params: []const Type,
+    expected: []const Type,
+    ret: Type,
+
+    pub fn format(s: LambdaSig, w: *std.Io.Writer) std.Io.Writer.Error!void {
+        try w.writeAll("fn(");
+        for (s.params, 0..) |p, i| {
+            if (i != 0) try w.writeAll(", ");
+            // An open `_` param has no type of its own yet; the expected one stands in.
+            const shown = if (p.kind == .invalid and i < s.expected.len) s.expected[i] else p;
+            try w.print("{f}", .{s.bc.fmtType(shown).nested()});
+        }
+        try w.print(") -> {f}", .{s.bc.fmtType(s.ret)});
+    }
+};
 
 /// Decide how each captured local is held. A closure copies a capture when it is made,
 /// which is sound only for a local that nothing assigns; a captured local that is
@@ -125,13 +136,11 @@ pub fn typeOfLambda(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Ou
             exp_params = parts.params;
             if (bc.givesType(parts.ret)) exp_ret = parts.ret;
         } else {
-            var shown: std.ArrayList(u8) = .empty;
-            defer shown.deinit(bc.gpa);
-            try bc.writeTypeNamed(&shown, e, bc.body.open_names, bc.body.open_vars, bc.openOrdBase());
+            const shown = bc.fmtTypeNamed(e, bc.body.open_names, bc.body.open_vars, bc.openOrdBase());
             if (capture)
-                try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0039 }, "a '_' capture takes 1 parameter, but the expected type {s} takes {d}", .{ shown.items, parts.params.len })
+                try bc.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0039 }, "a '_' capture takes 1 parameter, but the expected type {f} takes {d}", .{ shown, parts.params.len })
             else
-                try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0039 }, "lambda takes {d} parameter(s), but the expected type {s} takes {d}", .{ proto.params.len, shown.items, parts.params.len });
+                try bc.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0039 }, "lambda takes {d} parameter(s), but the expected type {f} takes {d}", .{ proto.params.len, shown, parts.params.len });
             arity_err = true;
         }
     };
@@ -186,13 +195,13 @@ pub fn typeOfLambda(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Ou
         if (want_value and !bc.blockReturns(n.rhs) and !Type.assignable(r, body_ty)) {
             if (annotated) {
                 if (!try bc.reportTailMismatch(n.rhs, body_ty, r))
-                    try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "lambda must return {s} but may fall off the end", .{bc.typeName(r)});
+                    try bc.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "lambda must return {f} but may fall off the end", .{bc.fmtType(r)});
             } else if (try reportExpectedTailMismatch(bc, n.rhs, params, body_ty, exp_fn.?)) {
                 // Poisoned so the call or binding that expected the type does not report
                 // the same mismatch again.
                 ret = .invalid;
             } else {
-                try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "lambda must return {s} but may fall off the end", .{bc.typeName(r)});
+                try bc.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "lambda must return {f} but may fall off the end", .{bc.fmtType(r)});
             }
         }
     } else {
@@ -251,7 +260,7 @@ pub fn checkLocalFn(bc: *BodyChecker, idx: Ast.Index, n: Ast.Node) error{OutOfMe
     const body_ty = try bc.typeOfBlockExpected(n.rhs, want_value, if (want_value) ret else null);
     if (want_value and !bc.blockReturns(n.rhs) and !Type.assignable(ret, body_ty)) {
         if (!try bc.reportTailMismatch(n.rhs, body_ty, ret))
-            try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "function '{s}' must return {s} but may fall off the end", .{ bc.nameText(n.main_token), bc.typeName(ret) });
+            try bc.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "function '{s}' must return {f} but may fall off the end", .{ bc.nameText(n.main_token), bc.fmtType(ret) });
     }
 }
 
@@ -286,7 +295,7 @@ pub fn joinLambdaReturn(bc: *BodyChecker, at: Ast.Index, ty: Type) error{OutOfMe
     } else if (j.kind == .never) {
         bc.body.ret_join = ty;
     } else if (ty.kind != .never and !Type.eql(j, ty)) {
-        try bc.sink.report(.{ .span = bc.spanOf(at), .code = .T0042 }, "return type {s} does not match the lambda's earlier return type {s}", .{ bc.typeName(ty), bc.typeName(j) });
+        try bc.report(.{ .span = bc.spanOf(at), .code = .T0042 }, "return type {f} does not match the lambda's earlier return type {f}", .{ bc.fmtType(ty), bc.fmtType(j) });
         bc.body.ret_join = .invalid;
     }
 }
@@ -299,10 +308,10 @@ fn joinLambdaTail(bc: *BodyChecker, n: Ast.Node, tail: Type) error{OutOfMemory}!
     if (j.kind == .never) return if (tail.kind == .never) Type.unit else tail;
     if (tail.kind == .never or Type.eql(j, tail)) return j;
     if (tail.kind == .unit) {
-        try bc.sink.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "lambda must return {s} but may fall off the end", .{bc.typeName(j)});
+        try bc.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "lambda must return {f} but may fall off the end", .{bc.fmtType(j)});
     } else {
         const at = if (bc.blockTail(n.rhs)) |t| bc.spanOf(t) else bc.tokSpan(n.main_token);
-        try bc.sink.report(.{ .span = at, .code = .T0042 }, "lambda's value {s} does not match its return type {s}", .{ bc.typeName(tail), bc.typeName(j) });
+        try bc.report(.{ .span = at, .code = .T0042 }, "lambda's value {f} does not match its return type {f}", .{ bc.fmtType(tail), bc.fmtType(j) });
     }
     return .invalid;
 }

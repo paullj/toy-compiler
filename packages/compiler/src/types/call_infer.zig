@@ -25,9 +25,9 @@ const refs = Typecheck.refs;
 /// collapse to a single caret rather than double-underlining one token.
 fn reportInferConflict(bc: *BodyChecker, args: []const Ast.Index, generic_params: []const []const u8, c: @FieldType(Infer.Outcome, "conflict")) error{OutOfMemory}!void {
     if (c.first_pos == c.second_pos) {
-        try bc.sink.report(.{ .span = bc.spanOf(args[c.second_pos]), .code = .T0015 }, "conflicting types for type parameter '{s}': {s} vs {s}", .{ generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
+        try bc.report(.{ .span = bc.spanOf(args[c.second_pos]), .code = .T0015 }, "conflicting types for type parameter '{s}': {f} vs {f}", .{ generic_params[c.ord], bc.fmtType(c.prev), bc.fmtType(c.cur) });
     } else {
-        try bc.sink.report(.{ .span = bc.spanOf(args[c.second_pos]), .code = .T0015, .related = bc.spanOf(args[c.first_pos]) }, "conflicting types for type parameter '{s}': {s} vs {s}", .{ generic_params[c.ord], bc.typeName(c.prev), bc.typeName(c.cur) });
+        try bc.report(.{ .span = bc.spanOf(args[c.second_pos]), .code = .T0015, .related = bc.spanOf(args[c.first_pos]) }, "conflicting types for type parameter '{s}': {f} vs {f}", .{ generic_params[c.ord], bc.fmtType(c.prev), bc.fmtType(c.cur) });
     }
 }
 
@@ -324,13 +324,7 @@ fn reportMisfit(bc: *BodyChecker, site: InferSite, nodes: []const Ast.Index, fir
         const want = BC.substTy(bc, params[i], targs);
         if (fitsShape(bc, want, arg_types[i])) continue;
         const pos = i - first + 1;
-        var text: std.ArrayList(u8) = .empty;
-        defer text.deinit(bc.gpa);
-        try text.print(bc.gpa, "argument {d}{s}: expected ", .{ pos, bc.pipedArgHint(site.call, pos) });
-        try bc.writeTypeNamed(&text, want, site.sig.generic_names, open, bc.openOrdBase());
-        try text.print(bc.gpa, ", got {s}", .{bc.typeName(arg_types[i])});
-        try bc.writeSigSuffixOpen(&text, site.sig, targs, open);
-        try bc.sink.report(.{ .span = bc.spanOf(a), .code = .T0040, .related = site.sig.decl }, "{s}", .{text.items});
+        try bc.report(.{ .span = bc.spanOf(a), .code = .T0040, .related = site.sig.decl }, "argument {d}{s}: expected {f}, got {f}{f}", .{ pos, bc.pipedArgHint(site.call, pos), bc.fmtTypeNamed(want, site.sig.generic_names, open, bc.openOrdBase()), bc.fmtType(arg_types[i]), bc.sigSuffixOpen(site.sig, targs, open) });
         return true;
     }
     return false;
@@ -393,10 +387,7 @@ fn reportOwnGenericArity(bc: *BodyChecker, call: Ast.Index, got: usize, sig: Bod
     const open = try bc.gpa.alloc(bool, n_gp);
     defer bc.gpa.free(open);
     for (open, bnd) |*o, b| o.* = !b;
-    var suffix: std.ArrayList(u8) = .empty;
-    defer suffix.deinit(bc.gpa);
-    try bc.writeSigSuffixOpen(&suffix, sig, targs, open);
-    try bc.emitArity(call, sig.params.len, got, sig.decl, suffix.items);
+    try bc.emitArity(call, sig.params.len, got, sig.decl, bc.sigSuffixOpen(sig, targs, open));
 }
 
 /// T0016 for `Pair.make(..)` on the bare generic struct `sid`. When the call was inferred,

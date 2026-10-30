@@ -167,11 +167,10 @@ pub const refs = struct {
         if (ty.kind == .@"enum" and ty.enum_id < self.enumSyms().len)
             return self.enumSyms()[ty.enum_id].name;
         // A composite `App` (`Box[int]` / `Either[int,bool]`) renders as its generic
-        // ctor's name (`Box` / `Either`) — its args are not spelled here (no alloc in
-        // this borrowing accessor), but that beats leaking the internal kind tag "app"
-        // into a user diagnostic. The ctor id space is struct-vs-enum disambiguated by
-        // `ctor_is_enum`, so render an enum-App off `enumSyms`, a struct-App off
-        // `structSyms`.
+        // ctor's name (`Box` / `Either`): this borrowing accessor cannot allocate, so a
+        // message spells the args through `writeType`. The ctor id space is
+        // struct-vs-enum disambiguated by `ctor_is_enum`, so render an enum-App off
+        // `enumSyms`, a struct-App off `structSyms`.
         if (ty.kind == .app) {
             const e = self.composite.at(ty.appIdx());
             if (e.ctor_is_enum) {
@@ -291,18 +290,14 @@ pub const refs = struct {
     }
 
     /// Intern the function type `fn(params) -> ret`. The label is rendered BEFORE the
-    /// intern: `typeName` reads the composite table, whose spinlock is not reentrant.
+    /// intern: rendering reads the composite table, whose spinlock is not reentrant. It
+    /// names no type var, since one interned fn type serves every scope that spells it.
     /// Out of memory poisons to `.invalid`.
     pub fn internFn(self: anytype, params: []const Type, ret: Type) Type {
-        var label: std.ArrayList(u8) = .empty;
-        refs.renderFnLabel(self, &label, params, ret) catch {
-            label.deinit(self.gpa);
-            return .invalid;
-        };
-        const name = label.toOwnedSlice(self.gpa) catch {
-            label.deinit(self.gpa);
-            return .invalid;
-        };
+        var label: std.Io.Writer.Allocating = .init(self.gpa);
+        defer label.deinit();
+        refs.writeFnSig(self, &label.writer, params, ret, .{}) catch return .invalid;
+        const name = label.toOwnedSlice() catch return .invalid;
         const idx = self.composite.internFn(self.gpa, params, ret, name) catch return .invalid;
         return Type.func(idx);
     }
@@ -332,22 +327,93 @@ pub const refs = struct {
         return ty;
     }
 
-    /// `fn(A, B) -> R`, with a unit `-> ()` left off as in the source spelling.
-    fn renderFnLabel(self: anytype, out: *std.ArrayList(u8), params: []const Type, ret: Type) !void {
-        try out.appendSlice(self.gpa, "fn(");
-        for (params, 0..) |p, i| {
-            if (i != 0) try out.appendSlice(self.gpa, ", ");
-            try out.appendSlice(self.gpa, refs.typeNameOrUnit(self, p));
+    /// The names `writeType` gives type vars; a var with none renders as `typeName` does.
+    pub const VarNames = struct {
+        /// Names for the vars `base + i`; with `open`, only for those still open there.
+        names: []const []const u8 = &.{},
+        open: ?[]const bool = null,
+        base: u32 = 0,
+        /// Names for the vars `i` below `base`: a bounded template's own params in its
+        /// abstract check, which a generic call inside it leaves unbound.
+        outer: []const []const u8 = &.{},
+
+        fn get(v: VarNames, ord: u32) ?[]const u8 {
+            if (ord >= v.base) {
+                const i = ord - v.base;
+                const is_open = if (v.open) |o| i < o.len and o[i] else true;
+                if (i < v.names.len and is_open) return v.names[i];
+            }
+            return if (ord < v.outer.len) v.outer[ord] else null;
         }
-        try out.append(self.gpa, ')');
-        if (ret.kind != .unit) {
-            try out.appendSlice(self.gpa, " -> ");
-            try out.appendSlice(self.gpa, refs.typeNameOrUnit(self, ret));
+    };
+
+    /// `ty` as a diagnostic spells it: an `App` with its args (`Map[str, Vec[int]]`), a fn
+    /// type from its parts, a type var by `vars`, and any other type as `typeName`.
+    pub fn writeType(self: anytype, w: *std.Io.Writer, ty: Type, vars: VarNames) std.Io.Writer.Error!void {
+        // An instance re-check writes a report again as its template would, at any depth,
+        // so the reports of instances that fail alike can merge into one.
+        if (comptime @hasDecl(std.meta.Child(@TypeOf(self)), "templateSpelling"))
+            if (self.templateSpelling(ty)) |name| return w.writeAll(name);
+        if (ty.isTypeVar()) if (vars.get(ty.typeVarOrd())) |name| return w.writeAll(name);
+        if (ty.isApp()) {
+            try w.writeAll(refs.typeName(self, ty));
+            try w.writeByte('[');
+            for (self.composite.at(ty.appIdx()).args, 0..) |a, i| {
+                if (i != 0) try w.writeAll(", ");
+                try refs.writeTypePart(self, w, a, vars);
+            }
+            return w.writeByte(']');
         }
+        if (ty.isFunc()) {
+            const parts = Composite.fnParts(self.composite.at(ty.funcIdx()));
+            return refs.writeFnSig(self, w, parts.params, parts.ret, vars);
+        }
+        try w.writeAll(refs.typeName(self, ty));
     }
 
-    fn typeNameOrUnit(self: anytype, ty: Type) []const u8 {
-        return if (ty.kind == .unit) "()" else refs.typeName(self, ty);
+    /// `writeType` as a `{f}` format argument, so a message spells its types in place.
+    pub fn Fmt(comptime Self: type) type {
+        return struct {
+            self: Self,
+            ty: Type,
+            vars: VarNames = .{},
+            part: bool = false,
+
+            /// Spelled as a part of another type, where unit reads `()`.
+            pub fn nested(f: @This()) @This() {
+                var g = f;
+                g.part = true;
+                return g;
+            }
+
+            pub fn format(f: @This(), w: *std.Io.Writer) std.Io.Writer.Error!void {
+                if (f.part) return refs.writeTypePart(f.self, w, f.ty, f.vars);
+                try refs.writeType(f.self, w, f.ty, f.vars);
+            }
+        };
+    }
+
+    pub fn fmt(self: anytype, ty: Type, vars: VarNames) Fmt(@TypeOf(self)) {
+        return .{ .self = self, .ty = ty, .vars = vars };
+    }
+
+    /// `fn(A, B) -> R`, with a unit `-> ()` left off as in the source spelling.
+    fn writeFnSig(self: anytype, w: *std.Io.Writer, params: []const Type, ret: Type, vars: VarNames) std.Io.Writer.Error!void {
+        try w.writeAll("fn(");
+        for (params, 0..) |p, i| {
+            if (i != 0) try w.writeAll(", ");
+            try refs.writeTypePart(self, w, p, vars);
+        }
+        try w.writeByte(')');
+        if (ret.kind == .unit) return;
+        try w.writeAll(" -> ");
+        try refs.writeTypePart(self, w, ret, vars);
+    }
+
+    /// A type nested in another's spelling, where unit reads as source writes it.
+    pub fn writeTypePart(self: anytype, w: *std.Io.Writer, ty: Type, vars: VarNames) std.Io.Writer.Error!void {
+        if (ty.kind == .unit) return w.writeAll("()");
+        try refs.writeType(self, w, ty, vars);
     }
 
     /// Resolve a qualified `mod.Type` type-reference (a `field_access` in type
@@ -2935,12 +3001,14 @@ fn monomorphize(t: *Typecheck, model: *const Model) !void {
     t.sink.sort();
 }
 
-/// An unbounded template's body is checked once per instance, so a T0016 or T0025 hint
-/// in it names each instance's own types: one report per instance, and following one
+/// An unbounded template's body is checked once per instance, so a report in it names
+/// each instance's own types: one report per instance, and following a hint in one
 /// breaks the others. Where the reports at one site differ but all read alike as the
 /// template spells them, each takes that text, and the sink's dedup keeps one. Where
 /// they agree already, a concrete type that one instance's binding merely equals stays
-/// as written.
+/// as written. Where they differ and the template spellings do too (a concrete type
+/// equal to one instance's arg spells as the param there), the site still reports once,
+/// as its shortest instance text: polymorphic recursion makes one instance per depth.
 fn unifyInstanceHints(t: *Typecheck) !void {
     defer {
         for (t.instance_hints.items) |h| t.gpa.free(h.template);
@@ -2958,14 +3026,30 @@ fn unifyInstanceHints(t: *Typecheck) !void {
             if (!std.mem.eql(u8, e.message, d.message)) differ = true;
             if (!std.mem.eql(u8, t.templateText(e.message), h.template)) alike = false;
         };
-        if (!differ or !alike) continue;
-        try t.sink.adopt(h.template);
-        const text = h.template;
-        h.template = &.{};
+        if (!differ) continue;
+        const text = if (alike) adopted: {
+            try t.sink.adopt(h.template);
+            const tmpl = h.template;
+            h.template = &.{};
+            break :adopted tmpl;
+        } else shortest: {
+            var best = d.message;
+            for (diags) |e| if (e.scope == d.scope and e.byte_offset == d.byte_offset and e.code == d.code) {
+                if (!t.hasInstanceHint(e.message)) break :shortest null;
+                if (e.message.len < best.len or (e.message.len == best.len and std.mem.lessThan(u8, e.message, best))) best = e.message;
+            };
+            break :shortest best;
+        } orelse continue;
         for (diags) |*e| if (e.scope == d.scope and e.byte_offset == d.byte_offset and e.code == d.code) {
             e.message = text;
         };
     }
+}
+
+/// Whether `message` is an instance re-check's report that names the instance's types.
+fn hasInstanceHint(t: *const Typecheck, message: []const u8) bool {
+    for (t.instance_hints.items) |h| if (h.message.ptr == message.ptr) return true;
+    return false;
 }
 
 /// `message` as its instance's template spells it: its recorded spelling, else itself.
@@ -3491,13 +3575,13 @@ fn demandWitnesses(t: *Typecheck, model: *const Model, pid: u32, ty: Type, workl
         try t.demandWitnesses(model, pid, ft, worklist, seen, visited, at, mod);
 }
 
-/// `P[A, B]`, each arg by its type name.
+/// `P[A, B]`, each arg as a diagnostic spells it.
 fn writeProtocolRef(t: *Typecheck, out: *std.ArrayList(u8), pname: []const u8, args: []const Type) !void {
     try out.appendSlice(t.gpa, pname);
     try out.append(t.gpa, '[');
     for (args, 0..) |a, i| {
         if (i != 0) try out.appendSlice(t.gpa, ", ");
-        try out.appendSlice(t.gpa, if (a.kind == .unit) "()" else t.typeName(a));
+        try out.print(t.gpa, "{f}", .{t.fmtType(a).nested()});
     }
     try out.append(t.gpa, ']');
 }
@@ -3612,11 +3696,12 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
         if (holdsPoison(t.composite, args[ord])) return;
         _ = t.gphSelect(mod);
         const tname = t.typeName(args[ord]);
+        const shown = t.fmtType(args[ord]);
         const pname = model.protocols[pid].name;
         // A generic impl exists but an impl-param bound fails: suggesting that impl again
         // would be wrong, so name the type arg that fails it.
         if (unmet) |u| {
-            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; its generic impl needs type argument '{s}' to conform to '{s}'", .{ tname, pname, t.typeName(u.arg), model.protocols[u.pid].name });
+            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{f}' does not conform to protocol '{s}'; its generic impl needs type argument '{f}' to conform to '{s}'", .{ shown, pname, t.fmtType(u.arg), model.protocols[u.pid].name });
         } else if (if (subst_buf.len > 0) try conform.givenArgs(t.conformTables(model, &.{}), args[ord], pid) else null) |given| {
             // Its generic impl exists at other protocol args: name both rather than
             // suggest writing the impl again.
@@ -3627,24 +3712,24 @@ fn enqueueInstance(t: *Typecheck, model: *const Model, gid: u32, args: []const T
             defer got.deinit(t.gpa);
             try t.writeProtocolRef(&want, pname, subst_buf);
             try t.writeProtocolRef(&got, pname, given);
-            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; its generic impl gives '{s}'", .{ tname, want.items, got.items });
+            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{f}' does not conform to protocol '{s}'; its generic impl gives '{s}'", .{ shown, want.items, got.items });
         } else if (args[ord].isFunc()) {
             // No impl can be written for a function type, so the usual fixes do not apply.
-            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "function type '{s}' does not conform to protocol '{s}'; a function value only compares by identity ('==') and renders as '<fn>'", .{ tname, pname });
+            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "function type '{f}' does not conform to protocol '{s}'; a function value only compares by identity ('==') and renders as '<fn>'", .{ shown, pname });
         } else if (scalarImplModule(model, tname, pid)) |m| {
-            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; its impl is in std/{s}: " ++ StdNames.add_import, .{ tname, pname, m, m });
+            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{f}' does not conform to protocol '{s}'; its impl is in std/{s}: " ++ StdNames.add_import, .{ shown, pname, m, m });
         } else if (try conform.displayBlockingBox(model.structs, model.enums, model.conformances, .of(model), t.composite, args[ord], pid, &cmemo, t.gpa)) |box| {
             if (refImportModule(model, t.composite, box)) |m| {
                 if (Type.eql(box, args[ord])) {
-                    try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; its impl is in std/{s}: " ++ StdNames.add_import, .{ tname, pname, m, m });
+                    try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{f}' does not conform to protocol '{s}'; its impl is in std/{s}: " ++ StdNames.add_import, .{ shown, pname, m, m });
                 } else {
-                    try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; its field type '{s}' has its impl in std/{s}: " ++ StdNames.add_import, .{ tname, pname, t.typeName(box), m, m });
+                    try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{f}' does not conform to protocol '{s}'; its field type '{f}' has its impl in std/{s}: " ++ StdNames.add_import, .{ shown, pname, t.fmtType(box), m, m });
                 }
-            } else try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; it is or holds a managed box (a 'Ref' or a collection), which never derives '{s}': add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, pname, tname, pname });
+            } else try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{f}' does not conform to protocol '{s}'; it is or holds a managed box (a 'Ref' or a collection), which never derives '{s}': add an `impl {s} has {s} {{ ... }}`", .{ shown, pname, pname, tname, pname });
         } else if (isDerivableProtocol(model, pid) and isAggregate(args[ord])) {
-            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; make every field of '{s}' conform to '{s}' (it then derives automatically), or add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname, tname, pname });
+            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{f}' does not conform to protocol '{s}'; make every field of '{s}' conform to '{s}' (it then derives automatically), or add an `impl {s} has {s} {{ ... }}`", .{ shown, pname, tname, pname, tname, pname });
         } else {
-            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{s}' does not conform to protocol '{s}'; add an `impl {s} has {s} {{ ... }}`", .{ tname, pname, tname, pname });
+            try t.sink.report(.{ .span = t.anchorSpan(mod, at), .code = .T0023 }, "type '{f}' does not conform to protocol '{s}'; add an `impl {s} has {s} {{ ... }}`", .{ shown, pname, tname, pname });
         }
         return;
     }
@@ -4168,7 +4253,7 @@ fn checkPubType(t: *Typecheck, ty: Type, at: Span, owner_kind: []const u8, owner
         else => false,
     };
     if (non_pub)
-        try t.sink.report(.{ .span = at, .code = .T0009 }, "pub {s} '{s}' exposes non-pub type '{s}'", .{ owner_kind, owner_name, t.typeName(ty) });
+        try t.sink.report(.{ .span = at, .code = .T0009 }, "pub {s} '{s}' exposes non-pub type '{f}'", .{ owner_kind, owner_name, t.fmtType(ty) });
 }
 
 /// The type-ref of a `name: T` param or field, or the node itself when it is a bare
@@ -4723,6 +4808,10 @@ fn typeFromQualified(t: *Typecheck, node_idx: Ast.Index, n: Ast.Node) Type {
 
 pub fn typeName(t: *const Typecheck, ty: Type) []const u8 {
     return refs.typeName(t, ty);
+}
+
+pub fn fmtType(t: *const Typecheck, ty: Type) refs.Fmt(*const Typecheck) {
+    return refs.fmt(t, ty, .{});
 }
 
 pub fn nameText(t: *const Typecheck, tok: u32) []const u8 {
@@ -6166,7 +6255,7 @@ test "an associated fn of a bare generic struct infers its type params from its 
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     const cases = [_]struct { stmt: []const u8, code: codes.Code, message: []const u8 }{
         // The inferred `T` is the arg's own type, so a mismatched annotation is still caught.
-        .{ .stmt = "_y: Box[bool] = Box.new(5)", .code = .T0041, .message = "cannot bind Box to '_y' of type Box" },
+        .{ .stmt = "_y: Box[bool] = Box.new(5)", .code = .T0041, .message = "cannot bind Box[int] to '_y' of type Box[bool]" },
         // No value arg binds `T`: the turbofish is still required.
         .{ .stmt = "_e := Box.empty()", .code = .T0016, .message = "cannot infer type parameter 'T' for 'Box.empty'; add explicit type arguments, e.g. Box[int].empty" },
         .{ .stmt = "_p := Box.pair(1, true)", .code = .T0015, .message = "conflicting types for type parameter 'T': int vs bool" },
@@ -6198,10 +6287,10 @@ test "a field of a call result is no store target, and a user Vec has no index" 
     ;
     const cases = [_]struct { stmt: []const u8, code: codes.Code, message: []const u8 }{
         // The `Vec` here is the user's, which has no element primitives to lower to.
-        .{ .stmt = "ps[0].x = 5", .code = .T0057, .message = "cannot index a value of type 'Vec'" },
-        .{ .stmt = "xs[1] = 7", .code = .T0057, .message = "cannot index a value of type 'Vec'" },
-        .{ .stmt = "h.xs[0] = 7", .code = .T0057, .message = "cannot index a value of type 'Vec'" },
-        .{ .stmt = "i = xs[0]", .code = .T0057, .message = "cannot index a value of type 'Vec'" },
+        .{ .stmt = "ps[0].x = 5", .code = .T0057, .message = "cannot index a value of type 'Vec[P]'" },
+        .{ .stmt = "xs[1] = 7", .code = .T0057, .message = "cannot index a value of type 'Vec[int]'" },
+        .{ .stmt = "h.xs[0] = 7", .code = .T0057, .message = "cannot index a value of type 'Vec[int]'" },
+        .{ .stmt = "i = xs[0]", .code = .T0057, .message = "cannot index a value of type 'Vec[int]'" },
         // Any other temporary is no place either.
         .{ .stmt = "id[H](h).xs = xs", .code = .T0075, .message = "cannot assign to a field of a temporary value, such as a call result; it is a copy, so the write would be lost" },
     };
@@ -6505,9 +6594,9 @@ test "a std/option method without the import is T0018 naming std/option" {
     try testing.expectEqual(@as(usize, 3), c.result.diags.len);
     const hint = "add 'import std/option'";
     for (c.result.diags) |d| try testing.expectEqual(codes.Code.T0018, d.code);
-    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "'map' on type 'Option'") != null);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "'map' on type 'Option[int]'") != null);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, hint) != null);
-    try testing.expect(std.mem.indexOf(u8, c.result.diags[1].message, "'map_error' on type 'Result'") != null);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[1].message, "'map_error' on type 'Result[int, str]'") != null);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[1].message, hint) != null);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[2].message, hint) == null);
 }
@@ -8092,6 +8181,45 @@ test "an unbounded template's per-instance T0025 and T0016 hints read as the tem
     }
 }
 
+test "a site that fails in every instance of a template reports once" {
+    const gpa = testing.allocator;
+    const box = "struct Box[T] { v: T }\n";
+    const Case = struct { src: []const u8, code: codes.Code, message: []const u8 };
+    const cases = [_]Case{
+        // `int` is the declared type and also one instance's `T`, so the instances
+        // spell their templates differently; the site still reports once.
+        .{
+            .src = box ++ "fn f[T](x: T) -> int {\n _y: int = Box { v: x }\n 0\n}\nfn main() -> int { return f(1) + f(true) }\n",
+            .code = .T0041,
+            .message = "cannot bind Box[int] to '_y' of type int",
+        },
+        .{
+            .src = "fn f[T](v: T) -> int {\n _g: fn(T) -> int = fn(_x) { true }\n 0\n}\nfn main() -> int { return f(1) + f(\"s\") }\n",
+            .code = .T0042,
+            .message = "lambda has type fn(int) -> bool, but fn(int) -> int is expected: its value is bool, not int",
+        },
+        // Polymorphic recursion: one instance per nesting depth (and a T0017 where the
+        // depth runs out), one report.
+        .{
+            .src = box ++ "fn grow[T](x: T, n: int) -> int {\n if n == 0 { return 0 }\n _bad: int = Box { v: x }\n grow(Box { v: x }, n - 1)\n}\nfn main() -> int { return grow(1, 3) }\n",
+            .code = .T0041,
+            .message = "cannot bind Box[int] to '_bad' of type int",
+        },
+    };
+    for (cases) |k| {
+        var c = try checkSource(k.src);
+        defer c.deinit(gpa);
+        errdefer for (c.result.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+        var n: usize = 0;
+        for (c.result.diags) |d| if (d.severity == .err and d.code != .T0017) {
+            try testing.expectEqual(k.code, d.code);
+            try testing.expectEqualStrings(k.message, d.message);
+            n += 1;
+        };
+        try testing.expectEqual(@as(usize, 1), n);
+    }
+}
+
 test "T0025 on a generic type offers a bounded fn, and following it compiles" {
     const gpa = testing.allocator;
     const decls =
@@ -9585,8 +9713,8 @@ test "protocol args on a generic receiver pick its conformance, written or piped
         try testing.expect(std.mem.indexOf(u8, first, "Scale$bool") != null);
         try testing.expect(std.mem.indexOf(u8, second, "Scale$int") != null);
     }
-    try expectOneDiag(pre ++ "fn main() -> int {\n b := Box { v: 1 }\n return b |> .nope[int](3)\n}\n", .T0018, "no method 'nope' on type 'Box'");
-    try expectOneDiag(pre ++ "fn main() -> int {\n b := Box { v: 1 }\n return b.scale[str](3)\n}\n", .T0018, "no method 'scale' on type 'Box' for the given protocol type arguments");
+    try expectOneDiag(pre ++ "fn main() -> int {\n b := Box { v: 1 }\n return b |> .nope[int](3)\n}\n", .T0018, "no method 'nope' on type 'Box[int]'");
+    try expectOneDiag(pre ++ "fn main() -> int {\n b := Box { v: 1 }\n return b.scale[str](3)\n}\n", .T0018, "no method 'scale' on type 'Box[int]' for the given protocol type arguments");
 }
 
 test "explicit own type args on a generic receiver pick one instance per call" {
@@ -9612,7 +9740,7 @@ test "explicit type args a method cannot take are each one error" {
     const pre = own_box_pre ++ "struct K { v: int }\nimpl K { fn make() -> K { K { v: 1 } } }\nfn main() -> int {\n b := Box { v: 2 }\n";
     const cases = [_]struct { body: []const u8, code: codes.Code, want: []const u8 }{
         .{ .body = "return b.tag[int, bool]()", .code = .T0054, .want = "'tag' takes 1 type argument(s) of its own, got 2" },
-        .{ .body = "return b.get[int]()", .code = .T0018, .want = "no method 'get' on type 'Box' for the given protocol type arguments" },
+        .{ .body = "return b.get[int]()", .code = .T0018, .want = "no method 'get' on type 'Box[int]' for the given protocol type arguments" },
         .{ .body = "return b.with[int](1, 2).get()", .code = .T0018, .want = "'with' is an associated function; call it as 'Box[..].with(..)'" },
         .{ .body = "return Box.with[bool](1, true).get()", .code = .T0016, .want = "cannot infer type parameter for 'Box.with'; add explicit type arguments, e.g. Box[int].with" },
         .{ .body = "return Box[int].tag[int]()", .code = .T0018, .want = "'tag' is an instance method, not an associated function; call it on a value" },
@@ -11548,6 +11676,38 @@ test "a lambda of the wrong arity in a generic call reports its count, naming th
     try expectOneDiag(bare, .T0039, "lambda takes 1 parameter(s), but the expected type fn(int, int) -> int takes 2");
 }
 
+test "diagnostics spell a generic type with its type arguments" {
+    const pre =
+        \\struct Box[T] { x: T }
+        \\struct Pair[A, B] { a: A, b: B }
+        \\fn unbox[T](b: Box[T], d: T) -> T { d }
+        \\fn take(p: Pair[str, Box[int]]) -> int { 0 }
+        \\fn same[T](a: T, b: T) -> int { 0 }
+        \\fn wrap(f: fn(int) -> Box[int]) -> int { 0 }
+        \\
+    ;
+    try expectOneDiag(pre ++ "fn main() -> int { return unbox(Box[int] { x: 1 }) }\n", .T0039, "expected 2 argument(s), got 1; 'unbox' takes (Box[T], T)");
+    try expectOneDiag(pre ++ "fn main() -> int {\n p := Pair { a: \"s\", b: Box { x: true } }\n return take(p)\n}\n", .T0040, "argument 1: expected Pair[str, Box[int]], got Pair[str, Box[bool]]; 'take' takes (Pair[str, Box[int]])");
+    try expectOneDiag(pre ++ "fn main() -> int { return same(Box { x: 1 }, Box { x: true }) }\n", .T0015, "conflicting types for type parameter 'T': Box[int] vs Box[bool]");
+    try expectOneDiag(pre ++ "fn main() -> int { return wrap(5) }\n", .T0040, "argument 1: expected fn(int) -> Box[int], got int; 'wrap' takes (fn(int) -> Box[int])");
+    try expectOneDiag(pre ++ "fn main() -> int {\n x := Box { x: true }\n b: Box[int] = x\n return 0\n}\n", .T0041, "cannot bind Box[bool] to 'b' of type Box[int]");
+}
+
+test "a generic body failing alike in every instance reports once, as the template spells it" {
+    const src =
+        \\struct Box[T] { x: T }
+        \\fn take(b: Box[int]) -> int { 0 }
+        \\fn f[T](v: T) -> int {
+        \\ b := Box { x: v }
+        \\ return take(b)
+        \\}
+        \\fn main() -> int { return f(true) + f("s") }
+        \\
+    ;
+    try expectOnlyDiag(src, .T0040);
+    try expectOneDiag(src, .T0040, "argument 1: expected Box[int], got Box[T]; 'take' takes (Box[int])");
+}
+
 test "an argument that cannot fit its partly bound param is T0040, not T0016" {
     const pre = own_box_pre ++
         \\impl Box[T] { fn then[U](self, f: fn(T) -> Box[U]) -> Box[U] { f(self.v) } }
@@ -11558,7 +11718,7 @@ test "an argument that cannot fit its partly bound param is T0040, not T0016" {
     try expectOneDiag(annotated, .T0040, "argument 1: expected fn(int) -> U, got fn(int, int) -> int; 'map' takes (fn(int) -> U)");
     const flat = pre ++ "fn main() -> int {\n b := Box { v: 2 }\n return b.then(fn(y) { y + 1 }).get()\n}\n";
     try expectOnlyDiag(flat, .T0040);
-    try expectOneDiag(flat, .T0040, "argument 1: expected fn(int) -> Box, got fn(int) -> int; 'then' takes (fn(int) -> Box)");
+    try expectOneDiag(flat, .T0040, "argument 1: expected fn(int) -> Box[U], got fn(int) -> int; 'then' takes (fn(int) -> Box[U])");
 }
 
 test "an own-generic arity error shows the signature as the receiver binds it" {
