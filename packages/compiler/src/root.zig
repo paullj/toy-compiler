@@ -53,6 +53,7 @@ pub const AdapterEmit = @import("lower/adapter_emit.zig");
 pub const Fingerprint = @import("query/Fingerprint.zig");
 pub const AstWalk = @import("query/AstWalk.zig");
 pub const Walk = @import("ast/Walk.zig");
+pub const angle_args = @import("ast/angle_args.zig");
 pub const Link = @import("link/Link.zig");
 pub const MachO = @import("link/MachO.zig");
 pub const CodeSign = @import("link/CodeSign.zig");
@@ -118,6 +119,7 @@ test {
     _ = Fingerprint;
     _ = AstWalk;
     _ = Walk;
+    _ = angle_args;
     _ = Link;
     _ = MachO;
     _ = CodeSign;

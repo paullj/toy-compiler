@@ -31,7 +31,7 @@ pub const Code = enum(u16) {
     P0007, // invalid-label-target ("a label must prefix a loop, while, for, or block")
     P0008, // expected-pattern     (match sub-pattern / variant pattern)
     P0009, // match-arm-arrow      (`=>` used where a match arm needs `->`)
-    P0010, // angle-type-args      (`<...>` type args in TYPE position; toy uses `[]`)
+    P0010, // angle-type-args      (`<...>` type args; toy uses `[]`)
     P0011, // c-style-for          (C-style `for (init; cond; step)` header)
     P0012, // colon-return-type    (`fn f(): T` return type written `:` not `->`)
     P0013, // stray-semicolon      (a `;` statement terminator)

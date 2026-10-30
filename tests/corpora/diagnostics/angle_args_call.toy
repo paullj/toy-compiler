@@ -1,0 +1,6 @@
+# '<...>' type arguments on a generic call are P0010: toy spells them 'f[int](x)'.
+fn id[T](x: T) -> T { x }
+
+fn main() -> int {
+    return id<int>(3)  #~ ERROR [P0010] type arguments use '[]', not '<>'
+}
