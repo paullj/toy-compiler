@@ -1,0 +1,60 @@
+# Feature: an associated fn named through its type is a function value, as a named fn is: `K.make`, `E.parse`, `S[int].mk` and `O[int].mk` with their args written, and a bare generic `S.mk` or `O.mk` taking them from the expected fn type; bound, passed, returned and called inside a generic fn
+# expect: stdout "3 4 1 6 5 2 9 20 7"
+# expect: exit 0
+import std/io
+
+struct K { v: int }
+
+impl K {
+    fn make(v: int) -> K { K { v: v } }
+}
+
+enum E { Up, Down }
+
+impl E {
+    fn parse(s: str) -> E { if s == "up" { E.Up } else { E.Down } }
+    fn sign(self) -> int { match self { .Up -> 1, .Down -> -1 } }
+}
+
+struct S[T] { v: T }
+
+impl S[T] {
+    fn mk(v: T) -> S[T] { S { v: v } }
+}
+
+enum O[T] { a(T), b }
+
+impl O[T] {
+    fn mk(v: T) -> O[T] { O.a(v) }
+}
+
+fn val(o: O[int]) -> int {
+    match o {
+        O.a(v) -> v,
+        O.b -> 0,
+    }
+}
+
+fn apply(f: fn(int) -> K, x: int) -> int { f(x).v }
+
+fn sapply(f: fn(int) -> S[int], x: int) -> int { f(x).v }
+
+fn maker() -> fn(int) -> O[int] { O.mk }
+
+fn through[T](x: T) -> T {
+    f := S[T].mk
+    f(x).v
+}
+
+fn put(acc: str, n: int) -> str { acc.concat(" ").concat(n.to_string()) }
+
+fn main() -> int {
+    f := K.make
+    p := E.parse
+    g := S[int].mk
+    h := O[int].mk
+    m := maker()
+    out := f(3).v.to_string() |> put(apply(K.make, 4)) |> put(p("up").sign()) |> put(g(6).v) |> put(sapply(S.mk, 5))
+    io.println(out |> put(val(h(2))) |> put(val(m(9))) |> put(through(20)) |> put(through("seven").len() + 2))
+    return 0
+}

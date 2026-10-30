@@ -1,0 +1,33 @@
+enum O[T] { a(T), b, mk(int) }
+impl O[T] {
+    fn mk(v: T) -> O[T] { O.a(v) }  #~ WARN [W0015] associated fn 'mk' of 'O' can never be called
+    fn make(v: T) -> O[T] { O.a(v) }
+    fn get(self) -> int { 7 }
+}
+struct S[T] { v: T }
+impl S[T] {
+    fn mk(v: T) -> S[T] { S { v: v } }
+    fn with[U](v: T, _u: U) -> S[T] { S { v: v } }
+    fn get(self) -> T { self.v }
+}
+struct K { v: int }
+impl K {
+    fn bump(mut v: int) -> int {
+        v += 1
+        v
+    }
+    fn get(self) -> int { self.v }
+}
+
+fn main() -> int {
+    _a := S.mk  #~ ERROR [T0016] cannot infer type parameter 'T' for 'S.mk'
+    _b := K.bump  #~ ERROR [T0049] 'bump' is a function with 'mut' parameters
+    _c := S[int].with  #~ ERROR [T0049] 'with' is a generic function
+    _d := K.get  #~ ERROR [T0056] type 'K' is not a value
+    _e := O.make  #~ ERROR [T0016] cannot infer type parameter 'T' for 'O.make'
+    _f: fn(int) -> O[int] = O.mk  #~ ERROR [T0016] for 'O.mk'
+    _g := O[int].nope(1)  #~ ERROR [T0061] enum 'O' has no variant 'nope'
+    _h := O.get()  #~ ERROR [T0018] 'get' is an instance method
+    _i: fn(int, int) -> int = S.mk  #~ ERROR [T0039] 'S.mk' takes 1 parameter(s), but the expected type fn(int, int) -> int takes 2
+    return 0
+}

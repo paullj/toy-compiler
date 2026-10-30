@@ -904,10 +904,20 @@ pub const InstanceIterator = struct {
 /// Whether member node `fa` binds a method as a value (`g := acc.plus`): in its body as
 /// checked, or in an instance of the generic fn around it.
 pub fn bindsMethod(an: *const Analysis, fa: u32) bool {
-    if (an.callees()[fa].view() == .bound_method) return true;
+    if (an.bindsReceiver(an.callees()[fa])) return true;
     var it = an.instancesOf(an.fnOf(an.module().nodes[fa].main_token));
-    while (it.next()) |inst| if (inst.nodes().callee(Ast.Index.from(fa)).view() == .bound_method) return true;
+    while (it.next()) |inst| if (an.bindsReceiver(inst.nodes().callee(Ast.Index.from(fa)))) return true;
     return false;
+}
+
+/// Whether `c` is a method value with a receiver: an associated fn named as a value
+/// (`K.make`) has none.
+fn bindsReceiver(an: *const Analysis, c: Callee) bool {
+    const mi = switch (c.view()) {
+        .bound_method => |mi| mi,
+        else => return false,
+    };
+    return mi < an.tc().methods.len and !an.tc().methods[mi].is_static;
 }
 
 /// The receiver type of the bound method value `fa`, when every check of it agrees on
@@ -915,11 +925,11 @@ pub fn bindsMethod(an: *const Analysis, fa: u32) bool {
 pub fn boundReceiver(an: *const Analysis, fa: u32) ?Type {
     const recv = an.module().nodes[fa].lhs;
     if (recv == Ast.none) return null;
-    if (an.callees()[fa].view() == .bound_method) return an.typeAt(recv.int());
+    if (an.bindsReceiver(an.callees()[fa])) return an.typeAt(recv.int());
     var agreed: ?Type = null;
     var it = an.instancesOf(an.fnOf(an.module().nodes[fa].main_token));
     while (it.next()) |inst| {
-        if (inst.nodes().callee(Ast.Index.from(fa)).view() != .bound_method) continue;
+        if (!an.bindsReceiver(inst.nodes().callee(Ast.Index.from(fa)))) continue;
         const t = inst.nodes().typeOf(recv);
         if (!render.isRenderable(t)) return null;
         if (agreed) |prev| if (!Type.eql(prev, t)) return null;

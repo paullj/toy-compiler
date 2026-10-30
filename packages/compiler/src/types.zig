@@ -2726,6 +2726,7 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // derive barrier and the mono tail append method rows no source declares.
     try t.checkStdShadows();
     try t.checkFnFieldMethods();
+    try t.checkVariantNamedFns();
 
     // Ord-refines-Eq: after coherence, append exactly one `(Eq, recv)` conformance
     // per `Ord` receiver that lacks an existing `(Eq, recv)` entry — so `==`/`!=` on an
@@ -4241,6 +4242,54 @@ fn reportFnFieldMethod(t: *Typecheck, fn_id: u32, struct_id: u32) !void {
         "method '{s}' on '{s}' has the same name as its field '{s}' of fn type: '{c}.{s}(..)' calls the method and '{c}.{s}' reads the field; rename one",
         .{ name, s.name, name, recv, name, recv, name },
     );
+}
+
+/// W0015 at each associated fn of an enum named like one of its variants, and the softer
+/// W0016 at each such `self` method. A variant keeps its name (`E.A(..)` builds it), so the
+/// associated fn is unreachable, while the method is reached only through a value.
+fn checkVariantNamedFns(t: *Typecheck) !void {
+    for (t.methods.items) |m| {
+        if (m.recv.kind != .@"enum") continue;
+        try t.reportVariantNamedFn(m.fn_id, m.recv.enum_id, m.is_static);
+    }
+    for (t.templates.items) |m| {
+        if (!m.recv_is_enum) continue;
+        try t.reportVariantNamedFn(m.fn_id, m.recv_ctor, !m.has_self);
+    }
+}
+
+fn reportVariantNamedFn(t: *Typecheck, fn_id: u32, enum_id: u32, is_static: bool) !void {
+    const e = t.enums.items[enum_id];
+    const f = t.fns.items[fn_id];
+    _ = t.gphSelect(f.mod);
+    const name_tok = t.tree.nodes[f.decl_node.int()].main_token;
+    const name = t.nameText(name_tok);
+    const vi = for (e.variants, 0..) |v, i| {
+        if (std.mem.eql(u8, v.name, name)) break i;
+    } else return;
+    // A related span indexes the diagnostic's own module, so a variant declared in another
+    // module goes unlabelled.
+    const related: ?Span = if (e.decl_node != Ast.none and e.mod == f.mod) blk: {
+        const variant_nodes = Ast.rangeSlice(t.tree, t.tree.nodes[e.decl_node.int()].lhs.int());
+        break :blk if (vi < variant_nodes.len) t.tokSpan(t.tree.nodes[variant_nodes[vi].int()].main_token) else null;
+    } else null;
+    const at: DiagnosticSink.Report = .{ .span = t.tokSpan(name_tok), .code = if (is_static) .W0015 else .W0016, .related = related };
+    // Another module's enum is spelled as the impl's module imports it, so the hint names
+    // the variant as the reader can write it.
+    var qual: []const u8 = "";
+    if (e.mod != f.mod) {
+        var it = t.graph.mods[f.mod].namespaces.iterator();
+        while (it.next()) |ns| if (ns.value_ptr.* == e.mod) {
+            qual = ns.key_ptr.*;
+            break;
+        };
+    }
+    const dot: []const u8 = if (qual.len > 0) "." else "";
+    if (is_static) {
+        try t.sink.report(at, "associated fn '{s}' of '{s}{s}{s}' can never be called: '{s}{s}{s}.{s}' always names the variant '{s}'; rename the function", .{ name, qual, dot, e.name, qual, dot, e.name, name, name });
+    } else {
+        try t.sink.report(at, "method '{s}' on '{s}{s}{s}' has the name of its variant '{s}': '.{s}(..)' on a value calls the method and '{s}{s}{s}.{s}' is the variant; rename one", .{ name, qual, dot, e.name, name, name, qual, dot, e.name, name });
+    }
 }
 
 /// Emit a coherence error if `ty` is a struct/enum whose declaration is not pub.
@@ -6328,7 +6377,9 @@ test "an associated fn of a non-generic struct or enum is called on its type as 
         \\
     );
     defer c.deinit(gpa);
-    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    // The variant keeps its name, which W0015 points out at `fn Mk`.
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.W0015, c.result.diags[0].code);
     const make = try calleeMethod(&c, "make", 0);
     try testing.expect(make.is_static and make.instance == null and make.recv.kind == .@"struct");
     const first = try calleeMethod(&c, "first", 0);
@@ -11883,10 +11934,10 @@ test "an impl rejected for its pattern is its only error: no conformance check, 
     try testing.expectEqual(codes.Code.T0018, c.result.diags[1].code);
 }
 
-test "an associated fn named through a type is not a value" {
+test "an associated fn with type params of its own is not a value" {
     const src = own_box_pre ++ "fn main() -> int {\n h := Box[int].with\n return 0\n}\n";
     try expectOnlyDiag(src, .T0049);
-    try expectOneDiag(src, .T0049, "'with' is an associated function and cannot be used as a value; wrap the call in a lambda");
+    try expectOneDiag(src, .T0049, "'with' is a generic function and cannot be used as a value; wrap the call in a lambda");
 }
 
 test "a struct or enum name used as a value is T0056, an enum's with a hint, wherever it stands" {
@@ -12176,6 +12227,71 @@ test "a method beside a field of another type, or an associated fn beside a fn f
         \\ h := H { run: fn(x) { x } }
         \\ f := h.run
         \\ return a.n() + a.xs() + a.xs.v()() + f(1)
+        \\}
+    );
+    defer c.deinit(gpa);
+    for (c.result.diags) |d| std.debug.print("got {s}: {s}\n", .{ @tagName(d.code), d.message });
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+}
+
+test "an enum fn named like a variant is W0015 when associated and W0016 when a method, at the fn" {
+    const gpa = testing.allocator;
+    const Case = struct { src: []const u8, code: codes.Code, want: []const u8 };
+    const cases = [_]Case{
+        .{
+            .src = "enum E { A(int), B }\nimpl E {\n fn A(n: int) -> E { E.A(n + 1) }\n}\nfn main() -> int {\n e := E.A(1)\n return match e {\n  E.A(v) -> v,\n  E.B -> 99,\n }\n}\n",
+            .code = .W0015,
+            .want = "associated fn 'A' of 'E' can never be called: 'E.A' always names the variant 'A'; rename the function",
+        },
+        .{
+            .src = "enum O[T] { S(T), N }\nimpl O[T] {\n fn N() -> O[T] { O.N }\n}\nfn main() -> int {\n o: O[int] = O.S(3)\n return match o {\n  O.S(v) -> v,\n  O.N -> 0,\n }\n}\n",
+            .code = .W0015,
+            .want = "associated fn 'N' of 'O' can never be called: 'O.N' always names the variant 'N'; rename the function",
+        },
+        .{
+            .src = "enum E { A(int), B }\nimpl E {\n fn B(self) -> int { 7 }\n}\nfn main() -> int {\n e := E.B\n return e.B()\n}\n",
+            .code = .W0016,
+            .want = "method 'B' on 'E' has the name of its variant 'B': '.B(..)' on a value calls the method and 'E.B' is the variant; rename one",
+        },
+        .{
+            .src = "enum O[T] { S(T), N }\nimpl O[T] {\n fn S(self) -> int { 1 }\n}\nfn main() -> int {\n o: O[int] = O.N\n return o.S()\n}\n",
+            .code = .W0016,
+            .want = "method 'S' on 'O' has the name of its variant 'S': '.S(..)' on a value calls the method and 'O.S' is the variant; rename one",
+        },
+    };
+    for (cases) |cs| {
+        try expectOnlyDiag(cs.src, cs.code);
+        try expectOneDiag(cs.src, cs.code, cs.want);
+        var c = try checkSource(cs.src);
+        defer c.deinit(gpa);
+        const d = c.result.diags[0];
+        const sp = d.span();
+        const rel = d.relatedSpan().?;
+        try testing.expectEqualStrings(cs.src[sp.start..sp.end], cs.src[rel.start..rel.end]);
+        try testing.expect(rel.start < sp.start);
+    }
+}
+
+test "an enum fn named unlike its variants, or a struct fn, is not W0015 or W0016" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum E { A(int), B }
+        \\impl E {
+        \\ fn a(n: int) -> E { E.A(n) }
+        \\ fn b(self) -> int { 2 }
+        \\}
+        \\enum O[T] { S(T), N }
+        \\impl O[T] {
+        \\ fn s(v: T) -> O[T] { O.S(v) }
+        \\}
+        \\struct A { n: int }
+        \\impl A {
+        \\ fn A() -> A { A { n: 1 } }
+        \\ fn B(self) -> int { self.n }
+        \\}
+        \\fn main() -> int {
+        \\ o: O[int] = O.s(1)
+        \\ return E.a(1).b() + A.A().B() + match o { O.S(v) -> v, O.N -> 0 }
         \\}
     );
     defer c.deinit(gpa);
@@ -13268,6 +13384,107 @@ test "acc.plus as a value types fn(int) -> int and records bound_method" {
     try testing.expectEqual(@as(usize, 1), a.sig.params.len);
     try testing.expectEqualStrings("Acc", c.result.layouts[a.recv.struct_id].name);
     try testing.expect(!a.mut_self);
+}
+
+test "K.make as a value is the null-env thunk of the associated fn" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct K { v: int }
+        \\impl K { fn make(v: int) -> K { K { v: v } } }
+        \\fn main() -> int {
+        \\ f := K.make
+        \\ return f(2).v
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const fa = try valueMember(&c, "make", 0);
+    const mi = c.result.callees[0][fa.int()].view().bound_method;
+    try testing.expect(c.result.methods[mi].is_static);
+    try testing.expectEqual(@as(usize, 1), c.result.adapters.len);
+    const a = c.result.adapters[0];
+    try testing.expectEqual(Closure.AdapterKind.assoc_value, a.kind);
+    try testing.expectEqualStrings("main.K.make$fnval", a.name);
+    try testing.expectEqualStrings("main.K.make", a.target.name);
+    try testing.expectEqual(@as(usize, 1), a.sig.params.len);
+}
+
+test "S[int].mk and a bare S.mk with an expected fn type seal to one instance" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\struct S[T] { v: T }
+        \\impl S[T] { fn mk(v: T) -> S[T] { S { v: v } } }
+        \\fn main() -> int {
+        \\ f := S[int].mk
+        \\ g: fn(int) -> S[int] = S.mk
+        \\ return f(2).v + g(3).v
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const f = c.result.callees[0][(try valueMember(&c, "mk", 0)).int()].view().bound_method;
+    const g = c.result.callees[0][(try valueMember(&c, "mk", 1)).int()].view().bound_method;
+    try testing.expectEqual(f, g);
+    try testing.expect(c.result.methods[f].is_static and c.result.methods[f].instance != null);
+    try testing.expectEqual(@as(usize, 1), c.result.adapters.len);
+    try testing.expectEqual(Closure.AdapterKind.assoc_value, c.result.adapters[0].kind);
+    for (c.result.callees[0]) |x| try testing.expect(!x.isPending());
+}
+
+test "a bare generic S.mk as a value with no expected fn type is T0016" {
+    try expectOneDiag(
+        \\struct S[T] { v: T }
+        \\impl S[T] { fn mk(v: T) -> S[T] { S { v: v } } }
+        \\fn main() -> int {
+        \\ _f := S.mk
+        \\ return 0
+        \\}
+        \\
+    , .T0016, "cannot infer type parameter 'T' for 'S.mk'; add explicit type arguments, e.g. S[int].mk");
+}
+
+test "an associated fn with a mut param is not a value" {
+    try expectOneDiag(
+        \\struct K { v: int }
+        \\impl K { fn add(mut t: int, x: int) { t += x } }
+        \\fn main() -> int {
+        \\ _f := K.add
+        \\ return 0
+        \\}
+        \\
+    , .T0049, "'add' is a function with 'mut' parameters and cannot be used as a value; wrap the call in a lambda");
+}
+
+test "an associated fn of a generic enum is called on its type; a variant keeps its name" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum O[T] { a(T), b(int) }
+        \\impl O[T] {
+        \\ fn mk(v: T) -> O[T] { O.a(v) }
+        \\ fn b(v: int) -> O[T] { O.b(v + 1) }
+        \\}
+        \\fn main() -> int {
+        \\ _x := O[int].mk(1)
+        \\ _y := O.mk(true)
+        \\ _z: O[int] = O.b(2)
+        \\ return 0
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.W0015, c.result.diags[0].code);
+    var calls: usize = 0;
+    for (c.result.callees[0]) |x| switch (x.view()) {
+        .method => |mi| {
+            if (std.mem.eql(u8, c.result.methods[mi].name, "mk")) calls += 1;
+            try testing.expect(!std.mem.eql(u8, c.result.methods[mi].name, "b"));
+        },
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 2), calls);
 }
 
 test "b.get on Box[int] seals to the instance method" {

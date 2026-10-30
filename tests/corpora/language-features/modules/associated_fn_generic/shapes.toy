@@ -1,0 +1,12 @@
+pub enum O[T] { a(T), b }
+
+impl O[T] {
+    fn mk(v: T) -> O[T] { O.a(v) }
+    fn get(self, d: T) -> T { match self { O.a(v) -> v, O.b -> d } }
+}
+
+pub struct S[T] { pub v: T }
+
+impl S[T] {
+    fn mk(v: T) -> S[T] { S { v: v } }
+}

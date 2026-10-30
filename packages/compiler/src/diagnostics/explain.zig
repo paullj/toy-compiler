@@ -96,4 +96,10 @@ test "docForStr resolves a known code and rejects garbage" {
 
     const w14 = docForStr("W0014") orelse return error.TestUnexpectedResult;
     try testing.expect(std.mem.indexOf(u8, w14, "copies of one element") != null);
+
+    const w15 = docForStr("W0015") orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, w15, "can never be called") != null);
+
+    const w16 = docForStr("W0016") orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, w16, "name of a variant") != null);
 }

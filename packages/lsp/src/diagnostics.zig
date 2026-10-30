@@ -225,6 +225,11 @@ test "checkBuffer publishes two mut copies of one Vec element W0014 as a warning
     try expectWarningsOnAnnotatedLines("tests/corpora/diagnostics/shared_element_mut_args.toy", "W0014");
 }
 
+test "checkBuffer publishes enum fns named like a variant W0015 and W0016 as warnings on their annotated lines" {
+    try expectWarningsOnAnnotatedLines("tests/corpora/diagnostics/variant_named_fn.toy", "W0015");
+    try expectWarningsOnAnnotatedLines("tests/corpora/diagnostics/variant_named_fn.toy", "W0016");
+}
+
 /// Every `code` diagnostic of the fixture at `path` is a warning on a line annotated
 /// `#~ WARN [code]`, and each annotation gets one.
 fn expectWarningsOnAnnotatedLines(path: []const u8, code: []const u8) !void {

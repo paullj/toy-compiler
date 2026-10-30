@@ -394,9 +394,9 @@ fn reportOwnGenericArity(bc: *BodyChecker, call: Ast.Index, got: usize, sig: Bod
 /// `mf` is the fn, `fn_args` what the call bound of its type params (`.invalid` when
 /// open) and `open` the one no arg binds. The hint names the struct's args through the
 /// impl's pattern, then the fn's own args when it has any, so it gets past T0016 for both.
-pub fn reportUninferableAssociated(bc: *BodyChecker, recv: Ast.Node, member: []const u8, sid: u32, mf: ?FnSym, fn_args: []const Type, open: ?u32) error{OutOfMemory}!void {
-    const name = bc.nameText(recv.main_token);
-    const n = bc.structSyms()[sid].generic_params.len;
+pub fn reportUninferableAssociated(bc: *BodyChecker, recv: Ast.Node, member: []const u8, ty: BodyChecker.GenericCtor, mf: ?FnSym, fn_args: []const Type, open: ?u32) error{OutOfMemory}!void {
+    const name = bc.typeRefText(recv);
+    const n = bc.genericParamCount(ty);
     const args = try bc.gpa.alloc(Type, n);
     defer bc.gpa.free(args);
     @memset(args, .invalid);
@@ -415,6 +415,16 @@ pub fn reportUninferableAssociated(bc: *BodyChecker, recv: Ast.Node, member: []c
         try bc.reportUninferable(bc.tokSpan(recv.main_token), " '{s}' for '{s}.{s}'", .{ mf.?.generic_params[ord], name, member }, name, args, &.{ ".", member }, own)
     else
         try bc.reportUninferable(bc.tokSpan(recv.main_token), " for '{s}.{s}'", .{ name, member }, name, args, &.{ ".", member }, own);
+}
+
+/// The instance an associated fn of a generic type runs on, its `self_type` at the
+/// impl's type args `targs`.
+pub fn receiverApp(bc: *BodyChecker, mf: FnSym, targs: []const Type) error{OutOfMemory}!Type {
+    const self_app = bc.composite.at(mf.self_type.appIdx());
+    const app_args = try bc.gpa.alloc(Type, self_app.args.len);
+    defer bc.gpa.free(app_args);
+    for (self_app.args, app_args) |p, *o| o.* = BC.substTy(bc, p, targs);
+    return Type.app(bc.composite.intern(bc.gpa, self_app.ctor, app_args, self_app.ctor_is_enum) catch return error.OutOfMemory);
 }
 
 /// Type a bare `Box.new(5)`: bind the impl's type params from the value args alone,
@@ -439,20 +449,16 @@ pub fn inferAssociatedCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, c
     switch (try inferArgs(bc, .{ .call = node_idx, .sig = bc.fnSig(mf, bc.nameText(callee.main_token)) }, args, mf.params, mf.generic_params, null, .none, arg_types, out)) {
         .failed => return .invalid,
         .unbound => |ord| {
-            try reportUninferableAssociated(bc, recv, bc.nameText(callee.main_token), bc.composite.at(mf.self_type.appIdx()).ctor, mf, out, ord);
+            const self_app = bc.composite.at(mf.self_type.appIdx());
+            try reportUninferableAssociated(bc, recv, bc.nameText(callee.main_token), .{ .ctor = self_app.ctor, .is_enum = self_app.ctor_is_enum }, mf, out, ord);
             return .invalid;
         },
         .ok => {},
     }
     if (!try concreteTargs(bc, node_idx, out)) return .invalid;
-    const pat = bc.composite.at(mf.self_type.appIdx()).args;
-    const app_args = try bc.gpa.alloc(Type, pat.len);
-    defer bc.gpa.free(app_args);
-    for (pat, app_args) |p, *o| o.* = BC.substTy(bc, p, out);
-    const sid = bc.composite.at(mf.self_type.appIdx()).ctor;
     // Load-bearing, as on the `type_app` path: scanCalls / reify / sealCallees read the
     // receiver off `node_types[callee.lhs]` whatever the node's tag.
-    bc.node_types[(callee.lhs).int()] = Type.app(bc.composite.intern(bc.gpa, sid, app_args, false) catch return error.OutOfMemory);
+    bc.node_types[(callee.lhs).int()] = try receiverApp(bc, mf, out);
     bc.setCallee(n, if (Typecheck.hasOwnTypeParams(bc.composite, mf)) Callee.pendingCall(node_idx) else Callee.pending);
     var sig = bc.fnSig(mf, bc.nameText(callee.main_token)).substituted(out);
     sig.pretyped = arg_types;

@@ -308,13 +308,14 @@ pub fn boundMethodRef(b: *const Builder, node_idx: Ast.Index) ?u32 {
     };
 }
 
-/// A bound method `recv.m` in value position: the pair `{its adapter's address, env}`.
-/// The env holds the receiver: the cell of a boxed local receiver, so the closure and its
-/// owner see each other's writes, else a copy of the receiver value, evaluated once here.
+/// A bound method `recv.m` in value position: the pair `{its adapter's address, env}`;
+/// an associated fn `K.make` has a null env. The env holds the receiver: the cell of a
+/// boxed local receiver, so the closure and its owner see each other's writes, else a
+/// copy of the receiver value, evaluated once here.
 pub fn lowerBoundValue(b: *Builder, node_idx: Ast.Index, mi: u32, ty: Typecheck.Type) error{OutOfMemory}!Ir.Operand {
     const n = b.in.tree.nodes[(node_idx).int()];
     const recv_local = Closure.boundRecvLocal(b.in.tree, b.in.resolutions, node_idx);
-    const kind = Closure.boundKind(recv_local, b.in.closure.storage);
+    const kind = Closure.methodValueKind(b.in.methods[mi].is_static, recv_local, b.in.closure.storage);
     const ai = Closure.findAdapter(b.in.closure.adapters, kind, mi) orelse {
         try b.note(n.main_token, "bound method has no adapter in lower");
         return .none;
@@ -347,6 +348,7 @@ pub fn lowerBoundValue(b: *Builder, node_idx: Ast.Index, mi: u32, ty: Typecheck.
             try L.lowerExprInto(b, n.lhs, env, recv_ty);
             return try emitFnPair(b, b.in.closure.adapters[ai].name, ty, env);
         },
+        .assoc_value => return try emitFnPair(b, b.in.closure.adapters[ai].name, ty, null),
         .fn_value => unreachable,
     }
 }

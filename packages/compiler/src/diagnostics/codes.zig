@@ -149,6 +149,8 @@ pub const Code = enum(u16) {
     W0012, // uncalled-function (an expression statement drops a function value it never calls)
     W0013, // fn-field-method-clash (a method shares its name with a fn-typed field of its receiver)
     W0014, // shared-element-mut-args (two `mut` places of one call copy one Vec element)
+    W0015, // variant-named-associated-fn (an enum's associated fn has a variant's name, so it is never called)
+    W0016, // variant-method-clash (an enum's `self` method has a variant's name)
 
     _,
 };
@@ -292,6 +294,8 @@ pub const table = [_]Entry{
     .{ .code = .W0012, .str = "W0012", .slug = "uncalled-function", .default_severity = .warning },
     .{ .code = .W0013, .str = "W0013", .slug = "fn-field-method-clash", .default_severity = .warning, .related = "field declared here" },
     .{ .code = .W0014, .str = "W0014", .slug = "shared-element-mut-args", .default_severity = .warning, .related = "earlier copy of the element" },
+    .{ .code = .W0015, .str = "W0015", .slug = "variant-named-associated-fn", .default_severity = .warning, .related = "variant declared here" },
+    .{ .code = .W0016, .str = "W0016", .slug = "variant-method-clash", .default_severity = .warning, .related = "variant declared here" },
 };
 
 /// The human code string ("R0001") or null for `.none` (=> no `[code]` bracket, so
@@ -650,6 +654,14 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqualStrings("shared-element-mut-args", slug(.W0014).?);
     try testing.expectEqual(Severity.warning, defaultSeverity(.W0014));
     try testing.expectEqual(Code.W0014, fromStr("W0014").?);
+
+    try testing.expectEqualStrings("variant-named-associated-fn", slug(.W0015).?);
+    try testing.expectEqual(Severity.warning, defaultSeverity(.W0015));
+    try testing.expectEqual(Code.W0015, fromStr("W0015").?);
+
+    try testing.expectEqualStrings("variant-method-clash", slug(.W0016).?);
+    try testing.expectEqual(Severity.warning, defaultSeverity(.W0016));
+    try testing.expectEqual(Code.W0016, fromStr("W0016").?);
 }
 
 test "fromStr round-trips every table code and rejects garbage" {

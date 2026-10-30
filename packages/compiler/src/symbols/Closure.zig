@@ -220,6 +220,7 @@ pub const AdapterKind = enum(u8) {
     bound_copy,
     bound_box,
     bound_ref,
+    assoc_value,
 
     /// How a bound adapter's env holds the receiver.
     pub fn recvHold(k: AdapterKind) Hold {
@@ -227,20 +228,22 @@ pub const AdapterKind = enum(u8) {
             .bound_copy => .copy,
             .bound_box => .cell,
             .bound_ref => .param_addr,
-            .fn_value => unreachable,
+            .fn_value, .assoc_value => unreachable,
         };
     }
 };
 
 /// A source-less unit that turns a named callee into the `(env, params..)` shape every
 /// function value is called with. `.fn_value` is the thunk a named fn taken as a value
-/// points at: it ignores the env and calls the fn directly. A bound method's adapter
+/// points at: it ignores the env and calls the fn directly; `.assoc_value` is the same
+/// thunk for an associated fn named through its type (`K.make`). A bound method's adapter
 /// passes the receiver its env holds as `self`: `.bound_copy` holds a copy of the
 /// receiver value, `.bound_box` the cell of a boxed local receiver, `.bound_ref` the
 /// address of a `mut` param receiver (as an `int`, so the word is never a root).
 pub const Adapter = struct {
     kind: AdapterKind,
-    /// `.fn_value`: the referenced fn's global id. `.bound_*`: the method's index.
+    /// `.fn_value`: the referenced fn's global id. `.bound_*`, `.assoc_value`: the method's
+    /// index.
     key: u32,
     /// Owned.
     name: []const u8,
@@ -268,6 +271,11 @@ pub fn boundKind(recv_local: ?u32, st: Storage) AdapterKind {
         .param_addr => .bound_ref,
         .frame_addr => unreachable,
     };
+}
+
+/// The adapter of a method named as a value: an associated fn's has no receiver to hold.
+pub fn methodValueKind(is_static: bool, recv_local: ?u32, st: Storage) AdapterKind {
+    return if (is_static) .assoc_value else boundKind(recv_local, st);
 }
 
 /// The slot of bound method `fa`'s receiver when it is a bare local (`acc` in
@@ -300,6 +308,13 @@ pub fn findAdapter(ads: []const Adapter, kind: AdapterKind, key: u32) ?u32 {
 
 const testing = std.testing;
 const Sig = @import("Sig.zig").Sig;
+
+test "an associated fn's value holds no receiver" {
+    const st: Storage = .{ .boxed = &.{3} };
+    try testing.expectEqual(AdapterKind.assoc_value, methodValueKind(true, 3, st));
+    try testing.expectEqual(AdapterKind.assoc_value, methodValueKind(true, null, st));
+    try testing.expectEqual(AdapterKind.bound_box, methodValueKind(false, 3, st));
+}
 
 test "boundKind boxes only a boxed local receiver" {
     const st: Storage = .{ .boxed = &.{ 1, 3 } };

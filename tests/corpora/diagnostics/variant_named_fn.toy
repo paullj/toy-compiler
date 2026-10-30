@@ -1,0 +1,44 @@
+# An enum fn with a variant's name. 'E.A(..)' always builds the variant, so an associated
+# fn 'A' can never be called: W0015 at the fn. A 'self' method 'B' is reached through a
+# value, but 'e.B(..)' and 'E.B' then mean different things: the softer W0016. Both hold
+# for a generic enum and a conformance method. A fn named unlike every variant, and a
+# struct's fns, do not warn.
+protocol Named {
+    fn C(self) -> int
+}
+
+enum E { A(int), B, C }
+enum O[T] { S(T), N }
+struct A { n: int }
+
+impl E {
+    fn A(n: int) -> E { E.A(n + 1) }  #~ WARN [W0015] associated fn 'A' of 'E' can never be called: 'E.A' always names the variant 'A'; rename the function
+    fn B(self) -> int { 7 }  #~ WARN [W0016] method 'B' on 'E' has the name of its variant 'B': '.B(..)' on a value calls the method and 'E.B' is the variant; rename one
+    fn a(n: int) -> E { E.A(n) }
+}
+
+impl E has Named {
+    fn C(self) -> int { 3 }  #~ WARN [W0016] method 'C' on 'E' has the name of its variant 'C'
+}
+
+impl O[T] {
+    fn N() -> O[T] { O.N }  #~ WARN [W0015] associated fn 'N' of 'O' can never be called
+    fn S(self) -> int { 1 }  #~ WARN [W0016] method 'S' on 'O' has the name of its variant 'S'
+    fn s(v: T) -> O[T] { O.S(v) }
+}
+
+impl A {
+    fn A() -> A { A { n: 1 } }
+    fn B(self) -> int { self.n }
+}
+
+fn main() -> int {
+    e := E.A(1)
+    o: O[int] = O.s(2)
+    v := match e {
+        E.A(v) -> v,
+        E.B -> 99,
+        E.C -> 98,
+    }
+    return v + e.B() + e.C() + E.a(1).B() + o.S() + A.A().B()
+}

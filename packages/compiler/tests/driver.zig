@@ -1133,6 +1133,47 @@ test "two mut arguments rooted at one Vec element are W0014: check exits 0, and 
     try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, denied.term);
 }
 
+test "enum fns named like a variant are W0015 and W0016: --deny fails on each, --allow silences each" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const dir_name = ".toy-test-variant-named-fn";
+    defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
+    const src =
+        \\enum E { A(int), B }
+        \\impl E {
+        \\    fn A(n: int) -> E { E.A(n + 1) }
+        \\    fn B(self) -> int { 7 }
+        \\}
+        \\fn main() -> int {
+        \\    e := E.A(1)
+        \\    return match e {
+        \\        E.A(v) -> v + e.B(),
+        \\        E.B -> 99,
+        \\    }
+        \\}
+        \\
+    ;
+    const warned = try runToyOnFixture(gpa, io, dir_name, src, &.{"check"});
+    defer gpa.free(warned.out);
+    try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, warned.term);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, warned.out, "warning[W0015]: associated fn 'A' of 'E' can never be called"));
+    try testing.expect(std.mem.indexOf(u8, warned.out, "one.toy:3:8") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, warned.out, "warning[W0016]: method 'B' on 'E' has the name of its variant 'B'"));
+    try testing.expect(std.mem.indexOf(u8, warned.out, "one.toy:4:8") != null);
+    for ([_][]const u8{ "W0015", "W0016" }) |code| {
+        const denied = try runToyOnFixture(gpa, io, dir_name, src, &.{ "check", "--deny", code });
+        defer gpa.free(denied.out);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 1 }, denied.term);
+        const allowed = try runToyOnFixture(gpa, io, dir_name, src, &.{ "check", "--allow", code });
+        defer gpa.free(allowed.out);
+        try testing.expectEqual(std.process.Child.Term{ .exited = 0 }, allowed.term);
+        try testing.expect(std.mem.indexOf(u8, allowed.out, code) == null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, allowed.out, "warning[W001"));
+    }
+}
+
 test "a trailing else-less `if` in a nested block is an effect statement (compiles and runs)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
