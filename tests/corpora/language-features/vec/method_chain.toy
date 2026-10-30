@@ -18,5 +18,5 @@ fn main() -> int {
     io.println(total)
     inc := xs.map(add(1, _))
     dbl := xs.map(double)
-    return total + inc.fold(0, fn(a, x) { a + x }) + dbl.get(4).unwrap()
+    return total + inc.fold(0, fn(a, x) { a + x }) + dbl.get(4).expect("no value")
 }

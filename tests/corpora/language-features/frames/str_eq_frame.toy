@@ -43,7 +43,7 @@ fn count(s: str) -> int {
     churn()
     io.println(t)
     io.println(keep)
-    io.println(held.get(0).unwrap_or(0))
+    io.println(held.get(0).or(0))
     t
 }
 

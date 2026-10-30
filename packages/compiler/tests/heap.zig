@@ -82,7 +82,7 @@ const map_high_bucket_src =
     \\    j := 0
     \\    loop {
     \\        if j >= 64 { break }
-    \\        v := m.get("k".concat(j.to_string())).unwrap_or(-1)
+    \\        v := m.get("k".concat(j.to_string())).or(-1)
     \\        if v == j { ok = ok + 1 }
     \\        j = j + 1
     \\    }
@@ -363,7 +363,7 @@ test "gc: a rooted Vec survives churning ~20000 unreachable Vecs (collect.toy sp
         \\        junk.push(i)
         \\        i = i + 1
         \\    }
-        \\    return keep.get(0).unwrap_or(0) + 8
+        \\    return keep.get(0).or(0) + 8
         \\}
         \\
     );
@@ -485,7 +485,7 @@ test "gc: a by-value aggregate SLOT survivor is kept by recursing the precise ro
         \\        i = i + 1
         \\    }
         \\    it := keep.items
-        \\    return it.get(0).unwrap_or(0)
+        \\    return it.get(0).or(0)
         \\}
         \\
     );

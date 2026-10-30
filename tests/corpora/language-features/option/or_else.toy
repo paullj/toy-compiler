@@ -1,4 +1,4 @@
-# Feature: `Option.or_else` is the lazy `unwrap_or`: its function runs only on `none`.
+# Feature: `Option.or_else` is the lazy `or`: its function runs only on `none`.
 # The function of a `some` would panic if it ran, and a counter it bumps stays 0.
 # expect: stdout "fallback\nkept\n"
 # expect: exit 20

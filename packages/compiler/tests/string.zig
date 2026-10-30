@@ -290,7 +290,7 @@ test "string: split, trim and join results survive forced collections" {
         \\    if joined != "xalpha|beta|gamma|delta" { return 1 }
         \\    if "a-b".replace("-", "x".concat("y")) != "axyb" { return 2 }
         \\    it := joined.chars()
-        \\    first := it.next().unwrap()
+        \\    first := it.next().expect("no value")
         \\    v: int = first.into()
         \\    return v
         \\}
@@ -351,7 +351,7 @@ const chars_src =
     \\    loop {
     \\        o := it.next()
     \\        if o.is_none() { break }
-    \\        io.print(o.unwrap())
+    \\        io.print(o.expect("no value"))
     \\        n = n + 1
     \\    }
     \\    return n - 5
@@ -474,10 +474,10 @@ test "string: str methods are byte-identical at -j1 and -j8" {
         \\    long := ws.filter(fn(w) { w.len() > 3 })
         \\    if !long.any(fn(w) { w.contains("q") }) || !ws.all(fn(w) { w.len() > 0 }) { return 4 }
         \\    ws.sort_by(fn(a, b) { a.len() < b.len() })
-        \\    if ws.find(fn(w) { w.starts_with("b") }).unwrap_or("") != "brown" { return 5 }
+        \\    if ws.find(fn(w) { w.starts_with("b") }).or("") != "brown" { return 5 }
         \\    ws.each(fn(w) { n = n + wide(w) })
         \\    lens := "é€,😀".split(",").map(fn(p) { wide(p) })
-        \\    return n + lens.fold(0, fn(a, x) { a + x }) + ws.get(0).unwrap().len()
+        \\    return n + lens.fold(0, fn(a, x) { a + x }) + ws.get(0).expect("no value").len()
         \\}
         \\
     ;

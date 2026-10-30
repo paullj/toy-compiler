@@ -21,7 +21,7 @@ fn main() -> int {
     loop {
         o := it.next()
         if o.is_none() { break }
-        v: int = o.unwrap().into()
+        v: int = o.expect("no value").into()
         io.print(v.to_string().concat(" "))
     }
     io.println("")

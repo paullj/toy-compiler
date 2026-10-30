@@ -15,7 +15,7 @@ impl Vec[T] {
     fn each(self, f: fn(T)) {  #~ WARN [W0011] method 'each' on 'Vec' shadows the one in std/vec
         i := self.len() - 1
         while i >= 0 {
-            f(self.get(i).unwrap())
+            f(self.get(i).expect("no value"))
             i = i - 1
         }
     }

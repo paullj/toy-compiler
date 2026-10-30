@@ -16,5 +16,5 @@ fn main() -> int {
         junk.push(i)
         i = i + 1
     }
-    return keep.get(0).unwrap_or(0) + 8
+    return keep.get(0).or(0) + 8
 }

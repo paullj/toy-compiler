@@ -23,12 +23,12 @@ fn main() -> int {
     ok: Result[int, bool] = Result.ok(1)
     err: Result[int, bool] = Result.err(false)
     if !ok.is_ok() { return 14 }
-    if !err.is_err() { return 15 }
+    if !err.is_error() { return 15 }
     small: uint8 = 5
     w: uint = small.into()
     big: uint = 300
-    back: uint8 = big.try_into().unwrap_or(0)
+    back: uint8 = big.try_into().or(0)
     if back != 0 { return 16 }
     if w != 5 { return 17 }
-    return some.unwrap() + none.unwrap_or(2)
+    return some.expect("no value") + none.or(2)
 }

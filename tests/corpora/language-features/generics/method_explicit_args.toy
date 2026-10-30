@@ -45,8 +45,8 @@ fn nothing[T](b: Box[T]) -> Option[T] { b.none[T]() }
 
 fn main() -> int {
     b := Box { v: 7 }
-    io.println(b.none[str]().unwrap_or("dflt"))
-    io.println(b.none[int]().unwrap_or(7).to_string())
+    io.println(b.none[str]().or("dflt"))
+    io.println(b.none[int]().or(7).to_string())
     io.println((b.pair[int](1) + b.pair[bool](true) + (b |> .pair[str]("x"))).to_string())
     io.println(b.map[str](fn(x) { x.to_string() }).get())
     io.println((b |> .map[int](fn(x) { x * 2 })).get().to_string())
@@ -61,7 +61,7 @@ fn main() -> int {
     io.println(n.to_string())
     io.println(Box[int].with[bool](3, true).get().to_string())
     xs := [1, 2, 3]
-    io.println(xs.map[bool](fn(x) { x > 1 }).get(0).unwrap().to_string())
+    io.println(xs.map[bool](fn(x) { x > 1 }).get(0).expect("no value").to_string())
     f := fn(k: int) -> int { b.pair[bool](false) + k }
     io.println(f(1).to_string())
     io.println((b.tail[str](40).n + b.tail[int](2).n).to_string())

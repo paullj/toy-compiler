@@ -21,7 +21,7 @@ fn main() -> int {
     fs.push(double)
     fs.push(triple)
     total = total + fs[0](5)                   # 25
-    total = total + fs.get(1).unwrap()(5)      # 40
+    total = total + fs.get(1).expect("no value")(5)      # 40
     total = total + pick(false)(10)            # 70
     total = total + pick(true)(10)             # 90
     if f == add { total = total + 1 }          # 91

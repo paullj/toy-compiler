@@ -1273,7 +1273,7 @@ pub fn isCharTy(t: Type, char_id: ?u32) bool {
 /// conversion is NEVER a phantom `t.methods` row (which would desync `names`/`sigs`) and
 /// the two consumers cannot diverge at any `-jN`. `recv` is the receiver type, `expected`
 /// the target inferred from context (a let-annotation / return / arg slot / the `T` of a
-/// chained `unwrap`). Returns null unless BOTH are integers, so a struct/enum receiver
+/// chained `expect`). Returns null unless BOTH are integers, so a struct/enum receiver
 /// leaves the existing `.ambiguous`/T0025/T0018 dispatch untouched.
 ///   * `into`: same-signedness AND `expected` at least as wide as `recv` ⇒ `.widen`
 ///     targeting `expected`; narrowing/sign-change via `into` is null (→ T0018).
@@ -1318,22 +1318,22 @@ pub fn builtinConvMethod(recv: Type, expected: Type, member: []const u8, char_id
 }
 
 /// A compiler-provided inherent method on the prelude `Option`/`Result` enums:
-/// `is_tag0`/`is_tag1` are the two predicates (typed `bool`), `unwrap`/`unwrap_or` yield
+/// `is_tag0`/`is_tag1` are the two predicates (typed `bool`), `expect`/`or` yield
 /// the payload type-arg (variant 0's payload). Like `builtinScalarMethod`, this is a pure
 /// recognizer with NO `t.methods`/`t.fns` entry — the checker types the call and `lower`
 /// inlines the tag test / payload load, so a native method never becomes a phantom table
 /// row (which would desync `names`/`sigs` and churn the method-count tests). The family's
-/// predicate NAMES differ (`is_some`/`is_none` vs `is_ok`/`is_err`) but both map to the
-/// same tag-0/tag-1 test; `unwrap`/`unwrap_or` are shared. Variant order is FIXED by
+/// predicate NAMES differ (`is_some`/`is_none` vs `is_ok`/`is_error`) but both map to the
+/// same tag-0/tag-1 test; `expect`/`or` are shared. Variant order is FIXED by
 /// `registerPrelude` (payload = index 0, absence/error = index 1).
-pub const OptResultMethod = enum { is_tag0, is_tag1, unwrap, unwrap_or };
+pub const OptResultMethod = enum { is_tag0, is_tag1, expect, @"or" };
 
 pub fn optResultBuiltin(op: OptResultMethod) Callee.Builtin {
     return switch (op) {
         .is_tag0 => .opt_is_tag0,
         .is_tag1 => .opt_is_tag1,
-        .unwrap => .opt_unwrap,
-        .unwrap_or => .opt_unwrap_or,
+        .expect => .opt_expect,
+        .@"or" => .opt_or,
     };
 }
 
@@ -1342,8 +1342,8 @@ pub fn builtinOptResult(k: Callee.Builtin) ?OptResultMethod {
     return switch (k) {
         .opt_is_tag0 => .is_tag0,
         .opt_is_tag1 => .is_tag1,
-        .opt_unwrap => .unwrap,
-        .opt_unwrap_or => .unwrap_or,
+        .opt_expect => .expect,
+        .opt_or => .@"or",
         .scalar_eq, .scalar_hash, .scalar_cmp, .str_concat, .str_len, .str_byte_at, .scalar_to_string, .display_to_string, .conv_into, .conv_try_into => null,
     };
 }
@@ -1357,11 +1357,11 @@ pub fn optionResultMethod(family: LayoutEngine.NativeEnumFamily, name: []const u
         },
         .result => {
             if (std.mem.eql(u8, name, "is_ok")) return .is_tag0;
-            if (std.mem.eql(u8, name, "is_err")) return .is_tag1;
+            if (std.mem.eql(u8, name, "is_error")) return .is_tag1;
         },
     }
-    if (std.mem.eql(u8, name, "unwrap")) return .unwrap;
-    if (std.mem.eql(u8, name, "unwrap_or")) return .unwrap_or;
+    if (std.mem.eql(u8, name, "expect")) return .expect;
+    if (std.mem.eql(u8, name, "or")) return .@"or";
     return null;
 }
 
@@ -6363,15 +6363,15 @@ fn methodCallKind(c: Checked, member: []const u8) ?Kind {
     return null;
 }
 
-test "Option native methods type to bool (predicates) / T (unwrap) with zero diags" {
+test "Option native methods type to bool (predicates) / T (expect) with zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int {
         \\ x := Option[int].some(7)
         \\ p := x.is_some()
         \\ q := x.is_none()
-        \\ u := x.unwrap()
-        \\ d := x.unwrap_or(0)
+        \\ u := x.expect("no value")
+        \\ d := x.or(0)
         \\ if p { if q { return u } }
         \\ return d
         \\}
@@ -6381,19 +6381,19 @@ test "Option native methods type to bool (predicates) / T (unwrap) with zero dia
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(Kind.bool, methodCallKind(c, "is_some").?);
     try testing.expectEqual(Kind.bool, methodCallKind(c, "is_none").?);
-    try testing.expectEqual(Kind.int, methodCallKind(c, "unwrap").?);
-    try testing.expectEqual(Kind.int, methodCallKind(c, "unwrap_or").?);
+    try testing.expectEqual(Kind.int, methodCallKind(c, "expect").?);
+    try testing.expectEqual(Kind.int, methodCallKind(c, "or").?);
 }
 
-test "Result native methods type to bool (predicates) / T (unwrap) with zero diags" {
+test "Result native methods type to bool (predicates) / T (expect) with zero diags" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int {
         \\ x := Result[int, str].ok(7)
         \\ p := x.is_ok()
-        \\ q := x.is_err()
-        \\ u := x.unwrap()
-        \\ d := x.unwrap_or(0)
+        \\ q := x.is_error()
+        \\ u := x.expect("no value")
+        \\ d := x.or(0)
         \\ if p { if q { return u } }
         \\ return d
         \\}
@@ -6402,17 +6402,45 @@ test "Result native methods type to bool (predicates) / T (unwrap) with zero dia
     defer c.deinit(gpa);
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
     try testing.expectEqual(Kind.bool, methodCallKind(c, "is_ok").?);
-    try testing.expectEqual(Kind.bool, methodCallKind(c, "is_err").?);
-    // `unwrap`/`unwrap_or` yield the FIRST type-arg (the `ok` payload), int here.
-    try testing.expectEqual(Kind.int, methodCallKind(c, "unwrap").?);
-    try testing.expectEqual(Kind.int, methodCallKind(c, "unwrap_or").?);
+    try testing.expectEqual(Kind.bool, methodCallKind(c, "is_error").?);
+    // `expect`/`or` yield the FIRST type-arg (the `ok` payload), int here.
+    try testing.expectEqual(Kind.int, methodCallKind(c, "expect").?);
+    try testing.expectEqual(Kind.int, methodCallKind(c, "or").?);
 }
 
-test "unwrap_or with a wrong-typed default is exactly one diagnostic" {
+test "expect takes exactly one str message" {
+    for ([_][]const u8{ "x.expect()", "x.expect(1)", "x.expect(\"a\", \"b\")" }) |call| {
+        var buf: [128]u8 = undefined;
+        const src = try std.fmt.bufPrint(&buf, "fn main() -> int {{\n x := Option[int].some(7)\n return {s}\n}}\n", .{call});
+        try testing.expectEqual(@as(usize, 1), try checkDiagCount(src));
+    }
+}
+
+test "unwrap, unwrap_or, is_err and map_err are not methods of Option or Result" {
+    const cases = [_][]const u8{
+        "fn main() -> int {\n x := Option[int].some(7)\n return x.unwrap()\n}\n",
+        "fn main() -> int {\n x := Option[int].some(7)\n return x.unwrap_or(0)\n}\n",
+        "fn main() -> int {\n x := Result[int, str].ok(7)\n return if x.is_err() { 1 } else { 0 }\n}\n",
+        "fn main() -> int {\n x := Result[int, str].ok(7)\n _y := x.map_err(fn(e: str) { e.len() })\n return 0\n}\n",
+    };
+    const gpa = testing.allocator;
+    for (cases, [_][]const u8{ "unwrap", "unwrap_or", "is_err", "map_err" }) |src, name| {
+        var c = try checkSource(src);
+        defer c.deinit(gpa);
+        try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+        const d = c.result.diags[0];
+        try testing.expectEqual(codes.Code.T0018, d.code);
+        var buf: [64]u8 = undefined;
+        try testing.expect(std.mem.startsWith(u8, d.message, try std.fmt.bufPrint(&buf, "no method '{s}' on type", .{name})));
+        try testing.expect(std.mem.indexOf(u8, d.message, "std/") == null);
+    }
+}
+
+test "or with a wrong-typed default is exactly one diagnostic" {
     try testing.expectEqual(@as(usize, 1), try checkDiagCount(
         \\fn main() -> int {
         \\ x := Option[int].some(7)
-        \\ return x.unwrap_or("s")
+        \\ return x.or("s")
         \\}
         \\
     ));
@@ -6467,7 +6495,7 @@ test "a std/option method without the import is T0018 naming std/option" {
         \\ o := Option[int].some(7)
         \\ r: Result[int, str] = Result.err("bad")
         \\ _a := o.map(fn(v: int) { v + 1 })
-        \\ _b := r.map_err(fn(e: str) { e.len() })
+        \\ _b := r.map_error(fn(e: str) { e.len() })
         \\ _c := Shade.dark.map(fn(v: int) { v })
         \\ return 0
         \\}
@@ -6479,7 +6507,7 @@ test "a std/option method without the import is T0018 naming std/option" {
     for (c.result.diags) |d| try testing.expectEqual(codes.Code.T0018, d.code);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, "'map' on type 'Option'") != null);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[0].message, hint) != null);
-    try testing.expect(std.mem.indexOf(u8, c.result.diags[1].message, "'map_err' on type 'Result'") != null);
+    try testing.expect(std.mem.indexOf(u8, c.result.diags[1].message, "'map_error' on type 'Result'") != null);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[1].message, hint) != null);
     try testing.expect(std.mem.indexOf(u8, c.result.diags[2].message, hint) == null);
 }
@@ -6510,46 +6538,46 @@ test "std/str methods do not shadow the builtin str methods" {
     try expectNoPending(&c.result);
 }
 
-test "unwrap on a str (aggregate) payload is accepted — no diagnostic" {
+test "expect on a str (aggregate) payload is accepted — no diagnostic" {
     try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         \\fn main() -> int {
         \\ x := Option[str].some("hi")
-        \\ s := x.unwrap()
+        \\ s := x.expect("no value")
         \\ return 0
         \\}
         \\
     ));
 }
 
-test "unwrap_or on a str (aggregate) payload is accepted — no diagnostic" {
+test "or on a str (aggregate) payload is accepted — no diagnostic" {
     try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         \\fn main() -> int {
         \\ x := Option[str].some("hi")
-        \\ s := x.unwrap_or("d")
+        \\ s := x.or("d")
         \\ return 0
         \\}
         \\
     ));
 }
 
-test "unwrap on a struct (aggregate) payload is accepted — no diagnostic" {
+test "expect on a struct (aggregate) payload is accepted — no diagnostic" {
     try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         \\struct P { x: int }
         \\fn main() -> int {
         \\ x := Option[P].some(P { x: 40 })
-        \\ p := x.unwrap()
+        \\ p := x.expect("no value")
         \\ return 0
         \\}
         \\
     ));
 }
 
-test "unwrap_or on a struct (aggregate) payload is accepted — no diagnostic" {
+test "or on a struct (aggregate) payload is accepted — no diagnostic" {
     try testing.expectEqual(@as(usize, 0), try checkDiagCount(
         \\struct P { x: int }
         \\fn main() -> int {
         \\ d := P { x: 2 }
-        \\ p := Option[P].none.unwrap_or(d)
+        \\ p := Option[P].none.or(d)
         \\ return 0
         \\}
         \\
@@ -10690,12 +10718,12 @@ test "witnessProtocolId resolves into/try_into to the bundle ids" {
     try testing.expectEqual(@as(?u32, 10), witnessProtocolId(ids, "try_into"));
 }
 
-test "chained `wide.try_into().unwrap()` leaks the int target to try_into" {
+test "chained `wide.try_into().expect(\"no value\")` leaks the int target to try_into" {
     const gpa = testing.allocator;
     var c = try checkSource(
         \\fn main() -> int {
         \\  wide: uint = 200
-        \\  back: uint8 = wide.try_into().unwrap()
+        \\  back: uint8 = wide.try_into().expect("no value")
         \\  return if back == 200 { 42 } else { 0 }
         \\}
         \\
@@ -10704,7 +10732,7 @@ test "chained `wide.try_into().unwrap()` leaks the int target to try_into" {
     try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 
     var saw_try_into = false;
-    var saw_unwrap = false;
+    var saw_expect = false;
     for (c.tree.nodes, 0..) |n, i| {
         if (n.tag != .call) continue;
         const callee = c.tree.nodes[n.lhs.int()];
@@ -10715,12 +10743,12 @@ test "chained `wide.try_into().unwrap()` leaks the int target to try_into" {
             saw_try_into = true;
             // Result[uint8, ConvErr] — an aggregate, never a bare scalar/invalid.
             try testing.expect(ty.kind == .@"enum" or ty.kind == .app);
-        } else if (std.mem.eql(u8, member, "unwrap")) {
-            saw_unwrap = true;
+        } else if (std.mem.eql(u8, member, "expect")) {
+            saw_expect = true;
             try testing.expectEqual(Type.uint8, ty);
         }
     }
-    try testing.expect(saw_try_into and saw_unwrap);
+    try testing.expect(saw_try_into and saw_expect);
 }
 
 test "narrowing via `into` is rejected (no silent lossy conversion)" {
@@ -10968,14 +10996,14 @@ test "every dispatch branch records its callee" {
             \\    ok: Result[int, bool] = Result.ok(1)
             \\    err: Result[int, bool] = Result.err(false)
             \\    if !ok.is_ok() { return 14 }
-            \\    if !err.is_err() { return 15 }
+            \\    if !err.is_error() { return 15 }
             \\    small: uint8 = 5
             \\    w: uint = small.into()
             \\    big: uint = 300
-            \\    back: uint8 = big.try_into().unwrap_or(0)
+            \\    back: uint8 = big.try_into().or(0)
             \\    if back != 0 { return 16 }
             \\    if w != 5 { return 17 }
-            \\    return some.unwrap() + none.unwrap_or(2)
+            \\    return some.expect("no value") + none.or(2)
             \\}
             \\
         );
@@ -10992,11 +11020,11 @@ test "every dispatch branch records its callee" {
             .{ .member = "is_some", .count = 1, .k = .opt_is_tag0 },
             .{ .member = "is_ok", .count = 1, .k = .opt_is_tag0 },
             .{ .member = "is_none", .count = 1, .k = .opt_is_tag1 },
-            .{ .member = "is_err", .count = 1, .k = .opt_is_tag1 },
+            .{ .member = "is_error", .count = 1, .k = .opt_is_tag1 },
             .{ .member = "into", .count = 1, .k = .conv_into },
             .{ .member = "try_into", .count = 1, .k = .conv_try_into },
-            .{ .member = "unwrap", .count = 1, .k = .opt_unwrap },
-            .{ .member = "unwrap_or", .count = 2, .k = .opt_unwrap_or },
+            .{ .member = "expect", .count = 1, .k = .opt_expect },
+            .{ .member = "or", .count = 2, .k = .opt_or },
         };
         for (wants) |w| {
             for (0..w.count) |nth| try testing.expectEqual(Callee.View{ .builtin = w.k }, try calleeView(&c, w.member, nth));
@@ -11230,7 +11258,7 @@ test "a '_' capture takes its param type from the position of its '_'" {
         \\ at := Pt(_, 4)
         \\ _q := at(1)
         \\ o: Option[bool] = Option.none
-        \\ d := o.unwrap_or(_)
+        \\ d := o.or(_)
         \\ _r := d(true)
         \\ return inc(1) + p(1) + h(true)
         \\}
@@ -11756,7 +11784,7 @@ test "a struct literal's field value is typed against its field" {
         \\fn main() -> int {
         \\ p := P { x: 5, o: .none }
         \\ q: P = P { x: 6, o: Option.some(1) }
-        \\ return if p.x == 5 { q.o.unwrap() } else { 0 }
+        \\ return if p.x == 5 { q.o.expect("no value") } else { 0 }
         \\}
         \\
     );
@@ -12116,7 +12144,7 @@ test "return and ? are local to the lambda" {
             \\  v := o?
             \\  .some(v + 1)
             \\ }
-            \\ return f(.some(1)).unwrap_or(0)
+            \\ return f(.some(1)).or(0)
             \\}
             \\
         );
@@ -12858,7 +12886,7 @@ test "missing return in a local fn is T0043" {
             \\  return .some(v + 1)
             \\ }
             \\ fn bad() -> int { return true }
-            \\ return next(.some(1)).unwrap_or(0) + bad()
+            \\ return next(.some(1)).or(0) + bad()
             \\}
             \\
         );
@@ -13184,7 +13212,7 @@ test "a builtin method as a value is T0049" {
     const msg = "'len' is a built-in method and cannot be used as a value; wrap the call in a lambda";
     try expectOneDiag("fn main() -> int {\n s := \"hi\"\n f := s.len\n return f()\n}\n", .T0049, msg);
     try expectOneDiag("fn main() -> int {\n n := 1\n f := n.eq\n return if f(1) { 1 } else { 0 }\n}\n", .T0049, "'eq' is a built-in method and cannot be used as a value; wrap the call in a lambda");
-    try expectOneDiag("fn main() -> int {\n o: Option[int] = .some(1)\n f := o.unwrap\n return f()\n}\n", .T0049, "'unwrap' is a built-in method and cannot be used as a value; wrap the call in a lambda");
+    try expectOneDiag("fn main() -> int {\n o: Option[int] = .some(1)\n f := o.expect\n return f()\n}\n", .T0049, "'expect' is a built-in method and cannot be used as a value; wrap the call in a lambda");
     try expectOneDiag("struct P { x: int }\nfn main() -> int {\n p := P { x: 1 }\n f := p.to_string\n return 0\n}\n", .T0049, "'to_string' is a built-in method and cannot be used as a value; wrap the call in a lambda");
     try expectOneDiag(
         \\protocol Shape { fn area(self) -> int }

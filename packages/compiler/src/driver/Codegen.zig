@@ -935,7 +935,7 @@ test "the calls a for-in and a try_into make are folded into the body's key (#35
         \\    t := 0
         \\    it := It[int] { i: 0, n: 4 }
         \\    for x in it { t = t + x }
-        \\    _c: char = t.try_into().unwrap()
+        \\    _c: char = t.try_into().expect("no value")
         \\    return t
         \\}
         \\

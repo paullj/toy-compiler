@@ -17,7 +17,7 @@ impl P has Tagged[int] {
 }
 
 impl P has Take[int] {
-    fn take(self, n: Option[int]) -> int { n.unwrap_or(0) + self.x }
+    fn take(self, n: Option[int]) -> int { n.or(0) + self.x }
 }
 
 impl P has Wrap {
@@ -28,7 +28,7 @@ fn ret[T has Tagged[int]](x: T, n: int) -> Option[int] { x.tag(n) }
 
 fn local[T has Tagged[int]](x: T, n: int) -> int {
     r := x.tag(n)
-    return r.unwrap_or(0)
+    return r.or(0)
 }
 
 fn explicit[T has Tagged[int]](x: T, n: int) -> Option[int] { x.tag[int](n) }
@@ -42,9 +42,9 @@ fn wrapped[U, T has Wrap](_u: U, x: T) -> int {
 
 fn main() -> int {
     p := P { x: 1 }
-    io.println(ret(p, 2).unwrap_or(0))
+    io.println(ret(p, 2).or(0))
     io.println(local(p, 2))
-    io.println(explicit(p, 2).unwrap_or(0))
+    io.println(explicit(p, 2).or(0))
     io.println(param(p, 2))
     io.println(wrapped(true, p))
     return wrapped(0, p)

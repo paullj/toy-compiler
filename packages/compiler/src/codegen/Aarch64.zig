@@ -484,7 +484,7 @@ pub const ldpFpLrPost: u32 = 0xA8C17BFD;
 pub const ret: u32 = 0xD65F03C0;
 
 /// brk #0 — a software breakpoint that aborts with SIGILL. The backstop after the
-/// `bl panic` that the `.trap` and `.panic` IR terminators emit, should `panic` ever
+/// `bl panic` that the `.panic` IR terminator emits, should `panic` ever
 /// return. → 0xD4200000.
 pub const brk0: u32 = 0xD4200000;
 

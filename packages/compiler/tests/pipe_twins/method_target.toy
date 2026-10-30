@@ -7,5 +7,5 @@ fn main() -> int {
     v.push(4)
     v.push(5)
     last := v.get(2)
-    return v.len() + last.unwrap() + 4
+    return v.len() + last.expect("no value") + 4
 }

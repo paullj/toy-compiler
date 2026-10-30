@@ -8,8 +8,8 @@ fn main() -> int {
     m.set(Point{ x: 1, y: 2 }, 10)
     m.set(Point{ x: 3, y: 4 }, 20)
     if m.len() != 2 { return 1 }
-    if m.get(Point{ x: 1, y: 2 }).unwrap_or(0) != 10 { return 2 }
-    if m.get(Point{ x: 3, y: 4 }).unwrap_or(0) != 20 { return 3 }
-    if m.get(Point{ x: 9, y: 9 }).unwrap_or(-1) != -1 { return 4 }
+    if m.get(Point{ x: 1, y: 2 }).or(0) != 10 { return 2 }
+    if m.get(Point{ x: 3, y: 4 }).or(0) != 20 { return 3 }
+    if m.get(Point{ x: 9, y: 9 }).or(-1) != -1 { return 4 }
     return 0
 }

@@ -56,7 +56,7 @@ pub const method_fixture =
     \\    s := "hi".concat("!")
     \\    e := if (3).eq(3) { 1 } else { 0 }
     \\    o: Option[int] = Option.some(4)
-    \\    u := o.unwrap() + o.unwrap_or(0)
+    \\    u := o.expect("no value") + o.or(0)
     \\    k := Key { a: 1 }.hash()
     \\    _k := Kind.plus
     \\    return x + y + g + s.len() + e + u + k + twice(acc)

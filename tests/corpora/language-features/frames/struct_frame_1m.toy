@@ -38,7 +38,7 @@ fn main() -> int {
     churn()
     io.println(x.e0.d0.c0.b0.a0 + x.e7.d7.c7.b7.a7 + y.e7.d7.c7.b7.a7)
     io.println(far)
-    io.println(held.get(0).unwrap_or(0))
+    io.println(held.get(0).or(0))
     io.println(y.name)
     return 0
 }

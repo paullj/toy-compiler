@@ -16,5 +16,5 @@ fn main() -> int {
     ps: Vec[P] = [P { k: 2, s: "a" }, P { k: 1, s: "b" }, P { k: 2, s: "c" }, P { k: 1, s: "d" }]
     ps.sort_by(fn(a, b) { a.k < b.k })
     io.println(ps.fold("", fn(acc, p) { acc.concat(p.s) }))
-    return xs.get(0).unwrap()
+    return xs.get(0).expect("no value")
 }

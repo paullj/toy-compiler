@@ -248,7 +248,7 @@ fn markEscapes(func: *const Ir.Function, def: []const ?Ir.Op, escaped: []bool) v
                 },
                 .none => {},
             },
-            .cond_br, .@"unreachable", .trap, .panic => {},
+            .cond_br, .@"unreachable", .panic => {},
         }
     }
 }

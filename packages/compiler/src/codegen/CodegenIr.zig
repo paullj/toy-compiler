@@ -986,7 +986,7 @@ fn genCallIndirect(g: *Gen, result: Ir.ValueId, c: Ir.CallIndirect) error{OutOfM
 /// display literal dedups to one `__cstring` blob entry; distinct hashes are harmless.
 const panic_lit_seed: u64 = 0x10c5_7e87;
 
-/// Retarget a `.panic`/`.trap` terminator to `panic(msg)`: intern `msg` as a
+/// Retarget a `.panic` terminator to `panic(msg)`: intern `msg` as a
 /// `__cstring` on THIS FnCode, put its ptr in x0 (adrp+add, `.cstr` relocs) and its
 /// byte-length in x1 (every message < 64 KiB -> one `movz`), then `bl panic` (a
 /// `.call26` reloc to the builtin, appended once at link time). The block has no
@@ -1031,7 +1031,6 @@ fn genTerm(g: *Gen, term: Ir.Terminator) error{OutOfMemory}!void {
             try emitEpilogue(g);
         },
         .@"unreachable" => {}, // emit nothing (preserve the never byte budget).
-        .trap => try emitPanicCall(g, "unwrap of empty Option/Result"),
         .panic => |reason| try emitPanicCall(g, switch (reason) {
             .div_by_zero => "division by zero",
             .rem_by_zero => "remainder by zero",

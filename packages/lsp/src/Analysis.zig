@@ -853,8 +853,8 @@ fn selectFrom(an: *const Analysis, a: std.mem.Allocator, fa: u32, c: Callee, nod
                 .scalar_to_string, .display_to_string => .{ .params = try a.dupe(Type, &.{recv}), .ret = Type.str, .names = &.{"self"} },
                 .conv_into, .conv_try_into => .{ .params = try a.dupe(Type, &.{recv}), .ret = call_ty, .names = &.{"self"} },
                 .opt_is_tag0, .opt_is_tag1 => .{ .params = try a.dupe(Type, &.{recv}), .ret = Type.bool, .names = &.{"self"} },
-                .opt_unwrap => .{ .params = try a.dupe(Type, &.{recv}), .ret = call_ty, .names = &.{"self"} },
-                .opt_unwrap_or => .{ .params = try a.dupe(Type, &.{ recv, call_ty }), .ret = call_ty, .names = &.{ "self", "default" } },
+                .opt_expect => .{ .params = try a.dupe(Type, &.{ recv, Type.str }), .ret = call_ty, .names = &.{ "self", "msg" } },
+                .opt_or => .{ .params = try a.dupe(Type, &.{ recv, call_ty }), .ret = call_ty, .names = &.{ "self", "default" } },
             };
             return .{ .name = name, .params = shape.params, .param_names = shape.names, .ret = shape.ret, .has_self = true };
         },
@@ -1011,7 +1011,7 @@ test "calleeAt: every recorded callee in the method fixture yields a signature; 
         try seen.put(gpa, sig.name, {});
         kinds.insert(std.meta.activeTag(v));
     }
-    for ([_][]const u8{ "plus", "make", "get", "dbl", "concat", "eq", "unwrap", "unwrap_or", "hash", "len" }) |want| {
+    for ([_][]const u8{ "plus", "make", "get", "dbl", "concat", "eq", "expect", "or", "hash", "len" }) |want| {
         if (!seen.contains(want)) {
             std.debug.print("no callee recorded for '{s}'\n", .{want});
             return error.MissingCallee;
@@ -1082,7 +1082,7 @@ test "a discovery that fails leaves only diagnostics" {
 
 test "hover, definition and signature help agree on what each token of the method fixtures is" {
     for ([_]struct { src: []const u8, calls: usize }{
-        // plus (twice), make, get, concat, eq, unwrap, unwrap_or, hash, len, dbl (twice), twice.
+        // plus (twice), make, get, concat, eq, expect, or, hash, len, dbl (twice), twice.
         .{ .src = test_util.method_fixture, .calls = 13 },
         // get (three times), plus, twice, use_box, with_acc (twice).
         .{ .src = test_util.generic_body_fixture, .calls = 8 },

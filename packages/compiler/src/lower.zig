@@ -915,8 +915,8 @@ fn lowerUnary(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!
 /// block, nonzero -> a fresh continuation the builder is left positioned in. Value-
 /// free by design (no join/merge param) — the panic path never produces a value, so
 /// the divide emitted afterward in `cont` is an ordinary SSA value dominating its
-/// uses. Modeled on the `unwrap` trap-block; block ids are handed out in a fixed
-/// per-call order so `--verify` re-lower stays byte-identical.
+/// uses. Block ids are handed out in a fixed per-call order so `--verify` re-lower
+/// stays byte-identical.
 fn emitZeroGuard(b: *Builder, rhs: Ir.ValueId, ty: Typecheck.Type, reason: Ir.Terminator.PanicReason) error{OutOfMemory}!void {
     const zero = try b.emit(.{ .iconst = 0 }, ty);
     const is_zero = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = rhs, .rhs = zero } }, Typecheck.Type.bool);
@@ -2574,7 +2574,7 @@ noinline fn lowerBuiltinMethod(b: *Builder, node_idx: Ast.Index, n: Ast.Node, k:
             const op = try lowerExpr(b, recv);
             return .{ .slot = try displayToSlot(b, recv_ty, op) };
         },
-        .opt_is_tag0, .opt_is_tag1, .opt_unwrap, .opt_unwrap_or => return try lowerOptionResultMethod(b, n, .{ .recv = recv, .op = Typecheck.builtinOptResult(k).? }),
+        .opt_is_tag0, .opt_is_tag1, .opt_expect, .opt_or => return try lowerOptionResultMethod(b, n, .{ .recv = recv, .op = Typecheck.builtinOptResult(k).? }),
         .conv_into => return try lowerConvMethod(b, node_idx, .{ .recv = recv, .into = true }),
         .conv_try_into => return try lowerConvMethod(b, node_idx, .{ .recv = recv, .into = false }),
     }
@@ -2598,11 +2598,11 @@ fn calleeOf(b: *const Builder, n: Ast.Node) Callee.View {
 }
 
 /// Inline a native `Option`/`Result` method. The receiver is materialized into a
-/// fresh slot (so a temporary construction receiver like `Option[int].some(40).unwrap()`
+/// fresh slot (so a temporary construction receiver like `Option[int].some(40).expect("..")`
 /// works, not just a local), giving a base ptr for `get_tag` + the payload load. Variant
 /// 0 is the payload variant, 1 the absence/error (fixed by `registerPrelude`), so
-/// `tag == 0` means present. `is_some`/`is_ok` = `tag == 0`; `is_none`/`is_err` =
-/// `tag == 1`; `unwrap` cond-branches to a `.trap` on absence; `unwrap_or` merges the
+/// `tag == 0` means present. `is_some`/`is_ok` = `tag == 0`; `is_none`/`is_error` =
+/// `tag == 1`; `expect` cond-branches to a runtime `panic` with its message on absence; `or` merges the
 /// payload / the default through a join block-arg. Scalar-payload T only (the accept
 /// set is int/bool); aggregate-payload T is deferred (its builtin Callee already keeps it
 /// from misrouting as a variant construction).
@@ -2612,7 +2612,7 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
     const recv_ty = b.in.nodes.typeOf(om.recv);
     const e = b.in.enum_layouts[recv_ty.enum_id];
 
-    // The native path ships scalar-payload `unwrap`/`unwrap_or` only: a non-scalar payload would
+    // The native path ships scalar-payload `expect`/`or` only: a non-scalar payload would
     // truncate a str/aggregate to one 8-byte load, and an aggregate join block-arg
     // crashes codegen (unassigned value offset). The checker already rejects this with
     // T0018, so this is a defensive clean-fail should an aggregate reach `lower`.
@@ -2627,12 +2627,12 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
             const kv = try b.emit(.{ .iconst = k }, int_ty);
             return .{ .value = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = kv } }, bool_ty) };
         },
-        .unwrap => {
+        .expect => {
             const payload_ty = Typecheck.somePayload(e);
             const zero = try b.emit(.{ .iconst = 0 }, int_ty);
             const present = try b.emit(.{ .icmp = .{ .cc = .eq, .lhs = tag, .rhs = zero } }, bool_ty);
             const ok_blk = try b.addBlock();
-            const trap_blk = try b.addBlock();
+            const absent_blk = try b.addBlock();
             const join = try b.addBlock();
             // An AGGREGATE payload (str/struct/enum) cannot ride a join block-arg (a
             // struct phi crashes codegen); route it through a result slot the some-arm
@@ -2640,13 +2640,13 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
             // A scalar/ref payload keeps the block-arg join, so its IR is byte-identical.
             if (isAggTy(b, payload_ty)) {
                 const res = try aggSlot(b, payload_ty);
-                b.setTerm(.{ .cond_br = .{ .cond = present, .t = ok_blk, .f = trap_blk } });
+                b.setTerm(.{ .cond_br = .{ .cond = present, .t = ok_blk, .f = absent_blk } });
                 b.switchTo(ok_blk);
                 const src = try addrAtOff(b, base, Typecheck.payloadAddr(e, 0), payload_ty);
                 try copyValueByType(b, res.addr, src, payload_ty);
                 try brTo(b, join, .none);
-                b.switchTo(trap_blk);
-                b.setTerm(.trap);
+                b.switchTo(absent_blk);
+                try lowerExpectPanic(b, n);
                 b.switchTo(join);
                 return .{ .slot = res.slot };
             }
@@ -2655,15 +2655,15 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
                 else => payload_ty,
             };
             const merge = try b.addParam(join, merge_ty);
-            b.setTerm(.{ .cond_br = .{ .cond = present, .t = ok_blk, .f = trap_blk } });
+            b.setTerm(.{ .cond_br = .{ .cond = present, .t = ok_blk, .f = absent_blk } });
             b.switchTo(ok_blk);
             try brTo(b, join, .{ .value = try loadNativePayload(b, e, base) });
-            b.switchTo(trap_blk);
-            b.setTerm(.trap);
+            b.switchTo(absent_blk);
+            try lowerExpectPanic(b, n);
             b.switchTo(join);
             return .{ .value = merge };
         },
-        .unwrap_or => {
+        .@"or" => {
             const payload_ty = Typecheck.somePayload(e);
             const args = Ast.rangeSlice(b.in.tree, (n.rhs).int());
             const zero = try b.emit(.{ .iconst = 0 }, int_ty);
@@ -2698,6 +2698,22 @@ fn lowerOptionResultMethod(b: *Builder, n: Ast.Node, om: OptResultCall) error{Ou
             return .{ .value = merge };
         },
     }
+}
+
+const panic_sym: Link.SymName = .{ .kind = .builtin, .name = "panic" };
+
+/// The absent arm of `expect(msg)`: the message is evaluated only here, so building it
+/// costs nothing on the present path, and it reaches the same runtime `panic` a
+/// `panic(msg)` call does.
+fn lowerExpectPanic(b: *Builder, n: Ast.Node) error{OutOfMemory}!void {
+    const msg = Ast.rangeSlice(b.in.tree, (n.rhs).int())[0];
+    const op = try lowerExpr(b, msg);
+    if (b.in.nodes.typeOf(msg).kind == .never) return;
+    const args = try b.gpa.alloc(Ir.Operand, 1);
+    errdefer b.gpa.free(args);
+    args[0] = op;
+    _ = try b.emit(.{ .call = .{ .callee = panic_sym, .args = args, .ret_slot = Ir.none_slot } }, null);
+    b.setTerm(.@"unreachable");
 }
 
 /// Re-canonicalize `v` to `ty`'s width via the existing `add v, 0` → `normalizeWidth`
@@ -3591,7 +3607,7 @@ fn lowerTryValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) error{Out
 ///     happy:    extract variant-0's payload into `dst_ptr`; control continues.
 ///
 /// Handles AGGREGATE payloads via field_addr + `copy` (NOT the scalar-only native
-/// `unwrap`). Variant 0 is the payload (some/ok), variant 1 the residual (none/err),
+/// `expect`). Variant 0 is the payload (some/ok), variant 1 the residual (none/err),
 /// fixed by `registerPrelude`.
 fn lowerTryInto(b: *Builder, node_idx: Ast.Index, dst_ptr: Ir.ValueId, ty: Typecheck.Type) error{OutOfMemory}!void {
     const int_ty = Typecheck.Type.int;
@@ -3713,7 +3729,7 @@ fn buildResidual(b: *Builder, op_base: Ir.ValueId, ol: Typecheck.EnumLayout, tok
 
 /// A fresh temp slot for an aggregate result, paired with its base address. The
 /// `Option`/`Result` aggregate-payload arms take the slot BEFORE the branch (its addr
-/// must dominate both arms — `unwrap_or` writes the default into it from the none arm),
+/// must dominate both arms — `or` writes the default into it from the none arm),
 /// then copy the payload in the happy arm, so they hold the pieces apart rather than
 /// calling `materializeAgg`.
 const AggSlot = struct { slot: Ir.SlotId, addr: Ir.ValueId };

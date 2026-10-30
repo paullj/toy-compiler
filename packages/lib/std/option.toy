@@ -1,5 +1,5 @@
 # The closure methods of the prelude `Option` and `Result`. Every method is generic, so
-# only the instances a program calls are emitted. `or_else` is the lazy `unwrap_or`: its
+# only the instances a program calls are emitted. `or_else` is the lazy `or`: its
 # function runs only when there is no value. The methods exist when the program imports
 # `std/option`, as `Ref`'s exist with `std/ref`.
 
@@ -41,7 +41,7 @@ impl Result[T, E] {
         }
     }
 
-    fn map_err[F](self, f: fn(E) -> F) -> Result[T, F] {
+    fn map_error[F](self, f: fn(E) -> F) -> Result[T, F] {
         match self {
             .ok(v) -> Result.ok(v),
             .err(e) -> Result.err(f(e)),

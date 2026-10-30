@@ -208,11 +208,6 @@ pub const Terminator = union(enum) {
     /// Function return. Emitted only by the single EXIT block; `.none` for unit.
     ret: Operand,
     @"unreachable",
-    /// The failure arm of `Option`/`Result` `unwrap`: codegen calls the runtime
-    /// `panic` with a fixed message (then a `brk #0` backstop). Distinct from
-    /// `.@"unreachable"`, which emits NOTHING: it ends a block control never reaches
-    /// the end of, such as one ending in a never-typed call. No successors (like `ret`).
-    trap,
     /// A runtime panic with a known cause: codegen calls the runtime `panic` with the
     /// reason's message, which prints it and a backtrace and exits 1 (then a `brk #0`
     /// backstop). No successors.
@@ -542,7 +537,6 @@ fn renderTerm(out: *std.Io.Writer, term: Terminator) anyerror!void {
             }
         },
         .@"unreachable" => try out.writeAll("  unreachable\n"),
-        .trap => try out.writeAll("  trap\n"),
         .panic => |r| try out.print("  panic {s}\n", .{@tagName(r)}),
     }
 }

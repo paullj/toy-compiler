@@ -14,18 +14,18 @@ fn add(a: int, b: int) -> int { a + b }
 fn main() -> int {
     o: Option[int] = Option.some(4)
     n: Option[int] = Option.none
-    a := o.map(fn(v) { v * 10 }).unwrap_or(0)
-    b := n.map(fn(v) { v * 10 }).unwrap_or(7)
-    io.println(o.map(fn(v) { v.to_string().concat("!") }).unwrap_or("none"))
-    io.println(n.map(fn(v) { v.to_string().concat("!") }).unwrap_or("none"))
+    a := o.map(fn(v) { v * 10 }).or(0)
+    b := n.map(fn(v) { v * 10 }).or(7)
+    io.println(o.map(fn(v) { v.to_string().concat("!") }).or("none"))
+    io.println(n.map(fn(v) { v.to_string().concat("!") }).or("none"))
     big := o.map(fn(v) { v > 3 })
     small := n.map(fn(v) { v > 3 })
-    c := o.map(add(1, _)).unwrap_or(0)
-    d := n.map(add(1, _)).unwrap_or(-1)
+    c := o.map(add(1, _)).or(0)
+    d := n.map(add(1, _)).or(-1)
     p := o.map(fn(v) { P { x: v, y: v + 1 } })
-    e := p.map(fn(q) { q.x * q.y }).unwrap_or(0)
+    e := p.map(fn(q) { q.x * q.y }).or(0)
     vs := o.map(fn(v) { [v, v, v] })
-    f := vs.map(fn(xs) { xs.len() }).unwrap_or(0)
-    if !big.unwrap() || small.is_some() { return 1 }
+    f := vs.map(fn(xs) { xs.len() }).or(0)
+    if !big.expect("no value") || small.is_some() { return 1 }
     return a + b + c + d + e + f
 }

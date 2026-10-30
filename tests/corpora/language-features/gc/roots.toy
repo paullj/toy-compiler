@@ -25,5 +25,5 @@ fn main() -> int {
         i = i + 1
     }
     it := keep.items
-    return it.get(0).unwrap_or(0)
+    return it.get(0).or(0)
 }

@@ -36,7 +36,7 @@ test "ref: two independent Ref.new(41) boxes compare UNEQUAL (cell identity, not
     try std.testing.expectEqual(@as(u8, 1), code);
 }
 
-test "ref: Option[Ref[int]] unwrap-some yields the boxed value; absence takes the default" {
+test "ref: Option[Ref[int]] expect-some yields the boxed value; absence takes the default" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -50,7 +50,7 @@ test "ref: Option[Ref[int]] unwrap-some yields the boxed value; absence takes th
         \\}
         \\fn main() -> int {
         \\    a := pick(true)
-        \\    base := if a.is_some() { a.unwrap().get() } else { 0 }
+        \\    base := if a.is_some() { a.expect("no value").get() } else { 0 }
         \\    b := pick(false)
         \\    extra := if b.is_some() { 0 } else { 2 }
         \\    return base + extra

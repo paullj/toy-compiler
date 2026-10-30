@@ -26,9 +26,9 @@ fn main() -> int {
     empty: Vec[str] = []
     n := 0
     if ", ".join(empty) == "" { n = n + 1 }
-    if parts.get(2).unwrap() == "" { n = n + 1 }
-    if parts.get(3).unwrap() == "ccc" { n = n + 1 }
-    if "abc".split("").get(0).unwrap() == "abc" { n = n + 1 }
+    if parts.get(2).expect("no value") == "" { n = n + 1 }
+    if parts.get(3).expect("no value") == "ccc" { n = n + 1 }
+    if "abc".split("").get(0).expect("no value") == "abc" { n = n + 1 }
     single: Vec[str] = ["solo"]
     if "+".join(single) == "solo" { n = n + 1 }
     if "".join(["a", "b", "c"]) == "abc" { n = n + 1 }

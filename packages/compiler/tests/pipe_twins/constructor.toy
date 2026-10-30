@@ -12,5 +12,5 @@ fn main() -> int {
     a := Option.some(5)
     b := Option[int].some(2)
     r := width(Shape.rect(3, 1))
-    return a.unwrap() + b.unwrap() + r + 2
+    return a.expect("no value") + b.expect("no value") + r + 2
 }

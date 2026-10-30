@@ -172,7 +172,7 @@ test "unit: a bare () is a usable Map key / Set element (zero-sized key witnesse
         \\fn main() -> int {
         \\    m := Map[(), int].new()
         \\    m.set((), 42)
-        \\    return m.get(()).unwrap_or(0)
+        \\    return m.get(()).or(0)
         \\}
         \\
     ;

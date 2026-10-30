@@ -198,7 +198,7 @@ There is one sharing model, so the `&x` / `*r` operators were removed.
 | Type | Methods |
 |---|---|
 | `Vec` | `map`, `filter`, `each`, `fold(init, f)`, `any`, `all`, `find` → `Option`, `sort()` (for `Ord`), `sort_by(less)`, `set(i, x)` (panics out of bounds; `xs[i] = x` is the same store) |
-| `Option` / `Result` | `map(f: fn(T) -> U)`, `then(f: fn(T) -> Option[U])` (and-then; `fn(T) -> Result[U, E]` on `Result`), `or_else(f: fn() -> T) -> T` (`fn(E) -> T` on `Result`), `map_err(f: fn(E) -> F) -> Result[T, F]` |
+| `Option` / `Result` | `map(f: fn(T) -> U)`, `then(f: fn(T) -> Option[U])` (and-then; `fn(T) -> Result[U, E]` on `Result`), `or_else(f: fn() -> T) -> T` (`fn(E) -> T` on `Result`), `map_error(f: fn(E) -> F) -> Result[T, F]` |
 | `str` | `split(sep) -> Vec[str]`, `sep.join(parts: Vec[str])`, `trim`, `contains`, `starts_with`, `ends_with`, `replace(from, to)`, `chars()` → `Chars[char]`, an iterator of `char` |
 | `Map` | `each(f: fn(K, V))`, `filter(f: fn(K, V) -> bool) -> Map[K, V]`, `map(f: fn(V) -> W) -> Map[K, W]` (maps the values), `keys() -> Vec[K]`, `values() -> Vec[V]` |
 | `Set` | `each(f: fn(T))`, `filter(f: fn(T) -> bool) -> Set[T]`, `map(f: fn(T) -> U) -> Set[U]` (`U` Hashable) |
@@ -208,10 +208,10 @@ There is one sharing model, so the `&x` / `*r` operators were removed.
 - **Order:** a `Map` or `Set` iterates in insertion order: the order keys were first added. Setting an existing key keeps its place, and there is no removal. `for`, `each`, `keys`, `values`, `filter` and `map` all follow it, and the maps and sets that `filter` and `map` return keep it. `Set.map` keeps one of two elements that map to one value, at the first one's place.
 - **`keys` and `values`:** they return a `Vec`, so `std/map` imports `std/vec`. A program that imports `std/map` can call them, and the methods of the `Vec` they return, with no import of `std/vec`; naming the type `Vec` still needs one.
 - **Escapes:** a std method only calls the functions passed to it, so they never escape (see Escape analysis).
-- **Option and Result:** the methods are in `std/option` (`import std/option`), as `Ref`'s methods are in `std/ref`. Without the import, a call is T0018 "add 'import std/option'". `is_some`, `unwrap`, `unwrap_or` and the other built-in methods need no import.
-- **`or_else(f)`** is the lazy `unwrap_or`: `f` runs only on `none` or `err`.
+- **Option and Result:** the methods are in `std/option` (`import std/option`), as `Ref`'s methods are in `std/ref`. Without the import, a call is T0018 "add 'import std/option'". `is_some`, `expect(msg)`, `or` and the other built-in methods need no import. `expect` evaluates `msg` only when there is no value.
+- **`or_else(f)`** is the lazy `or`: `f` runs only on `none` or `err`.
 - **Constructors in a `then` lambda:** write the constructor's type args (`Option[str].none`, `Result[int, str].ok(v)`) or annotate the lambda's return (`fn(v) -> Option[str] { .. }`), which reaches every branch of an `if`/`else` or `match` that is its value. The lambda's return type is not known while `U` is open ([#49](https://github.com/paullj/toy-compiler/issues/49)).
-- **Same-named methods:** a program's own `impl Option[T] { fn map .. }` next to `import std/option`, or `impl str { fn trim .. }` next to `import std/str`, is not an error: the program's own method is the one the program's calls reach, whatever the import order. The same holds for a program's own `Vec`, `Map` or `Set` method, and for a program's method with the name of a builtin (`impl str { fn len .. }`, `impl Option[T] { fn unwrap_or .. }`). Calls written inside std and core never reach it: they keep std's own method or the builtin, so a program's method cannot change what a std method does (a program's `len` on `str` does not move the bounds `trim` reads within). It is warning W0011 at the program's method: for a std method whenever that std module is part of the program, imported directly or through another module, and for a builtin always; renaming the method keeps both.
+- **Same-named methods:** a program's own `impl Option[T] { fn map .. }` next to `import std/option`, or `impl str { fn trim .. }` next to `import std/str`, is not an error: the program's own method is the one the program's calls reach, whatever the import order. The same holds for a program's own `Vec`, `Map` or `Set` method, and for a program's method with the name of a builtin (`impl str { fn len .. }`, `impl Option[T] { fn or .. }`). Calls written inside std and core never reach it: they keep std's own method or the builtin, so a program's method cannot change what a std method does (a program's `len` on `str` does not move the bounds `trim` reads within). It is warning W0011 at the program's method: for a std method whenever that std module is part of the program, imported directly or through another module, and for a builtin always; renaming the method keeps both.
 - **str:** the methods are in `std/str` (`import std/str`); without the import, a call is T0018 "add 'import std/str'". `len`, `byte_at`, `concat` and `to_string` stay built in.
   - Offsets are bytes. The search is a byte-wise scan, which on valid UTF-8 never matches inside a char.
   - `split` and `trim` results share the original's bytes; nothing is copied.
@@ -219,8 +219,6 @@ There is one sharing model, so the `&x` / `*r` operators were removed.
   - `split` keeps empty parts, so n separators give n + 1 parts. An empty separator gives `[self]`, and `replace("", to)` gives `self`.
   - `join` is called on the separator: `", ".join(parts)`. It sums the lengths first and copies each byte once, so `join`, and `replace` through it, are linear in the result.
   - `chars()` decodes UTF-8 and never panics: each invalid sequence (a stray byte, a truncated sequence, an overlong form, a surrogate, a code point past U+10FFFF) yields one U+FFFD. `C0` and `C1` never start a sequence, so `"\xC0\xAF"` gives two.
-
-The names `unwrap`, `unwrap_or`, `is_err` and `map_err` may change; see issue #24. `or_else` follows the name `unwrap_or` gets.
 
 ## Escape analysis
 
@@ -263,6 +261,5 @@ Open issues that touch this page. Each has a repro.
 
 ## Out of scope
 
-- Renaming `Option` / `Result` methods: issue #24.
 - `<T>` type arguments in expression position: issue #23.
 - Full, HM-style inference of lambda parameters from their uses.

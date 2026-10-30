@@ -107,7 +107,7 @@ pub const add_import = "add 'import std/{s}'";
 
 pub const ref_methods = [_][]const u8{ "new", "get", "set", "display" };
 pub const option_methods = [_][]const u8{ "map", "then", "or_else" };
-pub const result_methods = [_][]const u8{ "map", "then", "map_err", "or_else" };
+pub const result_methods = [_][]const u8{ "map", "then", "map_error", "or_else" };
 pub const str_methods = [_][]const u8{ "contains", "starts_with", "ends_with", "trim", "split", "join", "replace", "chars", "parse_int" };
 
 /// A prelude type some of whose methods live in a std module the program imports: `Ref`,
@@ -350,8 +350,8 @@ test "std_methods are the methods each std module declares, and all of them" {
         try std.testing.expectEqual(want, std.mem.count(u8, src, "    fn "));
     }
     try std.testing.expectEqualStrings(importHintFor("Ref").?.module, familyModule(.ref));
-    try std.testing.expectEqualStrings("option", methodModule(.result, "map_err").?);
-    try std.testing.expect(methodModule(.option, "map_err") == null);
+    try std.testing.expectEqualStrings("option", methodModule(.result, "map_error").?);
+    try std.testing.expect(methodModule(.option, "map_error") == null);
 }
 
 test "scalarImplModule names std/float only for float's Display" {

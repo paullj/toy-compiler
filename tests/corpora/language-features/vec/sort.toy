@@ -27,5 +27,5 @@ fn main() -> int {
     empty.sort()
     one: Vec[int] = [7]
     one.sort()
-    return ys.get(0).unwrap() + ys.get(5).unwrap() + empty.len() + one.get(0).unwrap()
+    return ys.get(0).expect("no value") + ys.get(5).expect("no value") + empty.len() + one.get(0).expect("no value")
 }

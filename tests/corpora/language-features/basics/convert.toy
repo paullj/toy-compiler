@@ -2,6 +2,6 @@
 fn main() -> int {
     small: uint8 = 200
     wide: uint   = small.into()
-    back: uint8  = wide.try_into().unwrap()
+    back: uint8  = wide.try_into().expect("no value")
     return if back == 200 { 42 } else { 0 }
 }

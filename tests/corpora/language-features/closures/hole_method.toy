@@ -22,7 +22,7 @@ fn main() -> int {
     add(3)
     add(4)
     o: Option[int] = Option.none
-    d := o.unwrap_or(_)
+    d := o.or(_)
     r2 := d(9)
     b := Box[int] { v: 1 }
     put := b.put(_)
