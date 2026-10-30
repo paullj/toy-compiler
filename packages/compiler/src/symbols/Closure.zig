@@ -16,6 +16,22 @@ const Body = @import("Body.zig");
 /// resolver slot, `first_use` the first identifier node (in resolve order) naming it.
 pub const Capture = struct { slot: u32, first_use: Ast.Index };
 
+/// The names of a group of adjacent local fns: resolver slots `lo..lo + len`, declared
+/// together before any of their bodies, so each body names every fn of the group. A lone
+/// local fn is a group of one; a lambda's is empty. The fns linked by naming each other,
+/// directly or through other fns of the group, share one env; `leader` is the slot of
+/// the first of them, which makes it. A fn that names no sibling keeps its own env, so it
+/// never carries (or keeps alive) captures it does not use.
+pub const Group = struct {
+    lo: u32 = 0,
+    len: u32 = 0,
+    leader: u32 = 0,
+
+    pub fn has(g: Group, slot: u32) bool {
+        return slot >= g.lo and slot - g.lo < g.len;
+    }
+};
+
 /// One lambda or local fn in a fn body, as the resolver saw it.
 pub const Boundary = struct {
     /// The `.lambda` or `.local_fn` node.
@@ -25,10 +41,14 @@ pub const Boundary = struct {
     /// Every slot the lambda declares is at least this; a local below it is declared
     /// outside (resolver slots are handed out monotonically per fn).
     slot_floor: u32,
-    /// A local fn's own name slot, declared just below `slot_floor`. Its body names itself
-    /// through this slot without capturing it: the unit rebuilds its own value from its env.
+    /// A local fn's own name slot, declared below `slot_floor`.
     self_slot: ?u32 = null,
-    /// Ascending slot, deduped; each keeps its first use.
+    /// A local fn's group, its own name included. Its body names the group's fns without
+    /// capturing them: the fns it names share its env, so the unit rebuilds each value
+    /// from its own.
+    group: Group = .{},
+    /// Ascending slot, deduped; each keeps its first use. The fns of a group that share an
+    /// env each list all of its captures.
     captures: []const Capture,
 };
 
@@ -158,8 +178,12 @@ pub const LambdaUnit = struct {
     sig: LayoutEngine.FnSig,
     /// The resolver slot of each param, in order; owned.
     param_slots: []const u32,
-    /// A local fn's own name slot, bound in its prologue to `{its code, its env}`.
+    /// A local fn's own name slot.
     self_slot: ?u32 = null,
+    /// A local fn's group: its prologue binds the name of each fn sharing its env to
+    /// `{that fn's code, its own env}`, and the body that makes the group allocates that
+    /// env at the leader.
+    group: Group = .{},
     /// One per capture, ascending slot; owned.
     env: []const EnvSlot = &.{},
     /// The env cell's byte size; 0 means the lambda's value carries a null env.
@@ -205,6 +229,26 @@ pub fn findUnit(units: []const LambdaUnit, owner: Owner, node: Ast.Index) ?u32 {
     }.order) orelse return null;
     return @intCast(i);
 }
+
+/// The units of `owner`'s local fns that share the env of `g`, in node order.
+pub fn groupUnits(units: []const LambdaUnit, owner: Owner, g: Group) GroupIter {
+    return .{ .units = ownerUnits(units, owner), .group = g };
+}
+
+pub const GroupIter = struct {
+    units: []const LambdaUnit,
+    group: Group,
+    i: usize = 0,
+
+    pub fn next(it: *GroupIter) ?*const LambdaUnit {
+        while (it.i < it.units.len) {
+            const u = &it.units[it.i];
+            it.i += 1;
+            if (u.self_slot != null and std.meta.eql(u.group, it.group)) return u;
+        }
+        return null;
+    }
+};
 
 /// Whether ascending `sorted` holds `x`.
 pub fn contains(sorted: []const u32, x: u32) bool {

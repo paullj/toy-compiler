@@ -73,7 +73,21 @@ fn main() -> int {
 ```
 
 - It can call itself, and it captures like a lambda.
-- It is named only after its declaration, so two local fns cannot call each other: the earlier one's use of the later one is R0001, which says the later one is declared further down. Make them top-level fns instead ([#47](https://github.com/paullj/toy-compiler/issues/47)).
+- **Groups:** a run of local fns with no other statement between them is one group, and each fn in a group can call the others, before or after it ([#47](https://github.com/paullj/toy-compiler/issues/47)):
+
+  ```toy
+  fn main() -> int {
+      fn is_even(n: int) -> bool { if n == 0 { true } else { is_odd(n - 1) } }
+      fn is_odd(n: int) -> bool { if n == 0 { false } else { is_even(n - 1) } }
+      return if is_even(10) { 1 } else { 0 }
+  }
+  ```
+
+  - Only the group's names are known before their declarations. So every local a group fn captures is declared before the group, and no fn of the group can run before a local it captures exists. A local declared after the group is R0001 in the group's bodies.
+  - Fns of a group that name each other, directly or through other fns of the group, share **one env**, which holds every capture of each of them. Each fn's value is its own code with that env, so a fn names the others without capturing them, and the envs never point at each other.
+  - A fn of the group that names no other keeps its own env. So it never carries, or keeps alive, the captures of its neighbours, and it can escape even when a neighbour captures a `mut` param (T0052 only applies to the fns that share that capture).
+  - Since every name of the group is known from its start, a group fn that names a sibling gets the sibling, even where an outer binding of the same name is in scope before the sibling's declaration. The outer binding is shadowed in the whole group (W0009).
+  - A fn outside the group is named only after its declaration: a use before it is R0001, which says that only the local fns next to it can name it earlier.
 - **Recovery:** inside a block, `fn name(` is a nested declaration, so it is no longer a place where a broken block stops.
   - `pub`, `struct`, `enum`, `impl` and `import` still stop a broken block.
   - To make up for this, when EOF is reached inside a function, the "missing `}`" error is reported at the first nested function written no further right than that function (a sibling declaration it swallowed), with the enclosing function as a secondary label. With no such function, the error is the plain "expected '}' to close block" at EOF.
@@ -129,7 +143,8 @@ bump(count)                          # count changes
   - A generic fn is checked once on its own text even when nothing instantiates it, so a library reports its own escaping captures. A call whose callee depends on the type arguments (a generic fn, a protocol method of `T`) is taken not to keep the closure there; each instance decides it.
 - **Limits:**
   - **Where `mut` may appear.** On the params of top-level fns and of inherent-impl methods, static (associated) methods included, and on any `self` receiver where `mut self` is allowed today. It is P0006 on a lambda's params, a local fn's params, an `extern` fn's params, a protocol sig's or a conformance method's params after `self`, and any param past the 64th.
-  - **A conformance method's receiver** is `self` or `mut self` exactly as its protocol method declares it; otherwise T0076. An operator or loop that calls a witness for you (`==`, `<`, `+`, `io.println`, a `Map` key's hash, `for`'s `next`) knows only the protocol, so that is how it passes the receiver. The prelude protocols (`Eq`, `Ord`, the arithmetic ones, `Hash`, `Display`, `From`, `Into`) declare `self`; `std/iter`'s `Iterator.next` declares `mut self`, so every iterator's `next` takes `mut self`, even one that changes nothing.
+  - **A conformance method's receiver** is `self` or `mut self` exactly as its protocol method declares it; otherwise T0076. An operator or loop that calls a witness for you (`==`, `<`, `+`, `io.println`, a `Map` key's hash, `for`'s `next`) knows only the protocol, and so does a generic call `t.m()` on a `T has P`, so that is how it passes the receiver: a copy for `self`, the caller's address for `mut self`. The prelude protocols (`Eq`, `Ord`, the arithmetic ones, `Hash`, `Display`, `From`, `Into`) declare `self`; `std/iter`'s `Iterator.next` declares `mut self`, so every iterator's `next` takes `mut self`, even a read-only one that changes nothing.
+    - **Why exact, not Swift's rule** ([#48](https://github.com/paullj/toy-compiler/issues/48)): letting a `self` witness satisfy a `mut self` requirement would need an adapter per (witness, protocol method) that loads the value and calls it, or a check of the witness's real mode at each protocol call, and boxing and "mutated by" hints would then differ between concrete and generic calls. One calling convention per protocol method is the simpler rule. The other direction cannot work at all: a `mut self` witness given a copy would write the copy, and the change would be lost.
   - **`for x in it`** calls `it.iter()` once, then `next()` on that iterator. `iter` gets its receiver as it declares it: a copy for `iter(self)`, the variable itself for `iter(mut self)`, which then must be a place (T0019 otherwise) and counts as a mutation of it. `next` gets the loop's own iterator by address. `for k, v` does the same.
   - **The argument.** A local (a param, a forwarded `mut` param, a loop variable and a match binding included), a `Vec` element `xs[i]`, or a field / tuple-field chain rooted at either. Not a place (T0019): a literal, a call result, a struct literal or its field, a top-level fn name, a local fn name, a bound method `p.m`.
   - **Elements.** An element has no address, so a `mut` argument, a `mut self` receiver (`ps[i].bump()`) or a `for` over an `iter(mut self)` rooted at one is copy-in/copy-out, as a field store `xs[i].f = v` is: the handle and the index run where the argument is, the element is copied in there, the callee writes the copy, and after the call each copy is written back with `set`, in argument order, the receiver first. The handle is not boxed: a lambda that calls `ps[i].bump()` captures `ps` like any read. A bound `ps[i].bump` is still T0019, because the bound value would outlive the write-back.

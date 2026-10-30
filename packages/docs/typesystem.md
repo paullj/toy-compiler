@@ -631,18 +631,24 @@ error. A capture passed to a bare generic call is typed by its own call, so
 `fn name(p: P, ..) -> R { .. }` as a statement inside a block declares a local
 function: a local `name` of type `fn(P, ..) -> R` (a missing `-> R` is `()`, as for a
 top-level function; every parameter is annotated). The local is bound before the body
-is checked, so the body can call itself; a later local function is not yet in scope,
-so two local functions cannot call each other (R0001). It is checked like an annotated
+is checked, so the body can call itself. A run of adjacent local functions, with no
+other statement between them, is one group: all of its names are bound, and all of
+their types known, before any of its bodies, so they can call each other. Any other
+later local function is not yet in scope (R0001). It is checked like an annotated
 lambda: `return` and `?` exit it (T0043 if a non-unit one can fall off the end), no
 jump leaves it (T0051), and it captures the locals around it by the same copy-or-box
 rule. It cannot be generic (**P0003**) or assigned (**R0007**), and one never named
 after its declaration is **W0003**.
 
 It lowers like a lambda: its unit is `<owner>$l<rank>`, and its declaration makes the
-value `{code, env}` straight into the name's slot. A reference to itself inside its
-body is not a capture: the unit rebuilds the pair from its own code and the env it was
-called with, which is the value its caller holds, so recursion costs no allocation and
-the value compares equal to itself inside and out.
+value `{code, env}` straight into the name's slot. The functions of a group linked by
+naming each other, directly or through others of the group, share one env holding all
+their captures, and the first of them makes it and the value of each of them; a
+function that names no other keeps its own env. A reference to itself, or to another
+function of its group, inside its body is not a capture: the unit rebuilds the pair
+from that function's code and the env it was called with, which is the value its maker
+holds, so recursion costs no allocation and the value compares equal to itself inside
+and out.
 
 ## Bound methods
 

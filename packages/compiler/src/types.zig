@@ -13058,6 +13058,44 @@ test "a box stays when an escaping closure, a bound value or an outer escaping l
     try testing.expectEqualStrings("main.f$l0:f main.f$l1:h main.f$l2:f main.f$l4:f main.f$l3:h ", where.items);
 }
 
+test "linked local fns keep a frame env only if none of them escapes; their leader decides" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn g1(k: int) -> int {
+        \\ x := k
+        \\ fn a() -> int { if x > 0 { b() } else { 0 } }
+        \\ fn b() -> int { x - 1 }
+        \\ a()
+        \\}
+        \\fn g2(k: int) -> fn() -> int {
+        \\ x := k
+        \\ fn a() -> int { b() }
+        \\ fn b() -> int { x }
+        \\ _r := a()
+        \\ b
+        \\}
+        \\fn g3(k: int) -> fn() -> int {
+        \\ x := k
+        \\ fn a() -> int { x }
+        \\ fn b() -> int { 7 }
+        \\ _r := a()
+        \\ b
+        \\}
+        \\fn main() -> int {
+        \\ return g1(1) + g2(2)() + g3(3)()
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    var where: std.ArrayList(u8) = .empty;
+    defer where.deinit(gpa);
+    for (c.result.lambda_units) |u| try where.print(gpa, "{s}:{c}{d} ", .{ u.name, @as(u8, if (u.frame_env != null) 'f' else 'h'), u.env_size });
+    // g2's group escapes only through `b`, so its leader `a` makes a heap env. In g3, `b`
+    // escapes but names no sibling, so it carries no env and `a` keeps a frame one.
+    try testing.expectEqualStrings("main.g1$l0:f8 main.g1$l1:h8 main.g2$l0:h8 main.g2$l1:h8 main.g3$l0:f8 main.g3$l1:h0 ", where.items);
+}
+
 test "a fn or method with mut params is not a value (T0049)" {
     const pre =
         \\struct P { x: int }
@@ -13194,8 +13232,11 @@ test "a local fn is typed before its body, so it recurses" {
     try testing.expectEqual(@as(?u32, c.resolve.resolutions[0][fact.int()].local), units[0].self_slot);
     try testing.expectEqual(@as(usize, 1), units[0].env.len);
     try testing.expectEqual(@as(u32, 0), units[0].env[0].slot);
+    // Adjacent, so one group, but neither names the other: `noop` keeps its own empty env.
     try testing.expectEqual(@as(u32, 0), units[1].env_size);
     try testing.expect(units[1].self_slot != null);
+    try testing.expectEqual(units[0].group.lo, units[1].group.lo);
+    try testing.expect(units[0].group.leader != units[1].group.leader);
     // The recursive call inside the body is a call of the fn-typed local.
     var saw_value = false;
     for (c.tree.nodes) |n| {
@@ -13206,6 +13247,28 @@ test "a local fn is typed before its body, so it recurses" {
         saw_value = true;
     }
     try testing.expect(saw_value);
+}
+
+test "a group's fns are typed before any body, so the first calls the second" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\fn main() -> int {
+        \\ fn even(n: int) -> bool { if n == 0 { true } else { odd(n - 1) } }
+        \\ fn odd(n: int) -> bool { if n == 0 { false } else { even(n - 1) } }
+        \\ return if even(4) { 1 } else { 0 }
+        \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
+    const odd = try nthLocalFn(&c, 1);
+    for (c.tree.nodes, 0..) |n, i| {
+        if (n.tag != .call) continue;
+        const callee = c.tree.nodes[n.lhs.int()];
+        if (callee.tag != .identifier or !std.mem.eql(u8, c.tokens[callee.main_token].text(c.source), "odd")) continue;
+        try testing.expect(Type.eql(Type.bool, c.result.node_types[0][i]));
+        try testing.expect(Type.eql(c.result.node_types[0][odd.int()], c.result.node_types[0][n.lhs.int()]));
+    }
 }
 
 test "a captured local fn is copied, never boxed" {

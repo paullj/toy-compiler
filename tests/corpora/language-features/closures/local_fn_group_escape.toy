@@ -1,0 +1,38 @@
+# Feature: a group's fns escape their maker as values and keep the group's one shared env, captures and a mut capture included
+# expect: exit 42
+import std/vec
+
+struct Pair { inc: fn() -> int, get: fn() -> int }
+
+fn counter(start: int, step: int) -> Pair {
+    n := start
+    fn inc() -> int {
+        n = n + step
+        get()
+    }
+    fn get() -> int { n }
+    Pair { inc: inc, get: get }
+}
+
+fn parity(bias: int) -> fn(int) -> int {
+    fn even(k: int) -> int { if k == 0 { bias } else { odd(k - 1) } }
+    fn odd(k: int) -> int { if k == 0 { 0 - bias } else { even(k - 1) } }
+    odd
+}
+
+fn main() -> int {
+    p := counter(10, 3)
+    _a := p.inc()
+    _b := p.inc()
+    a := p.get()
+    q := counter(0, 1)
+    fs: Vec[fn() -> int] = []
+    fs.push(q.inc)
+    fs.push(q.inc)
+    s := 0
+    for i in 0..fs.len() { s = s + fs[i]() }
+    # a = 16, s = 1 + 2 = 3, q.get() = 2
+    odd := parity(7)
+    # odd(5) reaches even(0) = 7; odd(4) reaches odd(0) = -7
+    return a + s + q.get() + odd(5) + odd(4) + 21
+}

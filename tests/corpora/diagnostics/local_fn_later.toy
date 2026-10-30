@@ -1,16 +1,18 @@
-# A local fn is named only after its declaration, so two local fns cannot call each
-# other. The earlier one's use is R0001 saying when the callee is declared, and the
-# later one is not also an unused function: the one W0003 below is the only one.
+# A local fn is named only after its declaration unless the fns are adjacent: a statement
+# between two local fns splits them, so the earlier one's use of the later one is R0001
+# saying so, and the later one is not also an unused function: the one W0003 below is the
+# only one.
 fn spare() {}  #~ WARN [W0003] unused function 'spare'
 
 fn main() -> int {
     fn even(n: int) -> bool {
         if n == 0 { return true }
-        return odd(n - 1)  #~ ERROR [R0001] the local function 'odd' is declared later in this block, and a local function can be named only after its declaration
+        return odd(n - 1)  #~ ERROR [R0001] the local function 'odd' is declared later in this block, and only the local functions declared next to it can name it before its declaration
     }
+    limit := 4
     fn odd(n: int) -> bool {
         if n == 0 { return false }
         return even(n - 1)
     }
-    return if even(4) { 1 } else { 0 }
+    return if even(limit) { 1 } else { 0 }
 }

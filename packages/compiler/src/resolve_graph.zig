@@ -151,7 +151,7 @@ const Local = struct { name_tok: u32, slot: u32, used: bool = false, warn_code: 
 const LaterFn = struct { name: []const u8, declared: bool = false, named_early: bool = false };
 /// A lambda or local fn whose body is being resolved: its captures grow as outer locals
 /// are named. A `_` capture's `hole` is the one node that reads its hidden param `hole_slot`.
-const OpenBoundary = struct { node: Ast.Index, rank: u32, slot_floor: u32, label_floor: usize, self_slot: ?u32 = null, captures: std.ArrayList(Closure.Capture) = .empty, hole: Ast.Index = Ast.none, hole_slot: u32 = 0 };
+const OpenBoundary = struct { node: Ast.Index, rank: u32, slot_floor: u32, label_floor: usize, self_slot: ?u32 = null, group: Closure.Group = .{}, captures: std.ArrayList(Closure.Capture) = .empty, hole: Ast.Index = Ast.none, hole_slot: u32 = 0 };
 const Scope = struct { names: std.StringHashMapUnmanaged(u32) = .empty };
 const LabelEntry = struct { name: []const u8, construct_node: Ast.Index };
 
@@ -196,6 +196,9 @@ const GraphResolve = struct {
     /// call may run that closure, which can read or write the slot, so a write to one is
     /// never a dead store.
     captured_so_far: std.AutoHashMapUnmanaged(u32, void) = .empty,
+    /// Each `{fn, sibling}` pair of a local fn group where the fn's body (or a lambda in
+    /// it) names the sibling: the pairs link the fns that share one env.
+    group_links: std.ArrayList([2]u32) = .empty,
     /// This fn's `mut` params (bit = param slot). A write to one stores into the caller's
     /// variable, which a closure the call was handed may read, so it is never a dead store.
     mut_params: u64 = 0,
@@ -693,6 +696,7 @@ const GraphResolve = struct {
         g.label_stack.clearRetainingCapacity();
         std.debug.assert(g.open.items.len == 0 and g.fn_boundaries.items.len == 0);
         g.captured_so_far.clearRetainingCapacity();
+        g.group_links.clearRetainingCapacity();
         g.next_rank = 0;
 
         const decl = g.nodes()[fn_idx.int()];
@@ -755,29 +759,99 @@ const GraphResolve = struct {
     /// every slot declared so far), each written as `.local` on its param node; the body
     /// resolves in the lambda's own scope, recording the outer locals it names.
     fn resolveLambda(g: *GraphResolve, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!void {
-        return g.resolveBoundary(node_idx, n, null);
+        return g.resolveBoundary(node_idx, n, null, .{});
     }
 
-    /// `fn name(params) -> R { body }` in a block: `name` is a local declared before the
-    /// body, so the body can call itself, and the rest resolves as a lambda whose
-    /// `self_slot` is that local.
-    fn resolveLocalFn(g: *GraphResolve, stmt_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!void {
-        const later = g.laterFn(g.nameText(n.main_token));
-        if (later) |lf| lf.declared = true;
-        const slot = try g.declare(n.main_token, "redeclaration of '{s}'", .W0003);
-        if (slot) |s| {
-            g.res(stmt_idx, .{ .local = s });
-            g.locals.items[s].is_fn = true;
+    /// A run of adjacent `fn name(params) -> R { body }` statements in a block: every name
+    /// is a local declared before any body, so each body can call itself and the others,
+    /// and each fn resolves as a lambda whose `self_slot` is its own name. Only the names
+    /// are hoisted, so every other local a body names is declared before the group, and
+    /// no fn of the group can run before a local it captures exists. The fns linked by
+    /// naming each other share one env, made by the first of them.
+    fn resolveLocalFnGroup(g: *GraphResolve, stmts: []const Ast.Index) error{OutOfMemory}!void {
+        const lo = g.slot_next;
+        for (stmts) |stmt_idx| {
+            const n = g.nodes()[stmt_idx.int()];
+            const later = g.laterFn(g.nameText(n.main_token));
+            if (later) |lf| lf.declared = true;
+            const slot = try g.declare(n.main_token, "redeclaration of '{s}'", .W0003) orelse continue;
+            g.res(stmt_idx, .{ .local = slot });
+            g.locals.items[slot].is_fn = true;
             if (later) |lf| if (lf.named_early) {
-                g.locals.items[s].used = true;
+                g.locals.items[slot].used = true;
             };
         }
-        try g.resolveBoundary(stmt_idx, n, slot);
+        const group: Closure.Group = .{ .lo = lo, .len = g.slot_next - lo };
+        const first = g.fn_boundaries.items.len;
+        for (stmts) |stmt_idx| {
+            const self_slot: ?u32 = switch (g.resolutions[g.cur_mod][stmt_idx.int()]) {
+                .local => |sl| if (group.has(sl)) sl else null,
+                else => null,
+            };
+            try g.resolveBoundary(stmt_idx, g.nodes()[stmt_idx.int()], self_slot, group);
+        }
+        if (group.len == 0) return;
+        const bs = g.fn_boundaries.items[first..];
+        const lead = try g.gpa.alloc(u32, group.len);
+        defer g.gpa.free(lead);
+        for (lead, 0..) |*l, i| l.* = @intCast(i);
+        for (g.group_links.items) |link| {
+            if (!group.has(link[0]) or !group.has(link[1])) continue;
+            const a = rootOf(lead, link[0] - lo);
+            const b = rootOf(lead, link[1] - lo);
+            lead[@max(a, b)] = @min(a, b);
+        }
+        for (bs) |*b| {
+            if (!std.meta.eql(b.group, group)) continue;
+            const ss = b.self_slot orelse continue;
+            b.group.leader = lo + rootOf(lead, ss - lo);
+        }
+        if (stmts.len == 1) return;
+        for (lead, 0..) |l, i| if (l == i) {
+            var env = group;
+            env.leader = lo + l;
+            try g.shareGroupCaptures(bs, env);
+        };
     }
 
-    fn resolveBoundary(g: *GraphResolve, node_idx: Ast.Index, n: Ast.Node, self_slot: ?u32) error{OutOfMemory}!void {
+    /// The index of the first fn linked to fn `i` of a group; links always point lower.
+    fn rootOf(lead: []const u32, i: u32) u32 {
+        var r = i;
+        while (lead[r] != r) r = lead[r];
+        return r;
+    }
+
+    /// Give every fn sharing `group`'s env (among `bs`, which also holds other fns of the
+    /// group and the lambdas nested in them) the union of their captures: that one env,
+    /// which each fn's value carries.
+    fn shareGroupCaptures(g: *GraphResolve, bs: []Closure.Boundary, group: Closure.Group) error{OutOfMemory}!void {
+        var all: std.ArrayList(Closure.Capture) = .empty;
+        defer all.deinit(g.gpa);
+        for (bs) |b| {
+            if (!std.meta.eql(b.group, group)) continue;
+            for (b.captures) |c| {
+                const seen = for (all.items) |a| {
+                    if (a.slot == c.slot) break true;
+                } else false;
+                if (!seen) try all.append(g.gpa, c);
+            }
+        }
+        std.mem.sort(Closure.Capture, all.items, {}, struct {
+            fn lt(_: void, a: Closure.Capture, b: Closure.Capture) bool {
+                return a.slot < b.slot;
+            }
+        }.lt);
+        for (bs) |*b| {
+            if (!std.meta.eql(b.group, group)) continue;
+            const caps = try g.gpa.dupe(Closure.Capture, all.items);
+            g.gpa.free(b.captures);
+            b.captures = caps;
+        }
+    }
+
+    fn resolveBoundary(g: *GraphResolve, node_idx: Ast.Index, n: Ast.Node, self_slot: ?u32, group: Closure.Group) error{OutOfMemory}!void {
         const proto = Ast.protoAt(g.tree(g.cur_mod), n.lhs.int());
-        try g.open.append(g.gpa, .{ .node = node_idx, .rank = g.next_rank, .slot_floor = g.slot_next, .label_floor = g.label_stack.items.len, .self_slot = self_slot });
+        try g.open.append(g.gpa, .{ .node = node_idx, .rank = g.next_rank, .slot_floor = g.slot_next, .label_floor = g.label_stack.items.len, .self_slot = self_slot, .group = group });
         g.next_rank += 1;
         try g.pushScope();
         if (Ast.isCaptureLambda(g.tree(g.cur_mod), g.tokens(), node_idx)) {
@@ -809,7 +883,7 @@ const GraphResolve = struct {
         for (ob.captures.items) |c| try g.captured_so_far.put(g.gpa, c.slot, {});
         try g.fn_boundaries.ensureUnusedCapacity(g.gpa, 1);
         const caps = try ob.captures.toOwnedSlice(g.gpa);
-        g.fn_boundaries.appendAssumeCapacity(.{ .node = node_idx, .rank = ob.rank, .slot_floor = ob.slot_floor, .self_slot = ob.self_slot, .captures = caps });
+        g.fn_boundaries.appendAssumeCapacity(.{ .node = node_idx, .rank = ob.rank, .slot_floor = ob.slot_floor, .self_slot = ob.self_slot, .group = ob.group, .captures = caps });
     }
 
     /// The hidden param slot `node_idx` reads when it is the innermost open capture's hole.
@@ -822,15 +896,20 @@ const GraphResolve = struct {
     /// Record a use of local `slot` at node `use` as a capture of every open lambda it
     /// crosses. A lambda's slots are all at or above its floor, so a slot below the floor
     /// is declared outside it; boundaries nest, so the first one it is inside stops the walk.
-    /// A local fn's own name stops it too: the local fn names itself without a capture, and
-    /// the name is declared just outside it. A new capture keeps every pending write to the
+    /// A local fn's group stops it too: the local fn names itself and the other fns of its
+    /// group without a capture, since naming one links the two to share its env, and the
+    /// names are declared just outside it. A new capture keeps every pending write to the
     /// slot live: the closure may read it.
     fn noteCapture(g: *GraphResolve, slot: u32, use: Ast.Index) error{OutOfMemory}!void {
         var i = g.open.items.len;
         while (i > 0) {
             i -= 1;
             const b = &g.open.items[i];
-            if (slot >= b.slot_floor or b.self_slot == slot) return;
+            if (slot >= b.slot_floor) return;
+            if (b.group.has(slot)) {
+                if (b.self_slot) |ss| if (ss != slot) try g.group_links.append(g.gpa, .{ ss, slot });
+                return;
+            }
             const seen = for (b.captures.items) |c| {
                 if (c.slot == slot) break true;
             } else false;
@@ -888,9 +967,15 @@ const GraphResolve = struct {
             const stmt = g.nodes()[stmt_idx.int()];
             if (stmt.tag == .local_fn) try g.later_fns.append(g.gpa, .{ .name = g.nameText(stmt.main_token) });
         }
-        for (stmts) |stmt_idx| {
-            try g.resolveStmt(stmt_idx); // resolves + taps this statement's reads (all levels)
-            try g.deadStoreStep(stmt_idx); // then classify the WRITE / FLUSH
+        var i: usize = 0;
+        while (i < stmts.len) {
+            const end = Ast.localFnRunEnd(g.tree(g.cur_mod), stmts, i);
+            if (g.nodes()[stmts[i].int()].tag == .local_fn)
+                try g.resolveLocalFnGroup(stmts[i..end])
+            else
+                try g.resolveStmt(stmts[i]); // resolves + taps this statement's reads (all levels)
+            for (stmts[i..end]) |stmt_idx| try g.deadStoreStep(stmt_idx); // then classify the WRITE / FLUSH
+            i = end;
         }
         var m = g.dead_pending.pop().?;
         m.deinit(g.gpa);
@@ -1062,7 +1147,7 @@ const GraphResolve = struct {
                 if (Ast.labelTok(stmt).unwrap()) |label| try g.resolveLabelTarget(stmt_idx, label.int(), "continue");
             },
             .labeled => try g.resolveLabeled(stmt_idx),
-            .local_fn => try g.resolveLocalFn(stmt_idx, stmt),
+            .local_fn => try g.resolveLocalFnGroup(&.{stmt_idx}),
             // A poison leaf as a statement: already-diagnosed, resolve nothing.
             .error_node => {},
             else => try g.resolveExpr(stmt_idx),
@@ -1102,7 +1187,7 @@ const GraphResolve = struct {
                     }
                     if (g.laterFn(name)) |lf| {
                         lf.named_early = true;
-                        try g.sink.report(.{ .span = off, .code = .R0001, .scope = g.cur_mod }, "undeclared identifier '{s}'; the local function '{s}' is declared later in this block, and a local function can be named only after its declaration", .{ name, name });
+                        try g.sink.report(.{ .span = off, .code = .R0001, .scope = g.cur_mod }, "undeclared identifier '{s}'; the local function '{s}' is declared later in this block, and only the local functions declared next to it can name it before its declaration", .{ name, name });
                         return;
                     }
                     // A declared type-level name is no value, so it is not undeclared either;
@@ -1839,6 +1924,7 @@ pub fn resolveGraph(gpa: std.mem.Allocator, graph: *const Graph.Graph) !GraphRes
         for (g.fn_boundaries.items) |b| gpa.free(b.captures);
         g.fn_boundaries.deinit(gpa);
         g.captured_so_far.deinit(gpa);
+        g.group_links.deinit(gpa);
         g.bound_names.deinit(gpa);
         // Emptied by the ownership move below on success.
         for (closures) |*c| {
@@ -4471,18 +4557,19 @@ test "a local fn is not a global fn (not in fns)" {
     }.run);
 }
 
-test "mutual recursion between local fns is R0001 that says when the callee is declared" {
+test "a local fn split from a later one by a statement names it only after its declaration" {
     try withResolvedSource(
         \\fn main() -> int {
         \\ fn a(n: int) -> int { if n <= 0 { 0 } else { b(n - 1) } }
+        \\ k := 3
         \\ fn b(n: int) -> int { a(n) }
-        \\ return b(3)
+        \\ return b(k)
         \\}
         \\
     , struct {
         fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
             try testing.expectEqual(@as(usize, 1), countCode(r, .R0001));
-            try testing.expectEqualStrings("undeclared identifier 'b'; the local function 'b' is declared later in this block, and a local function can be named only after its declaration", firstError(r).message);
+            try testing.expectEqualStrings("undeclared identifier 'b'; the local function 'b' is declared later in this block, and only the local functions declared next to it can name it before its declaration", firstError(r).message);
         }
     }.run);
     // The later fn was named, so it is not also unused; a name the block never declares
@@ -4490,8 +4577,9 @@ test "mutual recursion between local fns is R0001 that says when the callee is d
     try withResolvedSource(
         \\fn main() -> int {
         \\ fn a(n: int) -> int { if n <= 0 { 0 } else { b(n - 1) } }
+        \\ k := 3
         \\ fn b(n: int) -> int { n }
-        \\ return a(3) + c
+        \\ return a(k) + c
         \\}
         \\
     , struct {
@@ -4503,6 +4591,92 @@ test "mutual recursion between local fns is R0001 that says when the callee is d
                 plain = true;
             };
             try testing.expect(plain);
+        }
+    }.run);
+}
+
+test "adjacent local fns are one group: each names the others without a capture, and the fns linked by naming share their captures" {
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ x := 1
+        \\ y := 2
+        \\ fn a(n: int) -> int { if n <= 0 { x } else { b(n - 1) } }
+        \\ fn b(n: int) -> int { a(n) + y }
+        \\ fn c() -> int { 0 }
+        \\ return a(3) + c()
+        \\}
+        \\
+    , struct {
+        fn run(tree: Ast.Tree, toks: []const Token, src: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            const bs = r.closures[0][0].boundaries;
+            try testing.expectEqual(@as(usize, 3), bs.len);
+            for (bs, 0..) |b, i| {
+                try testing.expectEqual(try nthLocalFn(tree, i), b.node);
+                try testing.expectEqual(@as(?u32, 2 + @as(u32, @intCast(i))), b.self_slot);
+            }
+            // `a` and `b` name each other, so they share one env holding `x` and `y`, though
+            // each names one. `c` names neither, so it keeps its own (empty) env.
+            for (bs[0..2]) |b| {
+                try testing.expectEqual(Closure.Group{ .lo = 2, .len = 3, .leader = 2 }, b.group);
+                try testing.expectEqual(@as(usize, 2), b.captures.len);
+                try testing.expectEqual(@as(u32, 0), b.captures[0].slot);
+                try testing.expectEqual(@as(u32, 1), b.captures[1].slot);
+            }
+            try testing.expectEqual(Closure.Group{ .lo = 2, .len = 3, .leader = 4 }, bs[2].group);
+            try testing.expectEqual(@as(usize, 0), bs[2].captures.len);
+            try testing.expectEqual(Resolution{ .local = 3 }, r.resolutions[0][(try nthIdent(tree, toks, src, "b", 0)).int()]);
+            try testing.expectEqual(Resolution{ .local = 2 }, r.resolutions[0][(try nthIdent(tree, toks, src, "a", 1)).int()]);
+        }
+    }.run);
+    // A lambda in a group fn captures the sibling it names; the group fn does not, but
+    // the naming links the two fns.
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ fn a() -> int { f := fn() -> int { b() }
+        \\  f() }
+        \\ fn b() -> int { 1 }
+        \\ return a()
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            const bs = r.closures[0][0].boundaries;
+            try testing.expectEqual(@as(usize, 3), bs.len);
+            for (bs) |b| if (b.self_slot != null) {
+                try testing.expectEqual(@as(usize, 0), b.captures.len);
+                try testing.expectEqual(Closure.Group{ .lo = 0, .len = 2, .leader = 0 }, b.group);
+            } else {
+                try testing.expectEqual(@as(usize, 1), b.captures.len);
+                try testing.expectEqual(@as(u32, 1), b.captures[0].slot);
+                try testing.expectEqual(Closure.Group{}, b.group);
+            };
+        }
+    }.run);
+    // A chain links fns that do not name each other directly: `a` and `c` share `b`'s env.
+    try withResolvedSource(
+        \\fn main() -> int {
+        \\ x := 1
+        \\ fn a() -> int { b() }
+        \\ fn d() -> int { 4 }
+        \\ fn b() -> int { x }
+        \\ fn c() -> int { b() }
+        \\ return a() + c() + d()
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            const bs = r.closures[0][0].boundaries;
+            try testing.expectEqual(@as(usize, 4), bs.len);
+            for (bs) |b| if (b.self_slot.? == 2) {
+                try testing.expectEqual(@as(u32, 2), b.group.leader);
+                try testing.expectEqual(@as(usize, 0), b.captures.len);
+            } else {
+                try testing.expectEqual(@as(u32, 1), b.group.leader);
+                try testing.expectEqual(@as(usize, 1), b.captures.len);
+            };
         }
     }.run);
 }

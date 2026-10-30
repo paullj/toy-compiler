@@ -1,0 +1,27 @@
+# Feature: adjacent local fns form a group that calls each other: mutual recursion, a forward call, a mut capture and a nested group
+# expect: exit 42
+fn main() -> int {
+    base := 1
+    calls := 0
+    fn is_even(n: int) -> bool {
+        calls = calls + 1
+        if n == 0 { true } else { is_odd(n - 1) }
+    }
+    fn is_odd(n: int) -> bool {
+        calls = calls + 1
+        if n == 0 { false } else { is_even(n - 1) }
+    }
+    fn first() -> int { second() + base }
+    fn second() -> int {
+        fn ping(n: int) -> int { if n <= 0 { base } else { pong(n - 1) + 1 } }
+        fn pong(n: int) -> int { if n <= 0 { 0 } else { ping(n - 1) + 1 } }
+        ping(5)
+    }
+    # is_even(10) runs 11 calls, is_odd(7) 8: 19; ping(5) = 5, so first() = 6
+    e := if is_even(10) { 1 } else { 0 }
+    o := if is_odd(7) { 1 } else { 0 }
+    via := fn(k: int) -> bool { is_odd(k) }
+    v := if via(3) { 1 } else { 0 }
+    # calls = 19 + 4 = 23; 23 + 6 + 1 + 1 + 1 + 10 = 42
+    return calls + first() + e + o + v + 10
+}

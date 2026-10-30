@@ -46,7 +46,7 @@ pub fn lowerLambda(
     const lam = in.tree.nodes[unit.node.int()];
     const blocks = try L.openBodyBlocks(&b, unit.sig.ret);
     try bindCaptures(&b, unit, env_slot);
-    if (unit.self_slot) |ss| try bindSelf(&b, unit, ss, env_slot);
+    if (unit.self_slot != null) try bindGroup(&b, unit, env_slot);
     try places.boxParams(&b, unit.param_slots, params.items[1..], lam.main_token);
     try places.noteMutArgRoots(&b, lam.rhs);
     try places.noteUnboxedRoots(&b);
@@ -106,23 +106,38 @@ fn isSelfParam(b: *const Builder, fn_node: Ast.Index, slot: u32) bool {
     return Ast.isSelfParam(b.in.tree, b.in.tokens, b.in.source, proto.params[0]);
 }
 
-/// A local fn's prologue: its own name reads as the pair of its code and the env it was
-/// called with, which is exactly the value its caller holds, so recursion needs no capture.
-fn bindSelf(b: *Builder, unit: Closure.LambdaUnit, self_slot: u32, env_slot: Ir.SlotId) error{OutOfMemory}!void {
+/// A local fn's prologue: the name of each fn sharing its env reads as the pair of that
+/// fn's code and the env this one was called with, so each pair is exactly the value the
+/// group's maker holds, and neither recursion nor a call of a linked fn needs a capture.
+fn bindGroup(b: *Builder, unit: Closure.LambdaUnit, env_slot: Ir.SlotId) error{OutOfMemory}!void {
     const env_sa = try b.emit(.{ .slot_addr = env_slot }, Typecheck.Type.int);
     const env = try b.emit(.{ .load = .{ .addr = env_sa, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.rawptr);
-    const pair = try emitFnPair(b, unit.name, b.in.nodes.typeOf(unit.node), env);
-    try b.homes.put(b.gpa, self_slot, .{ .slot = pair.slot });
+    var it = Closure.groupUnits(b.in.closure.lambda_units, unit.owner, unit.group);
+    while (it.next()) |u| {
+        const pair = try emitFnPair(b, u.name, b.in.nodes.typeOf(u.node), env);
+        try b.homes.put(b.gpa, u.self_slot.?, .{ .slot = pair.slot });
+    }
 }
 
 /// `fn name(..) { .. }` in a block: make its closure like a lambda's, and let the pair's
-/// slot be the name's home. Nothing assigns a local fn, so it is never boxed.
+/// slot be the name's home. The leader of the fns sharing an env makes that env and each
+/// of their pairs with it; the others then have their homes. Nothing assigns a local fn,
+/// so it is never boxed.
 pub fn lowerLocalFn(b: *Builder, stmt_idx: Ast.Index) error{OutOfMemory}!void {
-    const v = try lowerLambdaValue(b, stmt_idx, b.in.nodes.typeOf(stmt_idx));
     const res = b.in.resolutions[(stmt_idx).int()];
-    if (v != .slot or res != .local) return;
+    if (res != .local) return;
+    const tok = b.in.tree.nodes[stmt_idx.int()].main_token;
+    const owner = b.in.closure.owner orelse return b.note(tok, "local fn outside a closure owner in lower");
+    const ui = Closure.findUnit(b.in.closure.lambda_units, owner, stmt_idx) orelse return b.note(tok, "local fn has no unit in lower");
+    const unit = b.in.closure.lambda_units[ui];
+    if (unit.group.leader != res.local) return;
     std.debug.assert(!b.isBoxedLocal(res.local));
-    try b.homes.put(b.gpa, res.local, .{ .slot = v.slot });
+    const env = try lowerEnv(b, unit, tok);
+    var it = Closure.groupUnits(b.in.closure.lambda_units, owner, unit.group);
+    while (it.next()) |u| {
+        const v = try emitFnPair(b, u.name, b.in.nodes.typeOf(u.node), env);
+        try b.homes.put(b.gpa, u.self_slot.?, .{ .slot = v.slot });
+    }
 }
 
 /// A call of a function-typed value: evaluate the callee to its `{code, env}` pair, then
@@ -207,21 +222,28 @@ pub fn lowerLambdaValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) er
         return .none;
     };
     const unit = b.in.closure.lambda_units[ui];
-    if (unit.env_size == 0) return try emitFnPair(b, unit.name, ty, null);
+    return try emitFnPair(b, unit.name, ty, try lowerEnv(b, unit, n.main_token));
+}
+
+/// The env of a closure of `unit`, made where it is made: null when it captures nothing,
+/// else a cell (or a frame slot) holding each capture at the table's offset: a copy of its
+/// current value, or for a boxed local the pointer to its cell.
+fn lowerEnv(b: *Builder, unit: Closure.LambdaUnit, tok: u32) error{OutOfMemory}!?Ir.ValueId {
+    if (unit.env_size == 0) return null;
     const env = if (b.in.closure.frame_envs and unit.frame_env != null)
         try b.emit(.{ .slot_addr = try b.addSlot(Typecheck.Type.structT(unit.frame_env.?)) }, Typecheck.Type.int)
     else
         try L.emitGcAlloc(b, unit.env_size);
     for (unit.env) |es| {
         const home = b.homes.get(es.slot) orelse {
-            try b.note(n.main_token, "captured local has no slot in lower");
+            try b.note(tok, "captured local has no slot in lower");
             continue;
         };
         switch (b.in.closure.storage.hold(es.slot)) {
             .param_addr, .frame_addr => try storeEnvAddress(b, env, es, home),
             .cell => {
                 if (home != .cell) {
-                    try b.note(n.main_token, "boxed capture has no cell in lower");
+                    try b.note(tok, "boxed capture has no cell in lower");
                     continue;
                 }
                 const dst = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = Typecheck.Type.rawptr } }, Typecheck.Type.int);
@@ -233,11 +255,11 @@ pub fn lowerLambdaValue(b: *Builder, node_idx: Ast.Index, ty: Typecheck.Type) er
                 // the address.
                 std.debug.assert(home != .addr);
                 const dst = try b.emit(.{ .field_addr = .{ .base = env, .off = es.off, .ty = es.ty } }, Typecheck.Type.int);
-                try copyCapture(b, dst, try places.homeAddr(b, home), es.ty, n.main_token);
+                try copyCapture(b, dst, try places.homeAddr(b, home), es.ty, tok);
             },
         }
     }
-    return try emitFnPair(b, unit.name, ty, env);
+    return env;
 }
 
 /// Store the address of the local at `home` into env slot `es`, typed `int` so the word is

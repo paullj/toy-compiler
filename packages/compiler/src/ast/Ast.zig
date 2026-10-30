@@ -564,6 +564,16 @@ pub fn forIn2HeaderAt(tree: Tree, header: u32) struct { body: Index, val_leaf: I
     return .{ .body = Index.from(tree.extra[header]), .val_leaf = Index.from(tree.extra[header + 1]) };
 }
 
+/// The end of the statement run starting at `stmts[i]`: past every adjacent `local_fn`
+/// (one group, whose names are all declared before any body), or just past `stmts[i]`.
+/// The resolver and the checker both split a block with it, so they agree on its groups.
+pub fn localFnRunEnd(tree: Tree, stmts: []const Index, i: usize) usize {
+    var end = i + 1;
+    if (tree.nodes[stmts[i].int()].tag != .local_fn) return end;
+    while (end < stmts.len and tree.nodes[stmts[end].int()].tag == .local_fn) end += 1;
+    return end;
+}
+
 /// Decode the 2-cell `match_arm` header at `header`: `{guard, body}`.
 pub fn armHeaderAt(tree: Tree, header: u32) struct { guard: Index, body: Index } {
     return .{ .guard = Index.from(tree.extra[header]), .body = Index.from(tree.extra[header + 1]) };
@@ -1449,6 +1459,21 @@ test "rangeSlice and protoAt accessors round-trip on a hand-built tree" {
     try testing.expectEqual(Index.from(1), proto.params[1]);
     // The additive cells decode to an empty generic-param slice for a plain fn.
     try testing.expectEqual(@as(usize, 0), proto.generic_params.len);
+}
+
+test "localFnRunEnd spans adjacent local fns and stops at any other statement" {
+    var nodes = [_]Node{
+        .{ .tag = .local_fn, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .local_fn, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .identifier, .main_token = 0, .lhs = none, .rhs = none },
+        .{ .tag = .local_fn, .main_token = 0, .lhs = none, .rhs = none },
+    };
+    const tree = Tree{ .nodes = &nodes, .extra = &.{} };
+    const stmts = [_]Index{ Index.from(0), Index.from(1), Index.from(2), Index.from(3) };
+    try testing.expectEqual(@as(usize, 2), localFnRunEnd(tree, &stmts, 0));
+    try testing.expectEqual(@as(usize, 2), localFnRunEnd(tree, &stmts, 1));
+    try testing.expectEqual(@as(usize, 3), localFnRunEnd(tree, &stmts, 2));
+    try testing.expectEqual(@as(usize, 4), localFnRunEnd(tree, &stmts, 3));
 }
 
 test "isMutParam detects a kw_mut token immediately before the param name" {

@@ -297,6 +297,23 @@ fn recallFix(bc: *BodyChecker, node_idx: Ast.Index, exp_fn: ?Type) ??Type {
 /// itself. The body checks like an annotated lambda's: `return` exits the local fn and
 /// no jump leaves it.
 pub fn checkLocalFn(bc: *BodyChecker, idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!void {
+    const ret = try declareLocalFn(bc, idx, n);
+    const frame = enterBody(bc, true);
+    defer leaveBody(bc, frame);
+    bc.body.cur_ret = ret;
+    bc.body.ret_infer = false;
+    const want_value = ret.kind != .unit and ret.kind != .invalid;
+    const body_ty = try bc.typeOfBlockExpected(n.rhs, want_value, if (want_value) ret else null);
+    if (want_value and !bc.blockReturns(n.rhs) and !Type.assignable(ret, body_ty)) {
+        if (!try bc.reportTailMismatch(n.rhs, body_ty, ret))
+            try bc.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "function '{s}' must return {f} but may fall off the end", .{ bc.nameText(n.main_token), bc.fmtType(ret) });
+    }
+}
+
+/// Type local fn `idx` from its signature alone and bind its name, returning its return
+/// type. Idempotent, so a group's fns are declared once before any body and again at
+/// each one.
+pub fn declareLocalFn(bc: *BodyChecker, idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Type {
     const proto = Ast.protoAt(bc.tree, n.lhs.int());
     const params = try bc.gpa.alloc(Type, proto.params.len);
     defer bc.gpa.free(params);
@@ -313,17 +330,7 @@ pub fn checkLocalFn(bc: *BodyChecker, idx: Ast.Index, n: Ast.Node) error{OutOfMe
     const ty: Type = if (poisoned) .invalid else refs.internFn(bc, params, ret);
     bc.node_types[idx.int()] = ty;
     if (bc.resolutions[idx.int()] == .local) try bc.setSlot(bc.resolutions[idx.int()].local, ty);
-
-    const frame = enterBody(bc, true);
-    defer leaveBody(bc, frame);
-    bc.body.cur_ret = ret;
-    bc.body.ret_infer = false;
-    const want_value = ret.kind != .unit and ret.kind != .invalid;
-    const body_ty = try bc.typeOfBlockExpected(n.rhs, want_value, if (want_value) ret else null);
-    if (want_value and !bc.blockReturns(n.rhs) and !Type.assignable(ret, body_ty)) {
-        if (!try bc.reportTailMismatch(n.rhs, body_ty, ret))
-            try bc.report(.{ .span = bc.tokSpan(n.main_token), .code = .T0043 }, "function '{s}' must return {f} but may fall off the end", .{ bc.nameText(n.main_token), bc.fmtType(ret) });
-    }
+    return ret;
 }
 
 /// Enter a lambda or local fn body: no expected type flows in and no jump leaves it.
