@@ -84,7 +84,7 @@ const order_src =
     \\    for k in order { s.add(k) }
     \\    j := 0
     \\    for x in s {
-    \\        if x != order.get(j).unwrap() { return 1 }
+    \\        if x != order.get(j).expect("no value") { return 1 }
     \\        j = j + 1
     \\    }
     \\    if j != 8 { return 2 }

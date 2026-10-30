@@ -14,8 +14,8 @@ fn main() -> int {
         .some(v * 2)
     }
     empty: Vec[int] = []
-    total = total + first([20, 1]).unwrap_or(0)            # 57
-    total = total + first(empty).unwrap_or(5)              # 62
+    total = total + first([20, 1]).or(0)            # 57
+    total = total + first(empty).or(5)              # 62
     five := fn() { return 5 }
     sign := fn(b: bool) {
         if b { return 1 }

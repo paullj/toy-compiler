@@ -22,7 +22,7 @@ fn churn() {
 fn count(words: Vec[str]) -> Map[str, int] {
     counts := Map[str, int].new()
     for w in words {
-        n := counts.get(w).unwrap_or(0)
+        n := counts.get(w).or(0)
         counts.set(w, n + 1)
     }
     return counts

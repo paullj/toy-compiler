@@ -223,7 +223,7 @@ test "definition: a method callee jumps to its declaration" {
         .{ .use = "dbl()", .decl = "dbl(self) -> int\n}" },
         .{ .use = "concat(", .decl = null },
         .{ .use = "eq(3)", .decl = null },
-        .{ .use = "unwrap_or(", .decl = null },
+        .{ .use = "or(", .decl = null },
         .{ .use = "hash()", .decl = null },
     };
     for (cases) |c| {

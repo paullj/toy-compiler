@@ -23,7 +23,7 @@ fn main() -> int {
     if radius(vs[0][0].s) != 8 { return 7 }
     m := Map[int, P].new()
     m.set(1, mk(9))
-    if radius(m.get(1).unwrap().s) != 9 { return 8 }
+    if radius(m.get(1).expect("no value").s) != 9 { return 8 }
     t := match ps[0].s { .dot -> 0, .circle(r) -> r * 10 }
     if t != 40 { return 9 }
     if radius(Shape.dot) != 0 { return 10 }

@@ -31,12 +31,12 @@ test "option: Option.map over a str payload survives forced collections" {
         \\        })
         \\        gc.collect()
         \\        want := fresh(i).concat("!")
-        \\        if m.unwrap() != want { return 1 }
+        \\        if m.expect("no value") != want { return 1 }
         \\        t := m.then(fn(s) {
         \\            gc.collect()
         \\            Option.some(s.concat("?"))
         \\        })
-        \\        if t.unwrap() != want.concat("?") { return 2 }
+        \\        if t.expect("no value") != want.concat("?") { return 2 }
         \\        n: Option[str] = Option.none
         \\        k := i + 100
         \\        d := n.or_else(fn() {
@@ -45,13 +45,13 @@ test "option: Option.map over a str payload survives forced collections" {
         \\        })
         \\        if d != fresh(k) { return 3 }
         \\        r: Result[int, str] = Result.err(fresh(i))
-        \\        e := r.map_err(fn(s) {
+        \\        e := r.map_error(fn(s) {
         \\            gc.collect()
         \\            s.concat("#")
         \\        })
         \\        gc.collect()
         \\        if e.or_else(fn(s) { s.len() }) != fresh(i).len() + 1 { return 4 }
-        \\        total = total + m.unwrap().len()
+        \\        total = total + m.expect("no value").len()
         \\        i = i + 1
         \\    }
         \\    return total
@@ -75,11 +75,11 @@ test "option: two Option.map instances on one payload type run their own code" {
         \\fn dec(v: int) -> int { v - 1 }
         \\fn main() -> int {
         \\    o: Option[int] = Option.some(6)
-        \\    a := o.map(fn(v) { v * 7 }).unwrap()
-        \\    b := o.map(fn(v) { v.to_string().concat("x") }).unwrap()
-        \\    c := o.map(fn(v) { v + 1 }).unwrap()
-        \\    d := o.map(dec).unwrap()
-        \\    big := o.map(fn(v) { v > 5 }).unwrap()
+        \\    a := o.map(fn(v) { v * 7 }).expect("no value")
+        \\    b := o.map(fn(v) { v.to_string().concat("x") }).expect("no value")
+        \\    c := o.map(fn(v) { v + 1 }).expect("no value")
+        \\    d := o.map(dec).expect("no value")
+        \\    big := o.map(fn(v) { v > 5 }).expect("no value")
         \\    if b != "6x" || !big { return 1 }
         \\    r: Result[int, str] = Result.ok(3)
         \\    e := r.map(fn(v) { v * 2 }).or_else(fn(_m) { 0 })
@@ -130,7 +130,7 @@ test "option: Option and Result methods are byte-identical at -j1 and -j8" {
         \\    b := xs.map(half).fold(0, fn(acc, o) { acc + o.then(half).or_else(fn() { 1 }) })
         \\    words := xs.map(fn(x) { Option[int].some(x).map(fn(v) { v.to_string() }).or_else(fn() { "" }) })
         \\    c := parse("abc").map(fn(v) { v + 1 }).then(fn(v) { Result[int, str].ok(v * 2) }).or_else(fn(_e) { 0 })
-        \\    d := parse("").map_err(fn(m) { m.len() }).or_else(fn(k) { k * 3 })
+        \\    d := parse("").map_error(fn(m) { m.len() }).or_else(fn(k) { k * 3 })
         \\    return a + b + c + d + words.len()
         \\}
         \\

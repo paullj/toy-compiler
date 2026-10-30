@@ -659,7 +659,7 @@ test "signatureHelpAt: method calls show the selected method, piped or not" {
         .{ .after = "v.dbl(", .label = "fn dbl() -> int", .active = 0 },
         .{ .after = "\"hi\".concat(", .label = "fn concat(str) -> str", .active = 0 },
         .{ .after = "(3).eq(", .label = "fn eq(int) -> bool", .active = 0 },
-        .{ .after = "o.unwrap_or(", .label = "fn unwrap_or(int) -> int", .active = 0 },
+        .{ .after = "o.or(", .label = "fn or(int) -> int", .active = 0 },
     };
     for (cases) |c| {
         const p = test_util.posAfterLast(src, c.after);
@@ -751,7 +751,7 @@ test "signatureHelpAt: a user protocol's method is labelled from its declaration
         \\protocol Finder { fn find(self, k: Option[int], n: int) -> Option[int] }
         \\struct P { x: int }
         \\impl P has Finder { fn find(self, k: Option[int], n: int) -> Option[int] { k } }
-        \\fn look[T has Finder](v: T) -> int { return v.find(Option.some(1), 2).unwrap_or(0) }
+        \\fn look[T has Finder](v: T) -> int { return v.find(Option.some(1), 2).or(0) }
         \\fn main() -> int { return look(P { x: 1 }) }
         \\
     ;

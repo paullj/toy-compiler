@@ -11,7 +11,7 @@ fn main() {
     counts := Map[str, int].new()
     words := ["the", "cat", "the"]
     for w in words {
-        n := counts.get(w).unwrap_or(0)
+        n := counts.get(w).or(0)
         counts.set(w, n + 1)
     }
     for k, _v in counts {

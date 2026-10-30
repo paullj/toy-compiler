@@ -42,6 +42,6 @@ fn main() -> int {
     b := go_lambda(one).v
     c := g(N { v: 2 }).v
     d := bound_place(N { v: 3 }).v
-    e := shift[int, N](Option.some(N { v: 4 }), N { v: 5 }).unwrap().v
+    e := shift[int, N](Option.some(N { v: 4 }), N { v: 5 }).expect("no value").v
     return a + b + c + d + e
 }

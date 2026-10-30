@@ -21,7 +21,7 @@ fn main() -> int {
     s := "hi"
     _l := s.len  #~ ERROR [T0049] 'len' is a built-in method and cannot be used as a value; wrap the call in a lambda
     o: Option[int] = .some(1)
-    _u := o.unwrap  #~ ERROR [T0049] 'unwrap' is a built-in method and cannot be used as a value; wrap the call in a lambda
+    _u := o.expect  #~ ERROR [T0049] 'expect' is a built-in method and cannot be used as a value; wrap the call in a lambda
     ok := c.get
     pk := c.peek()
     return ok() + h.c.n + pk()

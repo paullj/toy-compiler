@@ -456,8 +456,8 @@ test "hover on a method callee shows the selected method" {
         .{ .at = test_util.posOf(src, "dbl()"), .want = "fn dbl(self) -> int" },
         .{ .at = test_util.posOf(src, "concat("), .want = "fn concat(self: str, other: str) -> str" },
         .{ .at = test_util.posOf(src, "eq(3)"), .want = "fn eq(self: int, other: int) -> bool" },
-        .{ .at = test_util.posOf(src, "unwrap()"), .want = "fn unwrap(self: Option[int]) -> int" },
-        .{ .at = test_util.posOf(src, "unwrap_or(0)"), .want = "fn unwrap_or(self: Option[int], default: int) -> int" },
+        .{ .at = test_util.posOf(src, "expect(\"no value\")"), .want = "fn expect(self: Option[int], msg: str) -> int" },
+        .{ .at = test_util.posOf(src, "or(0)"), .want = "fn or(self: Option[int], default: int) -> int" },
         // A derive's method row has no fn of its own (`fn_id` 0 names some other fn).
         .{ .at = test_util.posOf(src, "hash()"), .want = "fn hash(self: Key) -> int" },
         .{ .at = test_util.posOf(src, "len()"), .want = "fn len(self: str) -> int" },

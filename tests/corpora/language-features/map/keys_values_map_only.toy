@@ -9,7 +9,7 @@ fn main() -> int {
     m.set("a", 1)
     m.set("b", 21)
     ks := m.keys()
-    if ks.len() != 2 || ks.first().unwrap_or("") != "b" { return 1 }
-    if ks.get(1).unwrap_or("") != "a" { return 2 }
+    if ks.len() != 2 || ks.first().or("") != "b" { return 1 }
+    if ks.get(1).or("") != "a" { return 2 }
     return m.values().fold(20, fn(acc, v) { acc + v })
 }

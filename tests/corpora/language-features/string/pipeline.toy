@@ -10,6 +10,6 @@ fn main() -> int {
     letters := "the quick brown fox".split(" ") |> .map(fn(w) { w.len() }) |> .fold(0, fn(a, x) { a + x })
     io.println("|".join(" alpha , beta,gamma ".split(",") |> .map(fn(p) { p.trim() })))
     long := "a bb ccc dddd".split(" ") |> .filter(fn(w) { w.len() > 2 }) |> .map(fn(w) { w.replace("c", "C") })
-    if long.len() != 2 || long.get(0).unwrap() != "CCC" { return 1 }
+    if long.len() != 2 || long.get(0).expect("no value") != "CCC" { return 1 }
     return letters
 }

@@ -265,7 +265,7 @@ pub const CallVisitor = struct {
                     const d = fr.derives[lower.convWitness(fr, kind) orelse return];
                     try self.out.append(self.gpa, .{ .kind = .user_fn, .name = d.name.?, .params = d.params, .ret = d.ret });
                 },
-                .str_concat, .str_len, .str_byte_at, .scalar_to_string, .conv_into, .opt_is_tag0, .opt_is_tag1, .opt_unwrap, .opt_unwrap_or => {},
+                .str_concat, .str_len, .str_byte_at, .scalar_to_string, .conv_into, .opt_is_tag0, .opt_is_tag1, .opt_expect, .opt_or => {},
             },
         }
     }

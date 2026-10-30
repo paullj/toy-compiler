@@ -69,6 +69,6 @@ fn main() -> int {
     io.println(a + b)
     m: Map[P, int] = Map[P, int].new()
     m.set(a, 1)
-    io.println(m.get(P { x: 3 }).unwrap_or(0))
+    io.println(m.get(P { x: 3 }).or(0))
     return 0
 }

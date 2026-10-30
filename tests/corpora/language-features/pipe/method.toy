@@ -32,7 +32,7 @@ fn main() -> int {
     b := Box[int] { v: 5 }
     g := b |> .get()                  # b.get() = 5
     o: Option[int] = Option.none
-    u := o |> .unwrap_or(7)           # o.unwrap_or(7) = 7
+    u := o |> .or(7)           # o.or(7) = 7
     ok := 2 + 3 |> .eq(5)             # (2 + 3).eq(5)
     return c.n + t + n + g + u + if ok { 5 } else { 0 }
 }

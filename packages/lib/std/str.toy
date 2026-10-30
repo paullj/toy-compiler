@@ -55,7 +55,7 @@ impl str {
         total := self.len() * (n - 1)
         i := 0
         while i < n {
-            total += parts.get(i).unwrap_or("").len()
+            total += parts.get(i).or("").len()
             i += 1
         }
         buf := text.alloc(total)
@@ -66,7 +66,7 @@ impl str {
                 text.put(buf, at, self)
                 at += self.len()
             }
-            p := parts.get(i).unwrap_or("")
+            p := parts.get(i).or("")
             text.put(buf, at, p)
             at += p.len()
             i += 1

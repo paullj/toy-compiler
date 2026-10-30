@@ -9,10 +9,10 @@ struct User { name: str, age: int }
 
 fn main() -> int {
     xs: Vec[int] = [3, 8, 5, 12]
-    hit := xs.find(fn(x) { x > 4 }).unwrap_or(0)
-    miss := xs.find(fn(x) { x > 100 }).unwrap_or(1)
+    hit := xs.find(fn(x) { x > 4 }).or(0)
+    miss := xs.find(fn(x) { x > 100 }).or(1)
     users: Vec[User] = [User { name: "ann", age: 31 }, User { name: "bob", age: 25 }, User { name: "cy", age: 25 }]
-    u := users.find(fn(u) { u.age < 30 }).unwrap()
+    u := users.find(fn(u) { u.age < 30 }).expect("no value")
     io.println(u.name)
     return hit + miss + u.age + 8
 }

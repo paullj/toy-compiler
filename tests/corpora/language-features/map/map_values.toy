@@ -17,5 +17,5 @@ fn main() -> int {
         io.println(v)
     }
     doubled := m.map(fn(v) { v * 2 })
-    return doubled.get("x").unwrap_or(0) + words.len()
+    return doubled.get("x").or(0) + words.len()
 }

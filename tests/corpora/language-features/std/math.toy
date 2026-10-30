@@ -8,6 +8,6 @@ import std/math
 
 fn main() -> int {
     io.print("math ok\n")
-    root: int = math.sqrt(16.0).try_into().unwrap()
+    root: int = math.sqrt(16.0).try_into().expect("no value")
     return root + math.max(1, 3)
 }

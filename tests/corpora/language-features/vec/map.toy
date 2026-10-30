@@ -17,5 +17,5 @@ fn main() -> int {
     io.println("")
     n := 0
     big.each(fn(b) { if b { n = n + 1 } })
-    return xs.len() + doubled.get(2).unwrap() * 2 + n + shouted.len() - 2
+    return xs.len() + doubled.get(2).expect("no value") * 2 + n + shouted.len() - 2
 }

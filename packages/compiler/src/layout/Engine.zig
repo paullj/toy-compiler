@@ -92,7 +92,7 @@ pub const VariantForm = enum(u8) { unit, tuple, @"struct" };
 /// instance (keyed off the prelude template id in `reifyAppToEnum`, NOT the name — a
 /// user `enum Option` mangles to the same `Option$int` yet is a distinct template) and
 /// copied through to its `EnumLayout`, so `lower` can recognize the compiler-provided
-/// `is_some`/`unwrap`/… inherent methods per-instance and inline the tag test / payload
+/// `is_some`/`expect`/… inherent methods per-instance and inline the tag test / payload
 /// load. Never serialized (layouts are recomputed each typecheck), so adding it needs no
 /// content-cache version bump.
 pub const NativeEnumFamily = enum(u8) { none, option, result };

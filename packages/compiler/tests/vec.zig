@@ -35,7 +35,7 @@ test "vec: growth past the initial capacity reads back a post-grow element" {
         \\        xs.push(i)
         \\        i = i + 1
         \\    }
-        \\    return xs.len() + xs.get(7).unwrap()   # 10 + 7 = 17
+        \\    return xs.len() + xs.get(7).expect("no value")   # 10 + 7 = 17
         \\}
         \\
     );
@@ -81,7 +81,7 @@ test "vec: `Vec[int].new()` and the empty-list literal build an identical empty 
         \\        v.push(i)
         \\        i = i + 1
         \\    }
-        \\    return v.len() * 2 + v.get(6).unwrap()   # 7*2 + 6 = 20
+        \\    return v.len() * 2 + v.get(6).expect("no value")   # 7*2 + 6 = 20
         \\}
         \\fn main() -> int {
         \\    a := Vec[int].new()
@@ -211,20 +211,20 @@ test "vec: an aggregate element survives a regrow, read via xs[i] below the init
     try std.testing.expectEqual(@as(u8, 9), code);
 }
 
-test "vec: Option[P] unwrap over an aggregate payload (get) yields the struct" {
+test "vec: Option[P] expect over an aggregate payload (get) yields the struct" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     try skipUnlessBackend(io);
-    // The SPIKE: get(1) -> Option[P], unwrap of an aggregate payload routes through a
+    // The SPIKE: get(1) -> Option[P], expect of an aggregate payload routes through a
     // result slot + copy. p.x + p.y = 3 + 4 = 7.
     const code = try buildAndRun(gpa, io, ".toy-test-vec-opt-struct",
         \\import std/vec
         \\struct P { x: int, y: int }
         \\fn main() -> int {
         \\    ps := [P{ x: 1, y: 2 }, P{ x: 3, y: 4 }]
-        \\    p := ps.get(1).unwrap()
+        \\    p := ps.get(1).expect("no value")
         \\    return p.x + p.y
         \\}
         \\
@@ -232,20 +232,20 @@ test "vec: Option[P] unwrap over an aggregate payload (get) yields the struct" {
     try std.testing.expectEqual(@as(u8, 7), code);
 }
 
-test "vec: Option[Vec[int]] unwrap round-trips a Vec payload" {
+test "vec: Option[Vec[int]] expect round-trips a Vec payload" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     try skipUnlessBackend(io);
-    // The unwrap payload is a Vec[int] (a struct aggregate — the 8-byte handle rides the
-    // result-slot copy). Build a Vec, wrap it in Option[Vec[int]], unwrap, and read back.
+    // The expect payload is a Vec[int] (a struct aggregate — the 8-byte handle rides the
+    // result-slot copy). Build a Vec, wrap it in Option[Vec[int]], expect, and read back.
     const code = try buildAndRun(gpa, io, ".toy-test-vec-opt-vec",
         \\import std/vec
         \\fn main() -> int {
         \\    xs := [10, 20, 30]
         \\    o := Option[Vec[int]].some(xs)
-        \\    v := o.unwrap()
+        \\    v := o.expect("no value")
         \\    return v.len() * 10 + v[2]   # 3*10 + 30 = 60
         \\}
         \\
@@ -253,40 +253,40 @@ test "vec: Option[Vec[int]] unwrap round-trips a Vec payload" {
     try std.testing.expectEqual(@as(u8, 60), code);
 }
 
-test "vec: Option[Ref[int]] unwrap rides the scalar/ref payload path" {
+test "vec: Option[Ref[int]] expect rides the scalar/ref payload path" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     try skipUnlessBackend(io);
-    // A managed-box payload is an 8-byte cell pointer, so unwrap keeps the scalar
+    // A managed-box payload is an 8-byte cell pointer, so expect keeps the scalar
     // block-arg join (byte-identical to HEAD). Read the unwrapped Ref: 42.
     const code = try buildAndRun(gpa, io, ".toy-test-vec-opt-ref",
         \\import std/ref
         \\fn main() -> int {
         \\    r := Ref.new(42)
         \\    o := Option[Ref[int]].some(r)
-        \\    return o.unwrap().get()
+        \\    return o.expect("no value").get()
         \\}
         \\
     );
     try std.testing.expectEqual(@as(u8, 42), code);
 }
 
-test "vec: unwrap_or with an aggregate default returns the default on none" {
+test "vec: or with an aggregate default returns the default on none" {
     const gpa = std.testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
     try skipUnlessBackend(io);
-    // unwrap_or's none-branch writes the aggregate default into the result slot via
+    // or's none-branch writes the aggregate default into the result slot via
     // lowerExprInto. An empty Vec's get(0) is none -> the default P{x:5,y:6} -> 11.
-    const code = try buildAndRun(gpa, io, ".toy-test-vec-unwrap-or",
+    const code = try buildAndRun(gpa, io, ".toy-test-vec-or",
         \\import std/vec
         \\struct P { x: int, y: int }
         \\fn main() -> int {
         \\    xs := Vec[P].new()
-        \\    p := xs.get(0).unwrap_or(P{ x: 5, y: 6 })
+        \\    p := xs.get(0).or(P{ x: 5, y: 6 })
         \\    return p.x + p.y
         \\}
         \\
@@ -304,9 +304,9 @@ test "vec: .first() returns the head element" {
         \\import std/vec
         \\fn main() -> int {
         \\    xs := [8, 1, 2]
-        \\    a := xs.first().unwrap()
+        \\    a := xs.first().expect("no value")
         \\    empty := Vec[int].new()
-        \\    b := empty.first().unwrap_or(3)
+        \\    b := empty.first().or(3)
         \\    return a + b   # 8 + 3 = 11
         \\}
         \\
@@ -377,7 +377,7 @@ test "vec: a Vec program is byte-identical at -j1 and -j8" {
         \\    xs.push(3)
         \\    ys := xs
         \\    ys.push(0)
-        \\    return xs.len() * 10 + xs.get(0).unwrap()
+        \\    return xs.len() * 10 + xs.get(0).expect("no value")
         \\}
         \\
     ;
@@ -632,7 +632,7 @@ test "vec: a float element round-trips through push/get (float as a monomorphiza
         \\    xs: Vec[float] = []
         \\    xs.push(1.5)
         \\    xs.push(2.5)
-        \\    return if xs.get(0).unwrap() +. xs.get(1).unwrap() == 4.0 { 42 } else { 0 }
+        \\    return if xs.get(0).expect("no value") +. xs.get(1).expect("no value") == 4.0 { 42 } else { 0 }
         \\}
         \\
     );
@@ -647,7 +647,7 @@ test "vec: Vec[Vec[int]].new() nested container round-trips" {
     try skipUnlessBackend(io);
     // The outer element type is itself a generic instance (`Vec[int]`), so the outer
     // `new()` receiver `Vec[Vec[int]]` must resolve through the reified-arg -> App-form
-    // inverse. A local for the unwrap avoids method-chaining on the inner handle.
+    // inverse. A local for the expect avoids method-chaining on the inner handle.
     const code = try buildAndRun(gpa, io, ".toy-test-vec-nested-vec",
         \\import std/vec
         \\fn main() -> int {
@@ -655,8 +655,8 @@ test "vec: Vec[Vec[int]].new() nested container round-trips" {
         \\    inner := Vec[int].new()
         \\    inner.push(5)
         \\    outer.push(inner)
-        \\    got: Vec[int] = outer.get(0).unwrap()
-        \\    return got.get(0).unwrap()
+        \\    got: Vec[int] = outer.get(0).expect("no value")
+        \\    return got.get(0).expect("no value")
         \\}
         \\
     );
@@ -670,7 +670,7 @@ test "vec: Vec[Ref[int]].new() round-trips managed-box elements" {
     const io = threaded.io();
     try skipUnlessBackend(io);
     // The element is a managed box (`Ref[int]`, an `isRefPayload` type). `Ref.new(x)` boxes
-    // the value; `get(i).unwrap().get()` reads the boxed cell back.
+    // the value; `get(i).expect(..).get()` reads the boxed cell back.
     const code = try buildAndRun(gpa, io, ".toy-test-vec-ref",
         \\import std/ref
         \\import std/vec
@@ -678,7 +678,7 @@ test "vec: Vec[Ref[int]].new() round-trips managed-box elements" {
         \\    xs := Vec[Ref[int]].new()
         \\    xs.push(Ref.new(3))
         \\    xs.push(Ref.new(4))
-        \\    return xs.get(0).unwrap().get() + xs.get(1).unwrap().get()
+        \\    return xs.get(0).expect("no value").get() + xs.get(1).expect("no value").get()
         \\}
         \\
     );
@@ -698,7 +698,7 @@ test "vec: Vec[Option[int]].new() constructs + round-trips an enum element" {
         \\fn main() -> int {
         \\    xs := Vec[Option[int]].new()
         \\    xs.push(Option.some(9))
-        \\    return xs.get(0).unwrap().unwrap()
+        \\    return xs.get(0).expect("no value").expect("no value")
         \\}
         \\
     );
@@ -719,7 +719,7 @@ test "vec: a nested-generic-container program is byte-identical at -j1 and -j8" 
         \\    xs := Vec[Ref[int]].new()
         \\    xs.push(Ref.new(3))
         \\    xs.push(Ref.new(4))
-        \\    return xs.get(0).unwrap().get() + xs.get(1).unwrap().get()
+        \\    return xs.get(0).expect("no value").get() + xs.get(1).expect("no value").get()
         \\}
         \\
     ;
@@ -733,8 +733,8 @@ test "vec: a .field off a call/method result materializes the aggregate rvalue" 
     defer threaded.deinit();
     const io = threaded.io();
     try skipUnlessBackend(io);
-    // A `.field` off an expression with no named place — `get(i).unwrap().field`, a
-    // nested `.unwrap().i.x`, a direct `mk().x` — must materialize the aggregate rvalue
+    // A `.field` off an expression with no named place — `get(i).expect(..).field`, a
+    // nested `.expect(..).i.x`, a direct `mk().x` — must materialize the aggregate rvalue
     // into a temp once and read the field from the copy. Regression: the lowerer had no
     // arm for a call base, so it read a stale register (garbage) or crashed codegen when
     // the field fed arithmetic. 3 + 5 + 3 + 5 == 16.
@@ -746,8 +746,8 @@ test "vec: a .field off a call/method result materializes the aggregate rvalue" 
         \\fn main() -> int {
         \\    ps := Vec[P].new()
         \\    ps.push(mk())
-        \\    a := ps.get(0).unwrap().x
-        \\    b := ps.get(0).unwrap().i.x
+        \\    a := ps.get(0).expect("no value").x
+        \\    b := ps.get(0).expect("no value").i.x
         \\    c := mk().x
         \\    return a + b + c + mk().i.x
         \\}
@@ -769,7 +769,7 @@ test "vec: a program's own Vec method wins over std's of the same name, whatever
         \\    fn each(self, f: fn(T)) {
         \\        i := self.len() - 1
         \\        while i >= 0 {
-        \\            f(self.get(i).unwrap())
+        \\            f(self.get(i).expect("no value"))
         \\            i = i - 1
         \\        }
         \\    }
@@ -809,7 +809,7 @@ test "vec: a program's own Vec and Option methods never change what std's method
     defer threaded.deinit();
     const io = threaded.io();
     try skipUnlessBackend(io);
-    // std's `split`, `map` and `join` call `push`, `len`, `get` and `unwrap_or`, `sort`
+    // std's `split`, `map` and `join` call `push`, `len`, `get` and `or`, `sort`
     // calls `sort_by`, and a `for` walks with `get`: each keeps std's own method or the
     // builtin. The program's own calls reach its methods: `len` is 99, `get` finds nothing
     // and `push` drops its element (the `fold` count, which reads std's length, stays 3).
@@ -824,7 +824,7 @@ test "vec: a program's own Vec and Option methods never change what std's method
         \\    fn sort_by(self, _less: fn(T, T) -> bool) {}
         \\}
         \\impl Option[T] {
-        \\    fn unwrap_or(self, d: T) -> T { d }
+        \\    fn or(self, d: T) -> T { d }
         \\}
         \\fn main() -> int {
         \\    parts := "c a b".split(" ")
@@ -839,7 +839,7 @@ test "vec: a program's own Vec and Option methods never change what std's method
         \\    io.println(parts.fold(0, fn(n, _s) { n + 1 }))
         \\    io.println(parts.len())
         \\    io.println(parts.get(0).is_none())
-        \\    io.println(Option.some(5).unwrap_or(6))
+        \\    io.println(Option.some(5).or(6))
         \\    return 0
         \\}
         \\
@@ -942,8 +942,8 @@ test "vec: sort_by is stable and sort agrees on 1000 elements" {
         \\    rs.sort_by(fn(a, b) { a.k < b.k })
         \\    i = 1
         \\    while i < 1000 {
-        \\        a := rs.get(i - 1).unwrap()
-        \\        b := rs.get(i).unwrap()
+        \\        a := rs.get(i - 1).expect("no value")
+        \\        b := rs.get(i).expect("no value")
         \\        if a.k > b.k { return 1 }
         \\        if a.k == b.k && a.seq >= b.seq { return 2 }
         \\        i = i + 1
@@ -953,11 +953,11 @@ test "vec: sort_by is stable and sort agrees on 1000 elements" {
         \\    ks.sort()
         \\    i = 0
         \\    while i < 1000 {
-        \\        if ks.get(i).unwrap() != want.get(i).unwrap() { return 3 }
-        \\        if by_ord.get(i).unwrap().seq != rs.get(i).unwrap().seq { return 4 }
+        \\        if ks.get(i).expect("no value") != want.get(i).expect("no value") { return 3 }
+        \\        if by_ord.get(i).expect("no value").seq != rs.get(i).expect("no value").seq { return 4 }
         \\        i = i + 1
         \\    }
-        \\    if rs.get(0).unwrap().k != 0 || rs.get(999).unwrap().k != 9 { return 5 }
+        \\    if rs.get(0).expect("no value").k != 0 || rs.get(999).expect("no value").k != 9 { return 5 }
         \\    return 42
         \\}
         \\
@@ -982,13 +982,13 @@ test "vec: Vec closure methods are byte-identical at -j1 and -j8" {
         \\    words := xs.map(fn(x) { x.to_string() })
         \\    big := xs.filter(fn(x) { x > 2 })
         \\    sum := big.fold(0, fn(a, x) { a + x })
-        \\    found := xs.find(fn(x) { x > 6 }).unwrap_or(0)
+        \\    found := xs.find(fn(x) { x > 6 }).or(0)
         \\    flags := if xs.any(fn(x) { x == 1 }) && xs.all(fn(x) { x > 0 }) { 1 } else { 0 }
         \\    ps: Vec[P] = [P { k: 2, s: "a" }, P { k: 1, s: "b" }]
         \\    ps.sort_by(fn(a, b) { a.k < b.k })
         \\    xs.sort()
         \\    digits := words.fold("", fn(acc, w) { acc.concat(w) })
-        \\    return total + sum + found + flags + xs.get(0).unwrap() + ps.len() + digits.len()
+        \\    return total + sum + found + flags + xs.get(0).expect("no value") + ps.len() + digits.len()
         \\}
         \\
     ;

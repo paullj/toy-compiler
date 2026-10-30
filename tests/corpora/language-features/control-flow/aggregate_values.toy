@@ -190,16 +190,16 @@ fn try_option(t: bool, a: Option[P], b: Option[P]) -> Option[int] {
 }
 
 fn option_methods(t: bool, a: Option[P], b: Option[P]) -> int {
-    n := check("if option unwrap", (if t { a } else { b }).unwrap().y, 6)
-    n = n + check("loop option unwrap", (loop { break if t { a } else { b } }).unwrap().y, 6)
-    n = n + check("labeled loop option unwrap", (@l loop { break @l if t { a } else { b } }).unwrap().y, 6)
-    n = n + check("labeled block option unwrap", (@k { if t { a } else { b } }).unwrap().y, 6)
+    n := check("if option expect", (if t { a } else { b }).expect("no value").y, 6)
+    n = n + check("loop option expect", (loop { break if t { a } else { b } }).expect("no value").y, 6)
+    n = n + check("labeled loop option expect", (@l loop { break @l if t { a } else { b } }).expect("no value").y, 6)
+    n = n + check("labeled block option expect", (@k { if t { a } else { b } }).expect("no value").y, 6)
     n = n + yes("if option is_none", (if t { b } else { a }).is_none())
     n = n + yes("loop option is_none", (loop { break if t { b } else { a } }).is_none())
     n = n + yes("labeled loop option is_none", (@l loop { break @l if t { b } else { a } }).is_none())
     n = n + yes("labeled block option is_none", (@k { if t { b } else { a } }).is_none())
-    n = n + check("option ?", try_option(t, a, b).unwrap_or(0), 24)
-    n = n + check("option ? none", try_option(t, b, a).unwrap_or(-1), -1)
+    n = n + check("option ?", try_option(t, a, b).or(0), 24)
+    n = n + check("option ? none", try_option(t, b, a).or(-1), -1)
     return n
 }
 
@@ -212,14 +212,14 @@ fn option_eqs(t: bool, a: Option[P], b: Option[P]) -> int {
 }
 
 fn option_args(t: bool, a: Option[P], b: Option[P]) -> int {
-    n := check("if option arg", same(if t { a } else { b }).unwrap().x, 5)
-    n = n + check("loop option arg", same(loop { break if t { a } else { b } }).unwrap().x, 5)
-    n = n + check("labeled loop option arg", same(@l loop { break @l if t { a } else { b } }).unwrap().x, 5)
-    n = n + check("labeled block option arg", same(@k { if t { a } else { b } }).unwrap().x, 5)
-    n = n + check("if option ret", ret_if(t, a, b).unwrap().x, 5)
-    n = n + check("loop option ret", ret_loop(t, a, b).unwrap().x, 5)
-    n = n + check("labeled loop option ret", ret_lloop(t, a, b).unwrap().x, 5)
-    n = n + check("labeled block option ret", ret_lblock(t, a, b).unwrap().x, 5)
+    n := check("if option arg", same(if t { a } else { b }).expect("no value").x, 5)
+    n = n + check("loop option arg", same(loop { break if t { a } else { b } }).expect("no value").x, 5)
+    n = n + check("labeled loop option arg", same(@l loop { break @l if t { a } else { b } }).expect("no value").x, 5)
+    n = n + check("labeled block option arg", same(@k { if t { a } else { b } }).expect("no value").x, 5)
+    n = n + check("if option ret", ret_if(t, a, b).expect("no value").x, 5)
+    n = n + check("loop option ret", ret_loop(t, a, b).expect("no value").x, 5)
+    n = n + check("labeled loop option ret", ret_lloop(t, a, b).expect("no value").x, 5)
+    n = n + check("labeled block option ret", ret_lblock(t, a, b).expect("no value").x, 5)
     return n
 }
 
@@ -232,15 +232,15 @@ fn try_result(t: bool, a: Result[P, str], b: Result[P, str]) -> Result[int, str]
 }
 
 fn result_methods(t: bool, a: Result[P, str], b: Result[P, str]) -> int {
-    n := check("if result unwrap", (if t { a } else { b }).unwrap().x, 7)
-    n = n + check("loop result unwrap", (loop { break if t { a } else { b } }).unwrap().x, 7)
-    n = n + check("labeled loop result unwrap", (@l loop { break @l if t { a } else { b } }).unwrap().x, 7)
-    n = n + check("labeled block result unwrap", (@k { if t { a } else { b } }).unwrap().x, 7)
-    n = n + yes("if result is_err", (if t { b } else { a }).is_err())
-    n = n + yes("loop result is_err", (loop { break if t { b } else { a } }).is_err())
-    n = n + yes("labeled loop result is_err", (@l loop { break @l if t { b } else { a } }).is_err())
-    n = n + yes("labeled block result is_err", (@k { if t { b } else { a } }).is_err())
-    n = n + check("result ?", try_result(t, a, b).unwrap_or(0), 28)
+    n := check("if result expect", (if t { a } else { b }).expect("no value").x, 7)
+    n = n + check("loop result expect", (loop { break if t { a } else { b } }).expect("no value").x, 7)
+    n = n + check("labeled loop result expect", (@l loop { break @l if t { a } else { b } }).expect("no value").x, 7)
+    n = n + check("labeled block result expect", (@k { if t { a } else { b } }).expect("no value").x, 7)
+    n = n + yes("if result is_error", (if t { b } else { a }).is_error())
+    n = n + yes("loop result is_error", (loop { break if t { b } else { a } }).is_error())
+    n = n + yes("labeled loop result is_error", (@l loop { break @l if t { b } else { a } }).is_error())
+    n = n + yes("labeled block result is_error", (@k { if t { b } else { a } }).is_error())
+    n = n + check("result ?", try_result(t, a, b).or(0), 28)
     n = n + check("result ? err", match try_result(t, b, a) { .ok(_) -> 0, .err(e) -> e.len() }, 3)
     return n
 }
@@ -254,14 +254,14 @@ fn result_eqs(t: bool, a: Result[P, str], b: Result[P, str]) -> int {
 }
 
 fn result_args(t: bool, a: Result[P, str], b: Result[P, str]) -> int {
-    n := check("if result arg", same(if t { a } else { b }).unwrap().y, 8)
-    n = n + check("loop result arg", same(loop { break if t { a } else { b } }).unwrap().y, 8)
-    n = n + check("labeled loop result arg", same(@l loop { break @l if t { a } else { b } }).unwrap().y, 8)
-    n = n + check("labeled block result arg", same(@k { if t { a } else { b } }).unwrap().y, 8)
-    n = n + check("if result ret", ret_if(t, a, b).unwrap().y, 8)
-    n = n + check("loop result ret", ret_loop(t, a, b).unwrap().y, 8)
-    n = n + check("labeled loop result ret", ret_lloop(t, a, b).unwrap().y, 8)
-    n = n + check("labeled block result ret", ret_lblock(t, a, b).unwrap().y, 8)
+    n := check("if result arg", same(if t { a } else { b }).expect("no value").y, 8)
+    n = n + check("loop result arg", same(loop { break if t { a } else { b } }).expect("no value").y, 8)
+    n = n + check("labeled loop result arg", same(@l loop { break @l if t { a } else { b } }).expect("no value").y, 8)
+    n = n + check("labeled block result arg", same(@k { if t { a } else { b } }).expect("no value").y, 8)
+    n = n + check("if result ret", ret_if(t, a, b).expect("no value").y, 8)
+    n = n + check("loop result ret", ret_loop(t, a, b).expect("no value").y, 8)
+    n = n + check("labeled loop result ret", ret_lloop(t, a, b).expect("no value").y, 8)
+    n = n + check("labeled block result ret", ret_lblock(t, a, b).expect("no value").y, 8)
     return n
 }
 

@@ -533,7 +533,7 @@ test "sibling protocol reusing eq/cmp: build+run yields the derive result (exit 
     }
 }
 
-test "panic: div/mod/unwrap traps + user panic() write msg + a symbolized-backtrace dump to STDERR and exit nonzero at BOTH -O levels; nonzero controls exit normally" {
+test "panic: div/mod/expect traps + user panic() write msg + a symbolized-backtrace dump to STDERR and exit nonzero at BOTH -O levels; nonzero controls exit normally" {
     // `__panic` writes the message to fd 2, then a symbolized backtrace — one `0x<hex>`
     // line per frame walked off the x29 chain (each is the call site's slide-independent
     // __text offset) — then SYS_exit(1): a clean nonzero exit, no SIGILL/brk. A panicking
@@ -552,7 +552,8 @@ test "panic: div/mod/unwrap traps + user panic() write msg + a symbolized-backtr
     const fixtures = .{
         .{ .dir = ".toy-test-panic-div0", .src = "fn main() -> int { return 10 / 0 }\n", .want = @as(?u8, 1), .err = "division by zero" },
         .{ .dir = ".toy-test-panic-mod0", .src = "fn main() -> int { return 10 % 0 }\n", .want = @as(?u8, 1), .err = "remainder by zero" },
-        .{ .dir = ".toy-test-panic-unwrap", .src = "fn main() -> int {\n  x := Option[int].none\n  return x.unwrap()\n}\n", .want = @as(?u8, 1), .err = "unwrap of empty" },
+        .{ .dir = ".toy-test-panic-expect", .src = "fn main() -> int {\n  x := Option[int].none\n  return x.expect(\"lookup failed\")\n}\n", .want = @as(?u8, 1), .err = "lookup failed" },
+        .{ .dir = ".toy-test-panic-expect-str", .src = "fn main() -> int {\n  x := Result[str, int].err(4)\n  return x.expect(\"bad str\").len()\n}\n", .want = @as(?u8, 1), .err = "bad str" },
         .{ .dir = ".toy-test-panic-user", .src = "fn main() -> int {\n  panic(\"boom\")\n  return 0\n}\n", .want = @as(?u8, 1), .err = "boom" },
         .{ .dir = ".toy-test-panic-oob", .src = "import std/vec\nfn main() -> int {\n  xs := [10]\n  return xs[5]\n}\n", .want = @as(?u8, 1), .err = "index out of bounds" },
         .{ .dir = ".toy-test-panic-oob-store", .src = "import std/vec\nfn main() -> int {\n  xs := [10]\n  xs[-1] = 5\n  return 0\n}\n", .want = @as(?u8, 1), .err = "index out of bounds" },
@@ -560,6 +561,7 @@ test "panic: div/mod/unwrap traps + user panic() write msg + a symbolized-backtr
         .{ .dir = ".toy-test-panic-oob-field", .src = "import std/vec\nstruct P { x: int }\nfn main() -> int {\n  ps := [P { x: 1 }]\n  ps[1].x = 5\n  return 0\n}\n", .want = @as(?u8, 1), .err = "index out of bounds" },
         .{ .dir = ".toy-test-panic-oob-field-compound", .src = "import std/vec\nstruct P { x: int }\nfn main() -> int {\n  ps := [P { x: 1 }]\n  ps[1].x += 5\n  return 0\n}\n", .want = @as(?u8, 1), .err = "index out of bounds" },
         .{ .dir = ".toy-test-panic-ctldiv", .src = "fn main() -> int { return 10 / 3 }\n", .want = @as(?u8, 3), .err = "" },
+        .{ .dir = ".toy-test-panic-ctlexpect", .src = "fn msg() -> str {\n  panic(\"evaluated\")\n}\nfn main() -> int {\n  x := Option[int].some(5)\n  return x.expect(msg())\n}\n", .want = @as(?u8, 5), .err = "" },
         .{ .dir = ".toy-test-panic-ctlmod", .src = "fn main() -> int { return 17 % 5 }\n", .want = @as(?u8, 2), .err = "" },
     };
     inline for (fixtures) |fx| {

@@ -25,9 +25,9 @@ fn main() -> int {
     if cp(b.into()) != 200 { return 6 }
 
     # char -> byte (fallible): 'A' fits, '€' does not.
-    okb: byte = 'A'.try_into().unwrap_or(0)
+    okb: byte = 'A'.try_into().or(0)
     if okb != 65 { return 7 }
-    errb: byte = '€'.try_into().unwrap_or(255)
+    errb: byte = '€'.try_into().or(255)
     if errb != 255 { return 8 }
 
     # int -> char (fallible): valid scalar Ok, surrogate/out-of-range Err.

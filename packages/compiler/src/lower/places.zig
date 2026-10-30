@@ -91,7 +91,7 @@ pub fn lowerPlaceAddr(b: *Builder, node_idx: Ast.Index) error{OutOfMemory}!Ir.Va
         // Any other base that produces an aggregate RVALUE with no named place — a
         // call/method result, a `match`/`if` expression — is materialized into a temp
         // once so the field_addr chain reads from the copy. Without this, `f().field`
-        // (e.g. the idiomatic `v.get(i).unwrap().field`) resolves to no address and
+        // (e.g. the idiomatic `v.get(i).expect("..").field`) resolves to no address and
         // silently reads a stale register, or crashes when used in arithmetic. The
         // checker rejects a store through such a base (T0075), so this read-only
         // materialization can never alias a real place.

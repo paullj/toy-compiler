@@ -11,5 +11,5 @@ fn main() -> int {
     xs.push(0)
     ys := xs               # shares the same GcArray (Model R)
     ys.push(0)             # visible through xs
-    return xs.len() * 10 + xs.get(0).unwrap()   # 3*10 + 3 = 33
+    return xs.len() * 10 + xs.get(0).expect("no value")   # 3*10 + 3 = 33
 }

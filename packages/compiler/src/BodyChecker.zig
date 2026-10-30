@@ -4436,8 +4436,8 @@ pub const BodyChecker = struct {
         // A compiler-provided inherent method on the prelude `Option`/`Result`
         // enums: recognized by ctor id, NOT a `t.methods` entry (source-
         // less, like the builtin scalar `eq`/`hash`), so `pickGenericMethod`
-        // misses above. `is_some`/`is_none`/`is_ok`/`is_err` -> bool (arity 0);
-        // `unwrap` -> the payload type-arg (arity 0); `unwrap_or` -> the payload
+        // misses above. `is_some`/`is_none`/`is_ok`/`is_error` -> bool (arity 0);
+        // `expect` -> the payload type-arg (one `str` message); `or` -> the payload
         // type-arg (arity 1, default assignable to it). The receiver is an `App`
         // during Pass C (`e.args[0]` is the payload T); `lower` inlines the tag
         // test / payload load. Gated on `ctor_is_enum` (struct/enum ids share a
@@ -4446,18 +4446,18 @@ pub const BodyChecker = struct {
             const fam = Typecheck.optResultFamilyOf(bc.model, e.ctor);
             if (Typecheck.optionResultMethod(fam, member)) |op| {
                 const t_ty: Type = if (e.args.len >= 1) e.args[0] else .invalid;
-                // Predicates are tag-only, so safe for any payload. `unwrap`/
-                // `unwrap_or` carry the payload as ONE scalar value through
+                // Predicates are tag-only, so safe for any payload. `expect`/
+                // `or` carry the payload as ONE scalar value through
                 // `lower`, so only recognize them for a scalar (int/bool)
                 // payload; a str/struct/enum payload falls through to the T0018
-                // below — a clean rejection, since aggregate-payload unwrap is
+                // below — a clean rejection, since aggregate-payload expect is
                 // deferred (a scalar load would truncate a fat/aggregate
                 // value, and an aggregate join block-arg crashes codegen).
                 const native_ok = switch (op) {
                     .is_tag0, .is_tag1 => true,
                     // A managed-box payload (`Ref[T]`, an `.app` during Pass C) is an
-                    // 8-byte scalar cell pointer, so it rides the scalar unwrap path.
-                    .unwrap, .unwrap_or => t_ty.kind != .invalid,
+                    // 8-byte scalar cell pointer, so it rides the scalar expect path.
+                    .expect, .@"or" => t_ty.kind != .invalid,
                 };
                 if (native_ok) {
                     bc.setCallee(n, Callee.builtinMethod(Typecheck.optResultBuiltin(op)));
@@ -4467,12 +4467,12 @@ pub const BodyChecker = struct {
                             bc.node_types[(node_idx).int()] = Type.bool;
                             return Type.bool;
                         },
-                        .unwrap => {
-                            _ = try bc.checkCall(node_idx, args, .{ .params = &.{}, .name = member });
+                        .expect => {
+                            _ = try bc.checkCall(node_idx, args, .{ .params = &.{Type.str}, .name = member });
                             bc.node_types[(node_idx).int()] = t_ty;
                             return t_ty;
                         },
-                        .unwrap_or => {
+                        .@"or" => {
                             const payload = [_]Type{t_ty};
                             _ = try bc.checkCall(node_idx, args, .{ .params = &payload, .name = member });
                             bc.node_types[(node_idx).int()] = t_ty;
@@ -4748,7 +4748,7 @@ pub const BodyChecker = struct {
 
     /// Whether `t` is a managed box (`Ref[T]`/`gc_array[T]`) — a struct-`App` over a
     /// prelude box template — during Pass C (before reify). Such a payload is an 8-byte
-    /// scalar cell pointer, so it rides the scalar native-Option/Result unwrap path.
+    /// scalar cell pointer, so it rides the scalar native-Option/Result expect path.
     fn isRefPayload(bc: *BodyChecker, t: Type) bool {
         if (!t.isApp()) return false;
         const e = bc.composite.at(t.appIdx());

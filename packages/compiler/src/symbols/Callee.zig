@@ -62,8 +62,8 @@ pub const Callee = extern struct {
         conv_try_into,
         opt_is_tag0,
         opt_is_tag1,
-        opt_unwrap,
-        opt_unwrap_or,
+        opt_expect,
+        opt_or,
         scalar_cmp,
     };
 

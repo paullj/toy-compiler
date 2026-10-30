@@ -83,7 +83,7 @@ fn eachTermUseOperand(term: *Ir.Terminator, ctx: anytype, comptime each: anytype
             .value => |*v| each(ctx, v),
             .slot, .none => {},
         },
-        .@"unreachable", .trap, .panic => {},
+        .@"unreachable", .panic => {},
     }
 }
 

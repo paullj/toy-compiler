@@ -832,7 +832,7 @@ test "int->char try_into is a shared witness — 12 in one fn compile (pre-fix f
 test "char->byte try_into is a shared witness — 22 in one fn compile (pre-fix frame overflow)" {
     // 22 char->byte `try_into` in ONE fn — >20, the pre-fix inline overflowed the frame.
     // Each is now one CALL to the shared `TryInto$char_to_byte` witness. Codepoints 65..86
-    // all fit `byte`, so every `unwrap_or(0)` yields the codepoint; the two edge checks
+    // all fit `byte`, so every `or(0)` yields the codepoint; the two edge checks
     // (b0, b21) exit non-42 on any miscompile, else 42.
     // 22 is the smallest count that clears the pre-fix ~21-site overflow; the spill-all frame
     // now overflows at 25, so this test sits ~2 sites under the cap. A per-site frame-cost bump
@@ -848,28 +848,28 @@ test "char->byte try_into is a shared witness — 22 in one fn compile (pre-fix 
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     const src =
         \\fn g() -> int {
-        \\  b0: byte = 'A'.try_into().unwrap_or(0)
-        \\  b1: byte = 'B'.try_into().unwrap_or(0)
-        \\  b2: byte = 'C'.try_into().unwrap_or(0)
-        \\  b3: byte = 'D'.try_into().unwrap_or(0)
-        \\  b4: byte = 'E'.try_into().unwrap_or(0)
-        \\  b5: byte = 'F'.try_into().unwrap_or(0)
-        \\  b6: byte = 'G'.try_into().unwrap_or(0)
-        \\  b7: byte = 'H'.try_into().unwrap_or(0)
-        \\  b8: byte = 'I'.try_into().unwrap_or(0)
-        \\  b9: byte = 'J'.try_into().unwrap_or(0)
-        \\  b10: byte = 'K'.try_into().unwrap_or(0)
-        \\  b11: byte = 'L'.try_into().unwrap_or(0)
-        \\  b12: byte = 'M'.try_into().unwrap_or(0)
-        \\  b13: byte = 'N'.try_into().unwrap_or(0)
-        \\  b14: byte = 'O'.try_into().unwrap_or(0)
-        \\  b15: byte = 'P'.try_into().unwrap_or(0)
-        \\  b16: byte = 'Q'.try_into().unwrap_or(0)
-        \\  b17: byte = 'R'.try_into().unwrap_or(0)
-        \\  b18: byte = 'S'.try_into().unwrap_or(0)
-        \\  b19: byte = 'T'.try_into().unwrap_or(0)
-        \\  b20: byte = 'U'.try_into().unwrap_or(0)
-        \\  b21: byte = 'V'.try_into().unwrap_or(0)
+        \\  b0: byte = 'A'.try_into().or(0)
+        \\  b1: byte = 'B'.try_into().or(0)
+        \\  b2: byte = 'C'.try_into().or(0)
+        \\  b3: byte = 'D'.try_into().or(0)
+        \\  b4: byte = 'E'.try_into().or(0)
+        \\  b5: byte = 'F'.try_into().or(0)
+        \\  b6: byte = 'G'.try_into().or(0)
+        \\  b7: byte = 'H'.try_into().or(0)
+        \\  b8: byte = 'I'.try_into().or(0)
+        \\  b9: byte = 'J'.try_into().or(0)
+        \\  b10: byte = 'K'.try_into().or(0)
+        \\  b11: byte = 'L'.try_into().or(0)
+        \\  b12: byte = 'M'.try_into().or(0)
+        \\  b13: byte = 'N'.try_into().or(0)
+        \\  b14: byte = 'O'.try_into().or(0)
+        \\  b15: byte = 'P'.try_into().or(0)
+        \\  b16: byte = 'Q'.try_into().or(0)
+        \\  b17: byte = 'R'.try_into().or(0)
+        \\  b18: byte = 'S'.try_into().or(0)
+        \\  b19: byte = 'T'.try_into().or(0)
+        \\  b20: byte = 'U'.try_into().or(0)
+        \\  b21: byte = 'V'.try_into().or(0)
         \\  if b0 != 65 { return 1 }
         \\  if b21 != 86 { return 2 }
         \\  return 42
@@ -925,9 +925,9 @@ test "char->byte witness — 0xFF fits, 0x100 does not (byte-exact through the C
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     const src =
         \\fn main() -> int {
-        \\  ok255: byte = '\u{FF}'.try_into().unwrap_or(0)
+        \\  ok255: byte = '\u{FF}'.try_into().or(0)
         \\  if ok255 != 255 { return 1 }
-        \\  err256: byte = '\u{100}'.try_into().unwrap_or(0)
+        \\  err256: byte = '\u{100}'.try_into().or(0)
         \\  if err256 != 0 { return 2 }
         \\  return 42
         \\}
@@ -979,18 +979,18 @@ test "float->int try_into is a shared witness — 12 in one fn compile (pre-fix 
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     const src =
         \\fn f() -> int {
-        \\  a0: int = (0.0).try_into().unwrap_or(0)
-        \\  a1: int = (1.0).try_into().unwrap_or(0)
-        \\  a2: int = (2.0).try_into().unwrap_or(0)
-        \\  a3: int = (3.0).try_into().unwrap_or(0)
-        \\  a4: int = (4.0).try_into().unwrap_or(0)
-        \\  a5: int = (5.0).try_into().unwrap_or(0)
-        \\  a6: int = (6.0).try_into().unwrap_or(0)
-        \\  a7: int = (7.0).try_into().unwrap_or(0)
-        \\  a8: int = (8.0).try_into().unwrap_or(0)
-        \\  a9: int = (9.0).try_into().unwrap_or(0)
-        \\  a10: int = (10.0).try_into().unwrap_or(0)
-        \\  a11: int = (11.0).try_into().unwrap_or(0)
+        \\  a0: int = (0.0).try_into().or(0)
+        \\  a1: int = (1.0).try_into().or(0)
+        \\  a2: int = (2.0).try_into().or(0)
+        \\  a3: int = (3.0).try_into().or(0)
+        \\  a4: int = (4.0).try_into().or(0)
+        \\  a5: int = (5.0).try_into().or(0)
+        \\  a6: int = (6.0).try_into().or(0)
+        \\  a7: int = (7.0).try_into().or(0)
+        \\  a8: int = (8.0).try_into().or(0)
+        \\  a9: int = (9.0).try_into().or(0)
+        \\  a10: int = (10.0).try_into().or(0)
+        \\  a11: int = (11.0).try_into().or(0)
         \\  return a0 + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11
         \\}
         \\fn main() -> int {
@@ -1006,7 +1006,7 @@ test "float->int try_into is a shared witness — 12 in one fn compile (pre-fix 
 
 test "float->int witness — NaN/+-inf/out-of-range Err, 2^63 boundary is byte-exact through the CALL" {
     // The fcmp range guard must reproduce the fallible-narrow verdicts: NaN and +-inf and
-    // |f|>=2^63 -> Err (unwrap_or(-1) sentinel); the largest f64 < 2^63 -> Ok. The exactly-
+    // |f|>=2^63 -> Err (or(-1) sentinel); the largest f64 < 2^63 -> Ok. The exactly-
     // representable 2^63 is the silent-saturation gate: fcvtzs alone would saturate it to
     // i64_max, but the strict `< 2^63` guard makes it Err.
     if (builtin.os.tag != .macos) return error.SkipZigTest;
@@ -1018,12 +1018,12 @@ test "float->int witness — NaN/+-inf/out-of-range Err, 2^63 boundary is byte-e
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
     const src =
         \\fn main() -> int {
-        \\  nan: int = (0.0 /. 0.0).try_into().unwrap_or(-1)
-        \\  pinf: int = (1.0 /. 0.0).try_into().unwrap_or(-1)
-        \\  huge: int = (1e30).try_into().unwrap_or(-1)
-        \\  nhuge: int = (0.0 -. 1e30).try_into().unwrap_or(-1)
-        \\  at63: int = (9223372036854775808.0).try_into().unwrap_or(-1)
-        \\  below: int = (9223372036854774784.0).try_into().unwrap()
+        \\  nan: int = (0.0 /. 0.0).try_into().or(-1)
+        \\  pinf: int = (1.0 /. 0.0).try_into().or(-1)
+        \\  huge: int = (1e30).try_into().or(-1)
+        \\  nhuge: int = (0.0 -. 1e30).try_into().or(-1)
+        \\  at63: int = (9223372036854775808.0).try_into().or(-1)
+        \\  below: int = (9223372036854774784.0).try_into().expect("no value")
         \\  if nan != -1 { return 1 }
         \\  if pinf != -1 { return 2 }
         \\  if huge != -1 { return 3 }
@@ -1297,7 +1297,7 @@ test "match: an out-of-range literal pattern on a narrow-int scrutinee reports T
     try testing.expect(std.mem.indexOf(u8, res.out, "does not match scrutinee") == null);
 }
 
-test "an Option is_some/unwrap_or program compiles + runs; exit is the guarded payload" {
+test "an Option is_some/or program compiles + runs; exit is the guarded payload" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -1308,9 +1308,9 @@ test "an Option is_some/unwrap_or program compiles + runs; exit is the guarded p
     const src =
         \\fn main() -> int {
         \\  a := Option[int].some(40)
-        \\  base := if a.is_some() { a.unwrap_or(0) } else { 0 }
+        \\  base := if a.is_some() { a.or(0) } else { 0 }
         \\  b := Option[int].none
-        \\  return base + b.unwrap_or(2)
+        \\  return base + b.or(2)
         \\}
         \\
     ;
@@ -1319,7 +1319,7 @@ test "an Option is_some/unwrap_or program compiles + runs; exit is the guarded p
     try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
 }
 
-test "a Result is_ok/unwrap_or program compiles + runs; exit is the ok payload" {
+test "a Result is_ok/or program compiles + runs; exit is the ok payload" {
     if (builtin.os.tag != .macos) return error.SkipZigTest;
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
@@ -1330,9 +1330,9 @@ test "a Result is_ok/unwrap_or program compiles + runs; exit is the ok payload" 
     const src =
         \\fn main() -> int {
         \\  r := Result[int, str].ok(40)
-        \\  base := if r.is_ok() { r.unwrap_or(0) } else { 99 }
+        \\  base := if r.is_ok() { r.or(0) } else { 99 }
         \\  e := Result[int, str].err("boom")
-        \\  return base + e.unwrap_or(2)
+        \\  return base + e.or(2)
         \\}
         \\
     ;
@@ -1341,22 +1341,22 @@ test "a Result is_ok/unwrap_or program compiles + runs; exit is the ok payload" 
     try testing.expectEqual(std.process.Child.Term{ .exited = 42 }, res.term);
 }
 
-test "unwrap on an aggregate payload compiles and runs (result-slot copy, not a crash)" {
+test "expect on an aggregate payload compiles and runs (result-slot copy, not a crash)" {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const dir_name = ".toy-test-agg-unwrap";
+    const dir_name = ".toy-test-agg-expect";
     defer Io.Dir.cwd().deleteTree(io, dir_name) catch {};
-    // Aggregate-payload `unwrap_or` once PANICKED codegen (unassigned join block-arg
+    // Aggregate-payload `or` once PANICKED codegen (unassigned join block-arg
     // offset) then was deferred with a T0018 reject; it now routes the struct payload
-    // through a result slot + copy, so it compiles and runs — `.none.unwrap_or(P{x:2})`
+    // through a result slot + copy, so it compiles and runs — `.none.or(P{x:2})`
     // takes the default, returning 2.
     const src =
         \\struct P { x: int }
         \\fn main() -> int {
         \\  d := P { x: 2 }
-        \\  p := Option[P].none.unwrap_or(d)
+        \\  p := Option[P].none.or(d)
         \\  return p.x
         \\}
         \\
@@ -2994,7 +2994,7 @@ test "`--allow W0010` silences the dead-store warning (exit 0)" {
 // 0), is promoted by `--deny-warnings` and `--deny W0011`, silenced by `--allow W0011`, and
 // a later `--warn W0011` keeps it a warning.
 const std_shadow_fixture =
-    "import std/vec\nimpl Vec[T] {\n  fn each(self, f: fn(T)) { f(self.get(0).unwrap()) }\n}\nfn main() -> int {\n  xs: Vec[int] = [4]\n  n := 0\n  xs.each(fn(v) { n = v })\n  return n\n}\n";
+    "import std/vec\nimpl Vec[T] {\n  fn each(self, f: fn(T)) { f(self.get(0).expect(\"no value\")) }\n}\nfn main() -> int {\n  xs: Vec[int] = [4]\n  n := 0\n  xs.each(fn(v) { n = v })\n  return n\n}\n";
 
 test "`toy check` renders W0011 for a method that shadows a std method and exits 0" {
     const gpa = testing.allocator;
@@ -3637,18 +3637,18 @@ test "integration: emitted binary runs with the right exit code" {
         // Into[T] WIDENING: `small.into()` widens uint8→uint losslessly, driven by
         // the `wide:` annotation. 200 round-trips → 42.
         .{ .src = "fn main() -> int {\n small: uint8 = 200\n wide: uint = small.into()\n return if wide == 200 { 42 } else { 0 }\n}\n", .name = "into_widen", .expect = 42 },
-        // TryInto[T] OK: 200 fits uint8 so `try_into().unwrap()` yields Ok(200) → 42.
-        .{ .src = "fn main() -> int {\n wide: uint = 200\n back: uint8 = wide.try_into().unwrap()\n return if back == 200 { 42 } else { 0 }\n}\n", .name = "tryinto_ok", .expect = 42 },
+        // TryInto[T] OK: 200 fits uint8 so `try_into().expect(..)` yields Ok(200) → 42.
+        .{ .src = "fn main() -> int {\n wide: uint = 200\n back: uint8 = wide.try_into().expect(\"no value\")\n return if back == 200 { 42 } else { 0 }\n}\n", .name = "tryinto_ok", .expect = 42 },
         // TryInto[T] ERR (same-sign narrowing): 300 does NOT fit uint8 ⇒ Err ⇒
-        // `unwrap_or(0)` gives 0. The negative range gate. → 0.
-        .{ .src = "fn main() -> int {\n wide2: uint = 300\n narrow: uint8 = wide2.try_into().unwrap_or(0)\n return if narrow == 0 { 0 } else { 1 }\n}\n", .name = "tryinto_err", .expect = 0 },
+        // `or(0)` gives 0. The negative range gate. → 0.
+        .{ .src = "fn main() -> int {\n wide2: uint = 300\n narrow: uint8 = wide2.try_into().or(0)\n return if narrow == 0 { 0 } else { 1 }\n}\n", .name = "tryinto_err", .expect = 0 },
         // TryInto[T] SIGN-FLIP ERR (cross-sign block): -1→uint has `fits` true (same
-        // 64 bits) but v<0 signed ⇒ Err ⇒ `unwrap_or(9)` = 9. The exact case the
+        // 64 bits) but v<0 signed ⇒ Err ⇒ `or(9)` = 9. The exact case the
         // sign-check block exists for. → 42.
-        .{ .src = "fn main() -> int {\n n: int = -1\n u: uint = n.try_into().unwrap_or(9)\n return if u == 9 { 42 } else { 0 }\n}\n", .name = "tryinto_signflip_err", .expect = 42 },
+        .{ .src = "fn main() -> int {\n n: int = -1\n u: uint = n.try_into().or(9)\n return if u == 9 { 42 } else { 0 }\n}\n", .name = "tryinto_signflip_err", .expect = 42 },
         // TryInto[T] SIGN-FLIP OK (cross-sign, same width, non-negative): 5→uint is
         // Ok(5). → 42.
-        .{ .src = "fn main() -> int {\n n: int = 5\n u: uint = n.try_into().unwrap()\n return if u == 5 { 42 } else { 0 }\n}\n", .name = "tryinto_signflip_ok", .expect = 42 },
+        .{ .src = "fn main() -> int {\n n: int = 5\n u: uint = n.try_into().expect(\"no value\")\n return if u == 5 { 42 } else { 0 }\n}\n", .name = "tryinto_signflip_ok", .expect = 42 },
         // Into[T] SIGNED WIDEN of a NEGATIVE value: int16 -5 -> int drives the sxth
         // sign-extend arm of `normalizeWidth` (the unsigned cases only exercise uxt). The
         // widened register must read as -5 in the full 64-bit width. → 42.
@@ -3656,9 +3656,9 @@ test "integration: emitted binary runs with the right exit code" {
         // Into[T] target from a RETURN type: `a.into()` widens uint8->uint with the
         // conversion target derived from `widen`'s return type, not a let-annotation. → 42.
         .{ .src = "fn widen(a: uint8) -> uint {\n return a.into()\n}\nfn main() -> int {\n return if widen(200) == 200 { 42 } else { 0 }\n}\n", .name = "into_ret_pos", .expect = 42 },
-        // TryInto[T] target from a RETURN type: the `try_into().unwrap()` payload
+        // TryInto[T] target from a RETURN type: the `try_into().expect(..)` payload
         // target flows from `narrow`'s uint8 return type. 200 fits → Ok(200). → 42.
-        .{ .src = "fn narrow(w: uint) -> uint8 {\n return w.try_into().unwrap()\n}\nfn main() -> int {\n return if narrow(200) == 200 { 42 } else { 0 }\n}\n", .name = "tryinto_ret_pos", .expect = 42 },
+        .{ .src = "fn narrow(w: uint) -> uint8 {\n return w.try_into().expect(\"no value\")\n}\nfn main() -> int {\n return if narrow(200) == 200 { 42 } else { 0 }\n}\n", .name = "tryinto_ret_pos", .expect = 42 },
         // Into[T] target from a CALL-ARGUMENT slot: `small.into()` widens uint8->uint
         // with the target derived from `takes`'s param type. → 42.
         .{ .src = "fn takes(u: uint) -> int {\n return if u == 200 { 42 } else { 0 }\n}\nfn main() -> int {\n small: uint8 = 200\n return takes(small.into())\n}\n", .name = "into_arg_slot", .expect = 42 },

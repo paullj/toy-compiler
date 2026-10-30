@@ -90,7 +90,7 @@ fn eachSuccessor(term: *Ir.Terminator, ctx: anytype, comptime each: anytype) voi
             each(ctx, &c.t);
             each(ctx, &c.f);
         },
-        .ret, .@"unreachable", .trap, .panic => {},
+        .ret, .@"unreachable", .panic => {},
     }
 }
 

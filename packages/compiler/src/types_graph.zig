@@ -1352,7 +1352,7 @@ test "W0011 fires at a program's method that a std module in the graph also decl
         \\struct Bag { n: int }
         \\impl Bag { fn each(self) -> int { self.n } }
         \\impl Vec[T] {
-        \\    fn each(self, f: fn(T)) { f(self.get(0).unwrap()) }
+        \\    fn each(self, f: fn(T)) { f(self.get(0).expect("no value")) }
         \\    fn total(self) -> int { self.len() }
         \\}
         \\impl Option[T] { fn or_else(self, f: fn() -> T) -> T { f() } }
@@ -1405,7 +1405,7 @@ test "W0011 fires at a program's method that a std module in the graph also decl
 }
 
 test "W0011 fires at a program's method named like a builtin of a builtin type, whatever the imports" {
-    // `str.len`, `int.to_string` and `Option.unwrap_or` are builtins; `str.shout` is a new
+    // `str.len`, `int.to_string` and `Option.or` are builtins; `str.shout` is a new
     // name, and `to_string` on the program's own `Tag` is how `Tag` implements it.
     try withCheckedGraph(".toy-test-builtin-shadow", &.{
         .{ .path = "main.toy", .source =
@@ -1416,10 +1416,10 @@ test "W0011 fires at a program's method named like a builtin of a builtin type, 
         \\    fn shout(self) -> str { self }
         \\}
         \\impl int { fn to_string(self) -> str { "n" } }
-        \\impl Option[T] { fn unwrap_or(self, d: T) -> T { d } }
+        \\impl Option[T] { fn or(self, d: T) -> T { d } }
         \\fn main() -> int {
         \\    t := Tag { n: 1 }
-        \\    return "ab".len() + "x".shout().len() + 7.to_string().len() + t.to_string().len() + Option.some(4).unwrap_or(5)
+        \\    return "ab".len() + "x".shout().len() + 7.to_string().len() + t.to_string().len() + Option.some(4).or(5)
         \\}
         \\
         },
@@ -1430,9 +1430,9 @@ test "W0011 fires at a program's method named like a builtin of a builtin type, 
             try testing.expectEqual(@as(usize, 3), ds.len);
             try testing.expectEqualStrings("method 'len' on 'str' shadows the built-in one: the program's calls reach this one, std's own calls keep the built-in; rename it to keep both", ds[0].message);
             try testing.expect(std.mem.startsWith(u8, ds[1].message, "method 'to_string' on 'int' shadows the built-in one:"));
-            try testing.expect(std.mem.startsWith(u8, ds[2].message, "method 'unwrap_or' on 'Option' shadows the built-in one:"));
+            try testing.expect(std.mem.startsWith(u8, ds[2].message, "method 'or' on 'Option' shadows the built-in one:"));
             const m = &g.modules[g.entry_index];
-            for (ds, [_][]const u8{ "len", "to_string", "unwrap_or" }) |d, name| {
+            for (ds, [_][]const u8{ "len", "to_string", "or" }) |d, name| {
                 try testing.expectEqual(@import("diagnostics/codes.zig").Code.W0011, d.code);
                 try testing.expectEqualStrings(name, m.source[d.byte_offset..d.end]);
             }
@@ -1441,7 +1441,7 @@ test "W0011 fires at a program's method named like a builtin of a builtin type, 
 }
 
 test "a call in a bundled module never reaches a program's shadowing method; the program's own call does" {
-    // The program's `len` and `byte_at` on `str` and `unwrap_or` on `Option` would steer
+    // The program's `len` and `byte_at` on `str` and `or` on `Option` would steer
     // `trim`, `split` and `join` if std's calls reached them.
     try withCheckedGraph(".toy-test-bundled-site", &.{
         .{ .path = "main.toy", .source =
@@ -1450,9 +1450,9 @@ test "a call in a bundled module never reaches a program's shadowing method; the
         \\    fn len(self) -> int { 100000 }
         \\    fn byte_at(self, _i: int) -> int { 120 }
         \\}
-        \\impl Option[T] { fn unwrap_or(self, d: T) -> T { d } }
+        \\impl Option[T] { fn or(self, d: T) -> T { d } }
         \\fn main() -> int {
-        \\    return "ab".len() + " a ".trim().concat(",".join("a b".split(" "))).byte_at(0) + Option.some(1).unwrap_or(2)
+        \\    return "ab".len() + " a ".trim().concat(",".join("a b".split(" "))).byte_at(0) + Option.some(1).or(2)
         \\}
         \\
         },
@@ -1477,7 +1477,7 @@ test "a call in a bundled module never reaches a program's shadowing method; the
             }
             try testing.expect(builtin_len > 0);
             for (tr.instances) |inst| if (g.modules[inst.mod].bundled) try testing.expect(!shadowing.any(tr, inst.callees));
-            // The program's calls reach its own `len`, `byte_at` and `unwrap_or`.
+            // The program's calls reach its own `len`, `byte_at` and `or`.
             var own: usize = 0;
             for (tr.callees[g.entry_index]) |c| switch (c.view()) {
                 .method => |id| own += @intFromBool(tr.methods[id].shadows),

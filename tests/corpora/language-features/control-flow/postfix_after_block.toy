@@ -74,8 +74,8 @@ fn statements(t: bool, h: H) -> int {
     loop { break U { f: fn(x: int) { m = m + x } } }.f(3)
     { fn(x: int) { m = m + x } }(4)
     n := check("loop statement", m, 7)
-    n = n + check("try some", try_option(t, Option.some(P { x: 5, y: 6 }), Option.none).unwrap_or(0), 33)
-    n = n + check("try none", try_option(t, Option.none, Option.some(P { x: 5, y: 6 })).unwrap_or(-1), -1)
+    n = n + check("try some", try_option(t, Option.some(P { x: 5, y: 6 }), Option.none).or(0), 33)
+    n = n + check("try none", try_option(t, Option.none, Option.some(P { x: 5, y: 6 })).or(-1), -1)
     n = n + check("match fn field", match t { true -> h, false -> h }.f(5), 6)
     return n
 }

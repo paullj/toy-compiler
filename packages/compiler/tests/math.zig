@@ -45,7 +45,7 @@ test "math: libm sqrt over the float extern (16.0 -> 4)" {
     const code = try buildAndRun(gpa, io, ".toy-test-math-sqrt",
         \\import std/math
         \\fn main() -> int {
-        \\    return math.sqrt(16.0).try_into().unwrap()
+        \\    return math.sqrt(16.0).try_into().expect("no value")
         \\}
         \\
     );
@@ -62,8 +62,8 @@ test "math: libm floor/ceil round toward -inf/+inf" {
     const code = try buildAndRun(gpa, io, ".toy-test-math-floorceil",
         \\import std/math
         \\fn main() -> int {
-        \\    f: int = math.floor(3.7).try_into().unwrap()
-        \\    c: int = math.ceil(3.2).try_into().unwrap()
+        \\    f: int = math.floor(3.7).try_into().expect("no value")
+        \\    c: int = math.ceil(3.2).try_into().expect("no value")
         \\    return f + c
         \\}
         \\

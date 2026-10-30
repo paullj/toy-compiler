@@ -42,7 +42,7 @@ fn vec_methods() -> int {
         a < b
     })
     flags := if has_one && all_pos { 1 } else { 0 }
-    return total + doubled.len() + big.len() + sum + flags + two.unwrap_or(0)
+    return total + doubled.len() + big.len() + sum + flags + two.or(0)
 }
 
 fn vec_mut(mut acc: int, xs: Vec[int]) -> int {
@@ -104,7 +104,7 @@ fn option_methods() -> int {
         total = total + 1
         Result[int, str].ok(v * 2)
     })
-    f := bad.map_err(fn(m) {
+    f := bad.map_error(fn(m) {
         total = total + 1
         m.len()
     })
@@ -112,8 +112,8 @@ fn option_methods() -> int {
         total = total + 1
         m.len() * 10
     })
-    err_flag := if f.is_err() { 1 } else { 0 }
-    return total + a.unwrap() + b.unwrap() + c + d.unwrap() + e.unwrap() + err_flag + g
+    err_flag := if f.is_error() { 1 } else { 0 }
+    return total + a.expect("no value") + b.expect("no value") + c + d.expect("no value") + e.expect("no value") + err_flag + g
 }
 
 fn option_mut(mut acc: int, o: Option[int], r: Result[int, str]) -> int {
@@ -137,7 +137,7 @@ fn option_mut(mut acc: int, o: Option[int], r: Result[int, str]) -> int {
         acc = acc + 1
         Result[int, str].ok(v)
     })
-    _f := r.map_err(fn(m) {
+    _f := r.map_error(fn(m) {
         acc = acc + 1
         m.len()
     })

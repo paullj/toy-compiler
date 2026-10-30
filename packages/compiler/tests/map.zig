@@ -61,7 +61,7 @@ const order_src =
     \\    for k in order { m.set(k, k * 2) }
     \\    j := 0
     \\    for k, v in m {
-    \\        if k != order.get(j).unwrap() { return 1 }
+    \\        if k != order.get(j).expect("no value") { return 1 }
     \\        if v != k * 2 { return 2 }
     \\        j = j + 1
     \\    }
@@ -94,9 +94,9 @@ const share_src =
     \\    m := Map[int, int].new()
     \\    n := m
     \\    m.set(1, 100)
-    \\    if n.get(1).unwrap_or(0) != 100 { return 1 }
+    \\    if n.get(1).or(0) != 100 { return 1 }
     \\    n.set(2, 200)
-    \\    if m.get(2).unwrap_or(0) != 200 { return 2 }
+    \\    if m.get(2).or(0) != 200 { return 2 }
     \\    if m.len() != 2 { return 3 }
     \\    return 0
     \\}
@@ -131,7 +131,7 @@ const custom_eq_src =
     \\    m.set(DK{ id: 1, tag: 10 }, 100)
     \\    m.set(DK{ id: 1, tag: 99 }, 200)
     \\    if m.len() != 1 { return 1 }
-    \\    if m.get(DK{ id: 1, tag: 0 }).unwrap_or(0) != 200 { return 2 }
+    \\    if m.get(DK{ id: 1, tag: 0 }).or(0) != 200 { return 2 }
     \\    return 0
     \\}
     \\
@@ -233,7 +233,7 @@ const unit_val_int_src =
     \\    if m.get(99).is_some() { return 3 }
     \\    j := 0
     \\    for k, v in m {
-    \\        if k != order.get(j).unwrap() { return 4 }
+    \\        if k != order.get(j).expect("no value") { return 4 }
     \\        j = j + 1
     \\    }
     \\    if j != 8 { return 5 }
@@ -373,8 +373,8 @@ test "map: filter and map results keep str keys across a forced collection" {
         \\    ok := 0
         \\    i = 0
         \\    while i < 30 {
-        \\        if i % 2 == 1 && odd.get(fresh(i)).unwrap_or(-1) == i { ok = ok + 1 }
-        \\        if tags.get(fresh(i)).unwrap_or("") == "v".concat(i.to_string()) { ok = ok + 1 }
+        \\        if i % 2 == 1 && odd.get(fresh(i)).or(-1) == i { ok = ok + 1 }
+        \\        if tags.get(fresh(i)).or("") == "v".concat(i.to_string()) { ok = ok + 1 }
         \\        i = i + 1
         \\    }
         \\    if ks[0] != "k1" || ks[14] != "k29" { return 2 }
@@ -405,9 +405,9 @@ test "map: two Map.map instances on one map run their own code" {
         \\    b := m.map(fn(v) { v.to_string().concat("x") })
         \\    c := m.map(fn(v) { v > 5 })
         \\    d := m.map(neg)
-        \\    if b.get("b").unwrap_or("") != "9x" { return 1 }
-        \\    if c.get("a").unwrap_or(true) || !c.get("b").unwrap_or(false) { return 2 }
-        \\    return a.get("a").unwrap_or(0) + a.get("b").unwrap_or(0) + d.get("a").unwrap_or(0) + 100
+        \\    if b.get("b").or("") != "9x" { return 1 }
+        \\    if c.get("a").or(true) || !c.get("b").or(false) { return 2 }
+        \\    return a.get("a").or(0) + a.get("b").or(0) + d.get("a").or(0) + 100
         \\}
         \\
     ;

@@ -1,5 +1,5 @@
 # Feature: `Result.map` and `Result.then` act on `ok` and pass an `err` through without
-# running their function; `map_err` changes the error type (`str` to `int`) and leaves
+# running their function; `map_error` changes the error type (`str` to `int`) and leaves
 # `ok` alone; `or_else(f)` turns an `err` into a value with `f`.
 # expect: stdout "2!\nempty?\n"
 # expect: exit 78
@@ -29,9 +29,9 @@ fn main() -> int {
         steps = steps + 1
         Result[int, str].ok(v)
     }).or_else(fn(m) { m.len() * 2 })
-    codes := parse("").map_err(fn(m) { m.len() })
+    codes := parse("").map_error(fn(m) { m.len() })
     f := codes.or_else(fn(k) { k + 1 })
-    g := parse("abcd").map_err(fn(m) { m.len() }).or_else(fn(k) { k * 100 })
-    h := parse("").map_err(fn(m) { m.len() }).then(fn(v) { Result[int, int].ok(v) }).or_else(fn(k) { k * 2 })
+    g := parse("abcd").map_error(fn(m) { m.len() }).or_else(fn(k) { k * 100 })
+    h := parse("").map_error(fn(m) { m.len() }).then(fn(v) { Result[int, int].ok(v) }).or_else(fn(k) { k * 2 })
     return a + b + c + d + e + f + g + h + steps
 }

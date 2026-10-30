@@ -16,7 +16,7 @@ fn main() -> int {
     ks := m.keys()
     vs := m.values()
     if ks.len() != 9 || vs.len() != 9 { return 1 }
-    if ks.first().unwrap_or(0) != 21 || vs.first().unwrap_or(0) != 1 { return 2 }
+    if ks.first().or(0) != 21 || vs.first().or(0) != 1 { return 2 }
     if ks[8] != 17 || vs[8] != 34 { return 3 }
     sorted := m.keys()
     sorted.sort()
@@ -26,6 +26,6 @@ fn main() -> int {
     })
     io.println("")
     m.keys().sort()
-    if m.keys().first().unwrap_or(0) != 21 { return 4 }
+    if m.keys().first().or(0) != 21 { return 4 }
     return vs.fold(0, fn(acc, v) { acc + v })
 }
