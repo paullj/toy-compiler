@@ -430,9 +430,12 @@ form). The count must be the method's own (**T0054**), the impl's never written 
 type parameters of its own takes protocol args instead, as on a concrete receiver:
 `b.into[bool]()` picks the `impl Box[T] has Into[bool]` conformance among the
 receiver's, and args no conformance has are **T0018**. A generic method is not a value
-(**T0049**). A method of a non-generic type cannot declare its own type parameters yet
-(**T0013** at the call): such a method would be a template on a concrete receiver, which
-the method table, discovery, the seal and the LSP all treat as one row per method. A method's own type parameter may not reuse a name of its
+(**T0049**). A method of a non-generic struct or enum may declare its own type
+parameters too (`impl K { fn map[U](self, f: fn(int) -> U) -> U }`, `fn with[U](v: int,
+tag: U) -> K`): it is a template on the concrete receiver, inferred or written alike
+(`k.map[str](f)`, `K.with[bool](1, true)`), with one instance row per instantiation on
+`K` itself. A builtin type's method cannot yet (**T0013** at its declaration; a call
+of it reports nothing more). A method's own type parameter may not reuse a name of its
 impl's (`impl Box[T] { fn conv[T](..) }`), and no fn declares one name twice
 (**T0053**). An impl's pattern, inherent or a conformance, names each type parameter
 once (`impl Pair[A, B]`); one on a single instance (`impl Box[int]`,

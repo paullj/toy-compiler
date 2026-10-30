@@ -262,9 +262,10 @@ fn collectMember(col: *Collector, an: *const Analysis, recv: u32, methods_only: 
     }
 }
 
-/// The generic type `rt` is an instance of, as the template-method table keys it, or null
-/// for a type that is no instance.
+/// The key of `rt`'s method templates: a non-generic type itself when it has some, else
+/// the generic type `rt` is an instance of, or null for a type that is no instance.
 fn templateOf(tc: *const toyc.TypecheckGraph.GraphResult, rt: Type) ?struct { ctor: u32, is_enum: bool } {
+    for (tc.templates) |t| if (t.recv_ctor == rt.nominalId() and t.recv_is_enum == (rt.kind == .@"enum")) return .{ .ctor = t.recv_ctor, .is_enum = t.recv_is_enum };
     // A method some body calls on `rt` names its template exactly.
     for (tc.methods) |mth| {
         if (!Type.eql(mth.recv, rt)) continue;
@@ -629,6 +630,49 @@ test "completion offers a generic std type's methods as declared, and no associa
     defer got2.deinit();
     try testing.expect(detailOf(got2.items, "plus") != null);
     try testing.expect(detailOf(got2.items, "zero") == null);
+}
+
+test "completion lists a non-generic type's own-generic method once, as declared" {
+    const gpa = testing.allocator;
+    var got = try completeAt(gpa,
+        \\struct K { v: int }
+        \\impl K {
+        \\    fn map[U](self, f: fn(int) -> U) -> U { f(self.v) }
+        \\    fn with[U](v: int, _u: U) -> K { K { v: v } }
+        \\    fn get(self) -> int { self.v }
+        \\}
+        \\fn main() -> int {
+        \\    k := K.with(1, true)
+        \\    _a := k.map(fn(x) { x + 1 })
+        \\    _b := k.map(fn(x) { x > 1 })
+        \\    n := k.@
+        \\    return 0
+        \\}
+        \\
+    );
+    defer got.deinit();
+    var maps: usize = 0;
+    for (got.items) |it| maps += @intFromBool(std.mem.eql(u8, it.label, "map"));
+    try testing.expectEqual(@as(usize, 1), maps);
+    try testing.expectEqualStrings("fn map(self: K, f: fn(int) -> U) -> U", detailOf(got.items, "map").?);
+    try testing.expectEqualStrings("fn get(K) -> int", detailOf(got.items, "get").?);
+    try testing.expect(detailOf(got.items, "with") == null);
+
+    // With no call, no instance row names the template.
+    var bare = try completeAt(gpa,
+        \\struct K { v: int }
+        \\impl K {
+        \\    fn map[U](self, f: fn(int) -> U) -> U { f(self.v) }
+        \\}
+        \\fn main() -> int {
+        \\    k := K { v: 1 }
+        \\    n := k.@
+        \\    return 0
+        \\}
+        \\
+    );
+    defer bare.deinit();
+    try testing.expectEqualStrings("fn map(self: K, f: fn(int) -> U) -> U", detailOf(bare.items, "map").?);
 }
 
 test "completion names a protocol witness as written" {

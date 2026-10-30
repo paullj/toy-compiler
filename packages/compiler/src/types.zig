@@ -807,7 +807,9 @@ pub fn witnessSig(m: Method, derives: []const DeriveRecipe, instances: []const M
     return .{ .params = sigs[m.fn_id].params, .ret = sigs[m.fn_id].ret, .mut_mask = sigs[m.fn_id].mut_mask };
 }
 
-/// A method TEMPLATE registered for a generic-type `impl Box[T] { .. }`. Kept in
+/// A method TEMPLATE registered for a generic-type `impl Box[T] { .. }`, or for a method
+/// with type params of its own on a non-generic struct or enum, keyed by that type's own
+/// id (see `templateRecv`). Kept in
 /// its OWN table (never `Method`) precisely because it carries NO `recv: Type`: a template's
 /// receiver would be a check-time `App` whose composite index is freed post-typecheck, so
 /// making it un-representable here turns the old prose-only "never deref a template's App
@@ -1175,7 +1177,8 @@ pub fn findMethod(methods: []const Method, recv: Type, name: []const u8) ?Method
     return first;
 }
 
-/// Look up a generic-type method TEMPLATE entry by its receiver type-constructor.
+/// Look up a method TEMPLATE entry by its receiver type-constructor, or by a non-generic
+/// struct or enum's own id for its own-generic methods.
 /// Keys off `recv_ctor`/`recv_is_enum` (plain ints, never a composite deref)
 /// so it is safe while the composite is alive (Pass A / Pass C / the mono tail) and
 /// deterministic at any `-jN`. Returns the first matching template entry, a program's own
@@ -1190,6 +1193,25 @@ pub fn findGenericMethod(templates: []const TemplateMethod, ctor: u32, is_enum: 
         if (first == null) first = tmpl;
     }
     return first;
+}
+
+/// The key a method template on `recv` is filed under (see `templateRecv`).
+pub const TemplateRecv = struct { ctor: u32, is_enum: bool, args: []const Type };
+
+/// Where to look up `recv`'s method templates: a generic type's instance (an `App`) by its
+/// ctor, its args binding the impl's params; a non-generic struct or enum by itself, with
+/// no args, since its only templates are methods with type params of their own. Null for
+/// any other type. A reified instance's fresh id keys no template.
+pub fn templateRecv(composite: *Composite, recv: Type) ?TemplateRecv {
+    if (recv.isApp()) {
+        const e = composite.at(recv.appIdx());
+        return .{ .ctor = e.ctor, .is_enum = e.ctor_is_enum, .args = e.args };
+    }
+    return switch (recv.kind) {
+        .@"struct" => .{ .ctor = recv.struct_id, .is_enum = false, .args = &.{} },
+        .@"enum" => .{ .ctor = recv.enum_id, .is_enum = true, .args = &.{} },
+        else => null,
+    };
 }
 
 /// What a call of method `name` on a generic-type receiver selects with no explicit
@@ -3155,11 +3177,12 @@ fn siteRank(bundled: bool, shadows: bool, site: Site) ?u1 {
     };
 }
 
-/// `Callee.template` for the generic method `member` of the type `recv` reified from,
-/// else none. Only a call that already failed to check gets here, so the scan of the
+/// `Callee.template` for the generic method `member` of `recv` itself (a non-generic
+/// struct or enum) or of the type `recv` was reified from, else none. Only a call that already failed to check gets here, so the scan of the
 /// reify table is off the hot path.
 fn templateCallee(t: *const Typecheck, recv: Type, member: []const u8, site: Site) Callee {
     if (recv.kind != .@"struct" and recv.kind != .@"enum") return .{};
+    if (findGenericMethod(t.templates.items, recv.nominalId(), recv.kind == .@"enum", member, site)) |m| return Callee.template(m.fn_id);
     var it = t.reify_map.iterator();
     while (it.next()) |kv| {
         if (!Type.eql(kv.value_ptr.*, recv)) continue;
@@ -3185,6 +3208,7 @@ fn importerImports(importer: *const GraphCtx.ModuleCtx, target: u32) bool {
 /// its grounded key. Returns null when `self_type` is not an App or that instance was
 /// never reified (defensive: an instance's own signature keeps its receiver reachable).
 fn reifiedStaticRecv(t: *Typecheck, self_type: Type, args: []const Type) error{OutOfMemory}!?Type {
+    if (self_type.kind == .@"struct" or self_type.kind == .@"enum") return self_type;
     if (!self_type.isApp()) return null;
     const e = t.composite.at(self_type.appIdx());
     var abuf: [8]Type = undefined;
@@ -3355,15 +3379,13 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
         // `pickExplicitTemplate` did.
         if (callee.tag == .type_app and tree.nodes[callee.lhs.int()].tag == .field_access) {
             const fa = tree.nodes[callee.lhs.int()];
-            const recv = node_types[fa.lhs.int()];
-            if (!recv.isApp()) continue;
-            const re = t.composite.at(recv.appIdx());
+            const re = templateRecv(t.composite, node_types[fa.lhs.int()]) orelse continue;
             const targ_nodes = Ast.rangeSlice(tree, callee.rhs.int());
             const explicit = try t.gpa.alloc(Type, targ_nodes.len);
             defer t.gpa.free(explicit);
             for (targ_nodes, explicit) |tn, *e| e.* = node_types[tn.int()];
             const member = mc.tokens[fa.main_token].text(mc.source);
-            switch (try pickExplicitTemplate(t.gpa, t.composite, model.templates, model.fns, re.ctor, re.ctor_is_enum, re.args, member, Site.of(mc.bundled), explicit)) {
+            switch (try pickExplicitTemplate(t.gpa, t.composite, model.templates, model.fns, re.ctor, re.is_enum, re.args, member, Site.of(mc.bundled), explicit)) {
                 .ok => |p| {
                     defer t.gpa.free(p.targs);
                     const conc = for (p.targs) |ta| {
@@ -3381,12 +3403,12 @@ fn scanCalls(t: *Typecheck, model: *const Model, templates: Mono.Templates, mod:
             // `impl Box[T]` method TEMPLATE. Bind the impl's type-params by matching the
             // template's `Self` pattern-args against the receiver App's concrete args —
             // the SAME `Infer.match` Pass C runs — then enqueue `(method_gid, targs)`.
-            // A method with its own `[U]` binds them from the call's value args too.
+            // A method with its own `[U]` binds them from the call's value args too; on a
+            // non-generic struct or enum those are all it has.
             const recv = node_types[callee.lhs.int()];
-            if (!recv.isApp()) continue;
-            const re = t.composite.at(recv.appIdx());
+            const re = templateRecv(t.composite, recv) orelse continue;
             const member = mc.tokens[callee.main_token].text(mc.source);
-            const m = switch (pickGenericMethod(model.templates, re.ctor, re.ctor_is_enum, member, Site.of(mc.bundled))) {
+            const m = switch (pickGenericMethod(model.templates, re.ctor, re.is_enum, member, Site.of(mc.bundled))) {
                 .one => |m| m,
                 .none => continue,
                 // The checker picked one through a bound (`boundTemplate`) and left it here.
@@ -4546,7 +4568,27 @@ fn decodeFnSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32, recv_type: Ast.Index)
         const has_self = proto.params.len > 0 and Ast.isSelfParam(t.tree, t.tokens, t.source, proto.params[0]);
         // A static method's `mut` first param is a place param, not a receiver.
         const mut_self = has_self and Modes.isMut(mut_mask, 0);
-        if (self_ty.isApp()) {
+        const nominal = self_ty.kind == .@"struct" or self_ty.kind == .@"enum";
+        if (gnames.len > 0 and !self_ty.isApp() and !nominal and self_ty.kind != .invalid) {
+            // Templates are keyed by a struct or enum id, which a builtin receiver has none
+            // of. Reported here, not at a call, so a method never called is caught too; its
+            // row stays so a call finds it rather than adding a no-such-method error.
+            try t.sink.report(.{ .span = t.tokSpan(decl.main_token), .code = .T0013 }, "'{s}' declares its own type parameters, which a method of the builtin type '{f}' cannot have yet; make it a generic fn", .{ name, t.fmtType(self_ty) });
+        }
+        if (!self_ty.isApp() and gnames.len > 0 and nominal) {
+            // A method with type params of its own on a non-generic struct or enum: a
+            // template like a generic type's, its params bound per call, with one instance
+            // row per instantiation on the receiver itself.
+            try t.templates.append(t.gpa, .{
+                .recv_ctor = self_ty.nominalId(),
+                .recv_is_enum = self_ty.kind == .@"enum",
+                .name = name,
+                .fn_id = gid,
+                .mut_self = mut_self,
+                .has_self = has_self,
+                .bundled = t.graph.mods[mod].bundled,
+            });
+        } else if (self_ty.isApp()) {
             // A generic receiver `impl Box[T]`: `self_ty` is a check-time `App`.
             // Record its ctor into the TEMPLATE table so `findGenericMethod` dispatches
             // off a concrete receiver `App`'s ctor without dereferencing the
@@ -11656,17 +11698,63 @@ test "a pass-1 conflict types the waiting lambda once" {
     try testing.expect(hasCode(&c, .T0050));
 }
 
-test "own type params on a non-generic type are T0013" {
+test "own type params on a non-generic struct make a template with one row per instance" {
     const gpa = testing.allocator;
-    const src =
+    var c = try checkSource(
         \\struct P { v: int }
         \\impl P {
         \\ fn conv[U](self, f: fn(int) -> U) -> U { f(self.v) }
+        \\ fn with[U](v: int, _u: U) -> P { P { v: v } }
         \\}
         \\fn main() -> int {
-        \\ p := P { v: 4 }
-        \\ return p.conv(fn(x: int) { x * 3 })
+        \\ p := P.with(4, true)
+        \\ n := p.conv(fn(x) { x * 3 })
+        \\ b := p.conv[bool](fn(x) { x > 3 })
+        \\ return if b { n + P.with[str](1, "s").v } else { 0 }
         \\}
+        \\
+    );
+    defer c.deinit(gpa);
+    try expectOwnGenericOk(&c);
+    const a = try calleeMethod(&c, "conv", 0);
+    const b = try calleeMethod(&c, "conv", 1);
+    const tm = findGenericMethod(c.result.templates, a.recv.nominalId(), false, "conv", .program) orelse return error.TestUnexpectedResult;
+    try testing.expect(tm.has_self and !tm.recv_is_enum);
+    try testing.expect(Type.eql(a.recv, b.recv) and a.recv.kind == .@"struct");
+    try testing.expect(a.instance.? != b.instance.?);
+    try testing.expect(std.mem.endsWith(u8, try instanceNameOf(&c, "conv", 0), "P.conv$int"));
+    try testing.expect(std.mem.endsWith(u8, try instanceNameOf(&c, "conv", 1), "P.conv$bool"));
+    const w = try calleeMethod(&c, "with", 0);
+    try testing.expect(w.is_static and Type.eql(w.recv, a.recv));
+    try testing.expect(std.mem.endsWith(u8, try instanceNameOf(&c, "with", 0), "P.with$bool"));
+    try testing.expect(std.mem.endsWith(u8, try instanceNameOf(&c, "with", 1), "P.with$str"));
+}
+
+test "own type params on a non-generic enum make a template" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\enum E { one(int), none }
+        \\impl E {
+        \\ fn fold[U](self, f: fn(int) -> U, d: U) -> U { match self { .one(v) -> f(v), .none -> d } }
+        \\ fn make[U](v: int, _u: U) -> E { E.one(v) }
+        \\}
+        \\fn main() -> int { return E.make(2, true).fold(fn(x) { x }, 0) }
+        \\
+    );
+    defer c.deinit(gpa);
+    try expectOwnGenericOk(&c);
+    const f = try calleeMethod(&c, "fold", 0);
+    try testing.expect(f.recv.kind == .@"enum" and !f.is_static);
+    try testing.expect(std.mem.endsWith(u8, try instanceNameOf(&c, "make", 0), "E.make$bool"));
+}
+
+test "own type params on a builtin type stay T0013 at the call" {
+    const gpa = testing.allocator;
+    const src =
+        \\impl int {
+        \\ fn twice[U](self, u: U) -> U { u }
+        \\}
+        \\fn main() -> int { return (3).twice(1) }
         \\
     ;
     try expectOnlyDiag(src, .T0013);
@@ -11796,15 +11884,21 @@ test "a generic call's failed argument is its only error" {
 
 test "the args of a call rejected for its type params add no T0050" {
     try expectOnlyDiag(
-        \\struct P { v: int }
-        \\impl P { fn conv[U](self, f: fn(int) -> U) -> U { f(self.v) } }
-        \\fn main() -> int {
-        \\ p := P { v: 4 }
-        \\ return p.conv(fn(x) { x + 1 })
-        \\}
+        \\impl int { fn conv[U](self, f: fn(int) -> U) -> U { f(self) } }
+        \\fn main() -> int { return (4).conv(fn(x) { x + 1 }) }
         \\
     , .T0013);
     try expectOnlyDiag(own_box_pre ++ "fn main() -> int {\n b := Box { v: 2 }\n return b.map[int, int](fn(x) { x }).get()\n}\n", .T0054);
+}
+
+test "a builtin type's method with type params of its own is T0013 at its declaration" {
+    const src = "impl int {\n fn twice[U](self, u: U) -> U { u }\n}\nfn main() -> int { return 0 }\n";
+    try expectOnlyDiag(src, .T0013);
+    try expectOneDiag(src, .T0013, "'twice' declares its own type parameters, which a method of the builtin type 'int' cannot have yet; make it a generic fn");
+    var called = try checkSource("impl int {\n fn twice[U](self, u: U) -> U { u }\n}\nfn main() -> int { return (3).twice(1) }\n");
+    defer called.deinit(testing.allocator);
+    try testing.expectEqual(1, called.result.diags.len);
+    try testing.expectEqual(.T0013, called.result.diags[0].code);
 }
 
 test "a type param that repeats a name is an error at its declaration" {

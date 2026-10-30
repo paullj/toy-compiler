@@ -113,9 +113,6 @@ impl Rng {
     }
 }
 
-# `choose` and `shuffle` are free fns: a method of the non-generic Rng cannot declare its own
-# type parameter yet (T0013).
-
 # A uniformly picked element, or none when `xs` is empty.
 pub fn choose[T](mut r: Rng, xs: Vec[T]) -> Option[T] {
     if xs.len() == 0 { return Option[T].none }
