@@ -977,7 +977,9 @@ const GraphResolve = struct {
                 // A `.`-rooted place (`p.x`) resolves as an expression (its root name is
                 // checked there), not as a bare assignable name. So does an element store
                 // (`xs[i] = v`), which writes through the handle and assigns no local.
-                if (target.tag == .field_access or target.tag == .tuple_field or target.tag == .index) {
+                // An element of a Vec no variable or field holds (`mk()[0] = v`) is a
+                // temporary like the call itself.
+                if (target.tag == .field_access or target.tag == .tuple_field or (target.tag == .index and symbols_res.indexesHeldVec(g.nodes(), stmt.lhs))) {
                     try g.resolveExpr(stmt.lhs);
                 } else if (target.tag != .identifier) {
                     // A call result (`p.get() = v`) or another value with no name: its
@@ -4413,6 +4415,26 @@ test "assigning a call result is R0007, not an undeclared '('" {
         fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
             try testing.expectEqual(@as(usize, 1), countCode(r, .R0007));
             try testing.expectEqualStrings("cannot assign to a temporary value, such as a call result; only a variable or a field of one can be assigned", firstError(r).message);
+        }
+    }.run);
+}
+
+test "an element store into a temporary Vec is R0007; through a grouped name it is not" {
+    try withResolvedSource(
+        \\fn mk() -> int { 0 }
+        \\fn main() -> int {
+        \\ xs := 0
+        \\ mk()[0] = 1
+        \\ (mk())[0][1] = 1
+        \\ { xs }[0] = 1
+        \\ (xs)[0] = 1
+        \\ return xs
+        \\}
+        \\
+    , struct {
+        fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+            try testing.expectEqual(@as(usize, 3), countCode(r, .R0007));
+            try testing.expectEqual(@as(usize, 3), r.diags.len);
         }
     }.run);
 }

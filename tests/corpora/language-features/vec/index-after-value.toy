@@ -1,0 +1,46 @@
+# Feature: `[i]` reads an element of any Vec value, not only a named one: a call result,
+# a parenthesized group, the value of a loop, if, match or block, a list literal and a
+# `?` result. The element's expected type does not leak into the indexed Vec.
+# expect: stdout "2\n3\n4\n6\n7\n8\n9\n20\n2\n6\n5\n4\n1\n2\n"
+# expect: exit 0
+import std/io
+import std/vec
+
+fn mk() -> Vec[int] { [1, 2, 3] }
+
+fn grid() -> Vec[Vec[int]] { [[10, 20], [30, 40]] }
+
+fn maybe() -> Option[Vec[int]] { .some([1, 2]) }
+
+fn second() -> Option[int] {
+    x := maybe()?[1]
+    return .some(x)
+}
+
+fn take(n: int) -> int { n }
+
+fn last() -> int { return [5, 6][1] }
+
+fn first(c: bool) -> int { match c { true -> [1], false -> [2] }[0] }
+
+fn inner() -> Vec[int] { [[1], [2]][1] }
+
+fn main() -> int {
+    io.println(mk()[1])
+    io.println((mk())[2])
+    io.println(loop { break [4, 5] }[0])
+    c := true
+    io.println(if c { [6] } else { [0] }[0])
+    io.println(match c { true -> [7], false -> [0] }[0])
+    io.println({ [0, 8] }[1])
+    io.println([7, 8, 9][2])
+    io.println(grid()[0][1])
+    io.println(second().expect("some"))
+    io.println(last())
+    x: int = loop { break [4, 5] }[1]
+    io.println(x)
+    io.println(take({ [3, 4] }[1]))
+    io.println(first(true))
+    io.println(inner()[0])
+    return 0
+}

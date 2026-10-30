@@ -1126,7 +1126,9 @@ pub const BodyChecker = struct {
     /// arm and the value-headed `.type_app` reinterpretation.
     fn typeOfIndexParts(bc: *BodyChecker, site: Ast.Index, recv: Ast.Index, idx: Ast.Index) error{OutOfMemory}!Type {
         if (bc.typeNameAt(idx)) |tname| return bc.typeArgsOnValue(site, recv, idx, tname);
-        const rt = try bc.typeOf(recv);
+        // The element's expected type says nothing about the Vec, and would mislead a
+        // list-literal receiver (`return [5, 6][1]`).
+        const rt = try bc.typeOfExpected(recv, null);
         const it = try bc.typeOfExpected(idx, Type.int);
         const vec_ctor = bc.activeStructMap().get(StdNames.vec_struct);
         if (!rt.isApp()) {
@@ -5138,7 +5140,8 @@ pub const BodyChecker = struct {
             const n = bc.tree.nodes[cur.int()];
             switch (n.tag) {
                 .field_access, .tuple_field => cur = n.lhs,
-                .identifier, .index, .type_app => return false,
+                .identifier, .type_app => return false,
+                .index => return !symbols_res.indexesHeldVec(bc.tree.nodes, cur),
                 else => return true,
             }
         }

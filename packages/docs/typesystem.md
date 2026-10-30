@@ -189,6 +189,9 @@ from two angles — assignability is directional (want ← got), join is symmetr
   local or a field / tuple-field chain rooted at one, or at an index element (see
   `xs[i].f = e` below). No other temporary is a place: a field of a call result
   (`p.get().x = v`) is **T0075**, and a call result itself (`p.get() = v`) **R0007**.
+  An element of a `Vec` that no variable or field holds (`mk()[0]`, `{ xs }[0]`) is a
+  temporary too: storing it is **R0007**, storing a field of it **T0075**, and passing
+  it as a `mut` argument or receiver **T0019**.
 * `xs[i] = e` — element store on a `Vec[T]`. It means `xs.set(i, e)`: `xs`, then `i`,
   then `e` are evaluated, left to right, then the index is checked and the element
   stored, so an out-of-bounds `i` panics after `e` has run. `e` is checked against `T`
@@ -336,7 +339,12 @@ The `[..]` bracket is disambiguated by **position**:
 `{` or `.` after it makes a type application (only on an `identifier` or `field_access`
 base), and any other token a value index (`xs[i]`). A type application whose base is a
 value is read as an index by the checker, so `fs[i](x)` calls the element and
-`xs[i].f` reads its field.
+`xs[i].f` reads its field. Any other base can never name a type, so it is always
+indexed: an index, a call, a `?`, a parenthesized group around anything but a name, a
+block-valued `loop`, `if`, `match` or block, and a literal (`mk()[1]`, `f()?[0]`,
+`(a + b)[1]`, `loop { break xs }[0]`, `[1, 2][0]`). A `loop`,
+`match` or block statement takes a `[..]` on its own line; one on the next line starts a
+new statement.
 
 A third `[..]` position is **construction position** — a `[..]` on a name
 followed by `{ .. }` (`Box[int]{ v: 1 }`) builds a `struct_init` whose lhs is the

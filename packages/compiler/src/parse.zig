@@ -2276,8 +2276,10 @@ fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
             // takes a subscript. The parser cannot tell `xs[i].f` (value index of a var)
             // from `Vec[int].new()` (type-app) — both are name-headed, type-shaped, and
             // `.`-followed — so that stays a `type_app` here and the checker reinterprets
-            // a value-resolved head as an index. Any other `lhs` breaks WITHOUT consuming
-            // `[`.
+            // a value-resolved head as an index. Any other head can never name a type (a
+            // call, a `?`, a block-valued expression, a literal, or an operator node, which
+            // reaches here only parenthesized since postfix binds tighter), so it is always
+            // indexed. A `type_app` or an error node breaks WITHOUT consuming `[`.
             .l_bracket => {
                 const ltag = p.nodes.items[lhs.int()].tag;
                 if (ltag == .identifier or ltag == .field_access) {
@@ -2286,9 +2288,11 @@ fn parsePostfix(p: *Parser, lhs0: Ast.Index) Error!Ast.Index {
                     } else {
                         lhs = try p.parseIndex(lhs);
                     }
-                } else if (ltag == .index) {
+                } else if (ltag == .type_app or ltag == .error_node) {
+                    break;
+                } else {
                     lhs = try p.parseIndex(lhs);
-                } else break;
+                }
             },
             // `Name { ... }` literal / variant construction — only when blocks are
             // allowed and `lhs` is a bare name (struct), an inferred `.V`
@@ -4309,6 +4313,27 @@ test "a call- or paren-led place parses as a store" {
     try expectProgram(
         "fn f() {\n mk().x = 1\n mk().x += 1\n mk().p.x = 1\n (p).x = 1\n mk() = 2\n mk().x\n (p).x == 1\n}\n",
         "(program (fn f () _ (block (= (. (call mk) x) 1) (+= (. (call mk) x) 1) (= (. (. (call mk) p) x) 1) (= (. p x) 1) (= (call mk) 2) (. (call mk) x) (== (. p x) 1))))",
+    );
+}
+
+test "an index follows a call, a group, a block-valued expression or a literal" {
+    try expectSexpr("mk()[1]", "(index (call mk) 1)");
+    try expectSexpr("(mk())[1]", "(index (call mk) 1)");
+    try expectSexpr("(a + b)[0]", "(index (+ a b) 0)");
+    try expectSexpr("grid()[0][1]", "(index (index (call grid) 0) 1)");
+    try expectSexpr("[1, 2][0]", "(index (list 1 2) 0)");
+    try expectSexpr("\"ab\"[0]", "(index \"ab\" 0)");
+    try expectSexpr("loop { break xs }[0]", "(index (loop (block (break xs))) 0)");
+    try expectSexpr("if c { a } else { b }[0]", "(index (if c (block a) (block b)) 0)");
+    try expectSexpr("match c { true -> a, false -> b }[0]", "(index (match c (arm (lit true) a) (arm (lit false) b)) 0)");
+    try expectSexpr("{ xs }[0]", "(index (block xs) 0)");
+    try expectSexpr("@l { xs }[0]", "(index (label l (block xs)) 0)");
+}
+
+test "a block statement indexes a '[..]' on its own line, not one on the next line" {
+    try expectProgram(
+        "fn f() {\n loop { break xs }[0]\n { xs }[1]\n mk()[0] = 2\n { xs }\n [2]\n}\n",
+        "(program (fn f () _ (block (index (loop (block (break xs))) 0) (index (block xs) 1) (= (index (call mk) 0) 2) (block xs) (list 2))))",
     );
 }
 

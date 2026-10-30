@@ -377,6 +377,41 @@ test "grammar agreement: a postfix binds to a block-bodied value on its line, no
     }
 }
 
+test "grammar agreement: both engines index a call, a group, a block value and a literal" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const parser = ts.Parser.create();
+    defer parser.destroy();
+    try parser.setLanguage(tree_sitter_toy());
+    const cases = [_]struct { src: []const u8, has: []const u8 }{
+        .{ .src = "fn f() {\n  x := mk()[1]\n}\n", .has = "(index_expression value: (call_expression" },
+        .{ .src = "fn f() {\n  x := (mk())[1]\n}\n", .has = "(index_expression value: (parenthesized_expression" },
+        .{ .src = "fn f() {\n  x := loop { break [4, 5] }[0]\n}\n", .has = "(index_expression value: (loop_expression" },
+        .{ .src = "fn f() {\n  x := if t { a } else { b }[0]\n}\n", .has = "(index_expression value: (if_expression" },
+        .{ .src = "fn f() {\n  x := match t { true -> a, false -> b }[0]\n}\n", .has = "(index_expression value: (match_expression" },
+        .{ .src = "fn f() {\n  x := { a }[0]\n}\n", .has = "(index_expression value: (block" },
+        .{ .src = "fn f() {\n  x := [1, 2][0]\n}\n", .has = "(index_expression value: (list_expression" },
+        .{ .src = "fn f() {\n  loop { break a }[0]\n}\n", .has = "(index_expression value: (loop_expression" },
+        .{ .src = "fn f() {\n  { a }[0]\n}\n", .has = "(index_expression value: (block" },
+        .{ .src = "fn f() {\n  x := mk()?[1]\n}\n", .has = "(index_expression value: (try_expression" },
+    };
+    for (cases) |c| {
+        if (try scope(a, c.src) != .in) {
+            std.debug.print("compiler rejects {s}\n", .{c.src});
+            return error.CompilerParseError;
+        }
+        _ = try compareFile(a, c.src, classifyTag, true);
+        const tree = parser.parseString(c.src, null) orelse return error.TreeSitterParseReturnedNull;
+        defer tree.destroy();
+        const sexp = try tree.rootNode().toSexp(a);
+        if (std.mem.indexOf(u8, sexp, c.has) == null) {
+            std.debug.print("unexpected parse of {s}\n  {s}\n", .{ c.src, sexp });
+            return error.UnexpectedGrammarShape;
+        }
+    }
+}
+
 // ---- One-sided negative control (liveness of the comparator) ---------------
 
 test "grammar agreement: a one-sided wrong classifier DISAGREES, the true one AGREES" {
