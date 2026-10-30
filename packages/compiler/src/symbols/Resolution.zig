@@ -51,6 +51,40 @@ pub fn leftmostHeadIsValue(tree: Ast.Tree, resolutions: []const Resolution, head
     return false;
 }
 
+/// Whether the Vec an `.index` (or a chain of them) reads is held by a name or a field
+/// (`xs[i]`, `h.xs[i][j]`), not made on the spot by a call, block or literal
+/// (`mk()[i]`). An element of such a temporary is no place: writing it is an error like
+/// writing the temporary itself.
+pub fn indexesHeldVec(nodes: []const Ast.Node, index: Ast.Index) bool {
+    var cur = index;
+    while (nodes[cur.int()].tag == .index) cur = nodes[cur.int()].lhs;
+    return switch (nodes[cur.int()].tag) {
+        .identifier, .field_access, .tuple_field, .type_app, .error_node => true,
+        else => false,
+    };
+}
+
+test indexesHeldVec {
+    const std = @import("std");
+    const idx = Ast.Index.from;
+    // 0: xs  1: xs[0]  2: xs[0][1]  3: h.xs  4: h.xs[0]  5: mk()  6: mk()[0]  7: mk()[0][1]
+    const nodes = [_]Ast.Node{
+        .{ .tag = .identifier, .main_token = 0, .lhs = Ast.none, .rhs = Ast.none },
+        .{ .tag = .index, .main_token = 1, .lhs = idx(0), .rhs = Ast.none },
+        .{ .tag = .index, .main_token = 2, .lhs = idx(1), .rhs = Ast.none },
+        .{ .tag = .field_access, .main_token = 3, .lhs = idx(0), .rhs = Ast.none },
+        .{ .tag = .index, .main_token = 4, .lhs = idx(3), .rhs = Ast.none },
+        .{ .tag = .call, .main_token = 5, .lhs = idx(0), .rhs = Ast.none },
+        .{ .tag = .index, .main_token = 6, .lhs = idx(5), .rhs = Ast.none },
+        .{ .tag = .index, .main_token = 7, .lhs = idx(6), .rhs = Ast.none },
+    };
+    try std.testing.expect(indexesHeldVec(&nodes, idx(1)));
+    try std.testing.expect(indexesHeldVec(&nodes, idx(2)));
+    try std.testing.expect(indexesHeldVec(&nodes, idx(4)));
+    try std.testing.expect(!indexesHeldVec(&nodes, idx(6)));
+    try std.testing.expect(!indexesHeldVec(&nodes, idx(7)));
+}
+
 /// The Vec element a place chain (`xs[i]`, `ps[i].q.a`, or a value-headed `b.ps[i].x`)
 /// is rooted at: an `.index`, or a `type_app` whose head is a value, which the parser could
 /// not tell from a turbofish. Null for a place rooted anywhere else. The one walker the
@@ -61,7 +95,7 @@ pub fn elementRoot(tree: Ast.Tree, resolutions: []const Resolution, place: Ast.I
         const n = tree.nodes[cur.int()];
         switch (n.tag) {
             .field_access, .tuple_field => cur = n.lhs,
-            .index => return cur,
+            .index => return if (indexesHeldVec(tree.nodes, cur)) cur else null,
             .type_app => return if (leftmostHeadIsValue(tree, resolutions, n.lhs)) cur else null,
             else => return null,
         }

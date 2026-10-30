@@ -1,0 +1,27 @@
+# An element of a Vec that only a call result holds is no place: a field of it cannot be
+# assigned (T0075), and it cannot be a 'mut' argument or receiver (T0019). Through a
+# group around a variable it still is one, and reading it is fine.
+import std/vec
+
+struct P { x: int }
+
+impl P {
+    fn bump(mut self) { self.x += 1 }
+}
+
+fn inc(mut n: int) { n += 1 }
+
+fn mk() -> Vec[int] { [1, 2, 3] }
+
+fn mkp() -> Vec[P] { [P { x: 1 }] }
+
+fn main() -> int {
+    mkp()[0].x = 3  #~ ERROR [T0075] cannot assign to a field of a temporary value
+    inc(mk()[0])  #~ ERROR [T0019] argument 1 must be a mutable place
+    mkp()[0].bump()  #~ ERROR [T0019] cannot call mutating method 'bump' on a temporary
+    xs := mk()
+    inc((xs)[1])
+    ps := mkp()
+    (ps)[0].bump()
+    return xs[1] + mkp()[0].x
+}

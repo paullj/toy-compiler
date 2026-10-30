@@ -1,0 +1,20 @@
+# An element store needs a named Vec to write into, so an element of a call result, a
+# group around one, a block's value or a list literal cannot be assigned (R0007). A group
+# around a variable is still that variable.
+import std/vec
+
+fn mk() -> Vec[int] { [1, 2, 3] }
+
+fn grid() -> Vec[Vec[int]] { [[1]] }
+
+fn main() -> int {
+    mk()[0] = 1  #~ ERROR [R0007] cannot assign to a temporary value, such as a call result; only a variable or a field of one can be assigned
+    (mk())[0] += 1  #~ ERROR [R0007] cannot assign to a temporary value
+    grid()[0][0] = 1  #~ ERROR [R0007] cannot assign to a temporary value
+    loop { break mk() }[0] = 1  #~ ERROR [R0007] cannot assign to a temporary value
+    { mk() }[0] = 1  #~ ERROR [R0007] cannot assign to a temporary value
+    [1, 2][0] = 1  #~ ERROR [R0007] cannot assign to a temporary value
+    xs := mk()
+    (xs)[0] = 5
+    return xs[0]
+}
