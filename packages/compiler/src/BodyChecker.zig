@@ -226,6 +226,13 @@ pub const BodyCtx = struct {
     /// `return` joins its operand into `ret_join` instead of checking it against `cur_ret`.
     ret_infer: bool = false,
     ret_join: Type = .never,
+    /// Inside such a lambda whose expected fn type returns a type that still holds a
+    /// generic call's open var (`Option[U]`, `Result[U, str]`): that type, expected of
+    /// each value the lambda returns so a constructor takes the args it does know.
+    ret_partial: ?Type = null,
+    /// The first ground type a returned value took under `ret_partial`: it fixes the
+    /// open vars, so the values that could not fix them are checked again against it.
+    ret_fix: ?Type = null,
     /// Inside a lambda whose return type is taken from the fn type expected for it rather
     /// than written: that fn type, which a mismatched `return` names, since the lambda
     /// declared nothing.
@@ -393,6 +400,12 @@ pub const BodyChecker = struct {
     retype_choices: std.AutoHashMapUnmanaged(Ast.Index, RetypeChoice) = .empty,
     infer_depth: u32 = 0,
 
+    /// What a re-check of a lambda against the type its returns fixed chose, while an
+    /// outermost lambda is checked: an outer re-check checks the nested lambdas again,
+    /// so without it each level of nesting would triple the work.
+    lambda_choices: std.AutoHashMapUnmanaged(Ast.Index, LambdaChoice) = .empty,
+    lambda_depth: u32 = 0,
+
     /// The ordered generic-param names + the concrete args they bind to, in
     /// generic-param order (`names[i]` binds `types[i]`).
     pub const Subst = struct { names: []const []const u8, types: []const Type };
@@ -400,6 +413,8 @@ pub const BodyChecker = struct {
     pub const HintChoice = struct { hint: Type, keep: bool };
 
     pub const RetypeChoice = struct { want: ?Expected, from_earlier: Type, keep: bool };
+
+    pub const LambdaChoice = struct { exp_fn: ?Type, fix: ?Type };
 
     /// `message` is the reported text (the sink's own buffer); `template` the same text with
     /// each instance type arg written as its param (owned).
@@ -418,6 +433,7 @@ pub const BodyChecker = struct {
         bc.conforms_memo.deinit(bc.gpa);
         bc.hint_choices.deinit(bc.gpa);
         bc.retype_choices.deinit(bc.gpa);
+        bc.lambda_choices.deinit(bc.gpa);
         for (bc.template_spellings.items) |ts| bc.gpa.free(ts.template);
         bc.template_spellings.deinit(bc.gpa);
     }
@@ -475,6 +491,13 @@ pub const BodyChecker = struct {
     /// The type expected of the node being typed, if any.
     pub fn expectedTy(bc: *const BodyChecker) ?Type {
         return if (bc.body.expected) |e| e.ty else null;
+    }
+
+    /// The expected type when it holds no generic call's open var: what a node that
+    /// takes its whole type from it (`[]`) can be.
+    fn groundExpectedTy(bc: *BodyChecker) ?Type {
+        const t = bc.expectedTy() orelse return null;
+        return if (bc.givesType(t)) t else null;
     }
 
     /// Whether this fn reported an ERROR since sink position `mark`. Warnings do not
@@ -679,7 +702,7 @@ pub const BodyChecker = struct {
             },
             .return_stmt => {
                 if (bc.body.ret_infer) {
-                    const rt: Type = if (stmt.lhs == Ast.none) Type.unit else try bc.typeOfExpected(stmt.lhs, null);
+                    const rt: Type = if (stmt.lhs == Ast.none) Type.unit else try bc.typeOfExpected(stmt.lhs, bc.body.ret_partial);
                     return LambdaChecker.joinLambdaReturn(bc, if (stmt.lhs == Ast.none) stmt_idx else stmt.lhs, rt);
                 }
                 const ty: Type = if (stmt.lhs == Ast.none) Type.unit else try bc.typeOfExpected(stmt.lhs, if (bc.body.cur_ret.kind == .invalid) null else bc.body.cur_ret);
@@ -968,7 +991,13 @@ pub const BodyChecker = struct {
         const save = bc.body.expected;
         bc.body.expected = exp;
         defer bc.body.expected = save;
-        return bc.typeOf(node_idx);
+        const t = try bc.typeOf(node_idx);
+        if (exp) |want| if (bc.body.ret_partial) |p| if (bc.body.ret_fix == null and want.ty.eql(p) and
+            t.kind != .invalid and t.kind != .never and bc.givesType(t) and CallInfer.fitsShape(bc, p, t))
+        {
+            bc.body.ret_fix = t;
+        };
+        return t;
     }
 
     /// The expected type of a part of a generic construction or call (a field value, a
@@ -1355,7 +1384,7 @@ pub const BodyChecker = struct {
                 // type: a `Vec[T]` annotation makes it the type's associated `new()`
                 // constructor. With no expected type (a bare `xs := []`) the element type
                 // is uninferable — require an annotation.
-                const exp = bc.expectedTy() orelse {
+                const exp = bc.groundExpectedTy() orelse {
                     try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0016 }, "an empty list literal '[]' requires a type annotation, e.g. 'xs: Vec[int] = []'", .{});
                     break :blk Type.invalid;
                 };
@@ -1381,7 +1410,7 @@ pub const BodyChecker = struct {
                     break :blk Type.invalid;
                 };
                 var seed: ?Type = null;
-                if (bc.expectedTy()) |exp| if (exp.isApp()) {
+                if (bc.groundExpectedTy()) |exp| if (exp.isApp()) {
                     const ce = bc.composite.at(exp.appIdx());
                     if (ce.ctor == vec_ctor and ce.args.len == 1) seed = ce.args[0];
                 };
@@ -1392,7 +1421,7 @@ pub const BodyChecker = struct {
                     if (!Type.assignable(v_ty, at))
                         try bc.report(.{ .span = bc.spanOf(ei), .code = .T0065 }, "list element {d}: expected '{f}', got '{f}'", .{ k, bc.fmtType(v_ty), bc.fmtType(at) });
                 }
-                if (bc.body.expected) |exp| if (!Type.eql(result, exp.ty) and !exp.soft) {
+                if (bc.body.expected) |exp| if (!Type.eql(result, exp.ty) and !exp.soft and bc.givesType(exp.ty)) {
                     if (seed) |s|
                         try bc.report(.{ .span = bc.spanOf(node_idx), .code = .T0065 }, "list element type '{f}' does not match the annotation's '{f}'", .{ bc.fmtType(v_ty), bc.fmtType(s) })
                     else
@@ -2345,10 +2374,10 @@ pub const BodyChecker = struct {
 
     const Reconciled = union(enum) { ok, err, unbound: u32 };
 
-    fn targetConflicts(out: []const Type, bound: []const bool, exp_args: ?[]const Type) bool {
+    fn targetConflicts(bc: *BodyChecker, out: []const Type, bound: []const bool, exp_args: ?[]const Type) bool {
         const ea = exp_args orelse return false;
         if (ea.len != out.len) return false;
-        for (out, bound, ea) |o, b, e| if (b and !Type.eql(o, e)) return true;
+        for (out, bound, ea) |o, b, e| if (b and bc.givesType(e) and !Type.eql(o, e)) return true;
         return false;
     }
 
@@ -2368,8 +2397,12 @@ pub const BodyChecker = struct {
         span_tok: u32,
     ) error{OutOfMemory}!Reconciled {
         const soft = if (bc.body.expected) |e| e.soft else false;
-        const ea = if (soft and targetConflicts(out, bound, exp_args)) null else exp_args;
-        switch (Infer.fillExpected(out, bound, ea)) {
+        const ea = if (soft and bc.targetConflicts(out, bound, exp_args)) null else exp_args;
+        // An expected arg that is still a generic call's open var (`U` of `Option[U]`) is
+        // unknown, not a type to bind: it is left open, so `Result.ok(1)` against
+        // `Result[U, str]` takes `E` and its own `T`. A poisoned arg is known, so it
+        // fills and stops the cascade.
+        switch (Infer.fillExpected(out, bound, ea, bc)) {
             // Unlike the leaf-carrying `match` conflict, this compares the WHOLE
             // per-ordinal type-args (no structural descent) — a container clash here
             // could differ at several depths at once (`Map[int,bool]` vs `Map[str,char]`
@@ -2501,11 +2534,17 @@ pub const BodyChecker = struct {
     }
 
     /// An arm of a value construct (a branch, a match arm, a break value) under `exp`,
-    /// the construct's expected type. With none, `join`, what the arms before it agree on,
-    /// reaches it as a hint, so an arm with no type of its own (`Option.none`, `[]`) takes
-    /// theirs; as a hint it never errs where the arm alone would not (`typeUnderHint`).
+    /// the construct's expected type. With none, or with one that still holds a generic
+    /// call's open var (a then lambda's `Option[U]`) and that `join` fits, `join`, what
+    /// the arms before it agree on, reaches it as a hint, so an arm with no type of its
+    /// own (`Option.none`, `[]`) takes theirs; as a hint it never errs where the arm alone
+    /// would not (`typeUnderHint`).
     pub fn typeOfArm(bc: *BodyChecker, node_idx: Ast.Index, exp: ?Expected, join: Type) error{OutOfMemory}!Type {
-        if (exp == null and join.kind != .never and join.kind != .invalid) return bc.typeUnderHint(node_idx, join);
+        if (join.kind != .never and join.kind != .invalid) {
+            if (exp == null) return bc.typeUnderHint(node_idx, join);
+            const e = exp.?.ty;
+            if (!bc.givesType(e) and bc.givesType(join) and CallInfer.fitsShape(bc, e, join)) return bc.typeUnderHint(node_idx, join);
+        }
         return bc.typeUnder(node_idx, exp);
     }
 
@@ -5662,4 +5701,8 @@ test "a receiver's expected type stays a hint through every arm, break and scrut
     // A hard expected type still rejects what cannot produce it.
     try Typecheck.expectDiagCodes("fn f() -> int8 { loop { break 300 } }\n", &.{.T0034});
     try Typecheck.expectDiagCodes("fn f() -> int8 { @b { break @b 300 } }\n", &.{.T0034});
+}
+
+test "an expected type arg poisoned by an unknown type is no open var to infer" {
+    try Typecheck.expectDiagCodes("fn f() -> int {\n _x: Option[Foo] = Option.none\n _y: Result[int, Bar] = Result.ok(1)\n 0\n}\n", &.{ .T0001, .T0013, .T0001, .T0013 });
 }

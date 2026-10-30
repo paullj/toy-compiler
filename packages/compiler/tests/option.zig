@@ -138,3 +138,34 @@ test "option: Option and Result methods are byte-identical at -j1 and -j8" {
 
     try harness.expectDeterministicBuild(gpa, io, ".toy-test-option-determinism", src, &.{}, 48);
 }
+
+test "option: a then lambda's constructors take their type args from its expected return" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.skipUnlessBackend(io);
+    // No annotation anywhere: `Option.none` is checked before the `Option.some` that fixes
+    // `U`, and `Result.ok` takes `E` from the receiver. 1 + 2 + 4 + 8 + 16 = 31.
+    const codes = try harness.exitAtBothLevels(gpa, io, ".toy-test-option-then-infer",
+        \\import std/option
+        \\fn main() -> int {
+        \\    o := Option.some(4)
+        \\    r := o.then(fn(v) { if v > 3 { Option.some("big") } else { Option.none } })
+        \\    n := o.then(fn(v) { if v > 3 { Option.none } else { Option.some("small") } })
+        \\    x: Result[int, str] = Result.ok(4)
+        \\    s := x.then(fn(v) { Result.ok(v + 1) })
+        \\    t := x.then(fn(v) { if v > 3 { Result.err("big") } else { Result.ok(v > 0) } })
+        \\    e := t.map_error(fn(m) { m.len() })
+        \\    total := 0
+        \\    if r.expect("no value") == "big" { total = total + 1 }
+        \\    if n.or("none") == "none" { total = total + 2 }
+        \\    if s.or(0) == 5 { total = total + 4 }
+        \\    if t.is_error() { total = total + 8 }
+        \\    if e.is_error() { total = total + 16 }
+        \\    return total
+        \\}
+        \\
+    );
+    try std.testing.expectEqual([2]u8{ 31, 31 }, codes);
+}
