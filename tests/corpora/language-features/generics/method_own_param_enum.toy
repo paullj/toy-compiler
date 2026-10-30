@@ -1,0 +1,22 @@
+# Feature: a method of a non-generic enum with its own type parameter, inferred and with
+# explicit args, and an associated fn of that enum with one: 3 + 4 + 30 + 1.
+# expect: exit 38
+enum E { one(int), none }
+
+impl E {
+    fn fold[U](self, some: fn(int) -> U, empty: U) -> U {
+        match self {
+            .one(v) -> some(v),
+            .none -> empty,
+        }
+    }
+    fn make[U](v: int, _tag: U) -> E { E.one(v) }
+}
+
+fn main() -> int {
+    a := E.one(3).fold(fn(x) { x }, 0)
+    b := E.make(4, "s").fold[bool](fn(x) { x > 3 }, false)
+    c := E.none.fold(fn(x) { x }, 30)
+    d := E.make[int](1, 0).fold(fn(x) { x }, 0)
+    return a + (if b { 4 } else { 0 }) + c + d
+}

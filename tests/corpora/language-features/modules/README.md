@@ -18,6 +18,7 @@ on each `main.toy` entry.
 | `fn_values/`                  | a qualified fn (`ops.add`) as a value; fn identity across modules |
 | `mut_params/`                 | an imported module's `mut` params and `mut self` take this module's places |
 | `own_generic_method/`         | an imported generic type's method with its own type param, two instances on one receiver |
+| `own_generic_method_concrete/` | an imported non-generic struct's method and associated fn with their own type param, inferred and explicit |
 | `display_generic/`            | an imported generic struct's instance renders under its template name (`Bx{v: 2}`) |
 | `associated_fn/`              | an imported non-generic struct's and enum's associated fns, called through the module (`shapes.Rect.square(3)`) |
 | `qualified_literal/`          | `lib.Pt { .. }`, inferred `lib.Pair { .. }` and `shapes.Shape.sq { .. }` beside same-named local types |

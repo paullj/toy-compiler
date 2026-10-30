@@ -1,0 +1,8 @@
+# Module `kinds`: a non-generic struct whose `map[U]` and associated `with[U]` declare
+# their own type parameter.
+pub struct K { pub v: int }
+
+impl K {
+    fn map[U](self, f: fn(int) -> U) -> U { f(self.v) }
+    fn with[U](v: int, _tag: U) -> K { K { v: v } }
+}

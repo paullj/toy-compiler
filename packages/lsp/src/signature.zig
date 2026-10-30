@@ -707,6 +707,27 @@ test "signatureHelpAt: a generic method's own type params show while its call is
     }
 }
 
+test "signatureHelpAt: a non-generic type's own-generic method shows its type param mid-call" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\struct K { v: int }
+        \\impl K {
+        \\    fn fold[A](self, init: A, f: fn(A, int) -> A) -> A { f(init, self.v) }
+        \\}
+        \\fn main() -> int {
+        \\    k := K { v: 2 }
+        \\    n := k.fold(0, 
+    ;
+    const p = test_util.posAfterLast(src, "k.fold(0, ");
+    var r = (try signatureHelpAt(gpa, ws, src, p.line, p.character, "file:///p/main.toy")) orelse return error.NoSignatureHelp;
+    defer r.deinit();
+    try testing.expectEqualStrings("fn fold(A, fn(A, int) -> A) -> A", r.help.signatures[0].label);
+    try testing.expectEqual(@as(u32, 1), r.help.activeParameter);
+}
+
 test "signatureHelpAt: a method pipe's piped value is the receiver, not an argument" {
     const gpa = testing.allocator;
     var docs: @import("Documents.zig") = .{};

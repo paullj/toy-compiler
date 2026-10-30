@@ -463,3 +463,26 @@ test "warm: an own-generic method call follows its argument's new type" {
         4,
     );
 }
+
+test "warm: a non-generic type's own-generic method call follows its argument's new type" {
+    const main_src =
+        \\import lib
+        \\struct K { v: int }
+        \\impl K {
+        \\    fn map[U](self, f: fn(int) -> U) -> U { f(self.v) }
+        \\    fn with[U](v: int, _u: U) -> K { K { v: v } }
+        \\}
+        \\fn main() -> int {
+        \\    k := K.with(41, lib.f(1))
+        \\    return k.map(lib.f).to_string().len()
+        \\}
+        \\
+    ;
+    try flip(
+        ".toy-test-places-own-generic-concrete",
+        &.{ .{ .name = "main.toy", .src = main_src }, .{ .name = "lib.toy", .src = "pub fn f(x: int) -> int { x + 1 }\n" } },
+        2,
+        &.{.{ .name = "lib.toy", .src = "pub fn f(x: int) -> bool { x > 0 }\n" }},
+        4,
+    );
+}

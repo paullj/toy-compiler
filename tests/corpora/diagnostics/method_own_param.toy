@@ -13,6 +13,11 @@ impl Pair[T, int] {  #~ ERROR [T0013] partly concrete or repeats a name
 struct P { v: int }
 impl P {
     fn conv[U](self, f: fn(int) -> U) -> U { f(self.v) }
+    fn tag[U](self) -> int { 0 }
+    fn with[U](v: int, _u: U) -> P { P { v: v } }
+}
+impl int {
+    fn twice[U](self, u: U) -> U { u }  #~ ERROR [T0013] a method of the builtin type 'int'
 }
 
 fn main() -> int {
@@ -20,8 +25,13 @@ fn main() -> int {
     p := P { v: 4 }
     _t := b.tag()  #~ ERROR [T0016] of method 'tag'
     _k := b.pick(1, true)  #~ ERROR [T0015]
-    _c := p.conv(fn(x: int) { x * 3 })  #~ ERROR [T0013] declares its own type parameters
-    _d := p.conv(fn(x) { x * 3 })  #~ ERROR [T0013] declares its own type parameters
+    _c := p.conv(fn(x: int) { x * 3 })
+    _d := p.tag()  #~ ERROR [T0016] of method 'tag'
+    _e := p.conv  #~ ERROR [T0049] a generic method
+    _f := P.with  #~ ERROR [T0049] a generic function
+    _g := p.with(1, 2)  #~ ERROR [T0018] call it as 'P.with(..)'
+    _h := p.conv[int, bool](fn(x: int) { x })  #~ ERROR [T0054] takes 1 type argument(s) of its own, got 2
+    _i := (3).twice(1)
     _m := b.map(fn(x, y) { x + y })  #~ ERROR [T0039] the expected type fn(int) -> U takes 1
     _n := b.map(fn(x: int, y: int) { x + y })  #~ ERROR [T0040] expected fn(int) -> U, got fn(int, int) -> int
     _a := b.map()  #~ ERROR [T0039] 'map' takes (fn(int) -> U)

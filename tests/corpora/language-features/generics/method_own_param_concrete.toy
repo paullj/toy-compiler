@@ -1,0 +1,36 @@
+# Feature: a method of a non-generic struct with its own type parameter, as on a generic
+# type: inferred from an unannotated lambda, with explicit args (`k.map[str](..)`),
+# through a method pipe, as a `mut self` method, from a generic fn's body, and an
+# associated fn (`K.with(..)`, `K.with[bool](..)`). Each `U` is its own instance.
+# expect: stdout "21 big 4 true 9 7 6"
+# expect: exit 0
+import std/io
+
+struct K { v: int }
+
+impl K {
+    fn map[U](self, f: fn(int) -> U) -> U { f(self.v) }
+    fn pick[U](self, a: U, b: U) -> U { if self.v > 10 { a } else { b } }
+    fn put[U](mut self, n: int, tag: U) -> U {
+        self.v = self.v + n
+        tag
+    }
+    fn with[U](v: int, _tag: U) -> K { K { v: v } }
+}
+
+fn relay[T](k: K, a: T, b: T) -> T { k.pick(a, b) }
+
+fn main() -> int {
+    k := K { v: 20 }
+    n := k.map(fn(x) { x + 1 })
+    s := k.map[str](fn(x) { if x > 10 { "big" } else { "small" } })
+    l := k |> .map(fn(x) { x.to_string() }) |> .len()
+    b := relay(k, true, false)
+    m := K { v: 2 }
+    _u := m.put(7, "seven")
+    _w := m.put(0, 1)
+    c := K.with(7, true).v
+    d := K.with[bool](6, false).v
+    io.println(n.to_string().concat(" ").concat(s).concat(" ").concat((l * 2).to_string()).concat(" ").concat(b.to_string()).concat(" ").concat(m.v.to_string()).concat(" ").concat(c.to_string()).concat(" ").concat(d.to_string()))
+    return 0
+}

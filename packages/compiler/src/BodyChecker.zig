@@ -1739,7 +1739,10 @@ pub const BodyChecker = struct {
                     try bc.emitAmbiguousConformance(bc.tokSpan(fa.main_token), recv_ty, member, fa.lhs);
                     return bc.poison();
                 },
-                .none => {},
+                .none => if (bc.concreteTemplate(recv_ty, member)) |m| {
+                    if (!m.has_self) return try bc.reportStaticBound(fa, member);
+                    return try bc.reportNotAValue(fa, member, "a generic method");
+                },
             }
             if (bc.isBuiltinMethod(recv_ty, member)) return try bc.reportNotAValue(fa, member, "a built-in method");
             return null;
@@ -1809,7 +1812,12 @@ pub const BodyChecker = struct {
             if (ty.kind == .@"enum" and !bc.isAssociatedFnOfEnum(ty.enum_id, n.main_token)) return null;
             const mi = switch (Typecheck.pickMethodIndex(bc.model.methods, ty, member, null, null, bc.methodSite())) {
                 .one => |mi| mi,
-                .none, .ambiguous => return null,
+                .ambiguous => return null,
+                .none => {
+                    const m = bc.concreteTemplate(ty, member) orelse return null;
+                    if (m.has_self) return null;
+                    return try bc.reportNotAValue(n, member, "a generic function");
+                },
             };
             const m = bc.model.methods[mi];
             if (!m.is_static) return null;
@@ -3020,10 +3028,9 @@ pub const BodyChecker = struct {
         const m = bc.model.methods[mi];
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         const mf = bc.model.fns[m.fn_id];
-        // Its params would bind per call, but a non-generic type's method rows have no
-        // instances for the seal to pick from.
+        // Only a builtin type's method reaches here generic (a struct or enum's is a
+        // template), and its declaration already reported T0013.
         if (mf.isGeneric()) {
-            try bc.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0013 }, "'{s}' declares its own type parameters, which a method of the non-generic type '{f}' cannot have yet", .{ member, bc.fmtType(recv_ty) });
             try bc.drainArgs(args);
             return .invalid;
         }
@@ -3401,6 +3408,7 @@ pub const BodyChecker = struct {
         if (try bc.explicitCallOnType(node_idx, n, callee, explicit)) |t| return t;
         const recv_ty = try bc.typeOfReceiver(fa.lhs); // also populates node_types[recv] for lower
         if (recv_ty.kind == .invalid) return .invalid;
+        if (bc.concreteTemplate(recv_ty, member) != null) return bc.explicitTemplateCall(node_idx, n, callee, recv_ty, explicit, false);
         if (recv_ty.kind == .@"struct" or recv_ty.kind == .@"enum" or recv_ty.isScalar()) {
             var bound_args: std.ArrayList(Type) = .empty;
             defer bound_args.deinit(bc.gpa);
@@ -3440,21 +3448,35 @@ pub const BodyChecker = struct {
             try bc.sink.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0018 }, "no method '{s}' on unbounded type parameter", .{member});
             return .invalid;
         }
-        if (recv_ty.isApp()) {
-            const e = bc.composite.at(recv_ty.appIdx());
-            switch (try Typecheck.pickExplicitTemplate(bc.gpa, bc.composite, bc.model.templates, bc.model.fns, e.ctor, e.ctor_is_enum, e.args, member, bc.methodSite(), explicit)) {
-                .ok => |p| {
-                    defer bc.gpa.free(p.targs);
-                    return bc.checkExplicitTemplateCall(node_idx, n, callee, recv_ty, p.m, p.targs, p.own, false);
-                },
-                .arity => |a| return bc.reportExplicitArity(n, member, a.want, explicit.len),
-                .no_conformance => return bc.reportNoExplicitMethod(n, recv_ty),
-                .none => {},
-            }
-        }
+        if (recv_ty.isApp()) return bc.explicitTemplateCall(node_idx, n, callee, recv_ty, explicit, false);
         try bc.drainArgs(args);
         try bc.emitNoMethod(bc.tokSpan(fa.main_token), member, recv_ty);
         return .invalid;
+    }
+
+    /// `b.m[A..](args)` (`on_type`: `Box[int].m[A..](args)`, `K.m[A..](args)`) on a
+    /// receiver whose methods are templates (`Typecheck.templateRecv`): the explicit args
+    /// pick the template and fill its type params.
+    fn explicitTemplateCall(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node, callee: Ast.Node, recv_ty: Type, explicit: []const Type, on_type: bool) error{OutOfMemory}!Type {
+        const fa = bc.tree.nodes[(callee.lhs).int()];
+        const member = bc.nameText(fa.main_token);
+        const r = Typecheck.templateRecv(bc.composite, recv_ty).?;
+        switch (try Typecheck.pickExplicitTemplate(bc.gpa, bc.composite, bc.model.templates, bc.model.fns, r.ctor, r.is_enum, r.args, member, bc.methodSite(), explicit)) {
+            .ok => |p| {
+                defer bc.gpa.free(p.targs);
+                return bc.checkExplicitTemplateCall(node_idx, n, callee, recv_ty, p.m, p.targs, p.own, on_type);
+            },
+            .arity => |a| return bc.reportExplicitArity(n, member, a.want, explicit.len),
+            .no_conformance => return bc.reportNoExplicitMethod(n, recv_ty),
+            .none => {
+                try bc.drainArgs(Ast.rangeSlice(bc.tree, (n.rhs).int()));
+                if (on_type)
+                    try bc.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0018 }, "'{f}' has no associated function '{s}'", .{ bc.fmtType(recv_ty), member })
+                else
+                    try bc.emitNoMethod(bc.tokSpan(fa.main_token), member, recv_ty);
+                return .invalid;
+            },
+        }
     }
 
     /// An explicit-args call whose receiver names a type (`Box[int].with[bool](..)`,
@@ -3473,20 +3495,7 @@ pub const BodyChecker = struct {
             }
             // Load-bearing: discovery and the seal read the receiver off this node.
             bc.node_types[(fa.lhs).int()] = app_ty;
-            const e = bc.composite.at(app_ty.appIdx());
-            switch (try Typecheck.pickExplicitTemplate(bc.gpa, bc.composite, bc.model.templates, bc.model.fns, e.ctor, e.ctor_is_enum, e.args, member, bc.methodSite(), explicit)) {
-                .ok => |p| {
-                    defer bc.gpa.free(p.targs);
-                    return try bc.checkExplicitTemplateCall(node_idx, n, callee, app_ty, p.m, p.targs, p.own, true);
-                },
-                .arity => |a| return try bc.reportExplicitArity(n, member, a.want, explicit.len),
-                .no_conformance => return try bc.reportNoExplicitMethod(n, app_ty),
-                .none => {
-                    try bc.drainArgs(args);
-                    try bc.report(.{ .span = bc.tokSpan(fa.main_token), .code = .T0018 }, "'{f}' has no associated function '{s}'", .{ bc.fmtType(app_ty), member });
-                    return .invalid;
-                },
-            }
+            return try bc.explicitTemplateCall(node_idx, n, callee, app_ty, explicit, true);
         }
         // A bare generic type: its own args come from nowhere once the method's are given.
         if (bc.genericTypeNamed(fa.lhs)) |g| {
@@ -3496,13 +3505,18 @@ pub const BodyChecker = struct {
                 return .invalid;
             }
         }
-        // A non-generic type's associated fn or variant takes no type args: neither has
-        // type params of its own, and a protocol declares no associated fn to pick.
+        // A non-generic type's associated fn takes type args only for type params of its
+        // own; a variant never does, and a protocol declares no associated fn to pick.
         if (bc.concreteTypeNamed(fa.lhs)) |ty| {
-            try bc.drainArgs(args);
             const is_variant = ty.kind == .@"enum" and for (bc.model.enums[ty.enum_id].variants) |v| {
                 if (std.mem.eql(u8, v.name, member)) break true;
             } else false;
+            if (!is_variant and bc.concreteTemplate(ty, member) != null) {
+                // Load-bearing: discovery and the seal read the receiver off this node.
+                bc.node_types[(fa.lhs).int()] = ty;
+                return try bc.explicitTemplateCall(node_idx, n, callee, ty, explicit, true);
+            }
+            try bc.drainArgs(args);
             if (is_variant or Typecheck.pickMethodIndex(bc.model.methods, ty, member, null, null, bc.methodSite()) != .none)
                 try bc.sink.report(.{ .span = bc.typeArgsSpan(n.lhs), .code = .T0054 }, "'{s}' is not generic; drop the type arguments", .{member})
             else
@@ -3536,13 +3550,7 @@ pub const BodyChecker = struct {
         const member = bc.nameText(fa.main_token);
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
         if (on_type and m.has_self) return bc.reportInstanceMethodOnType(args, fa.main_token);
-        if (!on_type and !m.has_self) {
-            try bc.drainArgs(args);
-            const e = bc.composite.at(recv_ty.appIdx());
-            const has_field = !e.ctor_is_enum and bc.fnField(e.ctor, member, e.args) != null;
-            try bc.reportAssociatedOnValue(fa, bc.typeName(recv_ty), "[..]", has_field);
-            return .invalid;
-        }
+        if (!on_type and !m.has_self) return bc.reportAssociatedOnValue(fa, args, recv_ty);
         if (own) {
             const targ_nodes = Ast.rangeSlice(bc.tree, (callee.rhs).int());
             var all_concrete = true;
@@ -3661,7 +3669,8 @@ pub const BodyChecker = struct {
         const e = bc.model.enums[enum_id];
         const member = bc.nameText(member_tok);
         for (e.variants) |v| if (std.mem.eql(u8, v.name, member)) return false;
-        if (e.is_generic) return Typecheck.findGenericMethod(bc.model.templates, enum_id, true, member, bc.methodSite()) != null;
+        if (Typecheck.findGenericMethod(bc.model.templates, enum_id, true, member, bc.methodSite()) != null) return true;
+        if (e.is_generic) return false;
         return Typecheck.pickMethodIndex(bc.model.methods, Type.enumT(enum_id), member, null, null, bc.methodSite()) != .none;
     }
 
@@ -3714,11 +3723,24 @@ pub const BodyChecker = struct {
                 try bc.emitAmbiguousConformance(bc.tokSpan(callee.main_token), ty, member, null);
             },
             .none => {
+                if (bc.concreteTemplate(ty, member)) |m| {
+                    if (m.has_self) return try bc.reportInstanceMethodOnType(args, callee.main_token);
+                    // Load-bearing: discovery and the seal read the receiver off this node.
+                    bc.node_types[(callee.lhs).int()] = ty;
+                    return CallInfer.checkOwnGenericCall(bc, node_idx, n, callee, ty, bc.model.fns[m.fn_id], member, true);
+                }
                 try bc.drainArgs(args);
                 try bc.report(.{ .span = bc.tokSpan(callee.main_token), .code = .T0018 }, "'{f}' has no associated function '{s}'", .{ bc.fmtType(ty), member });
             },
         }
         return .invalid;
+    }
+
+    /// The template of `member` on the non-generic struct or enum `recv`, a method with
+    /// type params of its own (see `Typecheck.templateRecv`), else null.
+    fn concreteTemplate(bc: *const BodyChecker, recv: Type, member: []const u8) ?Typecheck.TemplateMethod {
+        if (recv.kind != .@"struct" and recv.kind != .@"enum") return null;
+        return Typecheck.findGenericMethod(bc.model.templates, recv.nominalId(), recv.kind == .@"enum", member, bc.methodSite());
     }
 
     /// An ASSOCIATED-function call `Vec[int].new(args)`: a `field_access` callee whose
@@ -4309,12 +4331,7 @@ pub const BodyChecker = struct {
             .one => |mi| {
                 // An associated (self-less) function must be reached via `Type[..].fn()`,
                 // never on a value receiver.
-                if (bc.model.methods[mi].is_static) {
-                    try bc.drainArgs(args);
-                    const has_field = recv_ty.kind == .@"struct" and bc.fnField(recv_ty.struct_id, member, &.{}) != null;
-                    try bc.reportAssociatedOnValue(callee, bc.typeName(recv_ty), "", has_field);
-                    return .invalid;
-                }
+                if (bc.model.methods[mi].is_static) return bc.reportAssociatedOnValue(callee, args, recv_ty);
                 return try bc.dispatchMethod(node_idx, n, callee, recv_ty, member, mi);
             },
             .ambiguous => {
@@ -4322,7 +4339,11 @@ pub const BodyChecker = struct {
                 try bc.emitAmbiguousConformance(bc.tokSpan(callee.main_token), recv_ty, member, null);
                 return .invalid;
             },
-            .none => {},
+            .none => if (bc.concreteTemplate(recv_ty, member)) |m| {
+                if (!m.has_self) return bc.reportAssociatedOnValue(callee, args, recv_ty);
+                if (m.mut_self) try bc.checkMutReceiver(callee.lhs, member);
+                return CallInfer.checkOwnGenericCall(bc, node_idx, n, callee, recv_ty, bc.model.fns[m.fn_id], member, false);
+            },
         }
         // Target-directed `.into()` / `.try_into()` on an integer OR `char` receiver:
         // resolve the destination from the expected type. `into` is lossless (int widen /
@@ -4452,14 +4473,22 @@ pub const BodyChecker = struct {
     /// T0018 at `recv.m(..)` where `m` is an associated fn. A fn-typed field `m` beside it
     /// is not called instead (a call selects the method first); the message only says how
     /// to reach each, because "call it as 'T.m(..)'" alone misleads someone after the field.
-    fn reportAssociatedOnValue(bc: *BodyChecker, callee: Ast.Node, type_name: []const u8, targs: []const u8, has_field: bool) error{OutOfMemory}!void {
+    fn reportAssociatedOnValue(bc: *BodyChecker, callee: Ast.Node, args: []const Ast.Index, recv_ty: Type) error{OutOfMemory}!Type {
+        try bc.drainArgs(args);
         const member = bc.nameText(callee.main_token);
+        const type_name = bc.typeName(recv_ty);
+        const targs = if (recv_ty.isApp()) "[..]" else "";
+        const has_field = if (Typecheck.templateRecv(bc.composite, recv_ty)) |r| !r.is_enum and bc.fnField(r.ctor, member, r.args) != null else false;
         const at: DiagnosticSink.Report = .{ .span = bc.tokSpan(callee.main_token), .code = .T0018 };
-        if (!has_field) return bc.sink.report(at, "'{s}' is an associated function; call it as '{s}{s}.{s}(..)'", .{ member, type_name, targs, member });
+        if (!has_field) {
+            try bc.sink.report(at, "'{s}' is an associated function; call it as '{s}{s}.{s}(..)'", .{ member, type_name, targs, member });
+            return .invalid;
+        }
         const rs = bc.spanOf(callee.lhs);
         const text = bc.source[rs.start..rs.end];
         const recv = if (std.mem.indexOfScalar(u8, text, '\n') == null) text else "x";
         try bc.sink.report(at, "'{s}' is both an associated function of '{s}' and a field of fn type: '{s}{s}.{s}(..)' calls the function and '{s}.{s}' reads the field", .{ member, type_name, type_name, targs, member, recv, member });
+        return .invalid;
     }
 
     /// A direct `.cmp(other)` with no explicit `impl T has Ord`: answered by the same
@@ -4510,12 +4539,7 @@ pub const BodyChecker = struct {
         if (picked) |m| {
             // An associated (self-less) function is not callable on a value receiver —
             // it must be reached via `Type[args].fn()`.
-            if (!m.has_self) {
-                try bc.drainArgs(args);
-                const has_field = !e.ctor_is_enum and bc.fnField(e.ctor, member, e.args) != null;
-                try bc.reportAssociatedOnValue(callee, bc.typeName(recv_ty), "[..]", has_field);
-                return .invalid;
-            }
+            if (!m.has_self) return bc.reportAssociatedOnValue(callee, args, recv_ty);
             const mf = bc.model.fns[m.fn_id];
             if (m.mut_self) try bc.checkMutReceiver(callee.lhs, member);
             if (Typecheck.hasOwnTypeParams(bc.composite, mf)) return CallInfer.checkOwnGenericCall(bc, node_idx, n, callee, recv_ty, mf, member, false);
@@ -5325,7 +5349,8 @@ pub const BodyChecker = struct {
             const e = bc.composite.at(recv_ty.appIdx());
             const display = std.mem.eql(u8, member, "to_string") and bc.model.preludeProtocols().display != null;
             break :blk display or Typecheck.pickGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite()) != .none;
-        } else Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, null, bc.methodSite()) != .none or bc.isBuiltinMethod(recv_ty, member);
+        } else Typecheck.pickMethodIndex(bc.model.methods, recv_ty, member, null, null, bc.methodSite()) != .none or
+            bc.concreteTemplate(recv_ty, member) != null or bc.isBuiltinMethod(recv_ty, member);
         if (!is_method) return false;
         const recv = bc.spanOf(fa.lhs);
         const msg = "field '{s}' of '{s}' is private to module '{s}'; ";

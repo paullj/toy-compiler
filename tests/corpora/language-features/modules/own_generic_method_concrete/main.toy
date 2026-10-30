@@ -1,0 +1,11 @@
+# Feature: a non-generic struct's method and associated fn with their own type param,
+# declared in another module and called with two different `U` each: 45 + 1 + 3 + 4.
+# expect: exit 53
+import kinds
+
+fn main() -> int {
+    k := kinds.K.with(5, true)
+    n := k.map(fn(x) { x * 9 })
+    t := k.map(fn(x: int) { x > 3 })
+    return n + (if t { 1 } else { 0 }) + kinds.K.with(3, "s").v + kinds.K.with[int](4, 0).v
+}

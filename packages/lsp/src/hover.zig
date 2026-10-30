@@ -540,6 +540,43 @@ test "hover on a generic method call whose args do not check shows the method as
     try testing.expectEqualStrings("```toy\nfn map(self: Box[T], f: fn(T) -> U) -> Box[U]\n```", h.value);
 }
 
+test "hover on a non-generic type's own-generic method call shows the method as declared" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const tu = @import("test_util.zig");
+    const src =
+        \\struct K { v: int }
+        \\impl K {
+        \\    fn map[U](self, f: fn(int) -> U) -> U { f(self.v) }
+        \\    fn with[U](v: int, _u: U) -> K { K { v: v } }
+        \\}
+        \\fn main() -> int {
+        \\    k := K.with(2, "s")
+        \\    n := k.map(fn(x) { x + 1 })
+        \\    z := k.map(fn(s) { s.nope() })
+        \\    return n + z
+        \\}
+        \\
+    ;
+    const cases = [_]struct { at: @import("protocol.zig").Position, want: []const u8 }{
+        .{ .at = tu.posAfterLast(src, "n := k."), .want = "fn map(self: K, f: fn(int) -> int) -> int" },
+        .{ .at = tu.posAfterLast(src, "z := k."), .want = "fn map(self: K, f: fn(int) -> U) -> U" },
+        .{ .at = tu.posAfterLast(src, "k := K."), .want = "fn with(v: int, _u: str) -> K" },
+    };
+    for (cases) |c| {
+        var h = (try hoverAt(gpa, ws, src, c.at.line, c.at.character, "file:///p/main.toy")) orelse {
+            std.debug.print("no hover for '{s}'\n", .{c.want});
+            return error.NoHover;
+        };
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}\n```", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}
+
 test "hover inside a bounded template: a prelude bound spells Self, a concrete receiver shows its type" {
     const gpa = testing.allocator;
     var docs: @import("Documents.zig") = .{};
