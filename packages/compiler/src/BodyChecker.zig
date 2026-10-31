@@ -233,6 +233,12 @@ pub const BodyCtx = struct {
     /// The first ground type a returned value took under `ret_partial`: it fixes the
     /// open vars, so the values that could not fix them are checked again against it.
     ret_fix: ?Type = null,
+    /// A returned value under `ret_partial` failed, and may be what would have fixed its
+    /// open vars, so a later one left open by them is no new error.
+    ret_poisoned: bool = false,
+    /// A constructor under `ret_partial` was itself left open by its vars (T0016): its
+    /// value has no type, yet poisons nothing, or it would silence its own error.
+    ret_open: bool = false,
     /// Inside a lambda whose return type is taken from the fn type expected for it rather
     /// than written: that fn type, which a mismatched `return` names, since the lambda
     /// declared nothing.
@@ -1005,11 +1011,17 @@ pub const BodyChecker = struct {
         const save = bc.body.expected;
         bc.body.expected = exp;
         defer bc.body.expected = save;
+        const open_before = bc.body.ret_open;
+        bc.body.ret_open = false;
         const t = try bc.typeOf(node_idx);
-        if (exp) |want| if (bc.body.ret_partial) |p| if (bc.body.ret_fix == null and want.ty.eql(p) and
-            t.kind != .invalid and t.kind != .never and bc.givesType(t) and CallInfer.fitsShape(bc, p, t))
-        {
-            bc.body.ret_fix = t;
+        const opened = bc.body.ret_open;
+        bc.body.ret_open = open_before or opened;
+        if (exp) |want| if (bc.body.ret_partial) |p| if (want.ty.eql(p)) {
+            if (t.kind == .invalid) {
+                if (!opened) bc.body.ret_poisoned = true;
+            } else if (bc.body.ret_fix == null and t.kind != .never and bc.givesType(t) and CallInfer.fitsShape(bc, p, t)) {
+                bc.body.ret_fix = t;
+            }
         };
         return t;
     }
@@ -2222,9 +2234,18 @@ pub const BodyChecker = struct {
                 .ok => return bc.checkVariantPayloads(site, enum_id, vtok, node_form, args, out, pre),
                 .err => return .invalid,
                 .unbound => |ord| {
+                    // A payload without a type was reported where it failed and may be
+                    // what would have bound the param; one that erred inside but still
+                    // has a type bound what it could, so the param is really open. A
+                    // capture's hole is invalid only because it waits for this variant.
+                    for (arg_nodes, pre) |a, t| {
+                        const v = if (node_form == .@"struct") bc.tree.nodes[a.int()].lhs else a;
+                        if (t.kind == .invalid and v != bc.body.hole) return .invalid;
+                    }
                     for (out, bnd) |*o, b| if (!b) {
                         o.* = .invalid;
                     };
+                    bc.body.ret_open = true;
                     try bc.reportUninferable(bc.tokSpan(vtok), " '{s}' for '{s}.{s}'", .{ e.generic_params[ord], e.name, vname }, e.name, out, &.{ ".", vname }, null);
                     return .invalid;
                 },
@@ -2409,8 +2430,10 @@ pub const BodyChecker = struct {
     /// identically-worded T0015 arg-vs-expected conflict and the identical T0013
     /// concrete-value gate (both differ across the two sites only by `span_tok`).
     /// It returns `.unbound` WITHOUT emitting, so each site keeps its own
-    /// byte-identical, site-specific T0016 message. On `.ok` the caller proceeds to
-    /// the construction tail (`checkVariantPayloads` / `internApp` + field checks).
+    /// byte-identical, site-specific T0016 message, or `.err` without emitting when a
+    /// lambda's poisoned return left the var open (`ret_poisoned`). On `.ok` the caller
+    /// proceeds to the construction tail (`checkVariantPayloads` / `internApp` + field
+    /// checks).
     fn reconcileTargetArgs(
         bc: *BodyChecker,
         out: []Type,
@@ -2436,7 +2459,10 @@ pub const BodyChecker = struct {
                 try bc.report(.{ .span = bc.tokSpan(span_tok), .code = .T0015 }, "conflicting types for type parameter '{s}': {f} inferred from the value, {f} from the expected type", .{ param_names[c.ord], bc.fmtType(c.arg), bc.fmtType(c.expected) });
                 return .err;
             },
-            .unbound => |u| return .{ .unbound = u.ord },
+            .unbound => |u| {
+                if (bc.body.ret_poisoned) if (bc.body.ret_partial) |p| if (bc.expectedTy()) |e| if (e.eql(p)) return .err;
+                return .{ .unbound = u.ord };
+            },
             .ok => {
                 for (out) |ta| {
                     // A bounded template's own param inferred here grounds at the outer
@@ -5760,4 +5786,13 @@ test "a receiver's expected type stays a hint through every arm, break and scrut
 
 test "an expected type arg poisoned by an unknown type is no open var to infer" {
     try Typecheck.expectDiagCodes("fn f() -> int {\n _x: Option[Foo] = Option.none\n _y: Result[int, Bar] = Result.ok(1)\n 0\n}\n", &.{ .T0001, .T0013, .T0001, .T0013 });
+}
+
+test "a poisoned payload leaves the type params it would bind to the poison, not the others" {
+    try Typecheck.expectDiagCodes("fn go() -> int {\n _o := Option.some(1 + true)\n 0\n}\n", &.{.T0044});
+    try Typecheck.expectDiagCodes("fn go() -> int {\n _o: Option[int] = Option.some(1 + true)\n 0\n}\n", &.{.T0044});
+    try Typecheck.expectDiagCodes("fn go() -> int {\n _r := Result.ok(1 + true)\n 0\n}\n", &.{.T0044});
+    try Typecheck.expectDiagCodes("fn go(v: int) -> int {\n bad := v + true\n _o := Option.some(bad)\n 0\n}\n", &.{.T0044});
+    // The payload erred inside but still has a type, so it binds T and E stays open.
+    try Typecheck.expectDiagCodes("fn id(x: int) -> int { x }\nfn go() -> int {\n _r := Result.ok(id(1 + true))\n 0\n}\n", &.{ .T0016, .T0044 });
 }

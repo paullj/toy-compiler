@@ -1,0 +1,14 @@
+# Regression: a warning in a bounded template's body (here W0007 on a dead `if` arm)
+# poisoned the template like an error, so no instance was minted and lower failed
+# with 'unresolved generic instance in lower'.
+# expect: exit 12
+import std/option
+
+protocol Twice { fn twice(self) -> Self }
+impl int has Twice { fn twice(self) -> int { self * 2 } }
+
+fn dbl[T has Twice](o: Option[T], _c: bool) -> Option[T] {
+    o.then(fn(v) { if false { Option.some(v) } else { Option.some(v.twice()) } })
+}
+
+fn main() -> int { dbl(Option.some(6), false).or(0) }
