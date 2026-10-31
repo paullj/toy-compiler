@@ -173,6 +173,29 @@ taken against the workspace folder (`rootUri`). With no `root`, each document's 
 folder is its root, as with the CLI. Clients expose this as a server setting (Neovim's
 `init_options`, for example); restart the server after changing it.
 
+## Editor support
+
+The language server knows the module system:
+
+- **Import paths.** After `import ` or a `/` in a path, completion offers the next path
+  segment: a module (`x.toy`, or a folder with a `mod.toy`) or a folder of modules, from
+  the module root, every `include` root and the bundled `std/`. Open, unsaved files
+  count. The file being edited, `mod` and the private `core/` are never offered.
+- **Selection lists.** Inside `import a/b.{` completion lists what `a/b` exports: its
+  `pub` items, and the names its `pub import`s bind, under their re-exported names.
+  `b.` after a whole-module import lists the same set.
+- **Navigation.** Go-to-definition and hover on a selected name or its `as` alias reach
+  the item itself, through any chain of re-exports, as do uses of that name in the
+  module (`square(2)`, `util.square(2)`). On a path segment they reach the module's
+  file, and hover shows `module a/b`.
+
+Find-references is not supported yet.
+
+The tree-sitter grammar (`packages/tree-sitter-toy`) parses every import form. Its
+highlight query marks path segments and whole-module aliases as `@module`, and a
+selected name or alias as `@type` when it is capitalised and as `@function` otherwise,
+since the grammar cannot tell which item a name selects.
+
 ## Errors
 
 | Code | When |

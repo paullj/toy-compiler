@@ -996,3 +996,45 @@ test "hover on a name a re-export renames shows the item it names" {
     defer h.deinit();
     try testing.expectEqualStrings("```toy\npub struct Pt { pub x: int }\n```", h.value);
 }
+
+test "hover on a selected name, its alias and an import path shows what the import names" {
+    const gpa = testing.allocator;
+    const tu = @import("test_util.zig");
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws = try tu.reexportWorkspace(gpa, &docs);
+    const src = tu.reexport_main;
+    const cases = [_]struct { at: []const u8, want: []const u8 }{
+        .{ .at = "square,", .want = "fn sq(x: int) -> int" },
+        .{ .at = "P, side", .want = "pub struct Pt { pub x: int }" },
+        .{ .at = "Pt as", .want = "pub struct Pt { pub x: int }" },
+        .{ .at = "side}", .want = "fn side() -> int" },
+        .{ .at = "util.{", .want = "module util" },
+        .{ .at = "math.{sq}", .want = "module util/math" },
+        .{ .at = "square(p", .want = "fn sq(x: int) -> int" },
+    };
+    for (cases) |c| {
+        const pos = tu.posOf(src, c.at);
+        var h = (try hoverAt(gpa, ws, src, pos.line, pos.character, tu.reexport_main_uri)) orelse {
+            std.debug.print("no hover at '{s}'\n", .{c.at});
+            return error.NoHover;
+        };
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}\n```", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}
+
+test "hover on a selected type alias shows the type it names" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    try docs.put(gpa, "file:///ta/util.toy", "pub type Meters = int\n", 1);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src = "import util.{Meters as M}\nfn main() -> M { 0 }\n";
+    const pos = @import("test_util.zig").posOf(src, "Meters as");
+    var h = (try hoverAt(gpa, ws, src, pos.line, pos.character, "file:///ta/main.toy")) orelse return error.NoHover;
+    defer h.deinit();
+    try testing.expectEqualStrings("```toy\npub type Meters = int\n```", h.value);
+}

@@ -1000,11 +1000,12 @@ test "lsp completion: scope, member (fields+methods), module members, and a brok
     try ts.request(@as(i64, 23), compl, atPos(u_broken, posAfterLast(broken_src, "s.")));
     try ts.finish();
 
-    // Capability: the `.` trigger is advertised.
+    // Capability: the `.` and `/` triggers are advertised.
     const cp = objGet(ts.capabilities(), "completionProvider").?;
     const trigs = objGet(cp, "triggerCharacters").?;
-    try testing.expect(trigs == .array and trigs.array.items.len == 1);
+    try testing.expect(trigs == .array and trigs.array.items.len == 2);
     try testing.expectEqualStrings(".", trigs.array.items[0].string);
+    try testing.expectEqualStrings("/", trigs.array.items[1].string);
 
     // (1) SCOPE: enclosing-fn local + param + a visible top-level fn + a type + a keyword.
     const scope = resultArr(ts.response(20).?).?;

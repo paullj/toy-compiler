@@ -33,7 +33,22 @@ const BundledStd = @import("bundled_std");
 /// The `.toy` source extension that an import path maps onto.
 pub const ext = ".toy";
 /// A folder module's entry: `import util` may load `util/mod.toy`.
-const folder_entry = "mod";
+pub const folder_entry = "mod";
+
+/// The import paths of the bundled `core/` and `std/` modules, sorted.
+pub fn bundledPaths() BundledPaths {
+    return .{};
+}
+
+pub const BundledPaths = struct {
+    i: usize = 0,
+
+    pub fn next(it: *BundledPaths) ?[]const u8 {
+        if (it.i >= BundledStd.modules.len) return null;
+        defer it.i += 1;
+        return BundledStd.modules[it.i].path;
+    }
+};
 
 /// The bundled standard library source for an import path (e.g. `core/ffi`), or
 /// null when the path names no bundled module. The returned bytes are static

@@ -21,3 +21,9 @@ it('marks every compound assignment operator as one punctuation token', () => {
 		expect(toks.find((t) => t.text === op)?.cls).toBe('tok-punc');
 	}
 });
+
+it('marks pub, import and as keywords in a selective re-export', () => {
+	const toks = highlightLines('pub import util/math.{sq as square, Pt}').flat();
+	const cls = (text: string) => toks.find((t) => t.text === text)?.cls;
+	for (const kw of ['pub', 'import', 'as']) expect(cls(kw)).toBe('tok-kw');
+});

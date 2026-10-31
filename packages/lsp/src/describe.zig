@@ -45,6 +45,7 @@ pub const Describer = struct {
         const m = d.module();
         const resolutions = d.an.resolutions();
         const node_types = d.an.nodeTypes();
+        if (d.an.importedAt(tok)) |ex| return d.imported(ex);
 
         // func-first: a token shared by an identifier and its enclosing node (a callee and
         // its `call`, a `mod.fn` access and its receiver) should show the callable.
@@ -82,6 +83,27 @@ pub const Describer = struct {
         if (try d.qualifiedVariant(tok)) return true;
         // A type name is left unresolved by the resolver; match it against the type tables.
         return d.typeDefinition(d.text(tok));
+    }
+
+    /// What an import names: a fn as `function` renders it, any other item as written, and
+    /// a module by its path.
+    fn imported(d: *Describer, ex: Graph.Graph.Export) !bool {
+        const tm = &d.an.graph.modules[ex.mod];
+        if (ex.decl == Ast.none) {
+            try d.buf.print(d.a, "module {s}", .{tm.path});
+            return true;
+        }
+        for (d.an.res().fns, 0..) |gf, f| {
+            if (gf.module == ex.mod and gf.decl_node == ex.decl) return d.function(@intCast(f));
+        }
+        try d.appendNodeText(tm, ex.decl.int());
+        // An alias decl's extent ends at its name; the type it names is the point of the hover.
+        const decl = tm.nodes[ex.decl.int()];
+        if (decl.tag == .type_alias_decl) {
+            try d.buf.appendSlice(d.a, " = ");
+            try d.appendNodeText(tm, decl.lhs.int());
+        }
+        return true;
     }
 
     /// `Enum.variant` spelled through the type name (`Option.some(x)`) is a field access,
