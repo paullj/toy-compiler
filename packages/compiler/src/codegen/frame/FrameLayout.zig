@@ -164,9 +164,7 @@ pub fn compute(
                     .call => |c| {
                         arg_types.clearRetainingCapacity();
                         try arg_types.ensureTotalCapacity(gpa, c.args.len);
-                        for (c.args) |arg| {
-                            arg_types.appendAssumeCapacity(func.operandType(arg));
-                        }
+                        for (0..c.args.len) |i| arg_types.appendAssumeCapacity(func.argType(c.args, c.params, i));
                         // The callee's return type drives sret (x8), which does
                         // NOT consume NSAA — but planCall needs a ret type. Use
                         // the call's own ret_slot type if present, else unit
@@ -175,7 +173,8 @@ pub fn compute(
                             func.slots[c.ret_slot].type
                         else
                             Type.unit;
-                        var plan = try Abi.planCall(gpa, arg_types.items, ret_ty, layouts, enum_layouts);
+                        const conv: Abi.Conv = if (c.callee.kind == .import) .c else .toy;
+                        var plan = try Abi.planCallConv(gpa, conv, arg_types.items, ret_ty, layouts, enum_layouts);
                         defer plan.deinit(gpa);
                         if (plan.nsaa_bytes > max_nsaa) max_nsaa = plan.nsaa_bytes;
                     },

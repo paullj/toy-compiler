@@ -32,6 +32,7 @@ const Link = @import("Link.zig");
 const Abi = @import("../codegen/abi/Abi.zig");
 const MachO = @import("MachO.zig");
 const CodeSign = @import("CodeSign.zig");
+const Dylib = @import("Dylib.zig");
 const runtime = @import("../codegen/runtime/runtime.zig");
 const sym = @import("../symbols/Sym.zig");
 const Engine = @import("../query/Engine.zig");
@@ -424,6 +425,7 @@ pub fn assembleAndSign(
     entry_off: u32,
     cstrings: []const u8,
     data_relocs: []const Link.Reloc,
+    libs: Dylib.Linking,
 ) ![]u8 {
     // Derive the ordered dyld import set from the `.import` reloc targets: collect the
     // DISTINCT names, stable-sort by name → canonical GOT slot order. This is a pure
@@ -443,9 +445,9 @@ pub fn assembleAndSign(
         for (imports) |im| gpa.free(@constCast(im.name));
         gpa.free(imports);
     }
-    for (names, 0..) |nm, i| imports[i] = .{ .name = try std.fmt.allocPrint(gpa, "_{s}", .{nm}) };
+    for (names, 0..) |nm, i| imports[i] = .{ .name = try std.fmt.allocPrint(gpa, "_{s}", .{nm}), .ordinal = libs.ordinalOf(nm) };
 
-    const layout = try MachO.assemble(gpa, identifier, code, entry_off, cstrings, imports);
+    const layout = try MachO.assemble(gpa, identifier, code, entry_off, cstrings, imports, libs.load());
     errdefer gpa.free(layout.image);
 
     // Slot i binds the i-th sorted import; `applyDataRelocs` looks each `.import`
@@ -490,7 +492,7 @@ pub fn emitExecutable(io: Io, gpa: std.mem.Allocator, fns: []Link.FnCode, entry:
         };
         gpa.free(lk.data_relocs);
     }
-    return assembleAndSign(io, gpa, opts.identifier, lk.text, lk.entry_off, lk.cstrings, lk.data_relocs);
+    return assembleAndSign(io, gpa, opts.identifier, lk.text, lk.entry_off, lk.cstrings, lk.data_relocs, .{});
 }
 
 test "link.emitExecutable: hand-built main returns 42 (no front-end)" {

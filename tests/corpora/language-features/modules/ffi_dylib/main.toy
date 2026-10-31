@@ -1,0 +1,15 @@
+# expect: exit 15
+# libdir: "@harness"
+# Two modules name the same library: it is loaded once, and each module's externs bind
+# to it, here behind a module's safe wrappers.
+import counter
+
+extern "toyffi" {
+    fn toyffi_add(a: int, b: int) -> int
+}
+
+fn main() -> int {
+    c := counter.make(3)
+    _first := counter.bump(c)
+    return unsafe { toyffi_add(counter.bump(c), 10) }
+}

@@ -2123,6 +2123,7 @@ pub fn lowerCharDisplay(b: *Builder, slot: Ir.SlotId) error{OutOfMemory}!Ir.Slot
 fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!Ir.Operand {
     const callee_node = b.in.tree.nodes[(n.lhs).int()];
     var callee: Link.SymName = undefined;
+    var callee_gid: usize = std.math.maxInt(usize);
     // A method call `recv.m(args)`: dispatch to the method's mangled symbol and
     // PREPEND the receiver as the `self` arg (arg 0). `self_recv` set ⟺ this is a
     // method call; the receiver expr is lowered as arg 0 below.
@@ -2171,6 +2172,7 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
             const nm = b.in.names[gid];
             if (nm.kind == .builtin) if (Intrinsic.lookup(nm.name)) |ik| if (try lowerIntrinsicCall(b, node_idx, n, ik)) |op| return op;
             callee = nm;
+            callee_gid = gid;
         },
         // A miss (arity/conflict/unbound/unminted) is an internal invariant break — Pass C
         // already gated it — so note-and-drop.
@@ -2224,7 +2226,11 @@ fn lowerCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node) error{OutOfMemory}!I
         } else args[self_n + i] = try lowerExpr(b, arg);
     }
 
-    const result = try emitCall(b, .{ .direct = callee }, args, result_ty, n.main_token);
+    const target: CallTarget = if (callee.kind == .import and callee_gid < b.in.sigs.len)
+        .{ .import = .{ .sym = callee, .params = b.in.sigs[callee_gid].params } }
+    else
+        .{ .direct = callee };
+    const result = try emitCall(b, target, args, result_ty, n.main_token);
     try places.writeBacks(b, wbs.items);
     return result;
 }
@@ -2369,11 +2375,17 @@ fn lowerIntrinsicCall(b: *Builder, node_idx: Ast.Index, n: Ast.Node, ik: Intrins
 }
 
 /// What a call instruction invokes: a symbol (`bl`), or a computed code address (`blr`).
-pub const CallTarget = union(enum) { direct: Link.SymName, indirect: Ir.ValueId };
+/// An `extern` callee also carries its declared param types.
+pub const CallTarget = union(enum) {
+    direct: Link.SymName,
+    import: struct { sym: Link.SymName, params: []const Typecheck.Type },
+    indirect: Ir.ValueId,
+};
 
 fn callOp(target: CallTarget, args: []Ir.Operand, ret_slot: Ir.SlotId) Ir.Op {
     return switch (target) {
         .direct => |callee| .{ .call = .{ .callee = callee, .args = args, .ret_slot = ret_slot } },
+        .import => |im| .{ .call = .{ .callee = im.sym, .args = args, .ret_slot = ret_slot, .params = im.params } },
         .indirect => |t| .{ .call_indirect = .{ .target = t, .args = args, .ret_slot = ret_slot } },
     };
 }

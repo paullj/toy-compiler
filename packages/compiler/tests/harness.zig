@@ -117,7 +117,9 @@ pub fn runExitIn(gpa: std.mem.Allocator, io: Io, cwd_abs: []const u8, rel: []con
 }
 
 pub fn runExit(gpa: std.mem.Allocator, io: Io, prog: []const u8) !u8 {
-    var run = try std.process.spawn(io, .{ .argv = &.{prog} });
+    // Under `zig build test` the test binary's stdout is the build runner's protocol pipe,
+    // so a program that prints must not inherit it or the runner deadlocks.
+    var run = try std.process.spawn(io, .{ .argv = &.{prog}, .stdout = .ignore });
     const term = try run.wait(io);
     _ = gpa;
     return switch (term) {

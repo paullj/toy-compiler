@@ -245,6 +245,7 @@ pub fn classifyRet(ty: Type, layouts: []const Layout, enum_layouts: []const Enum
 /// NOT consume an NGRN (x8 is separate), so the walk is identical whether or not
 /// sret is set; the flag is threaded only so the caller can record it.
 fn walkAbi(
+    conv: Conv,
     types_: []const Type,
     out_locs: []ParamLoc,
     layouts: []const Layout,
@@ -299,13 +300,39 @@ fn walkAbi(
                     out_locs[i] = .{ .gpr = .{ .first = @intCast(ngrn), .count = 1 } };
                     ngrn += 1;
                 } else {
-                    out_locs[i] = .{ .stack = .{ .nsaa_off = nsaa, .bytes = 8 } };
-                    nsaa += 8;
+                    const bytes: u32 = switch (conv) {
+                        .toy => 8,
+                        .c => cScalarSize(ty),
+                    };
+                    nsaa = std.mem.alignForward(u32, nsaa, bytes);
+                    out_locs[i] = .{ .stack = .{ .nsaa_off = nsaa, .bytes = bytes } };
+                    nsaa += bytes;
                 }
             },
         }
     }
     return nsaa;
+}
+
+/// Whose calling convention a call follows. Toy functions give every stack argument
+/// an 8-byte slot. A C function follows Apple's arm64 variant of AAPCS64, which packs
+/// a stack argument at its own size and alignment; toy never defines a C-callable
+/// function, so only the call side needs `.c`.
+pub const Conv = enum { toy, c };
+
+/// The bytes a scalar takes as a C argument on the stack: a narrow int its width, a
+/// `bool` one byte (C `_Bool`), everything else 8.
+pub fn cScalarSize(ty: Type) u32 {
+    return switch (ty.kind) {
+        .bool => 1,
+        .int => switch (ty.int_desc.width) {
+            .w8 => 1,
+            .w16 => 2,
+            .w32 => 4,
+            .plat, .w64 => 8,
+        },
+        else => 8,
+    };
 }
 
 /// The full incoming-parameter plan for a function: where each param arrives,
@@ -336,7 +363,7 @@ pub fn planParams(
 ) error{OutOfMemory}!ParamPlan {
     const locs = try gpa.alloc(ParamLoc, params.len);
     errdefer gpa.free(locs);
-    _ = walkAbi(params, locs, layouts, enum_layouts);
+    _ = walkAbi(.toy, params, locs, layouts, enum_layouts);
     return .{
         .sret_in_x8 = classifyRet(ret, layouts, enum_layouts) == .sret,
         .locs = locs,
@@ -374,9 +401,21 @@ pub fn planCall(
     layouts: []const Layout,
     enum_layouts: []const EnumLayout,
 ) error{OutOfMemory}!CallPlan {
+    return planCallConv(gpa, .toy, args, ret, layouts, enum_layouts);
+}
+
+/// `planCall` under convention `conv`; an `extern` callee is `.c`.
+pub fn planCallConv(
+    gpa: std.mem.Allocator,
+    conv: Conv,
+    args: []const Type,
+    ret: Type,
+    layouts: []const Layout,
+    enum_layouts: []const EnumLayout,
+) error{OutOfMemory}!CallPlan {
     const locs = try gpa.alloc(ArgLoc, args.len);
     errdefer gpa.free(locs);
-    const nsaa = walkAbi(args, locs, layouts, enum_layouts);
+    const nsaa = walkAbi(conv, args, locs, layouts, enum_layouts);
     return .{
         .locs = locs,
         .nsaa_bytes = nsaa,
@@ -585,6 +624,28 @@ test "planCall: >=9 scalar args overflow to the stack (NSAA)" {
     try testing.expectEqual(@as(u32, 8), plan.locs[9].stack.nsaa_off);
     try testing.expectEqual(@as(u32, 16), plan.nsaa_bytes);
     try testing.expect(!plan.sret_in_x8);
+}
+
+test "planCallConv .c: stack args past x7 pack at their own size and alignment" {
+    const gpa = testing.allocator;
+    const ls: []const Layout = &.{};
+    const el: []const EnumLayout = &.{};
+    const i8_: Type = .{ .kind = .int, .int_desc = .{ .width = .w8 } };
+    const i16_: Type = .{ .kind = .int, .int_desc = .{ .width = .w16 } };
+    const i32_: Type = .{ .kind = .int, .int_desc = .{ .width = .w32 } };
+    const args = [_]Type{ Type.int, Type.int, Type.int, Type.int, Type.int, Type.int, Type.int, Type.int, i8_, i16_, i8_, i32_, Type.bool, Type.int };
+    var plan = try planCallConv(gpa, .c, &args, Type.int, ls, el);
+    defer plan.deinit(gpa);
+    const want = [_][2]u32{ .{ 0, 1 }, .{ 2, 2 }, .{ 4, 1 }, .{ 8, 4 }, .{ 12, 1 }, .{ 16, 8 } };
+    for (want, 8..) |w, i| {
+        try testing.expectEqual(w[0], plan.locs[i].stack.nsaa_off);
+        try testing.expectEqual(w[1], plan.locs[i].stack.bytes);
+    }
+    try testing.expectEqual(@as(u32, 24), plan.nsaa_bytes);
+
+    var toy = try planCall(gpa, &args, Type.int, ls, el);
+    defer toy.deinit(gpa);
+    try testing.expectEqual(@as(u32, 48), toy.nsaa_bytes);
 }
 
 test "planCall: AAPCS no-split — reg-pair that doesn't fit goes wholly to stack and forbids backfill" {

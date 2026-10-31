@@ -1,0 +1,37 @@
+# expect: exit 42
+# expect: stdout "ok\n"
+# libdir: "@harness"
+# Two C libraries the harness builds from ffi/clib, each its own LC_LOAD_DYLIB with its
+# own import ordinal: int, int32, float and mixed calls, and a rawptr handle. The bare
+# extern still binds to libSystem.
+import std/io
+
+extern "toyffi" {
+    fn toyffi_add(a: int, b: int) -> int
+    fn toyffi_neg32(x: int32) -> int32
+    fn toyffi_scale(x: float, k: float) -> float
+    fn toyffi_mix(n: int, x: float) -> float
+    fn toyffi_counter_new(start: int) -> rawptr
+    fn toyffi_counter_bump(p: rawptr) -> int
+    fn toyffi_counter_free(p: rawptr)
+}
+
+extern "toyffi2" {
+    fn toyffi2_twice(x: int) -> int
+}
+
+extern fn labs(x: int) -> int
+
+fn main() -> int {
+    if (unsafe { toyffi_add(40, 2) }) != 42 { return 1 }
+    if (unsafe { toyffi_neg32(-7) }) != 7 { return 2 }
+    if (unsafe { toyffi_scale(2.5, 4.0) }) != 10.0 { return 3 }
+    if (unsafe { toyffi_mix(3, 0.5) }) != 3.5 { return 4 }
+    c := unsafe { toyffi_counter_new(10) }
+    unsafe { toyffi_counter_bump(c) }
+    if (unsafe { toyffi_counter_bump(c) }) != 12 { return 5 }
+    unsafe { toyffi_counter_free(c) }
+    if (unsafe { labs(-9) }) != 9 { return 6 }
+    io.println("ok")
+    return unsafe { toyffi2_twice(21) }
+}

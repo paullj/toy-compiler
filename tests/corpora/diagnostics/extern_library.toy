@@ -1,0 +1,14 @@
+# A library is resolved when the program links (and when `toy check` runs): each
+# block that names one it cannot load is one error at its library string.
+extern "toy-no-such-lib" {  #~ ERROR [R0016] library 'toy-no-such-lib' not found: no libtoy-no-such-lib.dylib in /usr/local/lib, /usr/lib
+    fn nope_one() -> int
+    fn nope_two() -> int
+}
+
+extern "libvendor.a" {  #~ ERROR [R0015] library 'libvendor.a' is a static library; toy links only dynamic libraries
+    fn vendor_init()
+}
+
+fn main() -> int {
+    0
+}

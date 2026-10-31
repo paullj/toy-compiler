@@ -310,6 +310,20 @@ pub fn strb(rt: u32, rn: u32, byteOff: u12) u32 {
     return 0x39000000 | (@as(u32, byteOff) << 10) | (rn << 5) | rt;
 }
 
+/// strh wt, [rn, #byteOff] — halfword store, unsigned offset scaled by 2.
+/// strh w9,[sp,#2] → 0x790007E9.
+pub fn strh(rt: u32, rn: u32, byteOff: u32) u32 {
+    std.debug.assert(byteOff % 2 == 0 and byteOff / 2 <= 0xFFF);
+    return 0x79000000 | ((byteOff / 2) << 10) | (rn << 5) | rt;
+}
+
+/// str wt, [rn, #byteOff] — 32-bit store, unsigned offset scaled by 4.
+/// str w9,[sp,#8] → 0xB9000BE9.
+pub fn strW(rt: u32, rn: u32, byteOff: u32) u32 {
+    std.debug.assert(byteOff % 4 == 0 and byteOff / 4 <= 0xFFF);
+    return 0xB9000000 | ((byteOff / 4) << 10) | (rn << 5) | rt;
+}
+
 /// cbz rt, #(imm19 words) — branch if rt == 0, PC-relative signed word offset. The
 /// renderer never uses it directly but it completes the cbz/cbnz pair; symmetric to
 /// `cbnz`. cbz x0,#0 → 0xB4000000; cbz x0,#-4 → 0xB4FFFF80.
@@ -803,6 +817,9 @@ test "byte-store + conditional-branch encoders" {
     try testing.expectEqual(@as(u32, 0x3900014D), strb(13, 10, 0)); // strb w13,[x10]
     try testing.expectEqual(@as(u32, 0x39000400), strb(0, 0, 1)); // strb w0,[x0,#1]
     try testing.expectEqual(@as(u32, 0x3900002D), strb(13, 1, 0)); // strb w13,[x1]
+    try testing.expectEqual(@as(u32, 0x390017E9), strb(9, SP, 5)); // strb w9,[sp,#5]
+    try testing.expectEqual(@as(u32, 0x790007E9), strh(9, SP, 2)); // strh w9,[sp,#2]
+    try testing.expectEqual(@as(u32, 0xB9000BE9), strW(9, SP, 8)); // str w9,[sp,#8]
     // cbz — symmetric to cbnz (opcode 0xB4 vs 0xB5).
     try testing.expectEqual(@as(u32, 0xB4000000), cbz(0, 0)); // cbz x0,.+0
     try testing.expectEqual(@as(u32, 0xB4FFFF80), cbz(0, -4)); // cbz x0,.-16

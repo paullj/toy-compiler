@@ -92,6 +92,10 @@ pub const Call = struct {
     callee: SymName,
     args: []Operand,
     ret_slot: SlotId,
+    /// An `extern` callee's declared param types, borrowed from the checker's
+    /// signatures. The C convention sizes a stack argument by its declared type, and an
+    /// operand can carry another int width (a literal's `int`, or a forwarded store).
+    params: []const Type = &.{},
 };
 
 /// An indirect call. `target` is a computed value holding the callee's runtime
@@ -277,6 +281,12 @@ pub const Function = struct {
     /// `unit` for `none`. The single source for recovering the call-arg types fed
     /// to `Abi.planCall`; codegen and the frame pass MUST recover them identically
     /// or an arg lands at the wrong offset (SIGBUS).
+    /// The type call argument `i` is passed as: its declared type when the callee has
+    /// `params` (an `extern`), else its operand's type.
+    pub fn argType(func: *const Function, args: []const Operand, params: []const Type, i: usize) Type {
+        return if (params.len == args.len) params[i] else func.operandType(args[i]);
+    }
+
     pub fn operandType(func: *const Function, op: Operand) Type {
         return switch (op) {
             .value => |v| func.values[v].type,

@@ -1,0 +1,13 @@
+# Safe wrappers over a C handle: the module owns the extern block and the unsafe calls.
+extern "toyffi" {
+    fn toyffi_counter_new(start: int) -> rawptr
+    fn toyffi_counter_bump(p: rawptr) -> int
+}
+
+pub fn make(start: int) -> rawptr {
+    unsafe { toyffi_counter_new(start) }
+}
+
+pub fn bump(c: rawptr) -> int {
+    unsafe { toyffi_counter_bump(c) }
+}

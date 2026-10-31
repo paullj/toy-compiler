@@ -54,6 +54,10 @@ pub const Code = enum(u16) {
     R0012, // import-cycle (imports that lead back to a module that is still being imported)
     R0013, // core-import-private (a user module imports a bundled `core/` module)
     R0014, // ambiguous-module (an import path matches more than one file, or a file is imported under two paths)
+    R0015, // static-library (an `extern "lib"` block or `-l` names a .a/.o, or finds only lib<name>.a)
+    R0016, // library-not-found (no lib<name>.dylib in the -L folders, the default folders or the shared cache)
+    R0017, // not-a-dylib (the library file is not an arm64 Mach-O dynamic library)
+    R0018, // extern-library-conflict (one C symbol is bound to two different libraries)
 
     // Type band (T####).
     T0001, // unknown-type
@@ -205,6 +209,10 @@ pub const table = [_]Entry{
     .{ .code = .R0012, .str = "R0012", .slug = "import-cycle" },
     .{ .code = .R0013, .str = "R0013", .slug = "core-import-private" },
     .{ .code = .R0014, .str = "R0014", .slug = "ambiguous-module" },
+    .{ .code = .R0015, .str = "R0015", .slug = "static-library" },
+    .{ .code = .R0016, .str = "R0016", .slug = "library-not-found" },
+    .{ .code = .R0017, .str = "R0017", .slug = "not-a-dylib" },
+    .{ .code = .R0018, .str = "R0018", .slug = "extern-library-conflict" },
     .{ .code = .T0001, .str = "T0001", .slug = "unknown-type" },
     .{ .code = .T0002, .str = "T0002", .slug = "unknown-module" },
     .{ .code = .T0003, .str = "T0003", .slug = "module-has-no-type" },
