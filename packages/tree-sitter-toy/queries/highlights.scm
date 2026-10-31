@@ -87,6 +87,13 @@
 (protocol_declaration name: (identifier) @type)
 (type_alias name: (identifier) @type)
 
+; An import path and a whole-module alias name modules. A selected name can be any item,
+; which the grammar cannot tell apart, so a capitalised one is taken for a type.
+(import_path (identifier) @module)
+(import_declaration alias: (identifier) @module)
+((import_item [name: (identifier) alias: (identifier)] @type) (#match? @type "^[A-Z]"))
+(import_item [name: (identifier) alias: (identifier)] @function)
+
 (function_declaration name: (identifier) @function)
 (call_expression function: (identifier) @function.call)
 (call_expression function: (field_expression field: (identifier) @function.call))

@@ -3,7 +3,7 @@ import { highlightCode, tagHighlighter, tags as t } from '@lezer/highlight';
 
 const KEYWORDS = new Set([
 	'fn', 'struct', 'enum', 'impl', 'has', 'protocol', 'type', 'match',
-	'if', 'else', 'return', 'self', 'mut', 'true', 'false', 'import', 'pub'
+	'if', 'else', 'return', 'self', 'mut', 'true', 'false', 'import', 'pub', 'as'
 ]);
 
 const TYPES = new Set([

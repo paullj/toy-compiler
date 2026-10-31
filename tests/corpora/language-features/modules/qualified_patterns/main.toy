@@ -1,0 +1,43 @@
+# expect: stdout "1\n7\n2\n12\n3\n9\n"
+# expect: exit 0
+# A match pattern spells a variant through its module at any depth an expression
+# does: `util.Dir.up`, `util.extra.Dir.at(n)` through a re-exported namespace, and
+# `extra.Dir.box { w, h }` through a selected one; payloads bind and nest.
+import std/io.{println}
+import util
+import util.{extra}
+
+fn near(d: util.Dir) -> int {
+    match d {
+        util.Dir.up -> 1,
+        util.Dir.down -> 2,
+        util.Dir.at(n) -> n,
+    }
+}
+
+fn far(d: util.extra.Dir) -> int {
+    match d {
+        util.extra.Dir.up | util.extra.Dir.down -> 2,
+        util.extra.Dir.at(n) -> n,
+        extra.Dir.box { w, h } -> w * h,
+    }
+}
+
+fn wrapped(x: util.Wrap) -> int {
+    match x {
+        util.Wrap.one(util.Dir.at(n)) -> n,
+        util.Wrap.one(_) -> 3,
+        util.Wrap.two(extra.Dir.at(n)) -> n + 1,
+        util.Wrap.two(_) -> 0,
+    }
+}
+
+fn main() -> int {
+    println(near(util.Dir.up))
+    println(near(util.Dir.at(7)))
+    println(far(extra.Dir.down))
+    println(far(util.extra.Dir.box { w: 3, h: 4 }))
+    println(wrapped(util.Wrap.one(util.Dir.down)))
+    println(wrapped(util.Wrap.two(extra.Dir.at(8))))
+    0
+}

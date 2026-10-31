@@ -1,9 +1,11 @@
 //! textDocument/completion: the candidates at a cursor position.
 //!
-//! Three contexts are served: SCOPE (a bare identifier position → in-scope locals /
+//! Five contexts are served: SCOPE (a bare identifier position → in-scope locals /
 //! params / visible top-level fns + types + keywords), MEMBER (`recv.` → the receiver
-//! type's fields + methods; only methods after `x |> .`), and MODULE (`imported_ns.` →
-//! that module's pub members).
+//! type's fields + methods; only methods after `x |> .`), MODULE (`imported_ns.` →
+//! that module's pub members, re-exports included), IMPORT PATH (`import a/` → the next
+//! path segment: a module or a folder in any search root, or the bundled std) and IMPORT
+//! ITEM (`import a/b.{` → what module `a/b` exports).
 //! The active context returns ONLY its own candidates — a member/module context never
 //! falls back to scope, so a `p.` never leaks globals.
 //!
@@ -39,7 +41,7 @@ const Analysis = @import("Analysis.zig");
 const Workspace = @import("Workspace.zig");
 
 const Graph = toyc.Graph;
-const ResolveGraph = toyc.ResolveGraph;
+const lsp_uri = @import("uri.zig");
 const Token = toyc.Token;
 const Ast = toyc.Ast;
 const Type = toyc.Typecheck.Type;
@@ -74,6 +76,11 @@ pub fn at(a: std.mem.Allocator, gpa: std.mem.Allocator, ws: Workspace, doc: *Ana
     // Detect the context from a fault-tolerant raw lex — the parse tree may not exist yet.
     const toks = try toyc.Lexer.tokenize(a, source);
     const off = doc.offsetAt(line, character) orelse return &.{};
+    if (importSite(toks, source, off)) |site| return switch (site) {
+        .path => |prefix| collectModulePaths(a, ws, doc.uri, try std.mem.join(a, "/", prefix.slice())),
+        .item => |path| collectImportItems(a, gpa, ws, doc.uri, try std.mem.join(a, "/", path.slice())),
+        .alias => &.{},
+    };
     const det = classify(toks, off);
     if (det.context == .none) return &.{};
 
@@ -204,7 +211,7 @@ fn collectMember(col: *Collector, an: *const Analysis, recv: u32, methods_only: 
     const resolutions = an.resolutions();
     if (recv < resolutions.len and resolutions[recv] == .module) {
         // A module is no value, so it cannot be piped.
-        if (!methods_only) try collectModule(col, an.graph.modules, res, resolutions[recv].module);
+        if (!methods_only) try collectExports(col, &an.graph, resolutions[recv].module);
         return;
     }
 
@@ -290,30 +297,256 @@ fn templateOf(tc: *const toyc.TypecheckGraph.GraphResult, rt: Type) ?struct { ct
     return .{ .ctor = found orelse return null, .is_enum = is_enum };
 }
 
-/// A module's pub members: its pub fns (from the global fn table) plus its pub types
-/// (walked off that module's own program range). No detail on the fns — a generic std
-/// signature (`print[T has Display]`) renders as `fn print(?) -> ()`, which is noise.
-fn collectModule(col: *Collector, mods: []const Graph.Module, res: *const ResolveGraph.GraphResult, mod_id: u32) !void {
-    for (res.fns) |gf| {
-        if (gf.module != mod_id or !gf.is_pub) continue;
-        try col.add(render.bareName(gf.name), kind.function, null);
-    }
-    if (mod_id >= mods.len) return;
-    const tmod = &mods[mod_id];
-    if (tmod.nodes.len == 0) return;
-    const tree = tmod.tree();
-    const prog = tmod.nodes[Ast.root(tmod.nodes).int()];
+/// What module `mod` exports, as an importer names it: its pub items, and the names its
+/// `pub import`s bind (a namespace, or a selected item followed to its declaration).
+fn collectExports(col: *Collector, g: *const Graph.Graph, mod: u32) !void {
+    const m = &g.modules[mod];
+    if (m.nodes.len == 0) return;
+    const tree = m.tree();
+    const prog = m.nodes[Ast.root(m.nodes).int()];
     if (prog.tag != .program) return;
-    for (Ast.rangeSlice(tree, prog.lhs.int())) |decl_idx| {
-        if (!tree.isPub(decl_idx)) continue;
-        const decl = tmod.nodes[decl_idx.int()];
-        const name = tmod.tokens[decl.main_token].text(tmod.source);
+    for (Ast.rangeSlice(tree, prog.lhs.int())) |d| {
+        if (!tree.isPub(d)) continue;
+        const decl = m.nodes[d.int()];
         switch (decl.tag) {
-            .struct_decl, .tuple_struct_decl => try col.add(name, kind.@"struct", null),
-            .enum_decl => try col.add(name, kind.@"enum", null),
-            else => {},
+            .import_decl => {
+                const bound = Ast.importAliasTok(decl).unwrap() orelse Ast.TokIndex.from(decl.main_token);
+                try col.add(m.tokens[bound.int()].text(m.source), kind.module, null);
+            },
+            .import_select_decl => for (Ast.importItems(tree, decl)) |item| {
+                const label = m.tokens[item.bound().int()].text(m.source);
+                const ex = g.exportOf(mod, label) orelse continue;
+                try addItem(col, g, ex.mod, ex.decl, label);
+            },
+            else => try addItem(col, g, mod, d, m.tokens[decl.main_token].text(m.source)),
         }
     }
+}
+
+/// Item `decl` of module `mod` (a namespace when none) under the name `label`. A fn shows
+/// its header as written: a generic std fn's checked types would render as `?`.
+fn addItem(col: *Collector, g: *const Graph.Graph, mod: u32, decl: Ast.Index, label: []const u8) !void {
+    if (decl == Ast.none) return col.add(label, kind.module, null);
+    const m = &g.modules[mod];
+    switch (m.nodes[decl.int()].tag) {
+        .fn_decl => {
+            var buf: std.ArrayList(u8) = .empty;
+            try render.appendFnHeader(col.a, &buf, m, decl.int(), label);
+            try col.add(label, kind.function, buf.items);
+        },
+        .extern_fn_decl => try col.add(label, kind.function, null),
+        .struct_decl, .tuple_struct_decl, .type_alias_decl => try col.add(label, kind.@"struct", null),
+        .enum_decl => try col.add(label, kind.@"enum", null),
+        .protocol_decl => try col.add(label, kind.interface, null),
+        else => {},
+    }
+}
+
+/// Where the cursor sits in an import: typing a path (`import a/|`, the complete segments
+/// before it), in a selection list (`import a/b.{x, |`, the module's path), or naming an
+/// alias (`{x as |`), which is a new name and has nothing to offer.
+const ImportSite = union(enum) {
+    path: Segments,
+    item: Segments,
+    alias,
+};
+
+const Segments = struct {
+    buf: [16][]const u8 = undefined,
+    len: usize = 0,
+
+    fn slice(s: *const Segments) []const []const u8 {
+        return s.buf[0..s.len];
+    }
+
+    /// Prepend: the tokens are walked back from the cursor.
+    fn push(s: *Segments, seg: []const u8) bool {
+        if (s.len == s.buf.len) return false;
+        std.mem.copyBackwards([]const u8, s.buf[1 .. s.len + 1], s.buf[0..s.len]);
+        s.buf[0] = seg;
+        s.len += 1;
+        return true;
+    }
+};
+
+/// The import site at `off`, read off the raw lex, or null outside an import.
+fn importSite(tokens: []const Token, source: []const u8, off: u32) ?ImportSite {
+    var p = lastBefore(tokens, off) orelse return null;
+    // A name being typed is what the candidate replaces; its context is what precedes it.
+    if (tokens[p].tag == .identifier and tokens[p].end >= off) p = std.math.sub(usize, p, 1) catch return null;
+    if (tokens[p].tag == .kw_as) {
+        return if (selectionPath(tokens, source, p) != null) .alias else null;
+    }
+    if (importPath(tokens, source, p, .kw_import)) |segs| return .{ .path = segs };
+    if (selectionPath(tokens, source, p)) |segs| return .{ .item = segs };
+    return null;
+}
+
+/// The path segments of `import a/b/` ending at token `last` (a `/`, or `import` itself for
+/// an empty path), when the token before the path is `head`.
+fn importPath(tokens: []const Token, source: []const u8, last: usize, head: toyc.Tag) ?Segments {
+    var segs: Segments = .{};
+    var i = last;
+    while (true) {
+        if (tokens[i].tag == head) return segs;
+        if (tokens[i].tag != .slash or i < 2 or tokens[i - 1].tag != .identifier) return null;
+        if (!segs.push(tokens[i - 1].text(source))) return null;
+        i -= 2;
+    }
+}
+
+/// The module path of the selection list `import a/b.{..` that token `last` sits in.
+fn selectionPath(tokens: []const Token, source: []const u8, last: usize) ?Segments {
+    var i = last;
+    while (true) : (i -= 1) {
+        switch (tokens[i].tag) {
+            .identifier, .comma, .kw_as, .newline => {},
+            .l_brace => break,
+            else => return null,
+        }
+        if (i == 0) return null;
+    }
+    if (i < 3 or tokens[i - 1].tag != .dot or tokens[i - 2].tag != .identifier) return null;
+    // The last segment has no `/` after it: read it, then the rest as a path.
+    const segs = if (tokens[i - 3].tag == .kw_import) Segments{} else if (tokens[i - 3].tag == .slash)
+        importPath(tokens, source, i - 3, .kw_import) orelse return null
+    else
+        return null;
+    var out = segs;
+    if (out.len == out.buf.len) return null;
+    out.buf[out.len] = tokens[i - 2].text(source);
+    out.len += 1;
+    return out;
+}
+
+/// What module `path` exports, read from a graph that imports only it, so the list is
+/// served while the buffer's own selection list does not parse yet.
+fn collectImportItems(a: std.mem.Allocator, gpa: std.mem.Allocator, ws: Workspace, uri: []const u8, path: []const u8) ![]const protocol.CompletionItem {
+    // `core/` is private to the bundle (R0013), a resolve error discovery does not raise.
+    if (std.mem.startsWith(u8, path, "core/")) return &.{};
+    const src = try std.fmt.allocPrint(a, "import {s}\n", .{path});
+    var g = try ws.discover(gpa, uri, src);
+    defer g.deinit(gpa);
+    if (g.err != null) return &.{};
+    var col: Collector = .{ .a = a };
+    for (g.modules, 0..) |m, i| if (std.mem.eql(u8, m.path, path)) {
+        try collectExports(&col, &g, @intCast(i));
+        break;
+    };
+    return col.items.toOwnedSlice(a);
+}
+
+/// The path segments that can follow `prefix` (`/`-joined, empty at the start) in an
+/// import: from the bundled std, then from every search root, its open documents and, with
+/// a disk, its files. A segment that names a module (`x.toy`, or a folder with `mod.toy`)
+/// is a module; a folder that holds modules, itself or one folder down, is a folder.
+fn collectModulePaths(a: std.mem.Allocator, ws: Workspace, uri: []const u8, prefix: []const u8) ![]const protocol.CompletionItem {
+    var col: Collector = .{ .a = a };
+    var bundled = Graph.bundledPaths();
+    // `core/` is private to the bundle (R0013): a user module cannot import it.
+    while (bundled.next()) |p| if (!std.mem.startsWith(u8, p, "core/")) try addModulePath(&col, p, prefix);
+
+    // A uri with no file has no folder to root imports at (see `Workspace.discover`).
+    const doc_path = (try lsp_uri.uriToPath(a, uri)) orelse return col.items.toOwnedSlice(a);
+    var roots: std.ArrayList([]const u8) = .empty;
+    try roots.append(a, ws.roots.root orelse std.fs.path.dirname(doc_path) orelse ".");
+    try roots.appendSlice(a, ws.roots.include);
+
+    for (roots.items) |unresolved| {
+        // A configured root may be spelled `dir/.`; paths are compared as text below.
+        const root = try std.fs.path.resolve(a, &.{unresolved});
+        var docs = ws.docs.map.keyIterator();
+        while (docs.next()) |k| {
+            const path = (try lsp_uri.uriToPath(a, k.*)) orelse continue;
+            if (std.mem.eql(u8, path, doc_path)) continue;
+            const rel = relativeTo(root, path) orelse continue;
+            if (!std.mem.endsWith(u8, rel, Graph.ext)) continue;
+            try addModulePath(&col, moduleOf(rel[0 .. rel.len - Graph.ext.len]), prefix);
+        }
+        if (ws.disk) try listDir(&col, ws, a, root, prefix, doc_path);
+    }
+    return col.items.toOwnedSlice(a);
+}
+
+/// `path` relative to the folder `root`, or null outside it.
+fn relativeTo(root: []const u8, path: []const u8) ?[]const u8 {
+    const r = std.mem.trimEnd(u8, root, "/");
+    if (!std.mem.startsWith(u8, path, r) or path.len <= r.len + 1 or path[r.len] != '/') return null;
+    return path[r.len + 1 ..];
+}
+
+/// The module a root-relative file stem is: `util/mod` is the folder module `util`.
+fn moduleOf(stem: []const u8) []const u8 {
+    const tail = "/" ++ Graph.folder_entry;
+    if (std.mem.endsWith(u8, stem, tail)) return stem[0 .. stem.len - tail.len];
+    return stem;
+}
+
+/// The segment of module `path` after `prefix`, if `path` lies under it.
+fn addModulePath(col: *Collector, path: []const u8, prefix: []const u8) !void {
+    const rest = if (prefix.len == 0) path else blk: {
+        if (!std.mem.startsWith(u8, path, prefix) or path.len <= prefix.len or path[prefix.len] != '/') return;
+        break :blk path[prefix.len + 1 ..];
+    };
+    const end = std.mem.indexOfScalar(u8, rest, '/');
+    try addSegment(col, rest[0 .. end orelse rest.len], end == null);
+}
+
+/// One path segment; a name that is a module and a folder of modules too shows once, as
+/// the module.
+fn addSegment(col: *Collector, seg: []const u8, is_module: bool) !void {
+    // A folder module's entry file is imported by its folder's path, but a folder named
+    // `mod` can sit mid-path.
+    if (!isSegment(seg) or (is_module and std.mem.eql(u8, seg, Graph.folder_entry))) return;
+    for (col.items.items) |*it| if (std.mem.eql(u8, it.label, seg)) {
+        if (is_module) it.kind = kind.module;
+        return;
+    };
+    try col.add(seg, if (is_module) kind.module else kind.folder, null);
+}
+
+/// Whether `seg` can be spelled as an import path segment: an identifier, no keyword.
+fn isSegment(seg: []const u8) bool {
+    if (seg.len == 0 or std.ascii.isDigit(seg[0])) return false;
+    for (seg) |c| if (!std.ascii.isAlphanumeric(c) and c != '_') return false;
+    return toyc.token.keywords.get(seg) == null;
+}
+
+/// The modules and folders on disk in `root`/`prefix`.
+fn listDir(col: *Collector, ws: Workspace, a: std.mem.Allocator, root: []const u8, prefix: []const u8, doc_path: []const u8) !void {
+    const base = if (prefix.len == 0) root else try std.fs.path.join(a, &.{ root, prefix });
+    var dir = std.Io.Dir.cwd().openDir(ws.io, base, .{ .iterate = true }) catch return;
+    defer dir.close(ws.io);
+    var it = dir.iterate();
+    while (it.next(ws.io) catch return) |e| switch (e.kind) {
+        .file => {
+            if (!std.mem.endsWith(u8, e.name, Graph.ext)) continue;
+            if (std.mem.eql(u8, try std.fs.path.join(a, &.{ base, e.name }), doc_path)) continue;
+            try addSegment(col, e.name[0 .. e.name.len - Graph.ext.len], true);
+        },
+        .directory => {
+            if (!isSegment(e.name)) continue;
+            const entry = try std.fmt.allocPrint(a, "{s}/{s}{s}", .{ e.name, Graph.folder_entry, Graph.ext });
+            const folder_module = !std.mem.eql(u8, e.name, Graph.folder_entry) and
+                if (dir.access(ws.io, entry, .{})) true else |_| false;
+            if (folder_module or holdsModules(ws.io, dir, e.name, 1)) try addSegment(col, e.name, folder_module);
+        },
+        else => {},
+    };
+}
+
+/// Whether folder `name` in `parent` holds a module, directly or up to `depth` folders
+/// down. Bounded, since a project root also holds folders such as `node_modules`.
+fn holdsModules(io: std.Io, parent: std.Io.Dir, name: []const u8, depth: u8) bool {
+    var dir = parent.openDir(io, name, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch return false) |e| switch (e.kind) {
+        .file => if (std.mem.endsWith(u8, e.name, Graph.ext)) return true,
+        .directory => if (depth > 0 and isSegment(e.name) and holdsModules(io, dir, e.name, depth - 1)) return true,
+        else => {},
+    };
+    return false;
 }
 
 /// Scope enumeration (documented approximation): keywords, visible top-level fns/types,
@@ -726,5 +959,204 @@ test "completion outside a struct's module lists its private fields after its pu
             for (got.items) |o| if (o.kind != it.kind or !std.mem.eql(u8, o.label, it.label))
                 try testing.expect(std.mem.order(u8, o.sortText orelse o.label, it.sortText.?) == .lt);
         }
+    }
+}
+
+/// The candidates at `@` in `marked` (the `@` dropped), checked as the entry `uri` in `ws`.
+fn completeIn(gpa: std.mem.Allocator, ws: Workspace, uri: []const u8, marked: []const u8) !Completions {
+    const cut = std.mem.indexOfScalar(u8, marked, '@').?;
+    const src = try std.mem.concat(gpa, u8, &.{ marked[0..cut], marked[cut + 1 ..] });
+    defer gpa.free(src);
+    const p = @import("test_util.zig").posAt(src, cut);
+    return completionsAt(gpa, ws, src, p.line, p.character, uri);
+}
+
+fn kindOf(items: []const protocol.CompletionItem, label: []const u8) ?u8 {
+    for (items) |it| if (std.mem.eql(u8, it.label, label)) return it.kind;
+    return null;
+}
+
+test "completion in a selection list offers what the module exports, re-exports included" {
+    const gpa = testing.allocator;
+    const tu = @import("test_util.zig");
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws = try tu.reexportWorkspace(gpa, &docs);
+    const Want = struct { label: []const u8, kind: u8 };
+    const cases = [_]struct { src: []const u8, has: []const Want, not: []const []const u8 }{
+        .{
+            .src = "import util.{@}\nfn main() -> int { 0 }\n",
+            .has = &.{ .{ .label = "square", .kind = kind.function }, .{ .label = "Pt", .kind = kind.@"struct" }, .{ .label = "math", .kind = kind.module }, .{ .label = "side", .kind = kind.function } },
+            .not = &.{ "helper", "sq", "hidden", "fn" },
+        },
+        .{
+            .src = "import util.{side, Pt as Q, sq@}\nfn main() -> int { 0 }\n",
+            .has = &.{.{ .label = "square", .kind = kind.function }},
+            .not = &.{"helper"},
+        },
+        .{
+            .src = "import util/math.{\n    s@\n}\n",
+            .has = &.{ .{ .label = "sq", .kind = kind.function }, .{ .label = "Pt", .kind = kind.@"struct" } },
+            .not = &.{"hidden"},
+        },
+        .{ .src = "import util.{square as @}\n", .has = &.{}, .not = &.{ "square", "Pt", "fn" } },
+        .{ .src = "import nowhere.{@}\n", .has = &.{}, .not = &.{"fn"} },
+        .{ .src = "import core/ffi.{@}\n", .has = &.{}, .not = &.{ "abs", "sqrt", "fn" } },
+    };
+    for (cases) |c| {
+        var got = try completeIn(gpa, ws, tu.reexport_main_uri, c.src);
+        defer got.deinit();
+        for (c.has) |w| testing.expectEqual(@as(?u8, w.kind), kindOf(got.items, w.label)) catch |e| {
+            std.debug.print("'{s}' in {s}\n", .{ w.label, c.src });
+            return e;
+        };
+        for (c.not) |l| testing.expect(kindOf(got.items, l) == null) catch |e| {
+            std.debug.print("unexpected '{s}' in {s}\n", .{ l, c.src });
+            return e;
+        };
+    }
+    var sq = try completeIn(gpa, ws, tu.reexport_main_uri, "import util.{@}\n");
+    defer sq.deinit();
+    try testing.expectEqualStrings("fn square(x: int) -> int", detailOf(sq.items, "square").?);
+}
+
+test "completion after a module namespace lists its re-exports too" {
+    const gpa = testing.allocator;
+    const tu = @import("test_util.zig");
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws = try tu.reexportWorkspace(gpa, &docs);
+    var got = try completeIn(gpa, ws, tu.reexport_main_uri, "import util\nfn main() -> int {\n    x := util.@\n    return 0\n}\n");
+    defer got.deinit();
+    for ([_][]const u8{ "square", "Pt", "math", "side" }) |l| if (kindOf(got.items, l) == null) {
+        std.debug.print("no '{s}'\n", .{l});
+        return error.MissingCompletion;
+    };
+    try testing.expect(kindOf(got.items, "helper") == null);
+    try testing.expect(kindOf(got.items, "sq") == null);
+}
+
+test "completion of an import path offers the next segment from every root and the std" {
+    const gpa = testing.allocator;
+    const tu = @import("test_util.zig");
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    var ws = try tu.reexportWorkspace(gpa, &docs);
+    try docs.put(gpa, "file:///rx/lib/extra.toy", "pub fn one() -> int { 1 }\n", 1);
+    ws.roots = .{ .include = &.{"/rx/lib"} };
+    const Want = struct { label: []const u8, kind: u8 };
+    const cases = [_]struct { src: []const u8, has: []const Want, not: []const []const u8 }{
+        .{
+            .src = "import @\n",
+            .has = &.{ .{ .label = "util", .kind = kind.module }, .{ .label = "std", .kind = kind.folder }, .{ .label = "extra", .kind = kind.module }, .{ .label = "lib", .kind = kind.folder } },
+            .not = &.{ "core", "main", "fn" },
+        },
+        .{ .src = "import u@\n", .has = &.{.{ .label = "util", .kind = kind.module }}, .not = &.{} },
+        .{ .src = "import util/@\n", .has = &.{.{ .label = "math", .kind = kind.module }}, .not = &.{ "mod", "util", "std" } },
+        .{ .src = "import std/@\n", .has = &.{ .{ .label = "io", .kind = kind.module }, .{ .label = "vec", .kind = kind.module } }, .not = &.{"util"} },
+        .{ .src = "pub import util/ma@\n", .has = &.{.{ .label = "math", .kind = kind.module }}, .not = &.{} },
+        .{ .src = "import util\n@\n", .has = &.{}, .not = &.{"math"} },
+    };
+    for (cases) |c| {
+        var got = try completeIn(gpa, ws, tu.reexport_main_uri, c.src);
+        defer got.deinit();
+        for (c.has) |w| testing.expectEqual(@as(?u8, w.kind), kindOf(got.items, w.label)) catch |e| {
+            std.debug.print("'{s}' in {s}\n", .{ w.label, c.src });
+            return e;
+        };
+        for (c.not) |l| testing.expect(kindOf(got.items, l) == null) catch |e| {
+            std.debug.print("unexpected '{s}' in {s}\n", .{ l, c.src });
+            return e;
+        };
+    }
+}
+
+test "completion of an import path lists modules and folders on disk, not the entry itself" {
+    const gpa = testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const Io = std.Io;
+    const dir = ".lsp-import-paths-test";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    for ([_][]const u8{ "util/mod.toy", "util/math.toy", "pkg/a.toy", ".toy/x.toy", "main.toy", "other.toy", "docs/notes.md", "deep/inner/y.toy", "a/mod/x.toy" }) |f| {
+        const path = try std.fs.path.join(gpa, &.{ dir, f });
+        defer gpa.free(path);
+        try Io.Dir.cwd().createDirPath(io, std.fs.path.dirname(path).?);
+        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = "pub fn v() -> int { 1 }\n" });
+    }
+    try Io.Dir.cwd().createDirPath(io, dir ++ "/empty");
+    const abs = try Io.Dir.cwd().realPathFileAlloc(io, dir, gpa);
+    defer gpa.free(abs);
+    const uri = try std.fmt.allocPrint(gpa, "file://{s}/main.toy", .{abs});
+    defer gpa.free(uri);
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    const ws: Workspace = .{ .io = io, .docs = &docs };
+
+    var top = try completeIn(gpa, ws, uri, "import @\n");
+    defer top.deinit();
+    try testing.expectEqual(@as(?u8, kind.module), kindOf(top.items, "util"));
+    try testing.expectEqual(@as(?u8, kind.folder), kindOf(top.items, "pkg"));
+    try testing.expectEqual(@as(?u8, kind.module), kindOf(top.items, "other"));
+    try testing.expect(kindOf(top.items, "main") == null);
+    try testing.expect(kindOf(top.items, ".toy") == null);
+    try testing.expect(kindOf(top.items, "empty") == null);
+    try testing.expect(kindOf(top.items, "docs") == null);
+    try testing.expectEqual(@as(?u8, kind.folder), kindOf(top.items, "deep"));
+
+    var a_dir = try completeIn(gpa, ws, uri, "import a/@\n");
+    defer a_dir.deinit();
+    try testing.expectEqual(@as(?u8, kind.folder), kindOf(a_dir.items, "mod"));
+
+    // A root spelled with `.` still names the entry's own folder.
+    for ([_][]const u8{ "/.", "/./" }) |suffix| {
+        const dotted = try std.fmt.allocPrint(gpa, "{s}{s}", .{ abs, suffix });
+        defer gpa.free(dotted);
+        var rooted = ws;
+        rooted.roots = .{ .root = dotted };
+        var got = try completeIn(gpa, rooted, uri, "import @\n");
+        defer got.deinit();
+        try testing.expect(kindOf(got.items, "main") == null);
+        try testing.expectEqual(@as(?u8, kind.module), kindOf(got.items, "other"));
+    }
+
+    var sub = try completeIn(gpa, ws, uri, "import util/@\n");
+    defer sub.deinit();
+    try testing.expectEqual(@as(?u8, kind.module), kindOf(sub.items, "math"));
+    try testing.expect(kindOf(sub.items, "mod") == null);
+}
+
+test "importSite: path, selection list and alias positions" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { src: []const u8, want: ?std.meta.Tag(ImportSite), path: []const u8 = "" }{
+        .{ .src = "import ", .want = .path },
+        .{ .src = "import a/b/", .want = .path, .path = "a/b" },
+        .{ .src = "import a/b/c", .want = .path, .path = "a/b" },
+        .{ .src = "import a/b.{", .want = .item, .path = "a/b" },
+        .{ .src = "import a.{x, y as z,\n  w", .want = .item, .path = "a" },
+        .{ .src = "import a.{x as ", .want = .alias },
+        .{ .src = "import a.{x as y", .want = .alias },
+        .{ .src = "import a as ", .want = null },
+        .{ .src = "import a ", .want = null },
+        .{ .src = "fn f() { S {\n  a", .want = null },
+        .{ .src = "x", .want = null },
+    };
+    for (cases) |c| {
+        const toks = try toyc.Lexer.tokenize(gpa, c.src);
+        defer gpa.free(toks);
+        const got = importSite(toks, c.src, @intCast(c.src.len));
+        testing.expectEqual(c.want, if (got) |g| std.meta.activeTag(g) else null) catch |e| {
+            std.debug.print("importSite of '{s}'\n", .{c.src});
+            return e;
+        };
+        const segs = switch (got orelse continue) {
+            .path, .item => |s| s,
+            .alias => continue,
+        };
+        const joined = try std.mem.join(gpa, "/", segs.slice());
+        defer gpa.free(joined);
+        try testing.expectEqualStrings(c.path, joined);
     }
 }

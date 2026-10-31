@@ -1,0 +1,10 @@
+# Feature: a pattern may name a variant through its module only if the enum is `pub`.
+# expect: compile-error "enum 'Hidden' is not exported by module 'util'"
+import util
+
+fn main() -> int {
+    match util.code() {
+        util.Hidden.up -> 0,
+        _ -> 1,
+    }
+}

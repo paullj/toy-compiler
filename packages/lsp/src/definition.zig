@@ -384,3 +384,37 @@ test "definition: a struct literal's field jumps to the field in its module" {
         try testing.expectEqual(tu.posOf(tu.privacy_lib, c[1]), d.range.start);
     }
 }
+
+test "definition: a selected name, its alias, a re-exported name and an import path reach the real declaration" {
+    const gpa = testing.allocator;
+    const tu = @import("test_util.zig");
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    const ws = try tu.reexportWorkspace(gpa, &docs);
+    const src = tu.reexport_main;
+    const cases = [_]struct { use: []const u8, skip: u32 = 0, uri: []const u8, target: []const u8, decl: []const u8 }{
+        .{ .use = "square,", .uri = tu.reexport_math_uri, .target = tu.reexport_math, .decl = "sq(x" },
+        .{ .use = "Pt as", .uri = tu.reexport_math_uri, .target = tu.reexport_math, .decl = "Pt {" },
+        .{ .use = "P, side", .uri = tu.reexport_math_uri, .target = tu.reexport_math, .decl = "Pt {" },
+        .{ .use = "side}", .uri = tu.reexport_util_uri, .target = tu.reexport_util, .decl = "side()" },
+        .{ .use = "sq}", .uri = tu.reexport_math_uri, .target = tu.reexport_math, .decl = "sq(x" },
+        .{ .use = "util.{", .uri = tu.reexport_util_uri, .target = tu.reexport_util, .decl = "pub import util/math.{" },
+        .{ .use = "math.{sq}", .uri = tu.reexport_math_uri, .target = tu.reexport_math, .decl = "pub fn sq" },
+        .{ .use = "square(p", .uri = tu.reexport_math_uri, .target = tu.reexport_math, .decl = "sq(x" },
+        .{ .use = "P { x", .uri = tu.reexport_math_uri, .target = tu.reexport_math, .decl = "Pt {" },
+        .{ .use = "util.square(1)", .skip = 5, .uri = tu.reexport_math_uri, .target = tu.reexport_math, .decl = "sq(x" },
+    };
+    for (cases) |c| {
+        const use = tu.posOf(src, c.use);
+        const d = (try definitionAt(gpa, ws, src, use.line, use.character + c.skip, tu.reexport_main_uri)) orelse {
+            std.debug.print("no definition for '{s}'\n", .{c.use});
+            return error.NoDefinition;
+        };
+        defer gpa.free(d.uri);
+        testing.expectEqualStrings(c.uri, d.uri) catch |e| {
+            std.debug.print("definition of '{s}'\n", .{c.use});
+            return e;
+        };
+        try testing.expectEqual(tu.posOf(c.target, c.decl), d.range.start);
+    }
+}

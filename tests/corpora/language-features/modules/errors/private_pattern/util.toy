@@ -1,0 +1,8 @@
+enum Hidden { up, down }
+
+pub fn code() -> int {
+    match Hidden.up {
+        Hidden.up -> 1,
+        Hidden.down -> 2,
+    }
+}

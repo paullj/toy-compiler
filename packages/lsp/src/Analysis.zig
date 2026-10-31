@@ -449,11 +449,18 @@ pub fn callOfMember(an: *const Analysis, fa: u32) ?u32 {
 /// Where a declaration is: its module and its name token there.
 pub const Site = struct { module: u32, tok: u32 };
 
-/// The declaration the symbol at `tok` names: a fn's (in whichever module declares it),
-/// a local's binding, the method a call or a bound method value selects, or the type of
-/// that name. Null for a builtin, a derive, a bundled declaration (no file a client can
-/// open) and a token that names nothing.
+/// The declaration the symbol at `tok` names: what an import names (see `importedAt`), a
+/// fn's (in whichever module declares it), a local's binding, the method a call or a bound
+/// method value selects, or the type of that name. Null for a builtin, a derive, a
+/// bundled declaration (no file a client can open) and a token that names nothing.
 pub fn declOf(an: *const Analysis, a: std.mem.Allocator, tok: u32) !?Site {
+    if (an.importedAt(tok)) |ex| {
+        if (ex.decl != Ast.none) return an.sourceSite(ex.mod, ex.decl);
+        // A module has no name token: its file's first token stands in.
+        const tm = &an.graph.modules[ex.mod];
+        if (tm.bundled or tm.tokens.len == 0) return null;
+        return .{ .module = ex.mod, .tok = 0 };
+    }
     if (an.symbolAt(tok)) |sym| switch (sym) {
         .func => |f| {
             const fns = an.res().fns;
@@ -625,6 +632,33 @@ fn selectedTypeDecl(an: *const Analysis, local: []const u8) ?TypeDecl {
             .struct_decl, .tuple_struct_decl, .enum_decl, .protocol_decl => .{ .module = found.mod, .node = found.decl.int() },
             else => null,
         };
+    }
+    return null;
+}
+
+/// What an import of the entry module names at `tok`. A selected name, or its alias,
+/// names the item it imports, followed through re-exports to the module that declares it;
+/// a path segment, or a whole-module import's alias, names the module (`decl` none). The
+/// item is reported whether or not it is exported, so a private one still navigates.
+pub fn importedAt(an: *const Analysis, tok: u32) ?Graph.Graph.Export {
+    const m = an.module();
+    if (m.nodes.len == 0) return null;
+    const tree = m.tree();
+    const prog = m.nodes[Ast.root(m.nodes).int()];
+    if (prog.tag != .program) return null;
+    for (Ast.rangeSlice(tree, prog.lhs.int())) |d| {
+        const decl = m.nodes[d.int()];
+        if (!Ast.isImport(decl.tag)) continue;
+        const named = for (Ast.importPathToks(tree, decl)) |seg| {
+            if (seg.int() == tok) break true;
+        } else decl.tag == .import_decl and Ast.importAliasTok(decl).unwrap() != null and Ast.importAliasTok(decl).int() == tok;
+        const target = an.graph.importTarget(an.entry(), decl) orelse continue;
+        if (named) return .{ .mod = target, .decl = Ast.none, .exported = true };
+        if (decl.tag != .import_select_decl) continue;
+        for (Ast.importItems(tree, decl)) |item| {
+            if (item.name.int() != tok and item.bound().int() != tok) continue;
+            return an.graph.exportOf(target, m.tokens[item.name.int()].text(m.source));
+        }
     }
     return null;
 }

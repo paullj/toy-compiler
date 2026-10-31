@@ -5434,7 +5434,7 @@ pub const BodyChecker = struct {
         return bc.composite.intern(bc.gpa, ctor, args, ctor_is_enum);
     }
 
-    fn typeFromQualified(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) Type {
+    pub fn typeFromQualified(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) Type {
         return refs.typeFromQualified(bc, node_idx, n);
     }
 

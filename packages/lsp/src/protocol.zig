@@ -67,9 +67,11 @@ pub const completion_kind = struct {
     pub const function: u8 = 3;
     pub const field: u8 = 5;
     pub const variable: u8 = 6;
+    pub const interface: u8 = 8;
     pub const module: u8 = 9;
     pub const @"enum": u8 = 13;
     pub const keyword: u8 = 14;
+    pub const folder: u8 = 19;
     pub const @"struct": u8 = 22;
 };
 
@@ -119,7 +121,7 @@ pub const ServerCapabilities = struct {
     hoverProvider: bool = true,
     /// `textDocument/completion` is implemented. `.` re-triggers completion so a
     /// member/module access completes as the user types the dot.
-    completionProvider: struct { triggerCharacters: []const []const u8 = &.{"."} } = .{},
+    completionProvider: struct { triggerCharacters: []const []const u8 = &.{ ".", "/" } } = .{},
     /// `textDocument/definition` is implemented (within-file go-to-declaration).
     definitionProvider: bool = true,
     /// `(` opens the help; `,` retriggers so the active parameter advances as the user types.
@@ -206,7 +208,7 @@ test "InitializeResult advertises only the implemented capabilities" {
     try testing.expect(std.mem.indexOf(u8, out, "\"hoverProvider\":true") != null);
     // Completion is advertised with the `.` trigger.
     try testing.expect(std.mem.indexOf(u8, out, "\"completionProvider\"") != null);
-    try testing.expect(std.mem.indexOf(u8, out, "\"triggerCharacters\":[\".\"]") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "\"triggerCharacters\":[\".\",\"/\"]") != null);
     // Definition is advertised now that it is implemented.
     try testing.expect(std.mem.indexOf(u8, out, "\"definitionProvider\":true") != null);
     // Signature help is advertised with the `(`/`,` triggers.

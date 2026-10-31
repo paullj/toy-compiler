@@ -25,6 +25,11 @@ on each `main.toy` entry.
 | `qualified_literal/`          | `lib.Pt { .. }`, inferred `lib.Pair { .. }` and `shapes.Shape.sq { .. }` beside same-named local types |
 | `selective/`                  | `import a/b.{x, y as z}` binding a fn, generic fn, struct, enum, protocol and type alias bare |
 | `reexport/`                   | `pub import` re-exporting selected items and a whole namespace, used selectively and qualified (`util.extra.twice`) |
+| `qualified_alias/`             | a pub type alias named through its module (`shapes.Meters`) in every type position, and through re-exports |
+| `qualified_patterns/`          | match patterns naming variants through modules (`util.Dir.up`, `util.extra.Dir.at(n)`, `extra.Dir.box { w, h }`) |
+| `errors/private_alias/`       | a type alias without `pub` named through its module            |
+| `errors/private_pattern/`     | a pattern naming a variant of a non-`pub` enum through its module |
+| `errors/bad_pattern_qualifier/` | a pattern qualifier with a segment that is not a module (`util.Dir.zz.down`) |
 | `search_roots/`               | `# include:` extra roots (the CLI's `-I`) beside the module root |
 | `errors/root_clash/`          | a module both the module root and an extra root hold (R0014)    |
 | `folder/`                     | a folder module (`import util` -> `util/mod.toy`) importing and re-exporting its children |

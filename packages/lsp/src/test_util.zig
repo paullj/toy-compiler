@@ -144,3 +144,42 @@ pub fn privacyWorkspace(gpa: std.mem.Allocator, docs: *Documents) !Workspace {
     try docs.put(gpa, privacy_lib_uri, privacy_lib, 1);
     return .{ .io = std.Io.failing, .docs = docs, .disk = false };
 }
+
+/// A folder module `util` (`util/mod.toy`) that re-exports its child `util/math` whole and
+/// selectively, one item renamed, beside an entry `reexport_main` that imports through it,
+/// renames again, and imports the child directly. Open beside each other, disk off.
+pub const reexport_math_uri = "file:///rx/util/math.toy";
+pub const reexport_util_uri = "file:///rx/util/mod.toy";
+pub const reexport_main_uri = "file:///rx/main.toy";
+pub const reexport_math =
+    \\pub fn sq(x: int) -> int { x * x }
+    \\pub struct Pt { pub x: int }
+    \\fn hidden() -> int { 0 }
+    \\
+;
+pub const reexport_util =
+    \\pub import util/math.{sq as square, Pt}
+    \\pub import util/math
+    \\fn helper() -> int { 1 }
+    \\pub fn side() -> int { helper() }
+    \\
+;
+pub const reexport_main =
+    \\import util.{square, Pt as P, side}
+    \\import util/math.{sq}
+    \\import util
+    \\
+    \\fn main() -> int {
+    \\    p := P { x: 2 }
+    \\    return square(p.x) + sq(1) + side() + util.square(1)
+    \\}
+    \\
+;
+
+/// A workspace with `reexport_math` and `reexport_util` open, disk off; free `docs` after
+/// every analysis made in it.
+pub fn reexportWorkspace(gpa: std.mem.Allocator, docs: *Documents) !Workspace {
+    try docs.put(gpa, reexport_math_uri, reexport_math, 1);
+    try docs.put(gpa, reexport_util_uri, reexport_util, 1);
+    return .{ .io = std.Io.failing, .docs = docs, .disk = false };
+}

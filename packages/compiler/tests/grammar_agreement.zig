@@ -339,6 +339,15 @@ test "grammar agreement: deterministic control snippets agree span-for-span" {
         "fn f() {\n  n := g(loop { break h }(1), { o }?.x)\n}\n",
         "fn f() {\n  n := g(if t { p } else { q }.y, match t { true -> h, false -> h }.f(1))\n}\n",
         "fn f() {\n  n := g(@l loop { break @l o }?.y, @k { h }.f(1))\n}\n",
+        // Every import form: whole, aliased, selective with renames, multi-line, re-exports.
+        "import a/b\n",
+        "import a/b as c\n",
+        "import a/b.{x}\n",
+        "import a/b.{x, y as z}\n",
+        "import a.{\n    x,\n    Y as Z,\n}\n",
+        "pub import a/b\n",
+        "pub import a/b.{x as y, T}\n",
+        "pub import util/math.{sq as square}\nimport util.{square}\nfn main() -> int { square(2) }\n",
     };
     for (snippets) |src| {
         _ = compareFile(a, src, classifyTag, true) catch |err| {
@@ -424,4 +433,113 @@ test "grammar agreement: a one-sided wrong classifier DISAGREES, the true one AG
     try testing.expectError(error.GrammarDisagreement, compareFile(a, src, classifyTagWrong, false));
     // TRUE classifier on both sides: must agree.
     _ = try compareFile(a, src, classifyTag, true);
+}
+
+// ---- Highlight query ---------------------------------------------------------
+
+/// Whether every predicate of match `mt` holds over `src`. The query core leaves text
+/// predicates to the client; only the forms `queries/highlights.scm` uses are evaluated,
+/// and any other one fails the test rather than being skipped.
+fn predicatesHold(q: *const ts.Query, mt: ts.Query.Match, src: []const u8) !bool {
+    const steps = q.predicatesForPattern(mt.pattern_index);
+    var i: usize = 0;
+    while (i < steps.len) {
+        var j = i;
+        while (steps[j].type != .done) j += 1;
+        const pred = steps[i..j];
+        i = j + 1;
+        const op = q.stringValueForId(pred[0].value_id).?;
+        const text = for (mt.captures) |c| {
+            if (c.index == pred[1].value_id) break src[c.node.startByte()..c.node.endByte()];
+        } else return error.PredicateCaptureMissing;
+        const args = pred[2..];
+        const holds = if (std.mem.eql(u8, op, "eq?") or std.mem.eql(u8, op, "any-of?")) blk: {
+            for (args) |arg| if (std.mem.eql(u8, q.stringValueForId(arg.value_id).?, text)) break :blk true;
+            break :blk false;
+        } else if (std.mem.eql(u8, op, "match?")) blk: {
+            if (!std.mem.eql(u8, q.stringValueForId(args[0].value_id).?, "^[A-Z]")) return error.UnsupportedRegex;
+            break :blk text.len != 0 and std.ascii.isUpper(text[0]);
+        } else return error.UnsupportedPredicate;
+        if (!holds) return false;
+    }
+    return true;
+}
+
+test "highlights: import paths, aliases and selected names take their roles" {
+    const gpa = testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const scm = try Io.Dir.cwd().readFileAlloc(io, "packages/tree-sitter-toy/queries/highlights.scm", a, .unlimited);
+    var err_off: u32 = 0;
+    const q = ts.Query.create(tree_sitter_toy(), scm, &err_off) catch |e| {
+        std.debug.print("highlights.scm does not compile at byte {d}\n", .{err_off});
+        return e;
+    };
+    defer q.destroy();
+
+    const src =
+        \\pub import util/math.{sq as square, Pt}
+        \\import std/io as out
+        \\import geo.{
+        \\    Shape as S,
+        \\    area,
+        \\}
+        \\
+    ;
+    const parser = ts.Parser.create();
+    defer parser.destroy();
+    try parser.setLanguage(tree_sitter_toy());
+    const tree = parser.parseString(src, null) orelse return error.TreeSitterParseReturnedNull;
+    defer tree.destroy();
+    try testing.expect(!tree.rootNode().hasError());
+
+    // tree-sitter-highlight's rule: of the patterns capturing one node, the first wins.
+    const Best = struct { pattern: u16, name: []const u8 };
+    var best: std.AutoHashMapUnmanaged(u64, Best) = .empty;
+    const cursor = ts.QueryCursor.create();
+    defer cursor.destroy();
+    cursor.exec(q, tree.rootNode());
+    while (cursor.nextMatch()) |mt| {
+        if (!try predicatesHold(q, mt, src)) continue;
+        for (mt.captures) |c| {
+            const key = (@as(u64, c.node.startByte()) << 32) | c.node.endByte();
+            const gop = try best.getOrPut(a, key);
+            if (gop.found_existing and gop.value_ptr.pattern <= mt.pattern_index) continue;
+            gop.value_ptr.* = .{ .pattern = mt.pattern_index, .name = q.captureNameForId(c.index).? };
+        }
+    }
+
+    const cases = [_]struct { at: []const u8, len: u32, want: []const u8 }{
+        .{ .at = "pub", .len = 3, .want = "keyword.modifier" },
+        .{ .at = "import util", .len = 6, .want = "keyword" },
+        .{ .at = "util", .len = 4, .want = "module" },
+        .{ .at = "math", .len = 4, .want = "module" },
+        .{ .at = "sq as", .len = 2, .want = "function" },
+        .{ .at = "as square", .len = 2, .want = "keyword.modifier" },
+        .{ .at = "square", .len = 6, .want = "function" },
+        .{ .at = "Pt}", .len = 2, .want = "type" },
+        .{ .at = "std", .len = 3, .want = "module" },
+        .{ .at = "io as", .len = 2, .want = "module" },
+        .{ .at = "out", .len = 3, .want = "module" },
+        .{ .at = "geo", .len = 3, .want = "module" },
+        .{ .at = "Shape", .len = 5, .want = "type" },
+        .{ .at = "S,", .len = 1, .want = "type" },
+        .{ .at = "area", .len = 4, .want = "function" },
+    };
+    for (cases) |c| {
+        const start: u64 = std.mem.indexOf(u8, src, c.at).?;
+        const got = best.get((start << 32) | (start + c.len)) orelse {
+            std.debug.print("no capture at '{s}'\n", .{c.at});
+            return error.NoCapture;
+        };
+        testing.expectEqualStrings(c.want, got.name) catch |e| {
+            std.debug.print("capture at '{s}'\n", .{c.at});
+            return e;
+        };
+    }
 }
