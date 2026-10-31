@@ -1038,6 +1038,13 @@ const GraphResolve = struct {
             if (!is_pub) try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, n.main_token), .code = .R0005, .scope = g.cur_mod }, "enum '{s}' is not exported by module '{s}'", .{ member, g.graph.modules[target_mod].path });
             return;
         }
+        if (g.graph.exportOf(target_mod, member)) |found| if (found.decl != Ast.none and
+            g.graph.modules[found.mod].nodes[found.decl.int()].tag == .type_alias_decl)
+        {
+            // A pub import that fails to re-export reports at that import; its importers need not.
+            if (!found.exported and found.withheld_by == target_mod) try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, n.main_token), .code = .R0005, .scope = g.cur_mod }, "type alias '{s}' is not exported by module '{s}'", .{ member, g.graph.modules[target_mod].path });
+            return;
+        };
         try g.sink.report(.{ .span = g.tokSpan(g.cur_mod, n.main_token), .code = .R0006, .scope = g.cur_mod }, "module '{s}' has no type '{s}'", .{ g.graph.modules[target_mod].path, member });
     }
 
@@ -1618,6 +1625,7 @@ const GraphResolve = struct {
                 if (pat.rhs != Ast.none) try g.declarePattern(pat.rhs);
             },
             .pattern_variant => {
+                try g.resolveTypeRef(pat.lhs);
                 if (pat.rhs != Ast.none)
                     for (Ast.rangeSlice(g.tree(g.cur_mod), pat.rhs.int())) |c| try g.declarePattern(c);
             },
@@ -1647,6 +1655,7 @@ const GraphResolve = struct {
                 if (pat.rhs != Ast.none) try g.bindOrAltToFirst(pat.rhs);
             },
             .pattern_variant => {
+                try g.resolveTypeRef(pat.lhs);
                 if (pat.rhs != Ast.none)
                     for (Ast.rangeSlice(g.tree(g.cur_mod), pat.rhs.int())) |c| try g.bindOrAltToFirst(c);
             },

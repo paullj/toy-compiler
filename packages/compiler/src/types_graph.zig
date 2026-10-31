@@ -903,6 +903,234 @@ test "a type a module only imports is not its member, in any type position" {
     try withCheckedGraph(".toy-test-typ-plain-select-qualified", files, "main.toy", Check.run);
 }
 
+test "a pub type alias is nameable through its module in every type position" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import geo/shapes
+        \\import geo
+        \\type Span = shapes.Meters
+        \\struct Wall { len: shapes.Meters }
+        \\pub fn f(m: shapes.Meters, g: fn(geo.Len) -> Span) -> shapes.Meters { g(m) }
+        \\fn main() -> int {
+        \\    x: Option[geo.shapes.Meters] = Option.some(Wall { len: 2 }.len)
+        \\    match x { Option.some(n) -> n, Option.none -> 0 }
+        \\}
+        \\
+        },
+        .{ .path = "geo.toy", .source =
+        \\pub import geo/shapes.{Meters as Len}
+        \\pub import geo/shapes
+        \\
+        },
+        .{ .path = "geo/shapes.toy", .source = "pub type Meters = int\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            try testing.expectEqual(@as(usize, 0), tr.diags.len);
+            var f_id: ?u32 = null;
+            for (r.fns, 0..) |gf, i| if (std.mem.endsWith(u8, gf.name, ".f")) {
+                f_id = @intCast(i);
+            };
+            try testing.expectEqual(Typecheck.Kind.int, tr.sigs[f_id.?].ret.kind);
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-qalias", files, "main.toy", Check.run);
+}
+
+test "a private or merely imported type alias is not nameable through the module" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util
+        \\fn main() -> int {
+        \\    x: util.Secret = 1
+        \\    y: util.Meters = 2
+        \\    x + y
+        \\}
+        \\
+        },
+        .{ .path = "util.toy", .source =
+        \\import util/shapes.{Meters}
+        \\type Secret = int
+        \\pub fn mk() -> Meters { 1 }
+        \\
+        },
+        .{ .path = "util/shapes.toy", .source = "pub type Meters = int\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            _ = r;
+            var msgs: [2][]const u8 = undefined;
+            var n: usize = 0;
+            for (tr.diags) |d| if (d.code == .R0005) {
+                if (n < 2) msgs[n] = d.message;
+                n += 1;
+            };
+            try testing.expectEqual(@as(usize, 2), n);
+            try testing.expectEqualStrings("type alias 'Secret' is not exported by module 'util'", msgs[0]);
+            try testing.expectEqualStrings("type alias 'Meters' is not exported by module 'util'", msgs[1]);
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-qalias-private", files, "main.toy", Check.run);
+}
+
+test "a module-qualified variant pattern checks its qualifier like a qualified type" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util
+        \\fn main() -> int {
+        \\    match util.mk() {
+        \\        util.Other.up -> 1,
+        \\        util.S.x -> 4,
+        \\        nope.Dir.up -> 2,
+        \\        util.Dir.sideways -> 6,
+        \\        util.Dir.up -> 7,
+        \\        util.Dir.zz.down -> 8,
+        \\        zz.Dir.up -> 9,
+        \\        _ -> 3,
+        \\    }
+        \\}
+        \\
+        },
+        .{ .path = "util.toy", .source =
+        \\pub enum Dir { up, down }
+        \\pub enum Other { up, down }
+        \\pub struct S { pub x: int }
+        \\pub fn mk() -> Dir { Dir.up }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            const want = [_]struct { codes.Code, []const u8 }{
+                .{ .T0067, "pattern enum 'util.Other' does not match scrutinee 'Dir'" },
+                .{ .T0062, "'util.S' is not an enum type" },
+                .{ .T0002, "unknown module 'nope'" },
+                .{ .T0061, "enum 'Dir' has no variant 'sideways'" },
+                .{ .T0002, "'util.Dir' is not a module" },
+                .{ .T0002, "unknown module 'zz'" },
+            };
+            var n: usize = 0;
+            // The arms after `util.Dir.up` repeat a variant, so W0006 joins the errors.
+            for (tr.diags) |d| if (d.code != .W0006) {
+                try testing.expect(n < want.len);
+                try testing.expectEqual(want[n][0], d.code);
+                try testing.expectEqualStrings(want[n][1], d.message);
+                n += 1;
+            };
+            try testing.expectEqual(want.len, n);
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-qpattern", files, "main.toy", Check.run);
+}
+
+test "a type alias of an enum or an enum instance qualifies a variant pattern" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util
+        \\type B = util.Box[int]
+        \\type D = util.Dir
+        \\fn main() -> int {
+        \\    z: B = util.Box.some(4)
+        \\    d: D = util.Dir.up
+        \\    w: util.B = util.Box.some(5)
+        \\    a := match z { B.some(n) -> n, B.none -> 0 }
+        \\    b := match d { D.up -> 1, util.D.down -> 0 }
+        \\    c := match w { util.B.some(n) -> n, util.B.none -> 0 }
+        \\    a + b + c
+        \\}
+        \\
+        },
+        .{ .path = "util.toy", .source =
+        \\pub enum Box[T] { some(T), none }
+        \\pub type B = Box[int]
+        \\pub enum Dir { up, down }
+        \\pub type D = Dir
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            try testing.expectEqual(@as(usize, 0), tr.diags.len);
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-alias-pattern", files, "main.toy", Check.run);
+}
+
+test "type arguments on a qualified non-generic type name the type as written" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util
+        \\fn main() -> int {
+        \\    x: util.M[int] = 1
+        \\    x
+        \\}
+        \\pub fn b(s: util.SA[int]) -> int { s.x }
+        \\pub fn c(s: util.S[int]) -> int { s.x }
+        \\
+        },
+        .{ .path = "util.toy", .source =
+        \\pub type M = int
+        \\pub struct S { pub x: int }
+        \\pub type SA = S
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            const want = [_][]const u8{
+                "'M' is not generic; drop the type arguments",
+                "'SA' is not generic; drop the type arguments",
+                "'S' is not generic; drop the type arguments",
+            };
+            var n: usize = 0;
+            for (tr.diags) |d| if (d.code == .T0001) {
+                try testing.expect(n < want.len);
+                try testing.expectEqualStrings(want[n], d.message);
+                n += 1;
+            };
+            try testing.expectEqual(want.len, n);
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-qualified-not-generic", files, "main.toy", Check.run);
+}
+
+test "an alias a pub import fails to re-export is reported at that import only" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import geo
+        \\pub fn f(x: int) -> geo.L { x }
+        \\fn main() -> int {
+        \\    x: geo.L = 1
+        \\    x
+        \\}
+        \\
+        },
+        .{ .path = "geo.toy", .source = "pub import shapes.{M as L}\n" },
+        .{ .path = "shapes.toy", .source = "type M = int\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            var n: usize = 0;
+            for ([_][]const Diagnostic{ r.diags, tr.diags }) |ds| for (ds) |d| if (d.code == .R0005) {
+                try testing.expectEqualStrings("type alias 'M' is not exported by module 'shapes'", d.message);
+                n += 1;
+            };
+            try testing.expectEqual(@as(usize, 1), n);
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-alias-withheld", files, "main.toy", Check.run);
+}
+
 test "single-module graph typechecks like the single-file checker" {
     const files = &[_]FixtureFile{
         .{ .path = "solo.toy", .source =

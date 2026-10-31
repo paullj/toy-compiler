@@ -1,0 +1,33 @@
+# expect: stdout "8\n12\n3\n9\n10\n"
+# expect: exit 0
+# A pub type alias is nameable through its module (`shapes.Meters`) in every type
+# position: a param, a return, a binding, a field, a type argument, a fn type and
+# another alias; and through a module that re-exports it (`geo.Len`) or its namespace
+# (`geo.shapes.Meters`).
+import std/io.{println}
+import std/vec.{Vec}
+import geo/shapes
+import geo
+
+type Span = shapes.Meters
+
+struct Wall { len: shapes.Meters }
+
+fn twice(m: shapes.Meters) -> shapes.Meters { m * 2 }
+
+fn apply(f: fn(shapes.Meters) -> shapes.Meters, m: Span) -> geo.Len { f(m) }
+
+fn main() -> int {
+    x: shapes.Meters = 4
+    println(twice(x))
+    v := Vec[shapes.Meters].new()
+    v.push(6)
+    println(apply(twice, v.len() * 6))
+    p: shapes.Plane = shapes.Rect.square(3)
+    println(p.w)
+    w := Wall { len: 9 }
+    println(w.len)
+    n: geo.shapes.Meters = 10
+    println(n)
+    0
+}

@@ -217,15 +217,25 @@ fn checkVariantPattern(bc: *BodyChecker, pat_idx: Ast.Index, expected: Type, cov
     // A qualified `N.V` pattern: the type-name must name the scrutinee enum.
     var bad_qualifier = false;
     if (pat.lhs != Ast.none) {
-        const tname = bc.nameText(bc.tree.nodes[(pat.lhs).int()].main_token);
-        if (bc.activeEnumMap().get(tname)) |qid| {
-            if (qid != enum_id) {
+        const lhs = bc.tree.nodes[(pat.lhs).int()];
+        const span = bc.spanOf(pat.lhs);
+        const tname = bc.source[span.start..span.end];
+        const qid: ?u32 = if (lhs.tag == .field_access) blk: {
+            const q = bc.typeFromQualified(pat.lhs, lhs);
+            if (q.kind == .invalid) {
                 bad_qualifier = true;
-                try bc.sink.report(.{ .span = bc.spanOf(pat.lhs), .code = .T0067 }, "pattern enum '{s}' does not match scrutinee '{s}'", .{ tname, e.name });
+                break :blk null;
             }
-        } else {
+            break :blk bc.scrutEnumId(q);
+        } else bc.activeEnumMap().get(tname) orelse if (bc.activeAliasMap().get(tname)) |t| bc.scrutEnumId(t) else null;
+        if (qid) |id| {
+            if (id != enum_id) {
+                bad_qualifier = true;
+                try bc.sink.report(.{ .span = span, .code = .T0067 }, "pattern enum '{s}' does not match scrutinee '{s}'", .{ tname, e.name });
+            }
+        } else if (!bad_qualifier) {
             bad_qualifier = true;
-            try bc.sink.report(.{ .span = bc.spanOf(pat.lhs), .code = .T0062 }, "'{s}' is not an enum type", .{tname});
+            try bc.sink.report(.{ .span = span, .code = .T0062 }, "'{s}' is not an enum type", .{tname});
         }
     }
     const vname = bc.nameText(pat.main_token);

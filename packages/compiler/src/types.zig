@@ -423,11 +423,8 @@ pub const refs = struct {
     pub fn typeFromQualified(self: anytype, node_idx: Ast.Index, n: Ast.Node) Type {
         _ = node_idx;
         const g = self.graphCtx();
-        const recv = self.tree.nodes[n.lhs.int()];
         const target = refs.moduleOf(self, n.lhs) orelse {
-            if (recv.tag != .identifier) return .invalid;
-            const recv_name = refs.nameText(self, recv.main_token);
-            self.sink.report(.{ .span = refs.tokSpan(self, recv.main_token), .code = .T0002 }, err_unknown_module, .{recv_name}) catch {};
+            refs.reportNotModule(self, n.lhs);
             return .invalid;
         };
         const member = refs.nameText(self, n.main_token);
@@ -435,6 +432,8 @@ pub const refs = struct {
             .{ Type.structT(id), "struct", refs.exportsType(g, target, member, self.structSyms()[id]) }
         else if (g.mods[target].enum_ids.get(member)) |id|
             .{ Type.enumT(id), "enum", refs.exportsType(g, target, member, self.enumSyms()[id]) }
+        else if (g.mods[target].alias_ids.get(member)) |ty|
+            .{ ty, "type alias", refs.exportsAlias(g, target, member) }
         else {
             self.sink.report(.{ .span = refs.tokSpan(self, n.main_token), .code = .T0003 }, err_module_no_type, .{member}) catch {};
             return .invalid;
@@ -442,6 +441,19 @@ pub const refs = struct {
         if (exported) return ty;
         self.sink.report(.{ .span = refs.tokSpan(self, n.main_token), .code = .R0005 }, "{s} '{s}' is not exported by module '{s}'", .{ kind, member, g.mods[target].path }) catch {};
         return .invalid;
+    }
+
+    /// Report the first segment of qualifier `idx` that does not name a module, so a
+    /// qualifier with a bogus middle segment (`util.Dir.zz`) is never silently invalid.
+    fn reportNotModule(self: anytype, idx: Ast.Index) void {
+        const n = self.tree.nodes[idx.int()];
+        if (n.tag == .field_access and refs.moduleOf(self, n.lhs) == null) return refs.reportNotModule(self, n.lhs);
+        if (n.tag == .identifier) {
+            self.sink.report(.{ .span = refs.tokSpan(self, n.main_token), .code = .T0002 }, err_unknown_module, .{refs.nameText(self, n.main_token)}) catch {};
+            return;
+        }
+        const span = refs.spanOf(self, idx);
+        self.sink.report(.{ .span = span, .code = .T0002 }, "'{s}' is not a module", .{self.source[span.start..span.end]}) catch {};
     }
 
     /// Whether `target.member` names the type `sym` that `member` binds in `target`: a
@@ -453,6 +465,25 @@ pub const refs = struct {
         if (sym.mod == target) return true;
         for (g.mods[target].selections) |sel| {
             if (std.mem.eql(u8, sel.local, member)) return sel.exported;
+        }
+        return false;
+    }
+
+    /// Whether `target.member` names an alias: a pub `type` decl of `target`, or one a
+    /// `pub import` of it re-exports. The alias map holds the resolved type only, so
+    /// pub-ness is read from the decl.
+    pub fn exportsAlias(g: *const GraphCtx, target: u32, member: []const u8) bool {
+        const m = &g.mods[target];
+        for (m.selections) |sel| {
+            if (std.mem.eql(u8, sel.local, member)) return sel.exported;
+        }
+        if (m.tree.nodes.len == 0) return false;
+        const prog = m.tree.nodes[Ast.root(m.tree.nodes).int()];
+        if (prog.tag != .program) return false;
+        for (Ast.rangeSlice(m.tree, prog.lhs.int())) |decl_idx| {
+            const decl = m.tree.nodes[decl_idx.int()];
+            if (decl.tag != .type_alias_decl) continue;
+            if (std.mem.eql(u8, m.tokens[decl.main_token].text(m.source), member)) return m.tree.isPub(decl_idx);
         }
         return false;
     }
@@ -510,11 +541,16 @@ pub const refs = struct {
                     ctor_id = q.enum_id;
                     is_enum = true;
                 },
-                else => return q, // invalid: typeFromQualified already emitted
+                .invalid => return q,
+                else => {
+                    self.sink.report(.{ .span = refs.spanOf(self, node_idx), .code = .T0001 }, "'{s}' is not generic; drop the type arguments", .{refs.nameText(self, base.main_token)}) catch {};
+                    return .invalid;
+                },
             }
         } else return .invalid;
 
-        const gen_name = if (is_enum) self.enumSyms()[ctor_id].name else self.structSyms()[ctor_id].name;
+        // A qualified base is named as written: through an alias the ctor's own name is not what the user spelled.
+        const gen_name = if (base.tag == .field_access) refs.nameText(self, base.main_token) else if (is_enum) self.enumSyms()[ctor_id].name else self.structSyms()[ctor_id].name;
         const gen_params = if (is_enum) self.enumSyms()[ctor_id].generic_params else self.structSyms()[ctor_id].generic_params;
         const gen_is_generic = if (is_enum) self.enumSyms()[ctor_id].is_generic else self.structSyms()[ctor_id].is_generic;
         if (!gen_is_generic) {

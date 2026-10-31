@@ -1,5 +1,6 @@
-# Feature: an import cycle (main -> a -> b -> a) is rejected with the cycle path.
-# expect: compile-error "import cycle detected"
+# Feature: an import cycle (main -> a -> b -> a) is rejected with the cycle path,
+# which names only the modules in the cycle.
+# expect: compile-error "import cycle detected: a -> b -> a"
 import a
 
 fn main() -> int {

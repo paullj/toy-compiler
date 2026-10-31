@@ -1,0 +1,10 @@
+# Feature: every segment before the enum in a qualified pattern must name a module.
+# expect: compile-error "'util.Dir' is not a module"
+import util
+
+fn main() -> int {
+    match util.Dir.down {
+        util.Dir.zz.down -> 1,
+        _ -> 0,
+    }
+}

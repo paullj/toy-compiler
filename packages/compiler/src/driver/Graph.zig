@@ -592,10 +592,14 @@ const Discoverer = struct {
     overlay: ?Overlay = null,
     bundled_cache: ?*BundledCache = null,
     err: ?Error = null,
+    /// The gray modules in DFS order. The gray set alone cannot name a cycle: a
+    /// gray ancestor above the back-edge target is on the stack but not in the cycle.
+    stack: std.ArrayList(u32) = .empty,
 
     fn deinit(d: *Discoverer) void {
         for (d.slots.items) |*s| s.deinit(d.gpa);
         d.slots.deinit(d.gpa);
+        d.stack.deinit(d.gpa);
         d.by_canon.deinit(d.gpa);
         var it = d.realpath_cache.iterator();
         while (it.next()) |e| {
@@ -680,6 +684,7 @@ const Discoverer = struct {
             std.debug.assert(s.color == .white); // a gray re-entry is caught below
             s.color = .gray;
         }
+        try d.stack.append(d.gpa, id);
 
         try d.load(id);
 
@@ -701,6 +706,7 @@ const Discoverer = struct {
         }
 
         d.slots.items[id].color = .black;
+        _ = d.stack.pop();
     }
 
     /// Obtain module `id`'s source + tokens + AST, then fill its slot. On a parse error,
@@ -1214,25 +1220,16 @@ const Discoverer = struct {
         return hit;
     }
 
-    /// Build the `/`-arrow cycle path from the gray ancestor `target` to `from`,
-    /// then back to `target`, by walking the gray frontier. We do not keep an
-    /// explicit DFS stack, so reconstruct the cycle from the gray coloring: every
-    /// gray module is on the current stack. The message lists them in name order
-    /// joined by ` -> ` with the closing edge back to `target`.
+    /// Build the ` -> ` cycle path from the gray ancestor `target` down the DFS
+    /// stack to `from`, then back to `target`.
     fn cycleError(d: *Discoverer, from: u32, target: u32) DiscoverError!Error {
         var buf: std.ArrayList(u8) = .empty;
         errdefer buf.deinit(d.gpa);
-        try buf.appendSlice(d.gpa, d.slots.items[target].name);
-        // List the other gray modules (excluding target) to show the cycle body,
-        // then close back on target. The exact interior order is the gray set in
-        // id order — deterministic and sufficient to name the cycle.
-        for (d.slots.items, 0..) |s, i| {
-            if (s.color == .gray and i != target) {
-                try buf.appendSlice(d.gpa, " -> ");
-                try buf.appendSlice(d.gpa, s.name);
-            }
+        const start = std.mem.indexOfScalar(u32, d.stack.items, target).?;
+        for (d.stack.items[start..]) |id| {
+            try buf.appendSlice(d.gpa, d.slots.items[id].name);
+            try buf.appendSlice(d.gpa, " -> ");
         }
-        try buf.appendSlice(d.gpa, " -> ");
         try buf.appendSlice(d.gpa, d.slots.items[target].name);
         const detail = try buf.toOwnedSlice(d.gpa);
         errdefer d.gpa.free(detail);
@@ -1506,10 +1503,8 @@ test "discover: import cycle is rejected with a cycle path" {
         fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
             try testing.expect(g.err != null);
             try testing.expectEqual(Error.Kind.cycle, g.err.?.kind);
-            // The cycle path names both `a` and `b` and closes on itself.
-            try testing.expect(std.mem.indexOf(u8, g.err.?.detail, "a") != null);
-            try testing.expect(std.mem.indexOf(u8, g.err.?.detail, "b") != null);
-            try testing.expect(std.mem.indexOf(u8, g.err.?.detail, "->") != null);
+            // `main` imports the cycle but is not in it.
+            try testing.expectEqualStrings("a -> b -> a", g.err.?.detail);
         }
     };
     try withFixture(".toy-test-graph-cycle", files, "main.toy", Check.run);

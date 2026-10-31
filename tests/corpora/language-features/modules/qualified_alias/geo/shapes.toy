@@ -1,0 +1,9 @@
+pub type Meters = int
+
+pub type Plane = Rect
+
+pub struct Rect { pub w: Meters, pub h: Meters }
+
+impl Rect {
+    fn square(n: Meters) -> Rect { Rect { w: n, h: n } }
+}

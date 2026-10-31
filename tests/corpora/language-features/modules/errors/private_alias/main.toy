@@ -1,0 +1,8 @@
+# Feature: a type alias without `pub` is not nameable through its module.
+# expect: compile-error "type alias 'Secret' is not exported by module 'hidden'"
+import hidden
+
+fn main() -> int {
+    x: hidden.Secret = hidden.f()
+    x
+}

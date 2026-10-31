@@ -26,6 +26,11 @@ A whole-module import also makes the module's `pub` structs and enums nameable b
 (`Vec` after `import std/vec`), unless the importing module has its own type of that
 name.
 
+A type is named through its module in any type position (`shapes.Meters`, a `pub` type
+alias included), and so is a variant in a match pattern, through any depth of
+re-exported namespaces: `util.Dir.up`, `util.extra.Dir.at(n)`,
+`extra.Shape.box { w, h }`.
+
 ## Selective imports
 
 `import a/b.{x, y as z}` binds only the listed names: `x`, and `y` under the name `z`.

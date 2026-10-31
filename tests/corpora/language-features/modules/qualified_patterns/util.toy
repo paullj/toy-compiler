@@ -1,0 +1,5 @@
+pub import util/extra
+
+pub enum Dir { up, down, at(int) }
+
+pub enum Wrap { one(Dir), two(extra.Dir) }

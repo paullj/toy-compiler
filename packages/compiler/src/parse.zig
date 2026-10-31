@@ -1175,7 +1175,7 @@ fn parsePattern(p: *Parser) Error!Ast.Index {
 }
 
 /// A single (non-or) pattern: `_` (wildcard), an int/bool literal, a bare
-/// identifier binding, or `.V`/`N.V` (variant) with optional payload sub-patterns.
+/// identifier binding, or `.V`/`N.V`/`m.N.V` (variant) with optional payload sub-patterns.
 /// Tuple payloads `.V(p, ...)` and struct payloads `.V { f, f: alias, f: subpat }`
 /// each hold arbitrary sub-patterns (recursive via `parsePattern`).
 fn parseSubPattern(p: *Parser) Error!Ast.Index {
@@ -1199,9 +1199,15 @@ fn parseSubPattern(p: *Parser) Error!Ast.Index {
             p.advance();
             return p.addNode(.{ .tag = .pattern_binding, .main_token = bt, .lhs = Ast.none, .rhs = Ast.none });
         }
-        // Qualified `N.V`: build the type-name leaf, then expect `.V`.
+        // Qualified `N.V` or `m.N.V`: every segment before the last `.V` names the
+        // enum, a `field_access` chain as the same spelling is in an expression.
         type_name = try p.leaf(.identifier, p.index);
         try p.expect(.dot, "expected '.' after an enum type name in a pattern");
+        while (p.at(.identifier) and p.peek2().tag == .dot) {
+            type_name = try p.addNode(.{ .tag = .field_access, .main_token = p.index, .lhs = type_name, .rhs = Ast.none });
+            p.bump(.identifier);
+            p.bump(.dot);
+        }
     } else {
         try p.expect(.dot, "expected a variant pattern ('.V' or '_')");
     }
@@ -4422,6 +4428,13 @@ test "match with tuple/struct/unit/wildcard arms parses" {
     try expectProgram(
         "fn f(s: Shape) -> int { match s { .Circle(r) -> r, .Rect { w, h } -> w, .Empty -> 0, _ -> 1 } }\n",
         "(program (fn f ((param s Shape)) int (block (match s (arm (pvar Circle (bind r)) r) (arm (pvar Rect (bind w) (bind h)) w) (arm (pvar Empty) 0) (arm (_) 1)))))",
+    );
+}
+
+test "a module-qualified variant pattern parses at any depth, with its payload" {
+    try expectProgram(
+        "fn f(d: m.Dir) -> int { match d { m.Dir.up -> 1, a.b.Dir.at(n) -> n, Dir.down -> 0 } }\n",
+        "(program (fn f ((param d (. m Dir))) int (block (match d (arm (pvar (. m Dir) up) 1) (arm (pvar (. (. a b) Dir) at (bind n)) n) (arm (pvar Dir down) 0)))))",
     );
 }
 

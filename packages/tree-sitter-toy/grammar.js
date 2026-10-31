@@ -483,8 +483,8 @@ module.exports = grammar({
     variant_pattern: ($) =>
       seq(".", $.identifier, optional($._pattern_payload)),
 
-    // A qualified variant pattern (`Color.greem`) — the compiler accepts the enum-qualified
-    // form as well as the dot-leading one.
+    // A qualified variant pattern (`Color.green`, `util.Color.green`) — the compiler accepts
+    // the enum- and module-qualified forms as well as the dot-leading one.
     path_pattern: ($) =>
       seq($.identifier, repeat1(seq(".", $.identifier)), optional($._pattern_payload)),
 
