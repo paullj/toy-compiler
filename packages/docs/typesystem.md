@@ -451,7 +451,11 @@ composite protocol argument (`impl P has Into[Option[int]]`).
 
 An `impl` fn without `self` is an associated function, called on its type: `K.make(1)`
 on a struct or enum `K`, `lib.K.make(1)` through a module, `Box[int].new()` on a generic
-struct or enum (or `Box.new(5)`, inferred as above). The call selects it like a method and
+struct or enum (or `Box.new(5)`, inferred as above). An alias names its target's
+(`type A = K` makes `A.make(1)` call `K.make`, and `type B = Box[int]` makes `B.new()` call
+`Box[int].new`), and a builtin type has them too: with `impl int { fn zero() -> int { 0 } }`,
+`int.zero()` calls it. Through an alias or a builtin, a member that names no associated fn
+leaves a type used as a value (**T0056**). The call selects it like a method and
 passes no receiver. It is never called on a value (`k.make(1)` is **T0018**), an instance
 method is never called on a type (`K.get()` is **T0018**), and on an enum a variant keeps
 its name: `E.A(1)` constructs the variant `A` even when an associated fn `A` exists.

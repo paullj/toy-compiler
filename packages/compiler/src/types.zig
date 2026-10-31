@@ -4090,14 +4090,16 @@ fn bodyUnit(t: *const Typecheck, model: *const Model, fid: u32, out: *BodyResult
         out.err = e;
         return;
     };
+    // Poison a bounded template whose bound-as-axiom check reported an error, so the
+    // mono tail skips instantiating it (a definition error fires once, not per instance).
+    // A warning (a constant `if` condition) leaves the body sound, and its instances must
+    // still be minted or lower finds no callee.
+    out.poisoned = f.isGeneric() and bc.errorsSince(0);
     // Transfer the finished sink into the slot; leave bc holding a fresh empty sink
     // so the `defer bc.deinit()` frees nothing it no longer owns.
     out.sink.deinit();
     out.sink = bc.sink;
     bc.sink = DiagnosticSink.init(bc.gpa);
-    // Poison a bounded template whose bound-as-axiom check reported anything, so the
-    // mono tail skips instantiating it (a definition error fires once, not per instance).
-    out.poisoned = f.isGeneric() and out.sink.count() > 0;
     // Move this fn's derive requests into the slot (merged fn-id-ordered by
     // checkBodies). `toOwnedSlice` empties bc's list so the deferred `bc.deinit` frees
     // nothing it no longer owns.
@@ -7979,6 +7981,20 @@ test "calling a method NOT in the bound protocol from a bounded body is T0018 (b
     };
     try testing.expectEqual(@as(usize, 1), t0018_count); // reported ONCE, not per instance
     try testing.expectEqual(@as(usize, 0), c.result.instances.len); // poisoned: not instantiated
+}
+
+test "a warning in a bounded body does not poison the template: it is still instantiated" {
+    const gpa = testing.allocator;
+    var c = try checkSource(
+        \\protocol Twice { fn twice(self) -> Self }
+        \\impl int has Twice { fn twice(self) -> int { self * 2 } }
+        \\fn dbl[T has Twice](o: T) -> T { if false { o } else { o.twice() } }
+        \\fn main() -> int { dbl(6) }
+        \\
+    );
+    defer c.deinit(gpa);
+    for (c.result.diags) |d| try testing.expect(d.severity != .err);
+    try testing.expectEqual(@as(usize, 1), c.result.instances.len);
 }
 
 test "an undeclared bound protocol on a generic param is T0021 at the bound ref" {

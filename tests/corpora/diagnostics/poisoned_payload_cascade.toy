@@ -1,0 +1,13 @@
+# A payload that fails to type is reported once: it leaves its enum's type params to
+# the poison, so neither its constructor nor a sibling `Option.none` asks for type args.
+import std/option
+
+fn go(v0: int) -> bool {
+    r := Option.some(v0).then(fn(v1) { if v1 < 100 { Option.some(v1 + true) } else { Option.none } })  #~ ERROR [T0044] operands of '+' must have the same type
+    s := Option.some(v0).then(fn(v1) { if v1 < 100 { Option.none } else { Option.some(v1 + true) } })  #~ ERROR [T0044] operands of '+' must have the same type
+    r.is_some() && s.is_some()
+}
+
+fn main() -> int {
+    if go(1) { 1 } else { 0 }
+}

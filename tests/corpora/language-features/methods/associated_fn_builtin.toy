@@ -1,0 +1,41 @@
+# Feature: an associated fn of a builtin type (an `impl int` fn without `self`) is called on the type, `int.zero()`, through an alias of it, and named as a value
+# expect: stdout "0 42 hi 1.5 41 a 7"
+# expect: exit 0
+import std/io
+
+impl int {
+    fn zero() -> int { 0 }
+    fn answer() -> int { 42 }
+}
+
+impl str {
+    fn greeting() -> str { "hi" }
+}
+
+impl float {
+    fn half(x: float) -> float { x /. 2.0 }
+}
+
+impl char {
+    fn first() -> char { 'a' }
+}
+
+impl byte {
+    fn seven() -> byte { 7 }
+}
+
+type Count = int
+
+fn main() -> int {
+    f := Count.answer
+    g := int.zero
+    out := int.zero().to_string()
+    out = out.concat(" ").concat(Count.answer().to_string())
+    out = out.concat(" ").concat(str.greeting())
+    out = out.concat(" ").concat(float.half(3.0).to_string())
+    out = out.concat(" ").concat((f() - 1 + g()).to_string())
+    out = out.concat(" ").concat(char.first().to_string())
+    out = out.concat(" ").concat(byte.seven().to_string())
+    io.print(out)
+    0
+}

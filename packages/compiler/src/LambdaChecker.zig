@@ -206,9 +206,9 @@ pub fn typeOfLambda(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Ou
         ret = if (chosen) |fix|
             try checkDeclaredRet(bc, n, params, fix, false, refs.internFn(bc, exp_params, fix))
         else
-            try inferRet(bc, n, partial_ret);
+            try inferRet(bc, n, partial_ret, false);
     } else {
-        ret = try inferRet(bc, n, partial_ret);
+        ret = try inferRet(bc, n, partial_ret, false);
         if (bc.body.ret_fix) |fix| if (bc.errorsSince(mark)) {
             // A value checked before the one that fixed the open vars could not use them
             // (`Option.none` in `if c { return Option.none }`), so the body is checked
@@ -226,9 +226,28 @@ pub fn typeOfLambda(bc: *BodyChecker, node_idx: Ast.Index, n: Ast.Node) error{Ou
             } else {
                 bc.sink.truncate(mark);
                 bc.body = fresh;
-                ret = try inferRet(bc, n, partial_ret);
+                ret = try inferRet(bc, n, partial_ret, false);
             }
         };
+    }
+    if (declared == null and bc.body.ret_poisoned and bc.body.ret_fix == null and bc.errorsSince(mark)) {
+        // Likewise a value checked before the one without a type was left open by it
+        // (`Option.none` before a poisoned `Option.some(..)`), so the body is checked
+        // again knowing the poison from the start; the poison's own error, here or
+        // wherever it came from, still stops the program before lowering. Each check
+        // decides this afresh, since a value poisoned in one pass (a capture's hole
+        // still waiting) may be sound in the next.
+        const errs = bc.errorCountSince(mark);
+        bc.sink.truncate(mark);
+        bc.body = fresh;
+        const again = try inferRet(bc, n, partial_ret, true);
+        if (bc.errorCountSince(mark) < errs) {
+            ret = again;
+        } else {
+            bc.sink.truncate(mark);
+            bc.body = fresh;
+            ret = try inferRet(bc, n, partial_ret, false);
+        }
     }
     if (open) {
         const p = proto.params[0];
@@ -272,12 +291,14 @@ fn checkDeclaredRet(bc: *BodyChecker, n: Ast.Node, params: []const Type, r: Type
 }
 
 /// Infer a lambda's return type from its body: the join of its value and its `return`s,
-/// each checked against `partial` when the expected fn type gives one.
-fn inferRet(bc: *BodyChecker, n: Ast.Node, partial: ?Type) error{OutOfMemory}!Type {
+/// each checked against `partial` when the expected fn type gives one. `poisoned` says a
+/// returned value is known to fail (`ret_poisoned`).
+fn inferRet(bc: *BodyChecker, n: Ast.Node, partial: ?Type, poisoned: bool) error{OutOfMemory}!Type {
     bc.body.cur_ret = Type.unit;
     bc.body.ret_infer = true;
     bc.body.ret_join = .never;
     bc.body.ret_partial = partial;
+    bc.body.ret_poisoned = poisoned;
     const body_ty = try bc.typeOfBlockExpected(n.rhs, true, partial);
     const tail: Type = if (bc.blockDiverges(n.rhs)) .never else body_ty;
     return joinLambdaTail(bc, n, tail);
@@ -460,6 +481,17 @@ test "a then lambda whose returns fix no open var still asks for type args, nami
     try Typecheck.expectOneDiag(then_impls ++ "fn go(r: Result[int, str]) -> int {\n _s := r.then(fn(_v) { Result.err(\"x\") })\n 0\n}\n", .T0016, "cannot infer type parameter 'T' for 'Result.err'; add explicit type arguments, e.g. Result[int, str].err");
     // Two returns that disagree are a branch mismatch, not an error at the later one.
     try Typecheck.expectDiagCodes(then_impls ++ "fn go(o: Option[int]) -> int {\n _r := o.then(fn(v) { if v > 3 { Option.some(1) } else { Option.some(\"x\") } })\n 0\n}\n", &.{.T0058});
+}
+
+test "a poisoned payload leaves its enum's type params to the poison, so only its own error is reported" {
+    try Typecheck.expectDiagCodes(then_impls ++ "fn go(v0: int) -> bool {\n r := Option.some(v0).then(fn(v1) { if v1 < 100 { Option.some(v1 + true) } else { Option.none } })\n r.is_some()\n}\n", &.{.T0044});
+    try Typecheck.expectDiagCodes(then_impls ++ "fn go(v0: int) -> bool {\n r := Option.some(v0).then(fn(v1) { if v1 < 100 { Option.none } else { Option.some(v1 + true) } })\n r.is_some()\n}\n", &.{.T0044});
+    // The poison comes from outside the lambda: a poisoned local, or a fn whose return
+    // type is unknown, on either side of the open constructor.
+    try Typecheck.expectDiagCodes(then_impls ++ "fn go(v0: int) -> bool {\n bad := v0 + true\n r := Option.some(v0).then(fn(a) { if a > 1 { Option.none } else { Option.some(bad) } })\n s := Option.some(v0).then(fn(a) { if a > 1 { Option.some(bad) } else { Option.none } })\n r.is_some() && s.is_some()\n}\n", &.{.T0044});
+    try Typecheck.expectDiagCodes(then_impls ++ "fn bad() -> Nope { 1 }\nfn go(v0: int) -> bool {\n r := Option.some(v0).then(fn(a) { if a > 1 { Option.none } else { bad() } })\n r.is_some()\n}\n", &.{.T0001});
+    // A value that fixes the open var and a poisoned one in one lambda.
+    try Typecheck.expectDiagCodes(then_impls ++ "fn go(v0: int) -> bool {\n r := Option.some(v0).then(fn(a) { if a > 2 { Option.none } else if a > 1 { Option.some(1) } else { Option.some(a + true) } })\n r.is_some()\n}\n", &.{.T0044});
 }
 
 test "an if value's expected type reaches its else arm and an else-if ladder" {

@@ -1336,6 +1336,13 @@ const GraphResolve = struct {
         return null;
     }
 
+    /// A builtin type or an alias of this module: a name an associated fn can be called
+    /// through, unlike a protocol or a type parameter (which shadows an alias).
+    fn isTypeName(g: *GraphResolve, name: []const u8) bool {
+        const kind = g.typeLevelKind(name) orelse return false;
+        return std.mem.eql(u8, kind, "type");
+    }
+
     /// A bracket's content where a value index and type args look alike (`fs[i](x)`,
     /// `g[int](1)`, `id[int]`): a builtin type name no local shadows is left unresolved,
     /// for the checker to say the head takes no type args, rather than called undeclared.
@@ -1387,6 +1394,11 @@ const GraphResolve = struct {
                     try g.resolveModuleMember(node_idx, n, target_mod);
                     return;
                 }
+                // `A.mk` / `int.mk` may name an associated fn of the alias's target or of
+                // the builtin, which only the checker's impl tables can tell; it reports
+                // T0056 when the member names none, as it does for a struct.
+                if (!g.tables[g.cur_mod].structs.contains(recv_name) and
+                    !g.tables[g.cur_mod].enums.contains(recv_name) and g.isTypeName(recv_name)) return;
             }
         }
         // Ordinary receiver chain (value field access, or same-module `N.V`).
@@ -4142,6 +4154,34 @@ test "a type-level name used as a value is T0056, not undeclared (R0001)" {
                 try testing.expectEqualStrings(case[1], d.message);
                 const want: codes.Code = if (std.mem.startsWith(u8, case[1], "undeclared")) .R0001 else .T0056;
                 try testing.expectEqual(want, d.code);
+            }
+        }.run);
+    }
+}
+
+test "a builtin type or alias receiver is left to the checker; a protocol or type param is T0056" {
+    const quiet = .{
+        "fn main() -> int { int.mk() }\n",
+        "type A = int\nfn main() -> int { A.mk() }\n",
+        "fn main() -> int {\n f := str.mk\n f()\n}\n",
+        "fn main() -> int {\n _c := char.mk()\n _b := byte.one()\n 0\n}\n",
+    };
+    inline for (quiet) |src| {
+        try withResolvedSource(src, struct {
+            fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+                for (r.diags) |d| try testing.expect(d.severity == .warning);
+            }
+        }.run);
+    }
+    const loud = .{
+        .{ "protocol Pr { fn f(self) -> int }\nfn main() -> int { Pr.mk() }\n", "protocol 'Pr' is not a value" },
+        .{ "fn f[T](x: T) -> T {\n _y := T.mk()\n x\n}\nfn main() -> int { f(1) }\n", "type parameter 'T' is not a value" },
+        .{ "type A = int\nfn f[A](x: A) -> A {\n _y := A.mk()\n x\n}\nfn main() -> int { f(1) }\n", "type parameter 'A' is not a value" },
+    };
+    inline for (loud) |case| {
+        try withResolvedSource(case[0], struct {
+            fn run(_: Ast.Tree, _: []const Token, _: []const u8, r: *GraphResult) anyerror!void {
+                try testing.expectEqualStrings(case[1], firstError(r).message);
             }
         }.run);
     }

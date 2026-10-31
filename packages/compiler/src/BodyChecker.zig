@@ -233,6 +233,12 @@ pub const BodyCtx = struct {
     /// The first ground type a returned value took under `ret_partial`: it fixes the
     /// open vars, so the values that could not fix them are checked again against it.
     ret_fix: ?Type = null,
+    /// A returned value under `ret_partial` failed, and may be what would have fixed its
+    /// open vars, so a later one left open by them is no new error.
+    ret_poisoned: bool = false,
+    /// A constructor under `ret_partial` was itself left open by its vars (T0016): its
+    /// value has no type, yet poisons nothing, or it would silence its own error.
+    ret_open: bool = false,
     /// Inside a lambda whose return type is taken from the fn type expected for it rather
     /// than written: that fn type, which a mismatched `return` names, since the lambda
     /// declared nothing.
@@ -1005,11 +1011,17 @@ pub const BodyChecker = struct {
         const save = bc.body.expected;
         bc.body.expected = exp;
         defer bc.body.expected = save;
+        const open_before = bc.body.ret_open;
+        bc.body.ret_open = false;
         const t = try bc.typeOf(node_idx);
-        if (exp) |want| if (bc.body.ret_partial) |p| if (bc.body.ret_fix == null and want.ty.eql(p) and
-            t.kind != .invalid and t.kind != .never and bc.givesType(t) and CallInfer.fitsShape(bc, p, t))
-        {
-            bc.body.ret_fix = t;
+        const opened = bc.body.ret_open;
+        bc.body.ret_open = open_before or opened;
+        if (exp) |want| if (bc.body.ret_partial) |p| if (want.ty.eql(p)) {
+            if (t.kind == .invalid) {
+                if (!opened) bc.body.ret_poisoned = true;
+            } else if (bc.body.ret_fix == null and t.kind != .never and bc.givesType(t) and CallInfer.fitsShape(bc, p, t)) {
+                bc.body.ret_fix = t;
+            }
         };
         return t;
     }
@@ -1277,7 +1289,16 @@ pub const BodyChecker = struct {
             try bc.sink.report(at, "type '{s}' is not a value", .{name});
             return true;
         }
-        const eid = ids.e orelse return false;
+        const eid = ids.e orelse {
+            if (bc.aliasTypeNamed(idx) == null) return false;
+            // `float` names both a type and std/float, so `float.parse` without the
+            // import lands here.
+            if (if (Typecheck.type_names.has(name)) StdNames.importHintFor(name) else null) |hint|
+                try bc.sink.report(at, "type '{s}' is not a value; for the module std/{s}, " ++ StdNames.add_import, .{ name, hint.module, hint.module })
+            else
+                try bc.sink.report(at, "type '{s}' is not a value", .{name});
+            return true;
+        };
         const variants = bc.model.enums[eid].variants;
         if (variants.len == 0) {
             try bc.sink.report(at, "type '{s}' is not a value", .{name});
@@ -1875,8 +1896,8 @@ pub const BodyChecker = struct {
         const recv = bc.tree.nodes[n.lhs.int()];
         var app_ty: Type = undefined;
         var m: Typecheck.TemplateMethod = undefined;
-        if (recv.tag == .type_app and !bc.appHeadIsValue(n.lhs)) {
-            app_ty = bc.typeFromNode(n.lhs);
+        if (bc.appTypeNamed(n.lhs)) |named| {
+            app_ty = named;
             if (!app_ty.isApp()) return null;
             const e = bc.composite.at(app_ty.appIdx());
             if (e.ctor_is_enum and !bc.isAssociatedFnOfEnum(e.ctor, n.main_token)) return null;
@@ -2213,9 +2234,18 @@ pub const BodyChecker = struct {
                 .ok => return bc.checkVariantPayloads(site, enum_id, vtok, node_form, args, out, pre),
                 .err => return .invalid,
                 .unbound => |ord| {
+                    // A payload without a type was reported where it failed and may be
+                    // what would have bound the param; one that erred inside but still
+                    // has a type bound what it could, so the param is really open. A
+                    // capture's hole is invalid only because it waits for this variant.
+                    for (arg_nodes, pre) |a, t| {
+                        const v = if (node_form == .@"struct") bc.tree.nodes[a.int()].lhs else a;
+                        if (t.kind == .invalid and v != bc.body.hole) return .invalid;
+                    }
                     for (out, bnd) |*o, b| if (!b) {
                         o.* = .invalid;
                     };
+                    bc.body.ret_open = true;
                     try bc.reportUninferable(bc.tokSpan(vtok), " '{s}' for '{s}.{s}'", .{ e.generic_params[ord], e.name, vname }, e.name, out, &.{ ".", vname }, null);
                     return .invalid;
                 },
@@ -2400,8 +2430,10 @@ pub const BodyChecker = struct {
     /// identically-worded T0015 arg-vs-expected conflict and the identical T0013
     /// concrete-value gate (both differ across the two sites only by `span_tok`).
     /// It returns `.unbound` WITHOUT emitting, so each site keeps its own
-    /// byte-identical, site-specific T0016 message. On `.ok` the caller proceeds to
-    /// the construction tail (`checkVariantPayloads` / `internApp` + field checks).
+    /// byte-identical, site-specific T0016 message, or `.err` without emitting when a
+    /// lambda's poisoned return left the var open (`ret_poisoned`). On `.ok` the caller
+    /// proceeds to the construction tail (`checkVariantPayloads` / `internApp` + field
+    /// checks).
     fn reconcileTargetArgs(
         bc: *BodyChecker,
         out: []Type,
@@ -2427,7 +2459,10 @@ pub const BodyChecker = struct {
                 try bc.report(.{ .span = bc.tokSpan(span_tok), .code = .T0015 }, "conflicting types for type parameter '{s}': {f} inferred from the value, {f} from the expected type", .{ param_names[c.ord], bc.fmtType(c.arg), bc.fmtType(c.expected) });
                 return .err;
             },
-            .unbound => |u| return .{ .unbound = u.ord },
+            .unbound => |u| {
+                if (bc.body.ret_poisoned) if (bc.body.ret_partial) |p| if (bc.expectedTy()) |e| if (e.eql(p)) return .err;
+                return .{ .unbound = u.ord };
+            },
             .ok => {
                 for (out) |ta| {
                     // A bounded template's own param inferred here grounds at the outer
@@ -3540,8 +3575,7 @@ pub const BodyChecker = struct {
         const recv = bc.tree.nodes[(fa.lhs).int()];
         const member = bc.nameText(fa.main_token);
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-        if (recv.tag == .type_app and !bc.appHeadIsValue(fa.lhs)) {
-            const app_ty = bc.typeFromNode(fa.lhs);
+        if (bc.appTypeNamed(fa.lhs)) |app_ty| {
             if (!app_ty.isApp()) {
                 try bc.drainArgs(args);
                 return .invalid; // typeFromNode reported it
@@ -3749,7 +3783,31 @@ pub const BodyChecker = struct {
         const ids = bc.typeIdsNamed(recv_idx);
         if (ids.s) |sid| return if (sid < bc.structSyms().len and !bc.structSyms()[sid].is_generic) Type.structT(sid) else null;
         if (ids.e) |eid| return if (!bc.model.enums[eid].is_generic) Type.enumT(eid) else null;
-        return null;
+        const ty = bc.aliasTypeNamed(recv_idx) orelse return null;
+        return if (ty.isApp()) null else ty;
+    }
+
+    /// The type a bare builtin type or alias name names (`int`, or `A` of `type A = K`),
+    /// which the resolver leaves unresolved as a receiver; null for anything else.
+    fn aliasTypeNamed(bc: *const BodyChecker, idx: Ast.Index) ?Type {
+        const n = bc.tree.nodes[idx.int()];
+        if (n.tag != .identifier or bc.resolutions[idx.int()] != .unresolved) return null;
+        const name = bc.nameText(n.main_token);
+        if (bc.activeStructMap().contains(name) or bc.activeEnumMap().contains(name)) return null;
+        if (Typecheck.type_names.get(name)) |t| return t;
+        const ty = bc.activeAliasMap().get(name) orelse return null;
+        return if (ty.kind == .invalid) null else ty;
+    }
+
+    /// The generic-type instance a receiver names: a `Box[int]` type application, or an
+    /// alias of one. Null for a value or any other type.
+    fn appTypeNamed(bc: *BodyChecker, idx: Ast.Index) ?Type {
+        if (bc.tree.nodes[idx.int()].tag == .type_app) {
+            if (bc.appHeadIsValue(idx)) return null;
+            return bc.typeFromNode(idx);
+        }
+        const ty = bc.aliasTypeNamed(idx) orelse return null;
+        return if (ty.isApp()) ty else null;
     }
 
     /// `T.m(args)` naming an instance method `m` through a type, in any of its forms
@@ -3789,6 +3847,12 @@ pub const BodyChecker = struct {
         return .invalid;
     }
 
+    /// Whether `member` names a method or method template of the non-generic `ty`.
+    fn namesMethod(bc: *const BodyChecker, ty: Type, member: []const u8) bool {
+        return Typecheck.pickMethodIndex(bc.model.methods, ty, member, null, null, bc.methodSite()) != .none or
+            bc.concreteTemplate(ty, member) != null;
+    }
+
     /// The template of `member` on the non-generic struct or enum `recv`, a method with
     /// type params of its own (see `Typecheck.templateRecv`), else null.
     fn concreteTemplate(bc: *const BodyChecker, recv: Type, member: []const u8) ?Typecheck.TemplateMethod {
@@ -3808,11 +3872,11 @@ pub const BodyChecker = struct {
         const recv = bc.tree.nodes[(callee.lhs).int()];
         const member = bc.nameText(callee.main_token);
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-        if (recv.tag == .type_app and !bc.appHeadIsValue(callee.lhs)) {
-            const app_ty = bc.typeFromNode(callee.lhs);
+        if (bc.appTypeNamed(callee.lhs)) |app_ty| {
             if (!app_ty.isApp()) return null; // typeFromNode already diagnosed
             const e = bc.composite.at(app_ty.appIdx());
             const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite()) orelse {
+                if (recv.tag != .type_app) return null;
                 // An instance has no methods of its own (`impl Box[int]` is rejected), so a
                 // member no template declares names nothing.
                 try bc.drainArgs(args);
@@ -3837,7 +3901,10 @@ pub const BodyChecker = struct {
             _ = try bc.checkCall(node_idx, args, bc.fnSig(mf, member).substituted(targs_opt));
             return bc.substRet(node_idx, mf, targs_opt orelse return .invalid);
         }
-        if (bc.concreteTypeNamed(callee.lhs)) |ty| return try bc.checkConcreteAssociatedCall(node_idx, n, callee, ty);
+        if (bc.concreteTypeNamed(callee.lhs)) |ty| {
+            if (bc.aliasTypeNamed(callee.lhs) != null and !bc.namesMethod(ty, member)) return null;
+            return try bc.checkConcreteAssociatedCall(node_idx, n, callee, ty);
+        }
         // A bare `Box.new(5)` (no turbofish) naming a generic struct with an associated fn:
         // its type params come from the value args, or the call needs explicit ones.
         if (bc.genericTypeNamed(callee.lhs)) |g| {
@@ -5719,4 +5786,13 @@ test "a receiver's expected type stays a hint through every arm, break and scrut
 
 test "an expected type arg poisoned by an unknown type is no open var to infer" {
     try Typecheck.expectDiagCodes("fn f() -> int {\n _x: Option[Foo] = Option.none\n _y: Result[int, Bar] = Result.ok(1)\n 0\n}\n", &.{ .T0001, .T0013, .T0001, .T0013 });
+}
+
+test "a poisoned payload leaves the type params it would bind to the poison, not the others" {
+    try Typecheck.expectDiagCodes("fn go() -> int {\n _o := Option.some(1 + true)\n 0\n}\n", &.{.T0044});
+    try Typecheck.expectDiagCodes("fn go() -> int {\n _o: Option[int] = Option.some(1 + true)\n 0\n}\n", &.{.T0044});
+    try Typecheck.expectDiagCodes("fn go() -> int {\n _r := Result.ok(1 + true)\n 0\n}\n", &.{.T0044});
+    try Typecheck.expectDiagCodes("fn go(v: int) -> int {\n bad := v + true\n _o := Option.some(bad)\n 0\n}\n", &.{.T0044});
+    // The payload erred inside but still has a type, so it binds T and E stays open.
+    try Typecheck.expectDiagCodes("fn id(x: int) -> int { x }\nfn go() -> int {\n _r := Result.ok(id(1 + true))\n 0\n}\n", &.{ .T0016, .T0044 });
 }
