@@ -201,6 +201,20 @@ const Gen = struct {
         });
     }
 
+    /// Store the low `bytes` (1, 2 or 4) of `rt` at `sp + off`.
+    fn spStoreNarrow(g: *Gen, rt: u32, off: u32, bytes: u32) error{OutOfMemory}!void {
+        const direct = off / bytes <= 0xFFF;
+        const base: u32 = if (direct) Aarch64.SP else FA;
+        const rest: u32 = if (direct) off else 0;
+        if (!direct) try g.regAddr(FA, Aarch64.SP, off);
+        try g.emit(switch (bytes) {
+            1 => Aarch64.strb(rt, base, @intCast(rest)),
+            2 => Aarch64.strh(rt, base, rest),
+            4 => Aarch64.strW(rt, base, rest),
+            else => unreachable,
+        });
+    }
+
     /// `rd = sp + off` for any frame offset.
     fn spAddr(g: *Gen, rd: u32, off: u32) error{OutOfMemory}!void {
         return g.regAddr(rd, Aarch64.SP, off);
@@ -806,11 +820,11 @@ fn genFnAddr(g: *Gen, result: Ir.ValueId, f: Ir.SymName) error{OutOfMemory}!void
 /// drift on AAPCS64 marshalling — the single-authority the Abi header warns about.
 const PlanResult = struct { plan: Abi.CallPlan, ret_ty: Type };
 
-fn planFor(g: *Gen, args: []const Ir.Operand, ret_slot: Ir.SlotId, result: Ir.ValueId) error{OutOfMemory}!PlanResult {
+fn planFor(g: *Gen, conv: Abi.Conv, args: []const Ir.Operand, params: []const Type, ret_slot: Ir.SlotId, result: Ir.ValueId) error{OutOfMemory}!PlanResult {
     var arg_types: std.ArrayList(Type) = .empty;
     defer arg_types.deinit(g.gpa);
     try arg_types.ensureTotalCapacity(g.gpa, args.len);
-    for (args) |a| arg_types.appendAssumeCapacity(g.func.operandType(a));
+    for (0..args.len) |i| arg_types.appendAssumeCapacity(g.func.argType(args, params, i));
     // Recover the RETURN type: an aggregate result lands in `ret_slot` (its type);
     // a scalar result is the call instr's own value type; a unit call has neither.
     const ret_ty: Type = if (ret_slot != Ir.none_slot)
@@ -820,7 +834,7 @@ fn planFor(g: *Gen, args: []const Ir.Operand, ret_slot: Ir.SlotId, result: Ir.Va
     else
         Type.unit;
 
-    const plan = try Abi.planCall(g.gpa, arg_types.items, ret_ty, g.layouts, g.enum_layouts);
+    const plan = try Abi.planCallConv(g.gpa, conv, arg_types.items, ret_ty, g.layouts, g.enum_layouts);
     return .{ .plan = plan, .ret_ty = ret_ty };
 }
 
@@ -883,6 +897,11 @@ fn marshalArgs(g: *Gen, args: []const Ir.Operand, plan: Abi.CallPlan) error{OutO
                     .slot => |s| g.slotOff(s),
                     .none => continue,
                 };
+                if (st.bytes < 8) {
+                    try g.spMem(.ldr, S0, base);
+                    try g.spStoreNarrow(S0, st.nsaa_off, st.bytes);
+                    continue;
+                }
                 var k: u32 = 0;
                 while (k < st.bytes) : (k += 8) {
                     try g.spMem(.ldr, S0, base + k);
@@ -929,7 +948,8 @@ fn placeResult(g: *Gen, result: Ir.ValueId, ret_slot: Ir.SlotId, ret_ty: Type) e
 }
 
 fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
-    var pr = try planFor(g, c.args, c.ret_slot, result);
+    const conv: Abi.Conv = if (c.callee.kind == .import) .c else .toy;
+    var pr = try planFor(g, conv, c.args, c.params, c.ret_slot, result);
     defer pr.plan.deinit(g.gpa);
 
     try marshalArgs(g, c.args, pr.plan);
@@ -947,6 +967,11 @@ fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
     if (c.callee.kind == .import) {
         try rt_emit.emitImportPreamble(&g.code, &g.relocs, g.gpa, c.callee.name, 16);
         try g.emit(Aarch64.blr(16));
+        // A C callee leaves the bits above its return's own width unspecified (Apple
+        // extends a narrow int only to 32 bits), and toy keeps every value canonical.
+        if (result != Ir.none_value) {
+            if (pr.ret_ty.kind == .bool) try g.emit(Aarch64.andLowBits(0, 0, 7)) else try normalizeWidth(g, 0, pr.ret_ty);
+        }
     } else {
         const name_copy = try g.gpa.dupe(u8, c.callee.name);
         errdefer g.gpa.free(name_copy);
@@ -964,7 +989,7 @@ fn genCall(g: *Gen, result: Ir.ValueId, c: Ir.Call) error{OutOfMemory}!void {
 }
 
 fn genCallIndirect(g: *Gen, result: Ir.ValueId, c: Ir.CallIndirect) error{OutOfMemory}!void {
-    var pr = try planFor(g, c.args, c.ret_slot, result);
+    var pr = try planFor(g, .toy, c.args, &.{}, c.ret_slot, result);
     defer pr.plan.deinit(g.gpa);
 
     try marshalArgs(g, c.args, pr.plan);

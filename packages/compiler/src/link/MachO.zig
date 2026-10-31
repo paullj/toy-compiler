@@ -20,7 +20,9 @@
 //! `assemble` takes the MULTI-SEGMENT path:
 //!   __PAGEZERO, __TEXT(+__text +__cstring), __DATA_CONST(+__got), __LINKEDIT,
 //!   LC_DYLD_CHAINED_FIXUPS (a real one-import blob), LC_LOAD_DYLINKER,
-//!   LC_MAIN, LC_LOAD_DYLIB libSystem, LC_CODE_SIGNATURE (LAST).
+//!   LC_MAIN, LC_LOAD_DYLIB libSystem, an LC_LOAD_DYLIB per user library and the
+//!   LC_RPATHs they need, LC_CODE_SIGNATURE (LAST).
+//! A user library also forces this path, even with no import, so dyld loads it.
 //! The `__got` slot is seeded with the chained-fixups bind sentinel
 //! (0x8000000000000000), and `LC_DYLD_CHAINED_FIXUPS` names `_write` against
 //! libSystem so dyld binds the slot at load. `assemble` reports every segment's
@@ -60,6 +62,7 @@ const LC_LOAD_DYLIB: u32 = 0xc;
 const LC_MAIN: u32 = 0x28 | LC_REQ_DYLD;
 const LC_DYLD_CHAINED_FIXUPS: u32 = 0x34 | LC_REQ_DYLD;
 const LC_CODE_SIGNATURE: u32 = 0x1d;
+const LC_RPATH: u32 = 0x1c | LC_REQ_DYLD;
 
 const VM_PROT_READ: u32 = 0x1;
 const VM_PROT_WRITE: u32 = 0x2;
@@ -76,11 +79,48 @@ const S_NON_LAZY_SYMBOL_POINTERS: u32 = 0x6;
 const SG_READ_ONLY: u32 = 0x10;
 
 /// One dyld-imported external symbol, named by its dyld-facing linkage name (with
-/// the leading `_`, e.g. `_write`/`_labs`). All imports come from libSystem (the only
-/// LC_LOAD_DYLIB, so every dylib ordinal is 1). The imports slice is stable-sorted by
-/// name, so its index is the symbol's `__got` slot.
+/// the leading `_`, e.g. `_write`/`_labs`), and the 1-based ordinal of the
+/// LC_LOAD_DYLIB that exports it: libSystem is always 1, `Libraries.dylibs[i]` is
+/// i + 2. The imports slice is stable-sorted by name, so its index is the symbol's
+/// `__got` slot.
 pub const Import = struct {
     name: []const u8,
+    ordinal: u8 = 1,
+};
+
+/// A library loaded after libSystem, by the install name the binary records.
+/// dyld refuses to load a library whose own compatibility version is below
+/// `compat_version`, so it carries the library's own LC_ID_DYLIB values.
+pub const Dylib = struct {
+    install_name: []const u8,
+    current_version: u32 = 0,
+    compat_version: u32 = 0,
+};
+
+/// The libraries beyond libSystem and the LC_RPATH entries their `@rpath/` install
+/// names need. Empty (the default) keeps the image byte-identical to a build without
+/// user libraries.
+pub const Libraries = struct {
+    dylibs: []const Dylib = &.{},
+    rpaths: []const []const u8 = &.{},
+
+    /// The 8-bit import ordinal field reserves 0 and 0xF0..0xFF for special lookups.
+    pub const max_dylibs = 0xEF - 1;
+
+    fn isEmpty(self: Libraries) bool {
+        return self.dylibs.len == 0 and self.rpaths.len == 0;
+    }
+
+    fn cmdsCount(self: Libraries) u32 {
+        return @intCast(self.dylibs.len + self.rpaths.len);
+    }
+
+    fn cmdsSize(self: Libraries) u32 {
+        var n: u32 = 0;
+        for (self.dylibs) |d| n += pathCmdSize(24, d.install_name);
+        for (self.rpaths) |r| n += pathCmdSize(12, r);
+        return n;
+    }
 };
 
 /// The chained-fixups bind sentinel written into a SINGLE-import `__got` slot on
@@ -202,11 +242,12 @@ pub fn assemble(
     entry_text_off: u32,
     cstrings: []const u8,
     imports: []const Import,
+    libs: Libraries,
 ) !Layout {
-    if (cstrings.len == 0 and imports.len == 0) {
+    if (cstrings.len == 0 and imports.len == 0 and libs.isEmpty()) {
         return assembleEmpty(gpa, identifier, code, entry_text_off);
     }
-    return assembleMulti(gpa, identifier, code, entry_text_off, cstrings, imports);
+    return assembleMulti(gpa, identifier, code, entry_text_off, cstrings, imports, libs);
 }
 
 /// The unchanged single-segment layout (no __cstring, no imports). Kept
@@ -388,8 +429,12 @@ fn assembleMulti(
     entry_text_off: u32,
     cstrings: []const u8,
     imports: []const Import,
+    libs: Libraries,
 ) !Layout {
-    const code_file_off: u32 = std.mem.alignForward(u32, HEADER_SIZE + SIZEOFCMDS_MULTI, 4);
+    std.debug.assert(libs.dylibs.len <= Libraries.max_dylibs);
+    const ncmds: u32 = NCMDS_MULTI + libs.cmdsCount();
+    const sizeofcmds: u32 = SIZEOFCMDS_MULTI + libs.cmdsSize();
+    const code_file_off: u32 = std.mem.alignForward(u32, HEADER_SIZE + sizeofcmds, 4);
     const text_size: u32 = @intCast(code.len);
 
     std.debug.assert(entry_text_off < text_size);
@@ -441,8 +486,8 @@ fn assembleMulti(
     w.put32(CPU_TYPE_ARM64);
     w.put32(CPU_SUBTYPE_ARM64_ALL);
     w.put32(MH_EXECUTE);
-    w.put32(NCMDS_MULTI);
-    w.put32(SIZEOFCMDS_MULTI);
+    w.put32(ncmds);
+    w.put32(sizeofcmds);
     w.put32(MH_FLAGS);
     w.put32(0);
 
@@ -561,13 +606,32 @@ fn assembleMulti(
     w.put32(0x00010000); // compatibility_version
     w.path(LIBSYSTEM_PATH, DYLIB_CMD_SIZE, 24);
 
+    // Each user library follows libSystem, so its position fixes its import ordinal.
+    for (libs.dylibs) |d| {
+        const size = pathCmdSize(24, d.install_name);
+        w.put32(LC_LOAD_DYLIB);
+        w.put32(size);
+        w.put32(24);
+        w.put32(2);
+        w.put32(d.current_version);
+        w.put32(d.compat_version);
+        w.path(d.install_name, size, 24);
+    }
+    for (libs.rpaths) |r| {
+        const size = pathCmdSize(12, r);
+        w.put32(LC_RPATH);
+        w.put32(size);
+        w.put32(12);
+        w.path(r, size, 12);
+    }
+
     // LC_CODE_SIGNATURE (LAST).
     w.put32(LC_CODE_SIGNATURE);
     w.put32(SIG_CMD_SIZE);
     w.put32(sig_file_off);
     w.put32(sig_len);
 
-    std.debug.assert(w.pos == HEADER_SIZE + SIZEOFCMDS_MULTI);
+    std.debug.assert(w.pos == HEADER_SIZE + sizeofcmds);
 
     @memcpy(image[code_file_off..][0..code.len], code);
     @memcpy(image[cstring_file_off..][0..cstrings.len], cstrings);
@@ -688,8 +752,7 @@ fn buildChainedFixups(
     var name_off: u32 = 1;
     for (imports) |im| {
         // dyld_chained_import: ordinal:8 | weak:1 | name_offset:23.
-        const ordinal: u32 = 1; // libSystem is the only LC_LOAD_DYLIB → ordinal 1
-        const entry: u32 = (ordinal & 0xFF) | (name_off << 9);
+        const entry: u32 = @as(u32, im.ordinal) | (name_off << 9);
         w.put32(entry);
         name_off += @intCast(im.name.len + 1);
     }
@@ -799,7 +862,7 @@ fn rd64(image: []const u8, off: usize) u64 {
 }
 
 test "header fields" {
-    const layout = try assemble(testing.allocator, "stub", &stub_code, 0, &.{}, &.{});
+    const layout = try assemble(testing.allocator, "stub", &stub_code, 0, &.{}, &.{}, .{});
     defer testing.allocator.free(layout.image);
     const img = layout.image;
 
@@ -817,7 +880,7 @@ test "header fields" {
 }
 
 test "segments and load command order" {
-    const layout = try assemble(testing.allocator, "stub", &stub_code, 0, &.{}, &.{});
+    const layout = try assemble(testing.allocator, "stub", &stub_code, 0, &.{}, &.{}, .{});
     defer testing.allocator.free(layout.image);
     const img = layout.image;
 
@@ -844,7 +907,7 @@ test "segments and load command order" {
 }
 
 test "__PAGEZERO / __TEXT / __LINKEDIT geometry" {
-    const layout = try assemble(testing.allocator, "stub", &stub_code, 0, &.{}, &.{});
+    const layout = try assemble(testing.allocator, "stub", &stub_code, 0, &.{}, &.{}, .{});
     defer testing.allocator.free(layout.image);
     const img = layout.image;
 
@@ -873,7 +936,7 @@ test "__PAGEZERO / __TEXT / __LINKEDIT geometry" {
 }
 
 test "chained fixups, LC_MAIN entryoff, and sig placement" {
-    const layout = try assemble(testing.allocator, "stub", &stub_code, 0, &.{}, &.{});
+    const layout = try assemble(testing.allocator, "stub", &stub_code, 0, &.{}, &.{}, .{});
     defer testing.allocator.free(layout.image);
     const img = layout.image;
 
@@ -914,7 +977,7 @@ test "chained fixups, LC_MAIN entryoff, and sig placement" {
 test "nonzero entry_text_off shifts LC_MAIN entryoff" {
     // When `main` is not first in __text, its resolved offset is non-zero and the
     // entryoff must be code_file_off + that offset (so the kernel jumps to main).
-    const layout = try assemble(testing.allocator, "stub", &stub_code, 8, &.{}, &.{});
+    const layout = try assemble(testing.allocator, "stub", &stub_code, 8, &.{}, &.{}, .{});
     defer testing.allocator.free(layout.image);
     const img = layout.image;
 
@@ -941,7 +1004,7 @@ test "code spanning multiple pages grows __TEXT instead of being rejected" {
     // 4-byte-aligned blob so the layout assertions hold (real code is too).
     std.mem.writeInt(u32, big[0..4], 0xD65F03C0, .little); // ret at entry
 
-    const layout = try assemble(gpa, "stub", big, 0, &.{}, &.{});
+    const layout = try assemble(gpa, "stub", big, 0, &.{}, &.{}, .{});
     defer gpa.free(layout.image);
 
     // header+cmds+PAGE bytes of code spill into a second page -> __TEXT is 2 pages.
@@ -985,7 +1048,7 @@ test "buildChainedFixups reproduces the clang 96-byte blob" {
 }
 
 test "multi-seg: 9 commands in the expected order" {
-    const layout = try assemble(testing.allocator, "hello", &stub_code, 0, demo_cstrings, &demo_imports);
+    const layout = try assemble(testing.allocator, "hello", &stub_code, 0, demo_cstrings, &demo_imports, .{});
     defer testing.allocator.free(layout.image);
     const img = layout.image;
 
@@ -1013,7 +1076,7 @@ test "multi-seg: 9 commands in the expected order" {
 }
 
 test "multi-seg: __TEXT has __text + __cstring; __cstring carries the bytes" {
-    const layout = try assemble(testing.allocator, "hello", &stub_code, 0, demo_cstrings, &demo_imports);
+    const layout = try assemble(testing.allocator, "hello", &stub_code, 0, demo_cstrings, &demo_imports, .{});
     defer testing.allocator.free(layout.image);
     const img = layout.image;
 
@@ -1038,7 +1101,7 @@ test "multi-seg: __TEXT has __text + __cstring; __cstring carries the bytes" {
 }
 
 test "multi-seg: __DATA_CONST geometry, __got, and the seeded slot" {
-    const layout = try assemble(testing.allocator, "hello", &stub_code, 0, demo_cstrings, &demo_imports);
+    const layout = try assemble(testing.allocator, "hello", &stub_code, 0, demo_cstrings, &demo_imports, .{});
     defer testing.allocator.free(layout.image);
     const img = layout.image;
 
@@ -1082,7 +1145,7 @@ test "gotBindValue: chained-fixups bind encoding matches the clang 2-import refe
 test "multi-seg: two imports seed two chained __got slots + ordered import/symbol tables" {
     // Imports arrive in canonical (name-sorted) slot order: labs (0) before write (1).
     const two = [_]Import{ .{ .name = "_labs" }, .{ .name = "_write" } };
-    const layout = try assemble(testing.allocator, "hello", &stub_code, 0, demo_cstrings, &two);
+    const layout = try assemble(testing.allocator, "hello", &stub_code, 0, demo_cstrings, &two, .{});
     defer testing.allocator.free(layout.image);
     const img = layout.image;
 
@@ -1105,7 +1168,7 @@ test "multi-seg: two imports seed two chained __got slots + ordered import/symbo
 }
 
 test "multi-seg: fixups blob + sig placement, sig last" {
-    const layout = try assemble(testing.allocator, "hello", &stub_code, 0, demo_cstrings, &demo_imports);
+    const layout = try assemble(testing.allocator, "hello", &stub_code, 0, demo_cstrings, &demo_imports, .{});
     defer testing.allocator.free(layout.image);
     const img = layout.image;
 
@@ -1131,4 +1194,57 @@ test "multi-seg: fixups blob + sig placement, sig last" {
     try testing.expectEqual(layout.sig_file_off, sig_dataoff.?);
     // The sig region is the last thing in the file.
     try testing.expectEqual(@as(usize, layout.sig_file_off + layout.sig_len), img.len);
+}
+
+test "multi-seg: user dylibs follow libSystem, rpaths after them, and imports carry their ordinals" {
+    const imports = [_]Import{ .{ .name = "_labs" }, .{ .name = "_ffi_add", .ordinal = 2 }, .{ .name = "_z_crc", .ordinal = 3 } };
+    const dylibs = [_]Dylib{
+        .{ .install_name = "@rpath/libffi.dylib", .current_version = 0x10000, .compat_version = 0x10000 },
+        .{ .install_name = "/opt/z/lib/libz.1.dylib", .current_version = 0x10203 },
+    };
+    const rpaths = [_][]const u8{"/opt/ffi/lib"};
+    const layout = try assemble(testing.allocator, "hello", &stub_code, 0, demo_cstrings, &imports, .{ .dylibs = &dylibs, .rpaths = &rpaths });
+    defer testing.allocator.free(layout.image);
+    const img = layout.image;
+
+    const ncmds = rd32(img, 16);
+    try testing.expectEqual(NCMDS_MULTI + 3, ncmds);
+    var off: usize = HEADER_SIZE;
+    var dylib_names: [3][]const u8 = undefined;
+    var nd: usize = 0;
+    var rpath: []const u8 = "";
+    var last: u32 = 0;
+    for (0..ncmds) |_| {
+        const cmd = rd32(img, off);
+        const size = rd32(img, off + 4);
+        switch (cmd) {
+            LC_LOAD_DYLIB => {
+                dylib_names[nd] = std.mem.sliceTo(img[off + rd32(img, off + 8) .. off + size], 0);
+                if (nd == 2) try testing.expectEqual(@as(u32, 0x10203), rd32(img, off + 16));
+                nd += 1;
+            },
+            LC_RPATH => rpath = std.mem.sliceTo(img[off + rd32(img, off + 8) .. off + size], 0),
+            else => {},
+        }
+        last = cmd;
+        off += size;
+    }
+    try testing.expectEqual(@as(usize, HEADER_SIZE + rd32(img, 20)), off);
+    try testing.expectEqual(LC_CODE_SIGNATURE, last);
+    try testing.expectEqual(@as(usize, 3), nd);
+    try testing.expectEqualStrings(LIBSYSTEM_PATH, dylib_names[0]);
+    try testing.expectEqualStrings("@rpath/libffi.dylib", dylib_names[1]);
+    try testing.expectEqualStrings("/opt/z/lib/libz.1.dylib", dylib_names[2]);
+    try testing.expectEqualStrings("/opt/ffi/lib", rpath);
+
+    const blob = img[2 * PAGE ..];
+    const imports_off = rd32(blob, 8);
+    for (imports, 0..) |im, i| try testing.expectEqual(@as(u32, im.ordinal), rd32(blob, imports_off + 4 * i) & 0xFF);
+}
+
+test "a library with no imports still takes the multi-segment path to be loaded" {
+    const dylibs = [_]Dylib{.{ .install_name = "/usr/lib/libz.1.dylib" }};
+    const layout = try assemble(testing.allocator, "stub", &stub_code, 0, &.{}, &.{}, .{ .dylibs = &dylibs });
+    defer testing.allocator.free(layout.image);
+    try testing.expectEqual(NCMDS_MULTI + 1, rd32(layout.image, 16));
 }

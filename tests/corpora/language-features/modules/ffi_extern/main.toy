@@ -1,0 +1,12 @@
+# expect: exit 12
+# expect: stdout "OK\n"
+# The pub extern resolves qualified and selected; each call sits in the caller's unsafe.
+import c
+import c.{labs}
+
+fn main() -> int {
+    c.put_upper(111)
+    c.put_upper(107)
+    c.put_upper(10)
+    return unsafe { c.labs(-5) + labs(-7) }
+}

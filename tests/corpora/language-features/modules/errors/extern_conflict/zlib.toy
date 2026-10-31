@@ -1,0 +1,12 @@
+extern "z" {
+    fn crc32(crc: int, p: rawptr, n: int) -> int
+    fn zlibVersion() -> rawptr
+}
+
+pub fn empty() -> rawptr {
+    unsafe { zlibVersion() }
+}
+
+pub fn crc(c: int) -> int {
+    unsafe { crc32(c, zlibVersion(), 0) }
+}

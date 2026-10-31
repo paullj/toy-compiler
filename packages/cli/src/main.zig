@@ -100,6 +100,8 @@ pub fn main(init: std.process.Init) !void {
     var st: State = .{ .paths = .empty };
     defer st.paths.deinit(gpa);
     defer st.include.deinit(gpa);
+    defer st.libs.deinit(gpa);
+    defer st.lib_dirs.deinit(gpa);
 
     // COLLECT argv WITHOUT the program name into a gpa-owned list kept alive for the
     // WHOLE fn: Sink error strings AND Parsed string/append/variadic slices BORROW
@@ -279,7 +281,7 @@ pub fn main(init: std.process.Init) !void {
     // the config, 2 on a usage error or an unreadable entry. `--exit-zero` forces 0
     // regardless.
     if (st.check_seen) {
-        std.process.exit(try runCheck(gpa, out, level, usage, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.timings, st.sev, st.allow_core_imports, roots(&st)));
+        std.process.exit(try runCheck(gpa, out, level, usage, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.timings, st.sev, st.allow_core_imports, roots(&st), linkRequest(&st)));
     }
 
     // The DEFAULT action is to BUILD a signed executable: a bare `toy <file>` (and any
@@ -299,7 +301,7 @@ pub fn main(init: std.process.Init) !void {
 
     // Build the executable: output → `-o`/`--output`, else the default build dir.
     if (build_exe) {
-        std.process.exit(try emitExecutable(gpa, out, level, usage, st.target, st.paths.items, st.out_path, run_after, st.program_args, st.mode, st.codegen_stats, st.opt, st.specialize, st.opt_stats, st.timings, st.jlimit, threads, st.sev, st.allow_core_imports, roots(&st)));
+        std.process.exit(try emitExecutable(gpa, out, level, usage, st.target, st.paths.items, st.out_path, run_after, st.program_args, st.mode, st.codegen_stats, st.opt, st.specialize, st.opt_stats, st.timings, st.jlimit, threads, st.sev, st.allow_core_imports, roots(&st), linkRequest(&st)));
     }
 
     // `--emit ir`: print the target-independent IR for the whole program.
@@ -379,6 +381,9 @@ const State = struct {
     root: ?[]const u8 = null,
     // The `-I` roots in argv order; like `paths`, the elements borrow argv.
     include: std.ArrayList([]const u8) = .empty,
+    // `-l` and `-L` in argv order, borrowing argv.
+    libs: std.ArrayList([]const u8) = .empty,
+    lib_dirs: std.ArrayList([]const u8) = .empty,
     // `run`'s words after `--`, borrowing argv; they follow the binary's path in its argv.
     program_args: []const []const u8 = &.{},
     paths: std.ArrayList([]const u8),
@@ -448,6 +453,13 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
 fn takeRoots(gpa: std.mem.Allocator, p: anytype, st: *State) !void {
     st.root = p.root;
     for (p.include) |r| try st.include.append(gpa, r);
+    for (p.l) |l| try st.libs.append(gpa, l);
+    for (p.L) |d| try st.lib_dirs.append(gpa, d);
+}
+
+/// The `-l`/`-L` request `Libraries.collect` takes.
+fn linkRequest(st: *const State) toyc.Libraries.Request {
+    return .{ .libs = st.libs.items, .dirs = st.lib_dirs.items };
 }
 
 /// The search roots `discover` takes from `--root` and `-I`.
@@ -460,6 +472,8 @@ fn roots(st: *const State) Graph.Roots {
 fn checkRootDirs(io: Io, usage: Usage, st: *const State) !?u8 {
     if (st.root) |r| if (!isDir(io, r)) return try cliValueError(usage, .{ .kind = .bad_value, .arg = "--root", .got = r, .expected = "a directory" });
     for (st.include.items) |r| if (!isDir(io, r)) return try cliValueError(usage, .{ .kind = .bad_value, .arg = "-I", .got = r, .expected = "a directory" });
+    for (st.lib_dirs.items) |r| if (!isDir(io, r)) return try cliValueError(usage, .{ .kind = .bad_value, .arg = "-L", .got = r, .expected = "a directory" });
+    for (st.libs.items) |l| if (l.len == 0) return try cliValueError(usage, .{ .kind = .bad_value, .arg = "-l", .got = l, .expected = "a library name or .dylib path" });
     return null;
 }
 
@@ -771,6 +785,7 @@ fn emitExecutable(
     sev: SevCfg.SeverityConfig,
     allow_core_imports: bool,
     search: Graph.Roots,
+    link: toyc.Libraries.Request,
 ) !u8 {
     // A build takes the 1 ROOT (entry) file; the driver discovers the transitive
     // import graph from it and compiles the whole program. `argLine` flushes, because
@@ -919,6 +934,10 @@ fn emitExecutable(
     // The interpreter ran every stage clean: `lowered` is `.ok` with no EFFECTIVE error.
     const lp = &lowered.?.ok;
 
+    var libs = try toyc.Libraries.collect(gpa, io, &graph.?, link);
+    defer libs.deinit();
+    if (try reportLibraries(gpa, out, level, usage, &graph.?, &libs, sev)) |code| return code;
+
     // Render any surviving warnings + a summary, then build the binary. No warning
     // survives to here under `deny_warnings` (it would have promoted to an error and
     // bailed a stage), so the surviving warnings render as warnings and the build still
@@ -971,6 +990,7 @@ fn emitExecutable(
         lp.entry_off,
         lp.cstrings,
         lp.data_relocs,
+        libs.linking,
     );
     defer gpa.free(image);
 
@@ -1200,6 +1220,28 @@ fn argErr(usage: Usage, message: []const u8) noreturn {
     std.process.exit(usage_exit);
 }
 
+/// Report what stops the program's libraries from linking: a bad `-l` is a usage
+/// error, a bad `extern "name"` block a diagnostic at the block. Null when they link.
+fn reportLibraries(gpa: std.mem.Allocator, out: *Io.Writer, level: Style.ColorLevel, usage: Usage, g: *const Graph.Graph, libs: *const toyc.Libraries.Result, sev: SevCfg.SeverityConfig) !?u8 {
+    if (try reportLibraryUsage(usage, libs)) |code| return code;
+    if (libs.diags.len == 0) return null;
+    try DiagRender.renderScopedDiags(gpa, out, level, g, libs.diags, sev);
+    const counts = Check.tallyGraph(libs.diags, sev);
+    try DiagRender.renderDiagSummary(out, level, counts.errors, counts.warnings);
+    try out.flush();
+    return 1;
+}
+
+fn reportLibraryUsage(usage: Usage, libs: *const toyc.Libraries.Result) !?u8 {
+    if (libs.cli_errors.len == 0) return null;
+    for (libs.cli_errors) |e| {
+        try sty_err.styled(usage.w, usage.level, "error");
+        try usage.w.print("[{s}]: {s}\n", .{ codes.str(e.code).?, e.message });
+    }
+    try usage.w.flush();
+    return usage_exit;
+}
+
 /// `toy check <entry>`: the diagnostics-focused front-end. Runs the SAME graph
 /// front-end `build` drives — `Graph.discover` (FOLLOWING imports) -> `resolveGraph`
 /// -> `checkGraph` — then STOPS before codegen/lower/link. Reports EVERY diagnostic
@@ -1229,6 +1271,7 @@ fn runCheck(
     sev: SevCfg.SeverityConfig,
     allow_core_imports: bool,
     search: Graph.Roots,
+    link: toyc.Libraries.Request,
 ) !u8 {
     // `check` takes the 1 ROOT (entry) file, exactly like a `-o`/`--emit ir` build:
     // discover its transitive import graph.
@@ -1329,8 +1372,20 @@ fn runCheck(
             return 2;
         };
     }
+    var libs = toyc.Libraries.collect(gpa, cio, graph, link) catch |e| {
+        try argLine(usage, @errorName(e));
+        return 2;
+    };
+    defer libs.deinit();
+    if (try reportLibraryUsage(usage, &libs)) |code| return code;
     ns_typecheck = lapNs(cio, timings, &last_ns);
-    const type_diags: []const toyc.DiagnosticSink.Diagnostic = if (tc) |t| t.diags else &.{};
+    // A library error sits beside the type errors: like them, it is a fault in the
+    // program that `check` reports with the rest.
+    const checked: []const toyc.DiagnosticSink.Diagnostic = if (tc) |t| t.diags else &.{};
+    const type_diags = try gpa.alloc(toyc.DiagnosticSink.Diagnostic, checked.len + libs.diags.len);
+    defer gpa.free(type_diags);
+    @memcpy(type_diags[0..checked.len], checked);
+    @memcpy(type_diags[checked.len..], libs.diags);
 
     // SINGLE-MODULE (no imports discovered): render against the entry's ON-DISK `file`,
     // not its module `path` (a bare stem like `fix_bad` vs `/tmp/fix_bad.toy`), so the

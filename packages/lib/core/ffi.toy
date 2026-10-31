@@ -13,24 +13,24 @@ pub extern fn cos(x: float) -> float
 # `std` reaches C `labs` through this safe `abs`: the extern name resolves only inside
 # `core/`, so a std/user module calls this wrapper, never the raw extern.
 pub fn abs(x: int) -> int {
-    return labs(x)
+    return unsafe { labs(x) }
 }
 
 # Safe wrappers for the libm entry points. `std/math` calls these (never the raw externs,
 # which resolve only here). The `m` prefix keeps each wrapper distinct from the C-named
 # extern it forwards to.
 pub fn msqrt(x: float) -> float {
-    return sqrt(x)
+    return unsafe { sqrt(x) }
 }
 pub fn mfloor(x: float) -> float {
-    return floor(x)
+    return unsafe { floor(x) }
 }
 pub fn mceil(x: float) -> float {
-    return ceil(x)
+    return unsafe { ceil(x) }
 }
 pub fn msin(x: float) -> float {
-    return sin(x)
+    return unsafe { sin(x) }
 }
 pub fn mcos(x: float) -> float {
-    return cos(x)
+    return unsafe { cos(x) }
 }

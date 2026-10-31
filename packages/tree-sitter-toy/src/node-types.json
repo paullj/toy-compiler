@@ -1037,6 +1037,32 @@
     }
   },
   {
+    "type": "extern_block",
+    "named": true,
+    "fields": {
+      "library": {
+        "multiple": false,
+        "required": false,
+        "types": [
+          {
+            "type": "string",
+            "named": true
+          }
+        ]
+      }
+    },
+    "children": {
+      "multiple": true,
+      "required": false,
+      "types": [
+        {
+          "type": "function_declaration",
+          "named": true
+        }
+      ]
+    }
+  },
+  {
     "type": "field_expression",
     "named": true,
     "fields": {
@@ -3427,6 +3453,10 @@
       "types": [
         {
           "type": "enum_declaration",
+          "named": true
+        },
+        {
+          "type": "extern_block",
           "named": true
         },
         {

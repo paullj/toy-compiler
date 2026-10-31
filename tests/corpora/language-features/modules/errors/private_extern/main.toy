@@ -1,0 +1,7 @@
+# Feature: a non-pub extern follows the pub rules of any fn across modules.
+# expect: compile-error "function 'labs' is not exported by module 'c'"
+import c
+
+fn main() -> int {
+    return unsafe { c.labs(-5) }
+}

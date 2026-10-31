@@ -623,6 +623,17 @@ pub fn isSelfParam(tree: Tree, tokens: []const Token, src: []const u8, param_idx
     return n.tag == .param and isSelfTok(tokens, src, n.main_token);
 }
 
+/// The library an `extern_fn_decl` names through its `extern "lib" { .. }` block (the
+/// string token rides its synthesized body's main token), or null for libSystem.
+pub fn externLibrary(tree: Tree, tokens: []const Token, src: []const u8, decl_idx: Index) ?[]const u8 {
+    const n = tree.nodes[decl_idx.int()];
+    if (n.tag != .extern_fn_decl) return null;
+    const t = tokens[tree.nodes[n.rhs.int()].main_token];
+    if (t.tag != .string) return null;
+    const text = t.text(src);
+    return text[1 .. text.len - 1];
+}
+
 /// True when the `call` at `idx` came from `x |> f(..)` (see the `.call` tag). A
 /// synthetic call's `main_token` 0 is excluded, since `tokens[0]` is unrelated to it.
 pub fn isPipedCall(tree: Tree, tokens: []const Token, idx: Index) bool {
@@ -1184,7 +1195,9 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
         },
         .extern_fn_decl => {
             const proto = protoAt(tree, n.lhs.int());
-            try out.print("(extern-fn {s} (", .{tok_text});
+            try out.print("(extern-fn {s} ", .{tok_text});
+            if (externLibrary(tree, tokens, source, idx)) |lib| try out.print("\"{s}\" ", .{lib});
+            try out.writeByte('(');
             for (proto.params, 0..) |pidx, i| {
                 if (i != 0) try out.writeByte(' ');
                 try renderNode(out, tree, tokens, source, pidx);

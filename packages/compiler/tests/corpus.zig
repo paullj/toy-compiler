@@ -27,7 +27,9 @@
 //!   on a pipe (empty by default, never inherited), `# args: "a" "b c"` after argv[0],
 //!   only the `# env: K=V` variables, and its worker's scratch dir as cwd. Each
 //!   `# include: "<dir>"` adds an extra import root (the CLI's `-I`), relative to the
-//!   fixture's folder. The build+run is the same
+//!   fixture's folder. Each `# libdir: "<dir>"` adds a library folder (the CLI's `-L`),
+//!   relative to the fixture's folder; `"@harness"` is zig-out/test-lib, where
+//!   build.zig puts the C libraries built from `ffi/clib`. The build+run is the same
 //!   in-process path the real `toy build` uses (`Graph.discover` -> `resolveGraph`
 //!   -> `checkGraph` -> `lowerGraphProgram` -> `buildImage`), so it follows imports
 //!   and multi-file module graphs. Codegen+exec is gated on macOS/aarch64; off that
@@ -50,6 +52,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Io = std.Io;
 const toyc = @import("toy_compiler");
+const test_options = @import("test_options");
 
 const Driver = toyc.Driver;
 const Graph = toyc.Graph;
@@ -208,6 +211,9 @@ fn collectDiags(
             defer tc.deinit(gpa);
             try push.go(tc.diags);
         }
+        var libs = try toyc.Libraries.collect(gpa, io, &graph, .{});
+        defer libs.deinit();
+        try push.go(libs.diags);
     }
     if (push.bad_spans > 0) return error.SpanInvariant;
     if (push.foreign > 0) return error.ImportedModuleDiagnostic;
@@ -397,6 +403,8 @@ const Expect = struct {
     env: std.ArrayList([]const u8) = .empty,
     /// Extra import roots, relative to the fixture's folder.
     include: std.ArrayList([]const u8) = .empty,
+    /// Library folders (`-L`), relative to the fixture's folder, or `@harness`.
+    libdir: std.ArrayList([]const u8) = .empty,
 
     fn deinit(self: *Expect, gpa: std.mem.Allocator) void {
         if (self.stdout) |s| gpa.free(s);
@@ -410,6 +418,8 @@ const Expect = struct {
         self.env.deinit(gpa);
         for (self.include.items) |s| gpa.free(s);
         self.include.deinit(gpa);
+        for (self.libdir.items) |s| gpa.free(s);
+        self.libdir.deinit(gpa);
     }
 };
 
@@ -496,6 +506,13 @@ fn parseExpect(gpa: std.mem.Allocator, source: []const u8) !Expect {
             const owned = try gpa.dupe(u8, raw);
             errdefer gpa.free(owned);
             try e.include.append(gpa, owned);
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "# libdir:")) {
+            const raw = betweenQuotes(line["# libdir:".len..]) orelse return error.BadLibdirDirective;
+            const owned = try gpa.dupe(u8, raw);
+            errdefer gpa.free(owned);
+            try e.libdir.append(gpa, owned);
             continue;
         }
         if (std.mem.startsWith(u8, line, "# env:")) {
@@ -653,6 +670,23 @@ fn compileAndRun(
     try checkGraphSpans(gpa, &graph, tc.diags);
     if (countErr(tc.diags) > 0) return .{ .compile_error = try renderDiags(gpa, tc.diags) };
 
+    var libdirs: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (libdirs.items) |d| gpa.free(d);
+        libdirs.deinit(gpa);
+    }
+    for (e.libdir.items) |d| {
+        const dir = if (std.mem.eql(u8, d, "@harness"))
+            try gpa.dupe(u8, test_options.test_lib_dir)
+        else
+            try relDir(gpa, io, entry, d);
+        errdefer gpa.free(dir);
+        try libdirs.append(gpa, dir);
+    }
+    var libs = try toyc.Libraries.collect(gpa, io, &graph, .{ .dirs = libdirs.items });
+    defer libs.deinit();
+    if (libs.diags.len > 0) return .{ .compile_error = try renderDiags(gpa, libs.diags) };
+
     if (!can_exec) return .skipped_exec;
 
     var lowered = try DriverCodegen.lowerGraphProgram(gpa, io, cache, Driver.default_target, &graph, &res, &tc, .verify, .O0, true, null, null, 0);
@@ -666,7 +700,7 @@ fn compileAndRun(
     defer lp.deinit(gpa);
     if (lp.diags.len > 0) return .{ .compile_error = try std.fmt.allocPrint(gpa, "codegen diagnostics ({d})\n", .{lp.diags.len}) };
 
-    const image = try DriverCodegen.buildImage(io, gpa, out_name, lp.text, lp.entry_off, lp.cstrings, lp.data_relocs);
+    const image = try DriverCodegen.buildImage(io, gpa, out_name, lp.text, lp.entry_off, lp.cstrings, lp.data_relocs, libs.linking);
     defer gpa.free(image);
     {
         const perms: Io.File.Permissions = .fromMode(0o755);
@@ -684,6 +718,13 @@ fn compileAndRun(
         }
     }
     return .{ .ran = try runBinary(gpa, io, abs, e, cwd) };
+}
+
+/// The absolute path of `dir`, relative to the folder of the fixture `entry`.
+fn relDir(gpa: std.mem.Allocator, io: Io, entry: []const u8, dir: []const u8) ![]u8 {
+    const joined = try std.fs.path.join(gpa, &.{ std.fs.path.dirname(entry) orelse ".", dir });
+    defer gpa.free(joined);
+    return Io.Dir.cwd().realPathFileAlloc(io, joined, gpa);
 }
 
 /// Run `abs` with `e`'s args, stdin and environment, in `cwd`, capturing both output

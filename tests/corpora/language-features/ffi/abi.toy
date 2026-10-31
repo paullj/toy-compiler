@@ -1,0 +1,28 @@
+# expect: exit 0
+# libdir: "@harness"
+# Narrow C integers and bool: a return is widened to its toy width (Apple's callee
+# extends only to 32 bits), and stack arguments past x7 are packed at their own size.
+extern "toyffi" {
+    fn toyffi_neg8(x: int8) -> int8
+    fn toyffi_inc8(x: uint8) -> uint8
+    fn toyffi_sum16(a: int8, b: int16, c: int32) -> int16
+    fn toyffi_max32() -> uint32
+    fn toyffi_isneg(x: int) -> bool
+    fn toyffi_stack(a: int8, b: int, c: int, d: int, e: int, f: int, g: int, h: int, i: int8, j: int16, k: int8, l: int32, m: bool, n: uint8) -> int
+}
+
+fn main() -> int {
+    x: int8 = unsafe { toyffi_neg8(5) }
+    if x != -5 { return 1 }
+    y: uint8 = unsafe { toyffi_inc8(255) }
+    if y != 0 { return 2 }
+    s: int16 = unsafe { toyffi_sum16(-1, -2, -3) }
+    if s != -6 { return 3 }
+    m: uint32 = unsafe { toyffi_max32() }
+    if m != 4294967295 { return 4 }
+    if !(unsafe { toyffi_isneg(-3) }) { return 5 }
+    if (unsafe { toyffi_isneg(3) }) { return 6 }
+    r := unsafe { toyffi_stack(-1, 0, 0, 0, 0, 0, 0, 0, -2, -3, 4, -5, true, 6) }
+    if r != -1 - 20 - 300 + 4000 - 50000 + 100000 + 6000000 { return 7 }
+    return 0
+}

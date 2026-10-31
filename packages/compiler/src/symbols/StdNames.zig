@@ -202,6 +202,12 @@ pub fn scalarImplModule(ty: []const u8, protocol: []const u8) ?[]const u8 {
     return scalar_impls.get(key);
 }
 
+/// Whether a module is the bundled `core/` layer, the one place std binds C and names
+/// the heap intrinsics.
+pub fn isCoreModule(bundled: bool, path: []const u8) bool {
+    return bundled and std.mem.startsWith(u8, path, "core/");
+}
+
 /// The self-check modules only force or count collections for their tests, which std/gc
 /// does through a supported surface.
 const selftest_suffix = "_selftest";

@@ -4976,22 +4976,36 @@ fn decodeExternSig(t: *Typecheck, fn_idx: Ast.Index, mod: u32) !void {
     const decl = t.tree.nodes[fn_idx.int()];
     const proto = Ast.protoAt(t.tree, decl.lhs.int());
 
+    const mc = t.graph.mods[mod];
+    const core = StdNames.isCoreModule(mc.bundled, mc.path);
+    const bad_type_msg = if (core)
+        "extern function parameter/return type must be int, float, str, rawptr, or bool"
+    else
+        "extern function parameter/return type must be int, float, rawptr, or bool";
     const params = try t.gpa.alloc(Type, proto.params.len);
     for (proto.params, 0..) |param_idx, i| {
         const param = t.tree.nodes[param_idx.int()];
         const pty = t.typeFromNode(param.lhs);
-        if (externTypeOk(pty)) {
+        // Core's `str` spread is a private convention of its own wrappers; a C function a
+        // program declares expects a NUL-terminated pointer, which a `str` is not.
+        if (pty.kind == .str and !core) {
+            try t.sink.report(.{ .span = t.fieldTypeSpan(param_idx), .code = .T0037 }, "an extern function cannot take a 'str', which is not NUL-terminated; pass a 'rawptr'", .{});
+            params[i] = .invalid;
+        } else if (externTypeOk(pty)) {
             params[i] = pty;
         } else {
-            try t.sink.report(.{ .span = t.fieldTypeSpan(param_idx), .code = .T0037 }, "extern function parameter/return type must be int, float, str, rawptr, or bool", .{});
+            try t.sink.report(.{ .span = t.fieldTypeSpan(param_idx), .code = .T0037 }, "{s}", .{bad_type_msg});
             params[i] = .invalid;
         }
     }
     var ret = refs.retTypeFromNode(t, proto.ret_type);
     // A `void` extern omits `-> R` (ret == unit); an EXPLICIT return must be a C-ABI
     // scalar, or `never` for a C fn that does not return (`exit`, `abort`).
-    if (proto.ret_type != Ast.none and ret.kind != .never and !externTypeOk(ret)) {
-        try t.sink.report(.{ .span = t.spanOf(proto.ret_type), .code = .T0037 }, "extern function parameter/return type must be int, float, str, rawptr, or bool", .{});
+    if (proto.ret_type != Ast.none and ret.kind == .str and !core) {
+        try t.sink.report(.{ .span = t.spanOf(proto.ret_type), .code = .T0037 }, "an extern function cannot return a 'str'; return a 'rawptr'", .{});
+        ret = .invalid;
+    } else if (proto.ret_type != Ast.none and ret.kind != .never and !externTypeOk(ret)) {
+        try t.sink.report(.{ .span = t.spanOf(proto.ret_type), .code = .T0037 }, "{s}", .{bad_type_msg});
         ret = .invalid;
     }
     try t.fns.append(t.gpa, .{ .decl_node = fn_idx, .kind = .import, .params = params, .ret = ret, .mod = mod });
@@ -10510,7 +10524,7 @@ test "an extern and the seeded panic both return never" {
     var c = try checkSourceAs(
         \\extern fn abort() -> never
         \\fn pick(n: int) -> int {
-        \\ if n > 0 { n } else { abort() }
+        \\ if n > 0 { n } else { unsafe { abort() } }
         \\}
         \\fn main() -> int {
         \\ return pick(3)
@@ -10526,6 +10540,27 @@ test "an extern and the seeded panic both return never" {
         } else return error.TestExpectedFn;
         try testing.expectEqual(Kind.never, c.result.sigs[id].ret.kind);
     }
+}
+
+test "an extern call outside unsafe is T0079, in core too; inside unsafe (or a lambda in it) it checks" {
+    const outside = "extern fn labs(x: int) -> int\nfn main() -> int {\n return labs(-1)\n}\n";
+    try expectOnlyDiag(outside, .T0079);
+    const gpa = testing.allocator;
+    var c = try checkSourceAs(outside, .core);
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 1), c.result.diags.len);
+    try testing.expectEqual(codes.Code.T0079, c.result.diags[0].code);
+    try testing.expectEqual(@as(usize, 0), try checkDiagCount("extern { fn labs(x: int) -> int }\nfn main() -> int {\n f := unsafe { fn(x: int) -> int { labs(x) } }\n return f(-1) + unsafe { -2 |> labs }\n}\n"));
+    try expectOnlyDiag("extern fn labs(x: int) -> int\nfn main() -> int {\n f := fn(x: int) -> int { labs(x) }\n return unsafe { f(-1) }\n}\n", .T0079);
+}
+
+test "a str in a program's extern signature is one T0037, and the extern stays callable" {
+    try expectOnlyDiag("extern fn puts(s: str) -> int32\nfn main() -> int {\n _n := unsafe { puts(\"x\") }\n return 0\n}\n", .T0037);
+    try expectOnlyDiag("extern fn getenv(p: rawptr) -> str\nfn main() -> int {\n return 0\n}\n", .T0037);
+    const gpa = testing.allocator;
+    var c = try checkSourceAs("extern fn write(fd: int, s: str) -> int\nfn main() -> int {\n return unsafe { write(1, \"x\") }\n}\n", .core);
+    defer c.deinit(gpa);
+    try testing.expectEqual(@as(usize, 0), c.result.diags.len);
 }
 
 test "a user fn named panic keeps its declared type" {

@@ -1,0 +1,12 @@
+# A module binding libSystem functions: a pub extern its importers call inside their own
+# `unsafe`, and a private block extern behind a safe wrapper.
+pub extern fn labs(x: int) -> int
+
+extern {
+    fn putchar(c: int32) -> int32
+    fn toupper(c: int32) -> int32
+}
+
+pub fn put_upper(c: int32) {
+    unsafe { putchar(toupper(c)) }
+}

@@ -713,6 +713,10 @@ fn AppendLists(comptime cmd: Spec.Command) type {
 /// Parsed slice field so it is byte-identical to what the slice will hold.
 fn optListStruct(comptime cmd: Spec.Command) type {
     comptime {
+        // Each append option re-derives every field name of `Parsed(cmd)`, so the work
+        // grows with options x appends; a caller's quota does not reach this type-level
+        // evaluation, so it is raised here, in proportion to the spec.
+        @setEvalBranchQuota(2000 * (cmd.options.len + 1) * (cmd.options.len + 1));
         var n: usize = 0;
         for (cmd.options) |o| {
             if (o.action == .append) n += 1;

@@ -55,7 +55,7 @@ echo "building toy..."
 if command -v zig >/dev/null 2>&1; then zig="zig"
 elif command -v mise >/dev/null 2>&1; then zig="mise exec -- zig"
 else echo "build failed: no zig (and no mise to provide it)"; exit 1; fi
-( cd "$root" && $zig build ) || { echo "build failed"; exit 1; }
+( cd "$root" && $zig build install test-lib ) || { echo "build failed"; exit 1; }
 [ -x "$toyc" ] || { echo "no toyc binary at $toyc"; exit 1; }
 
 # GNU timeout is `timeout`, or `gtimeout` from Homebrew coreutils; macOS ships neither,
@@ -86,10 +86,17 @@ while IFS= read -r src; do
   want_cerr=0
   grep -qE '^compile-error' <<<"$directives" && want_cerr=1
 
+  # `# libdir:` folders as the corpus harness gives them (`-L`): relative to the
+  # fixture, or `@harness` for the C libraries `zig build test-lib` builds.
+  lib_flags=()
+  while IFS= read -r d; do
+    case "$d" in @harness) lib_flags+=(-L "$root/zig-out/test-lib") ;; *) lib_flags+=(-L "$(dirname "$src")/$d") ;; esac
+  done < <(grep -E '^# libdir:' "$src" | sed -E 's/^# libdir:[^"]*"(.*)".*$/\1/')
+
   b0="$work/$(basename "$src" .toy).o0"
   b1="$work/$(basename "$src" .toy).o1"
-  limit 30 "$toyc" --no-cache -O0 -o "$b0" "$src" >/dev/null 2>&1; c0=$?
-  limit 30 "$toyc" --no-cache -O1 -o "$b1" "$src" >/dev/null 2>&1; c1=$?
+  limit 30 "$toyc" --no-cache -O0 ${lib_flags[@]+"${lib_flags[@]}"} -o "$b0" "$src" >/dev/null 2>&1; c0=$?
+  limit 30 "$toyc" --no-cache -O1 ${lib_flags[@]+"${lib_flags[@]}"} -o "$b1" "$src" >/dev/null 2>&1; c1=$?
 
   if [ "$want_cerr" -eq 1 ]; then
     if [ "$c0" -eq 0 ] || [ "$c1" -eq 0 ]; then

@@ -27,6 +27,7 @@ const Walk = @import("../ast/Walk.zig");
 const Fingerprint = @import("../query/Fingerprint.zig");
 const Link = @import("../link/Link.zig");
 const link = @import("../link/emit.zig");
+const Dylib = @import("../link/Dylib.zig");
 const Abi = @import("../codegen/abi/Abi.zig");
 const Derive = @import("../symbols/Derive.zig");
 const Body = @import("../symbols/Body.zig");
@@ -675,8 +676,9 @@ pub fn buildImage(
     entry_off: u32,
     cstrings: []const u8,
     data_relocs: []const Link.Reloc,
+    libs: Dylib.Linking,
 ) ![]u8 {
-    return link.assembleAndSign(io, gpa, identifier, code, entry_off, cstrings, data_relocs);
+    return link.assembleAndSign(io, gpa, identifier, code, entry_off, cstrings, data_relocs, libs);
 }
 
 const testing = std.testing;

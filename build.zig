@@ -109,6 +109,28 @@ pub fn build(b: *std.Build) void {
     test_bin_step.dependOn(&b.addInstallArtifact(exe_tests, .{}).step);
     test_bin_step.dependOn(&install_exe.step);
 
+    // The C libraries the FFI corpus fixtures and integration tests link, built from
+    // tests/corpora/language-features/ffi/clib into zig-out/test-lib. A test reaches
+    // them through `test_lib_dir`, the folder it passes as `-L`.
+    const test_lib_dest: std.Build.InstallDir = .{ .custom = "test-lib" };
+    const test_lib_dir = b.getInstallPath(test_lib_dest, "");
+    const test_lib_step = b.step("test-lib", "Build the C libraries the FFI tests link into zig-out/test-lib");
+    var test_lib_installs: [2]*std.Build.Step = undefined;
+    for ([_][]const u8{ "toyffi", "toyffi2" }, &test_lib_installs) |name, *slot| {
+        const lib = b.addLibrary(.{
+            .name = name,
+            .linkage = .dynamic,
+            .root_module = b.createModule(.{ .target = target, .optimize = .ReleaseSafe, .link_libc = true }),
+        });
+        lib.root_module.addCSourceFile(.{ .file = b.path(b.fmt("tests/corpora/language-features/ffi/clib/{s}.c", .{name})) });
+        const inst = b.addInstallArtifact(lib, .{ .dest_dir = .{ .override = test_lib_dest } });
+        test_bin_step.dependOn(&inst.step);
+        test_lib_step.dependOn(&inst.step);
+        slot.* = &inst.step;
+    }
+    const corpus_options = b.addOptions();
+    corpus_options.addOption([]const u8, "test_lib_dir", test_lib_dir);
+
     // Integration tests consume the compiler as a BLACK BOX through the published
     // `toy_compiler` module (root.zig's pub exports) — `@import("toy_compiler")`,
     // never `../` into the compiler source (a Zig module can't import above its root).
@@ -143,6 +165,7 @@ pub fn build(b: *std.Build) void {
     // spawn a stale binary or find none on a fresh checkout.
     const test_options = b.addOptions();
     test_options.addOption([]const u8, "toy_exe", b.getInstallPath(.bin, exe.out_filename));
+    test_options.addOption([]const u8, "test_lib_dir", test_lib_dir);
     integration_mod.addOptions("test_options", test_options);
     const integration_tests = b.addTest(.{
         .name = "toy-integration-test",
@@ -150,6 +173,7 @@ pub fn build(b: *std.Build) void {
     });
     const run_integration = b.addRunArtifact(integration_tests);
     run_integration.step.dependOn(&install_exe.step);
+    for (test_lib_installs) |st| run_integration.step.dependOn(st);
     test_step.dependOn(&run_integration.step);
     // Install the integration binary too so it runs directly
     // (`./zig-out/bin/toy-integration-test`) alongside toy-test under `test-bin`.
@@ -167,7 +191,10 @@ pub fn build(b: *std.Build) void {
             .imports = &.{.{ .name = "toy_compiler", .module = mod }},
         }),
     });
-    test_step.dependOn(&b.addRunArtifact(corpus_tests).step);
+    corpus_tests.root_module.addOptions("test_options", corpus_options);
+    const run_corpus = b.addRunArtifact(corpus_tests);
+    for (test_lib_installs) |st| run_corpus.step.dependOn(st);
+    test_step.dependOn(&run_corpus.step);
     test_bin_step.dependOn(&b.addInstallArtifact(corpus_tests, .{}).step);
 
     // The language-server tests (transport framing, document store, diagnostic mapping,

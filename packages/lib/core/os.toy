@@ -26,7 +26,7 @@ fn load_i32(p: rawptr) -> int {
 
 # A copy of the NUL-terminated bytes at `p`.
 pub fn from_cstr(p: rawptr) -> str {
-    n := strlen(p)
+    n := unsafe { strlen(p) }
     buf := text.alloc(n)
     w := text.window(buf, 0, n)
     for i in 0..n {
@@ -47,16 +47,16 @@ pub fn to_cstr(s: str) -> rawptr {
 
 # The calling thread's errno, as the last failed libSystem call left it.
 pub fn errno() -> int {
-    return load_i32(__error())
+    return load_i32(unsafe { __error() })
 }
 
 # std cannot name an extern, so it ends the process through this wrapper.
 pub fn exit_process(code: int) -> never {
-    exit(code)
+    unsafe { exit(code) }
 }
 
 pub fn argc() -> int {
-    return load_i32(_NSGetArgc())
+    return load_i32(unsafe { _NSGetArgc() })
 }
 
 # argv[i] as a copied str; the caller keeps `0 <= i < argc()`.
@@ -68,7 +68,7 @@ pub fn argv(i: int) -> str {
 
 # The value of the environment variable `name`, or none when it is unset.
 pub fn env(name: str) -> Option[str] {
-    p := getenv(to_cstr(name))
+    p := unsafe { getenv(to_cstr(name)) }
     if p == 0 { return Option[str].none }
     return Option.some(from_cstr(offset(p, 0)))
 }
@@ -76,12 +76,12 @@ pub fn env(name: str) -> Option[str] {
 # Darwin's CLOCK_MONOTONIC (6). It keeps counting while the machine sleeps, so an elapsed
 # time includes the sleep, as a wall-clock duration should.
 pub fn monotonic_ns() -> int {
-    return clock_gettime_nsec_np(6)
+    return unsafe { clock_gettime_nsec_np(6) }
 }
 
 # Darwin's CLOCK_REALTIME (0): nanoseconds since 1970.
 pub fn realtime_ns() -> int {
-    return clock_gettime_nsec_np(0)
+    return unsafe { clock_gettime_nsec_np(0) }
 }
 
 # Sleeps at least `ns` nanoseconds. A signal cuts nanosleep short and leaves what remains in
@@ -94,7 +94,7 @@ pub fn sleep_ns(ns: int) {
         store(req, ns / 1_000_000_000)
         store(offset(req, 8), ns % 1_000_000_000)
     }
-    while nanosleep(req, rem) != 0 && errno() == 4 {
+    while (unsafe { nanosleep(req, rem) }) != 0 && errno() == 4 {
         unsafe {
             store(req, load(rem))
             store(offset(req, 8), load(offset(rem, 8)))
@@ -109,7 +109,7 @@ pub extern fn getentropy(buf: rawptr, len: int) -> int
 # 64 bits from the kernel's CSPRNG.
 pub fn entropy_u64() -> uint64 {
     buf := gc_alloc(8)
-    if (getentropy(buf, 8) & 0xFFFF_FFFF) != 0 { panic("getentropy failed") }
+    if (unsafe { getentropy(buf, 8) } & 0xFFFF_FFFF) != 0 { panic("getentropy failed") }
     v: uint64 = unsafe { load(buf) }
     return v
 }

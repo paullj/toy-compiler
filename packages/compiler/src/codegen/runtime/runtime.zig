@@ -42,6 +42,10 @@ pub const hand_builtins = [_]HandBuiltin{
     .{ .name = "__uint_to_str", .lower = str.lowerUintToStr, .static_call_deps = &.{"gc_alloc"} },
 };
 
+/// Every C symbol a hand-emitted builtin imports, sorted. They bind to libSystem, so
+/// a user `extern` block that names one for another library is a conflict.
+pub const libsystem_imports = [_][]const u8{ "calloc", "free", "malloc", "mmap", "msync", "munmap", "realloc", "write" };
+
 /// The `hand_builtins` index of `name`, resolved at comptime — lets a caller name
 /// a specific builtin (e.g. `panic`, which drives the backtrace symbol table)
 /// without hardcoding a numeric slot.
@@ -91,6 +95,25 @@ test "hand_builtins static_call_deps name real rows; gc_alloc pulls gc_collect" 
     const mpt = hand_builtins[comptime handBuiltinIndex("mp_trace")].static_call_deps;
     try std.testing.expectEqual(@as(usize, 1), mpt.len);
     try std.testing.expectEqualStrings("gc_mark_leaf", mpt[0]);
+}
+
+test "libsystem_imports lists every symbol a hand builtin imports" {
+    const gpa = std.testing.allocator;
+    var seen: [libsystem_imports.len]bool = @splat(false);
+    for (hand_builtins) |hb| {
+        var fc = try hb.lower(gpa);
+        defer fc.deinit(gpa);
+        for (fc.relocs) |r| if (r.target == .import) {
+            for (libsystem_imports, 0..) |nm, i| {
+                if (std.mem.eql(u8, nm, r.target.import.name)) {
+                    seen[i] = true;
+                    break;
+                }
+            } else return error.UnlistedImport;
+        };
+    }
+    for (seen) |s| try std.testing.expect(s);
+    for (libsystem_imports[1..], 0..) |nm, i| try std.testing.expect(std.mem.lessThan(u8, libsystem_imports[i], nm));
 }
 
 test {

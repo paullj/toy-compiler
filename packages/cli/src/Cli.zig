@@ -41,6 +41,13 @@ const roots_opts: []const Spec.Option = &.{
     .{ .long = "include", .short = 'I', .value = .string, .action = .append, .value_name = "DIR", .help = "Extra root to look up imports in, after the module root (repeatable)" },
 };
 
+/// The dynamic libraries a program links, shared by every command that compiles so
+/// `check` reports a library that `build` could not find.
+const link_opts: []const Spec.Option = &.{
+    .{ .short = 'l', .value = .string, .action = .append, .value_name = "NAME", .help = "Link the dynamic library lib<NAME>.dylib, or a .dylib path (repeatable)" },
+    .{ .short = 'L', .value = .string, .action = .append, .value_name = "DIR", .help = "Search DIR for -l and extern \"name\" libraries, before the default folders (repeatable)" },
+};
+
 /// `--target`, shared by every command that takes it, so `check` validates it too.
 const target_opt: Spec.Option = .{ .long = "target", .value = .{ .@"enum" = &toyc.Driver.targets }, .value_name = "TARGET", .help = "Compilation target (default: " ++ toyc.Driver.default_target ++ ")" };
 
@@ -51,7 +58,7 @@ const pass_names = std.meta.fieldNames(toyc.Opt.Pass);
 const pre_emit: []const Spec.Option = &[_]Spec.Option{
     .{ .long = "output", .short = 'o', .value = .string, .value_name = "PATH", .help = "Output path for the built binary (default: .toy/<stamp>/build/<name>)" },
     target_opt,
-} ++ roots_opts;
+} ++ roots_opts ++ link_opts;
 const post_emit: []const Spec.Option = &[_]Spec.Option{
     // -j: N>=1; the parser rejects -j0/negatives as a bad value via the Range.
     .{ .short = 'j', .value = .{ .int = .{ .min = 1, .max = null } }, .value_name = "N", .help = "Build worker threads (N>=1; -j1 = serial; default cpu-based)" },
@@ -108,13 +115,13 @@ const check_opts: []const Spec.Option = &[_]Spec.Option{
     .{ .long = "color", .value = .{ .@"enum" = &.{ "auto", "always", "never" } }, .value_name = "WHEN", .help = "Colorize output (default auto: on when stdout is a tty)" },
     target_opt,
     .{ .long = "timings", .action = .set_true, .help = "Print the per-stage wall-clock profile" },
-} ++ roots_opts ++ dev_core_opt;
+} ++ roots_opts ++ link_opts ++ dev_core_opt;
 
 /// The build options `check` does not take, so that using one names it as a build option.
 const check_declined: []const Spec.Option = blk: {
     var list: []const Spec.Option = &.{};
     for (shared_opts) |o| {
-        const taken = if (o.long) |l| hasLong(check_opts, l) else false;
+        const taken = if (o.long) |l| hasLong(check_opts, l) else hasShort(check_opts, o.short.?);
         if (!taken) list = list ++ &[_]Spec.Option{o};
     }
     break :blk list;
@@ -171,6 +178,13 @@ comptime {
 fn hasLong(comptime opts: []const Spec.Option, comptime long: []const u8) bool {
     for (opts) |o| {
         if (o.long) |l| if (std.mem.eql(u8, l, long)) return true;
+    }
+    return false;
+}
+
+fn hasShort(comptime opts: []const Spec.Option, comptime short: u8) bool {
+    for (opts) |o| {
+        if (o.long == null and o.short == short) return true;
     }
     return false;
 }

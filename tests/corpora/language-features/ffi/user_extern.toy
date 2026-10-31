@@ -1,0 +1,22 @@
+# expect: exit 42
+# expect: stdout "Hi\n"
+# A program binds libSystem itself: a bare extern and a block without a library name both
+# bind there, and each call sits inside `unsafe`.
+extern fn putchar(c: int32) -> int32
+
+extern {
+    fn labs(x: int) -> int
+    fn toupper(c: int32) -> int32
+}
+
+fn put(c: int32) {
+    unsafe { putchar(c) }
+}
+
+fn main() -> int {
+    unsafe { putchar(toupper(104)) }
+    put(105)
+    put(10)
+    n := unsafe { labs(-40) }
+    return n + unsafe { labs(-2) }
+}

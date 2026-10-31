@@ -1,0 +1,2 @@
+# An extern without `pub` is private to its module, like any fn.
+extern fn labs(x: int) -> int

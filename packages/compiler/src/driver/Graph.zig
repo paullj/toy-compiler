@@ -22,6 +22,7 @@ const std = @import("std");
 const Io = std.Io;
 const Token = @import("../ast/Token.zig").Token;
 const Ast = @import("../ast/Ast.zig");
+const StdNames = @import("../symbols/StdNames.zig");
 const Cache = @import("../query/Cache.zig");
 const Engine = @import("../query/Engine.zig");
 const DiagnosticMod = @import("../diagnostics/Diagnostic.zig");
@@ -107,7 +108,7 @@ pub const Module = struct {
     /// module may import it (R0013). `std/` is bundled but NOT core, so it calls
     /// core's members without itself naming an intrinsic.
     pub fn isCore(m: Module) bool {
-        return m.bundled and std.mem.startsWith(u8, m.path, "core/");
+        return StdNames.isCoreModule(m.bundled, m.path);
     }
 
     fn deinit(m: *Module, gpa: std.mem.Allocator) void {

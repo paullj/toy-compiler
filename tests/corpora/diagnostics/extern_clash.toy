@@ -1,0 +1,13 @@
+# A C symbol comes from one library. A block that binds one the toy runtime or a bundled
+# module imports from libSystem is the conflict, reported at the block's extern.
+import std/io
+
+extern "z" {
+    fn malloc(n: int) -> rawptr  #~ ERROR [R0018] C symbol 'malloc' is bound to library 'z' here but to 'libSystem' by the toy runtime
+    fn strlen(p: rawptr) -> int  #~ ERROR [R0018] C symbol 'strlen' is bound to library 'z' here but to 'libSystem' in module 'core/os'
+}
+
+fn main() -> int {
+    io.print("x\n")
+    0
+}

@@ -1,0 +1,12 @@
+struct P { x: int }
+
+extern "c" {
+    fn puts(s: str) -> int32  #~ ERROR [T0037] an extern function cannot take a 'str', which is not NUL-terminated; pass a 'rawptr'
+    fn getenv(name: rawptr) -> str  #~ ERROR [T0037] an extern function cannot return a 'str'; return a 'rawptr'
+    fn frob(p: P) -> int  #~ ERROR [T0037] extern function parameter/return type must be int, float, rawptr, or bool
+}
+
+fn main() -> int {
+    _n := unsafe { puts("one error per bad extern; its calls still check") }
+    return unsafe { frob(P { x: 1 }) }
+}

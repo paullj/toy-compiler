@@ -1,0 +1,9 @@
+# expect: compile-error "[R0018]: C symbol 'crc32' is bound to library"
+# One C symbol comes from one library: zlib binds crc32 to libz, this module to libSystem.
+import zlib
+
+extern fn crc32(crc: int, p: rawptr, n: int) -> int
+
+fn main() -> int {
+    unsafe { crc32(0, zlib.empty(), 0) + zlib.crc(0) }
+}
