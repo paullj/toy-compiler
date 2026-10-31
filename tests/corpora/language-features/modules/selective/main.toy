@@ -1,0 +1,44 @@
+# expect: stdout "6\n10\n5\n7\nbox\nrect\n5\n9\n"
+# expect: exit 0
+# A selective import binds each listed `pub` item bare, under its `as` name when it
+# has one: a fn, a generic fn, a struct (its methods and conformances come with it),
+# an enum (its variants too), a protocol and a type alias (its target's associated fns
+# too). The module name is not bound.
+import std/io.{println}
+import geo/shapes.{
+    Rect,
+    Color as C,
+    area as size,
+    Named,
+    Meters,
+    pick,
+    Plane,
+}
+
+type Span = Meters
+
+struct Box { w: int }
+
+impl Box has Named {
+    fn name(self) -> str { "box" }
+}
+
+fn show[T has Named](x: T) -> str { x.name() }
+
+fn main() -> int {
+    r := Rect { w: 2, h: 3 }
+    println(size(r))
+    println(r.perimeter())
+    m: Meters = 5
+    println(m)
+    s: Span = 7
+    println(s)
+    println(show(Box { w: 1 }))
+    println(show(r))
+    println(pick[int](4, 5))
+    println(Plane.square(3).w * 3)
+    match C.green {
+        C.red -> 1,
+        C.green -> 0,
+    }
+}

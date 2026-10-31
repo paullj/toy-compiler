@@ -36,7 +36,7 @@ fn makeDir(gpa: std.mem.Allocator, io: Io, root: []const u8, sub: []const u8) ![
 /// over it, then: a warm build runs to `v2_exit`, a warm `--verify` build passes, and a
 /// cold build of the same sources in `root/c` runs to `v2_exit` too. Each build writes a
 /// fresh `-o` dir, since macOS kills an image re-signed in place.
-fn flip(root: []const u8, v1: []const File, v1_exit: u8, v2: []const File, v2_exit: u8) !void {
+pub fn flip(root: []const u8, v1: []const File, v1_exit: u8, v2: []const File, v2_exit: u8) !void {
     return flipAt(root, &.{}, v1, v1_exit, v2, v2_exit);
 }
 

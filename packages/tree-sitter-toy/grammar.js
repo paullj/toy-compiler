@@ -191,7 +191,15 @@ module.exports = grammar({
       ),
 
     import_declaration: ($) =>
-      seq("import", $.import_path, optional(seq("as", field("alias", $.identifier)))),
+      seq(
+        "import",
+        $.import_path,
+        optional(
+          choice(seq("as", field("alias", $.identifier)), seq(".", "{", commaList($.import_item), "}")),
+        ),
+      ),
+
+    import_item: ($) => seq(field("name", $.identifier), optional(seq("as", field("alias", $.identifier)))),
 
     import_path: ($) => sepBy1("/", $.identifier),
 

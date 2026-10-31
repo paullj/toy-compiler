@@ -68,6 +68,7 @@ pub fn checkGraphWith(
             mc.protocol_ids.deinit(gpa);
             mc.namespaces.deinit(gpa);
             mc.alias_ids.deinit(gpa);
+            gpa.free(mc.selections);
         }
         gpa.free(ctx.mods);
     }
@@ -135,16 +136,46 @@ fn bindNamespaces(
     const tree = m.tree();
     const prog = m.nodes[Ast.root(m.nodes).int()];
     if (prog.tag != .program) return;
+    var selections: std.ArrayList(Typecheck.GraphCtx.Selection) = .empty;
+    defer selections.deinit(gpa);
     for (Ast.rangeSlice(tree, prog.lhs.int())) |decl_idx| {
         const decl = m.nodes[decl_idx.int()];
-        if (decl.tag != .import_decl) continue;
+        if (!Ast.isImport(decl.tag)) continue;
         const target = importTarget(graph, m, decl) orelse continue;
+        if (decl.tag == .import_select_decl) {
+            for (Ast.importItems(tree, decl)) |item| {
+                const name = m.tokens[item.name.int()].text(m.source);
+                const kind: @FieldType(Typecheck.GraphCtx.Selection, "kind") = switch (pubItemTag(&graph.modules[target], name) orelse continue) {
+                    .struct_decl, .tuple_struct_decl, .enum_decl, .type_alias_decl => .type,
+                    .protocol_decl => .protocol,
+                    else => continue,
+                };
+                try selections.append(gpa, .{ .local = m.tokens[item.bound().int()].text(m.source), .name = name, .target = target, .kind = kind });
+            }
+            continue;
+        }
         const ns_tok: u32 = if (Ast.importAliasTok(decl).unwrap()) |alias| alias.int() else decl.main_token;
         const ns_name = m.tokens[ns_tok].text(m.source);
         // First binding wins (resolve_graph already diagnosed collisions).
         const gop = try mc.namespaces.getOrPut(gpa, ns_name);
         if (!gop.found_existing) gop.value_ptr.* = target;
     }
+    mc.selections = try selections.toOwnedSlice(gpa);
+}
+
+/// The tag of the `pub` top-level decl module `m` names `name`, or null.
+fn pubItemTag(m: *const Graph.Module, name: []const u8) ?Ast.Node.Tag {
+    if (m.nodes.len == 0) return null;
+    const tree = m.tree();
+    const prog = m.nodes[Ast.root(m.nodes).int()];
+    if (prog.tag != .program) return null;
+    for (Ast.rangeSlice(tree, prog.lhs.int())) |decl_idx| {
+        const decl = m.nodes[decl_idx.int()];
+        if (Ast.isImport(decl.tag) or decl.tag == .impl_decl or decl.tag == .impl_has_decl) continue;
+        if (!std.mem.eql(u8, m.tokens[decl.main_token].text(m.source), name)) continue;
+        return if (tree.isPub(decl_idx)) decl.tag else null;
+    }
+    return null;
 }
 
 /// The graph module id an `import_decl` in module `m` refers to (rebuild its

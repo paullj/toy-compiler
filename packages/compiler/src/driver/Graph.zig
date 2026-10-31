@@ -878,7 +878,7 @@ const Discoverer = struct {
 
         for (Ast.rangeSlice(tree, prog.lhs.int())) |decl_idx| {
             const decl = s_nodes[decl_idx.int()];
-            if (decl.tag != .import_decl) continue;
+            if (!Ast.isImport(decl.tag)) continue;
 
             // Rebuild the `/`-joined import path from the segment TOKEN indices.
             const seg_tokens = Ast.importPathToks(tree, decl);
@@ -1077,7 +1077,7 @@ fn importTokenSpan(d: *Discoverer, from: u32, target: u32) ?Span {
     if (prog.tag != .program) return null;
     for (Ast.rangeSlice(tree, prog.lhs.int())) |decl_idx| {
         const decl = s.nodes[decl_idx.int()];
-        if (decl.tag != .import_decl) continue;
+        if (!Ast.isImport(decl.tag)) continue;
         const seg_tokens = Ast.importPathToks(tree, decl);
         const path = joinPath(d.gpa, s.tokens, s.source, seg_tokens) catch return null;
         defer d.gpa.free(path);

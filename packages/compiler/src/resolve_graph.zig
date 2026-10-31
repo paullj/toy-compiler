@@ -119,6 +119,12 @@ const ModuleTables = struct {
     enums: std.StringHashMapUnmanaged(bool) = .empty,
     /// Import namespaces: bound name → imported module id.
     namespaces: std.StringHashMapUnmanaged(u32) = .empty,
+    /// Names bound by selective imports → the token that binds each (its alias, else
+    /// the selected name).
+    selected: std.StringHashMapUnmanaged(u32) = .empty,
+    /// The selected type aliases and protocols, which no other table holds → the kind
+    /// `typeLevelKind` gives them.
+    selected_kinds: std.StringHashMapUnmanaged([]const u8) = .empty,
 
     fn deinit(self: *ModuleTables, gpa: std.mem.Allocator) void {
         self.fns.deinit(gpa);
@@ -126,6 +132,8 @@ const ModuleTables = struct {
         self.structs.deinit(gpa);
         self.enums.deinit(gpa);
         self.namespaces.deinit(gpa);
+        self.selected.deinit(gpa);
+        self.selected_kinds.deinit(gpa);
     }
 };
 
@@ -540,7 +548,7 @@ const GraphResolve = struct {
 
             for (Ast.rangeSlice(t, prog.lhs.int())) |decl_idx| {
                 const decl = m.nodes[decl_idx.int()];
-                if (decl.tag != .import_decl) continue;
+                if (!Ast.isImport(decl.tag)) continue;
 
                 // Resolve which graph module this import points at.
                 const target = g.importTarget(mod, decl) orelse {
@@ -553,14 +561,26 @@ const GraphResolve = struct {
                 // The namespace is still bound below, so the program's uses of it resolve
                 // and the one R0013 is the only diagnostic the import costs.
                 const tm = &g.graph.modules[target];
-                if (!m.bundled and tm.isCore() and !g.graph.allow_core_imports) {
+                if (g.coreRejected(mod, target)) {
                     const instead = StdNames.coreReplacement(tm.path) orelse "a std module";
                     try g.sink.report(.{ .span = g.importPathSpan(mod, decl), .code = .R0013, .scope = mod }, "module '{s}' is private to the standard library; import {s} instead", .{ tm.path, instead });
+                }
+
+                if (decl.tag == .import_select_decl) {
+                    try g.bindSelected(mod, decl, target);
+                    continue;
                 }
 
                 // Namespace name = alias token if present, else the last path segment.
                 const ns_tok: u32 = if (Ast.importAliasTok(decl).unwrap()) |alias| alias.int() else decl.main_token;
                 const ns_name = g.nameOf(mod, ns_tok);
+
+                // Checked before the decl tables below, which a selected fn or type has
+                // already joined.
+                if (g.tables[mod].selected.contains(ns_name)) {
+                    try g.sink.report(.{ .span = g.tokSpan(mod, ns_tok), .code = .R0004, .scope = mod }, "import namespace '{s}' collides with an earlier import (use `as` to disambiguate)", .{ns_name});
+                    continue;
+                }
 
                 // A namespace must not collide with a top-level declaration in the
                 // SAME module (design point 3: innermost binding wins, but a top-level
@@ -585,6 +605,99 @@ const GraphResolve = struct {
                 gop.value_ptr.* = target;
             }
         }
+    }
+
+    /// Whether module `mod` may not import `target`: only a bundled module may import
+    /// `core/*` (R0013).
+    fn coreRejected(g: *GraphResolve, mod: u32, target: u32) bool {
+        return !g.graph.modules[mod].bundled and g.graph.modules[target].isCore() and !g.graph.allow_core_imports;
+    }
+
+    /// Bind each name a selective import `import a/b.{x, y as z}` selects into module
+    /// `mod`: a fn joins the module's bare fn table, a struct or enum its type tables.
+    /// A protocol or type alias needs no resolver binding; the checker binds it. Each
+    /// selected name must be a `pub` top-level item of `target` and must not collide
+    /// with a top-level decl of `mod` or with another import's name.
+    fn bindSelected(g: *GraphResolve, mod: u32, decl: Ast.Node, target: u32) !void {
+        const tm = &g.graph.modules[target];
+        for (Ast.importItems(g.tree(mod), decl)) |item| {
+            const name = g.nameOf(mod, item.name.int());
+            const local_tok = item.bound().int();
+            const local = g.nameOf(mod, local_tok);
+            const span = g.importItemSpan(mod, item);
+            const found = g.topDecl(target, name) orelse {
+                try g.sink.report(.{ .span = span, .code = .R0006, .scope = mod }, "module '{s}' has no member '{s}'", .{ tm.path, name });
+                continue;
+            };
+            const tag = tm.nodes[found.int()].tag;
+            // An extern is served only to `core/` modules, as through `mod.member`.
+            const exported = g.tree(target).isPub(found) and !(tag == .extern_fn_decl and !g.graph.modules[mod].isCore());
+            if (!exported) {
+                try g.sink.report(.{ .span = span, .code = .R0005, .scope = mod }, "{s} '{s}' is not exported by module '{s}'", .{ itemKind(tag), name, tm.path });
+                continue;
+            }
+            if (g.topDecl(mod, local) != null) {
+                try g.sink.report(.{ .span = span, .code = .R0004, .scope = mod }, "imported name '{s}' collides with a top-level declaration named '{s}' (use `as` to rename it)", .{ local, local });
+                continue;
+            }
+            if (g.tables[mod].namespaces.contains(local) or g.tables[mod].selected.contains(local)) {
+                try g.sink.report(.{ .span = span, .code = .R0004, .scope = mod }, "imported name '{s}' collides with an earlier import (use `as` to rename it)", .{local});
+                continue;
+            }
+            // As for a declared type: `int` would name the import in value position but
+            // the builtin in type position.
+            if (builtin_type_names.has(local)) switch (tag) {
+                .struct_decl, .tuple_struct_decl, .enum_decl, .type_alias_decl => |tg| {
+                    try g.sink.report(.{ .span = span, .code = .T0011, .scope = mod }, "{s} '{s}' imported as '{s}' shadows a builtin type", .{ itemKind(tg), name, local });
+                    continue;
+                },
+                else => {},
+            };
+            try g.tables[mod].selected.put(g.gpa, local, local_tok);
+            switch (tag) {
+                .fn_decl, .extern_fn_decl => if (g.tables[target].fns.get(name)) |gid| try g.tables[mod].fns.put(g.gpa, local, gid),
+                .struct_decl, .tuple_struct_decl => try g.tables[mod].structs.put(g.gpa, local, false),
+                .enum_decl => try g.tables[mod].enums.put(g.gpa, local, false),
+                .type_alias_decl => try g.tables[mod].selected_kinds.put(g.gpa, local, "type"),
+                .protocol_decl => try g.tables[mod].selected_kinds.put(g.gpa, local, "protocol"),
+                else => {},
+            }
+        }
+    }
+
+    /// The top-level item of module `mod` named `name` that an import can select.
+    fn topDecl(g: *GraphResolve, mod: u32, name: []const u8) ?Ast.Index {
+        const m = &g.graph.modules[mod];
+        if (m.nodes.len == 0) return null;
+        const t = g.tree(mod);
+        const prog = m.nodes[Ast.root(m.nodes).int()];
+        if (prog.tag != .program) return null;
+        for (Ast.rangeSlice(t, prog.lhs.int())) |decl_idx| {
+            const decl = m.nodes[decl_idx.int()];
+            switch (decl.tag) {
+                .fn_decl, .extern_fn_decl, .struct_decl, .tuple_struct_decl, .enum_decl, .protocol_decl, .type_alias_decl => {
+                    if (std.mem.eql(u8, g.nameOf(mod, decl.main_token), name)) return decl_idx;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    fn itemKind(tag: Ast.Node.Tag) []const u8 {
+        return switch (tag) {
+            .fn_decl, .extern_fn_decl => "function",
+            .struct_decl, .tuple_struct_decl => "struct",
+            .enum_decl => "enum",
+            .protocol_decl => "protocol",
+            else => "type alias",
+        };
+    }
+
+    /// A selected name with its `as` alias: what a diagnostic about the item spans.
+    fn importItemSpan(g: *GraphResolve, mod: u32, item: Ast.ImportItem) Span {
+        const toks = g.graph.modules[mod].tokens;
+        return .{ .start = toks[item.name.int()].start, .end = toks[item.bound().int()].end };
     }
 
     /// Make a `pub` struct/enum in a DIRECTLY imported module nameable UNQUALIFIED in the
@@ -1333,10 +1446,10 @@ const GraphResolve = struct {
             };
             if (std.mem.eql(u8, g.nameText(decl.main_token), name)) return kind;
         }
-        return null;
+        return g.tables[g.cur_mod].selected_kinds.get(name);
     }
 
-    /// A builtin type or an alias of this module: a name an associated fn can be called
+    /// A builtin type or an alias this module declares or imports: a name an associated fn can be called
     /// through, unlike a protocol or a type parameter (which shadows an alias).
     fn isTypeName(g: *GraphResolve, name: []const u8) bool {
         const kind = g.typeLevelKind(name) orelse return false;
@@ -1831,8 +1944,14 @@ const GraphResolve = struct {
             // collisions); a loser was never bound to this target and already carries R0003/R0004.
             for (Ast.rangeSlice(t, prog.lhs.int())) |decl_idx| {
                 const decl = m.nodes[decl_idx.int()];
-                if (decl.tag != .import_decl) continue;
+                if (!Ast.isImport(decl.tag)) continue;
                 const target = g.importTarget(mod, decl) orelse continue;
+                // Already rejected: removing it is what R0013 asks.
+                if (g.coreRejected(mod, target)) continue;
+                if (decl.tag == .import_select_decl) {
+                    try g.warnUnusedItems(mod, decl, &ref_idents, has_list, has_forkv);
+                    continue;
+                }
                 const ns_tok: u32 = if (Ast.importAliasTok(decl).unwrap()) |a| a.int() else decl.main_token;
                 const ns_name = g.nameOf(mod, ns_tok);
                 const gop = try seen_ns.getOrPut(g.gpa, ns_name);
@@ -1843,6 +1962,29 @@ const GraphResolve = struct {
                 if (g.importIsUsed(target, ns_name, &ref_idents, &own_types, has_list, has_forkv, has_impl[target])) continue;
                 try g.sink.report(.{ .span = g.importPathSpan(mod, decl), .code = .W0004, .scope = mod }, "unused import '{s}'; remove it", .{g.graph.modules[target].path});
             }
+        }
+    }
+
+    /// W0004 on each name a selective import binds that the module never names. A list
+    /// literal or `for k, v` names `Vec` or `Entry` without spelling it.
+    fn warnUnusedItems(
+        g: *GraphResolve,
+        mod: u32,
+        decl: Ast.Node,
+        ref_idents: *const std.StringHashMapUnmanaged(void),
+        has_list: bool,
+        has_forkv: bool,
+    ) !void {
+        for (Ast.importItems(g.tree(mod), decl)) |item| {
+            const local_tok = item.bound().int();
+            const local = g.nameOf(mod, local_tok);
+            if ((g.tables[mod].selected.get(local) orelse continue) != local_tok) continue;
+            if (local.len != 0 and local[0] == '_') continue;
+            if (ref_idents.contains(local)) continue;
+            const name = g.nameOf(mod, item.name.int());
+            if (has_list and std.mem.eql(u8, name, StdNames.vec_struct)) continue;
+            if (has_forkv and std.mem.eql(u8, name, StdNames.entry_struct)) continue;
+            try g.sink.report(.{ .span = g.importItemSpan(mod, item), .code = .W0004, .scope = mod }, "unused import '{s}'; remove it", .{local});
         }
     }
 
@@ -4792,4 +4934,199 @@ test "a write to a bound method's receiver is never a dead store; a field read's
             };
         }
     }.run);
+}
+
+test "a selective import binds each selected fn bare, under its alias, and not the module" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util.{helper, twice as dbl}
+        \\fn main() -> int { return helper() + dbl(1) + util.helper() }
+        \\
+        },
+        .{ .path = "util.toy", .source =
+        \\pub fn helper() -> int { return 7 }
+        \\pub fn twice(x: int) -> int { return x * 2 }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            const entry = modId(g, "main");
+            const m = &g.modules[entry];
+            var funcs: usize = 0;
+            for (m.nodes, 0..) |n, i| {
+                if (n.tag != .identifier) continue;
+                const name = m.tokens[n.main_token].text(m.source);
+                const want: []const u8 = if (std.mem.eql(u8, name, "helper")) "util.helper" else if (std.mem.eql(u8, name, "dbl")) "util.twice" else continue;
+                const res = r.resolutions[entry][i];
+                try testing.expect(res == .func);
+                try testing.expectEqualStrings(want, r.fns[res.func].name);
+                funcs += 1;
+            }
+            try testing.expectEqual(@as(usize, 2), funcs);
+            // The module name stays unbound: `util.helper()` names an undeclared `util`.
+            try testing.expectEqual(@as(usize, 1), errorCount(r));
+            try testing.expectEqual(@as(usize, 1), countCode(r, .R0001));
+        }
+    };
+    try withResolvedGraph(".toy-test-select-fns", files, "main.toy", Check.run);
+}
+
+test "a selected name that is missing, private, or already bound is coded at the name" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util.{nope, hidden, Shape, helper}
+        \\import other.{helper, util}
+        \\import util
+        \\fn Shape() -> int { return 0 }
+        \\fn main() -> int { return helper() + Shape() }
+        \\
+        },
+        .{ .path = "util.toy", .source =
+        \\pub fn helper() -> int { return 7 }
+        \\fn hidden() -> int { return 1 }
+        \\pub struct Shape { w: int }
+        \\
+        },
+        .{ .path = "other.toy", .source =
+        \\pub fn helper() -> int { return 8 }
+        \\pub fn util() -> int { return 9 }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            const m = &g.modules[modId(g, "main")];
+            const Want = struct { code: codes.Code, at: []const u8, msg: []const u8 };
+            const wants = [_]Want{
+                .{ .code = .R0006, .at = "nope", .msg = "module 'util' has no member 'nope'" },
+                .{ .code = .R0005, .at = "hidden", .msg = "function 'hidden' is not exported by module 'util'" },
+                .{ .code = .R0004, .at = "Shape, helper}", .msg = "imported name 'Shape' collides with a top-level declaration named 'Shape' (use `as` to rename it)" },
+                .{ .code = .R0004, .at = "helper, util}", .msg = "imported name 'helper' collides with an earlier import (use `as` to rename it)" },
+                .{ .code = .R0004, .at = "util\nfn", .msg = "import namespace 'util' collides with an earlier import (use `as` to disambiguate)" },
+            };
+            try testing.expectEqual(wants.len, errorCount(r));
+            for (wants) |w| {
+                const at: u32 = @intCast(std.mem.indexOf(u8, m.source, w.at).?);
+                var found = false;
+                for (r.diags) |d| {
+                    if (d.code == w.code and d.byte_offset == at and std.mem.eql(u8, d.message, w.msg)) found = true;
+                }
+                if (!found) {
+                    for (r.diags) |d| std.debug.print("{s} {d} {s}\n", .{ @tagName(d.code), d.byte_offset, d.message });
+                    return error.TestExpectedEqual;
+                }
+            }
+        }
+    };
+    try withResolvedGraph(".toy-test-select-errors", files, "main.toy", Check.run);
+}
+
+test "an unused selected name is W0004 at that name" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util.{helper, Shape, twice as dbl}
+        \\fn main() -> int { return helper() }
+        \\
+        },
+        .{ .path = "util.toy", .source =
+        \\pub fn helper() -> int { return 7 }
+        \\pub fn twice(x: int) -> int { return x * 2 }
+        \\pub struct Shape { w: int }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            const m = &g.modules[modId(g, "main")];
+            try testing.expectEqual(@as(usize, 0), errorCount(r));
+            try testing.expectEqual(@as(usize, 2), countCode(r, .W0004));
+            for (r.diags) |d| {
+                if (d.code != .W0004) continue;
+                const text = m.source[d.byte_offset..d.end];
+                try testing.expect(std.mem.eql(u8, text, "Shape") or std.mem.eql(u8, text, "twice as dbl"));
+            }
+        }
+    };
+    try withResolvedGraph(".toy-test-select-unused", files, "main.toy", Check.run);
+}
+
+test "a selective import of core/* is R0013 like a whole one" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import core/mem.{ga_new}
+        \\import core/mem as m2
+        \\fn main() -> int { return 0 }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            // The rejected imports are not also unused (W0004).
+            try testing.expectEqual(@as(usize, 2), countCode(r, .R0013));
+            try testing.expectEqual(@as(usize, 2), r.diags.len);
+        }
+    };
+    try withResolvedGraph(".toy-test-select-core", files, "main.toy", Check.run);
+}
+
+test "a selected alias is a receiver like a local one; a selected protocol is T0056" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import s.{R, P}
+        \\fn main() -> int {
+        \\    _p := P.mk()
+        \\    R.new(4).w
+        \\}
+        \\
+        },
+        .{ .path = "s.toy", .source =
+        \\pub struct Rect { pub w: int }
+        \\impl Rect { fn new(w: int) -> Rect { Rect { w: w } } }
+        \\pub type R = Rect
+        \\pub protocol P { fn f(self) -> int }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), errorCount(r));
+            try testing.expectEqualStrings("protocol 'P' is not a value", firstError(r).message);
+        }
+    };
+    try withResolvedGraph(".toy-test-select-alias-recv", files, "main.toy", Check.run);
+}
+
+test "a selected type renamed to a builtin type name is T0011" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import lib.{Sh as int, St as bool, Al as str}
+        \\fn main() -> int { 0 }
+        \\
+        },
+        .{ .path = "lib.toy", .source =
+        \\pub enum Sh { a }
+        \\pub struct St { x: int }
+        \\pub type Al = int
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            const wants = [_][]const u8{
+                "enum 'Sh' imported as 'int' shadows a builtin type",
+                "struct 'St' imported as 'bool' shadows a builtin type",
+                "type alias 'Al' imported as 'str' shadows a builtin type",
+            };
+            try testing.expectEqual(wants.len, r.diags.len);
+            for (r.diags, wants) |d, w| {
+                try testing.expectEqual(codes.Code.T0011, d.code);
+                try testing.expectEqualStrings(w, d.message);
+            }
+        }
+    };
+    try withResolvedGraph(".toy-test-select-builtin-name", files, "main.toy", Check.run);
 }

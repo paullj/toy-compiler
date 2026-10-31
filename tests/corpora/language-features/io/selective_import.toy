@@ -1,0 +1,11 @@
+# Feature: a selective import binds just the names it lists, so `println` is called
+# bare and the module name `io` stays unbound.
+# expect: stdout "hi\n3\n"
+# expect: exit 0
+import std/io.{println, print as write}
+
+fn main() {
+    println("hi")
+    write(3)
+    write("\n")
+}

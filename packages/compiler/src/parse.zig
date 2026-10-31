@@ -479,12 +479,13 @@ fn parseImport(p: *Parser) Error!Ast.Index {
         try p.expect(.identifier, "expected a path segment after '/'");
         try segs.append(p.gpa, Ast.TokIndex.from(seg));
     }
+    const last_seg = segs.items[segs.items.len - 1];
+    if (p.eat(.dot)) return p.parseImportItems(segs.items);
     var alias: Ast.TokIndex = Ast.TokIndex.none;
     if (p.eat(.kw_as)) {
         alias = Ast.TokIndex.from(p.index);
         try p.expect(.identifier, "expected an alias name after 'as'");
     }
-    const last_seg = segs.items[segs.items.len - 1];
     const header = try p.addTokRange(segs.items);
     // The lhs holds a range header (a node-index slot by field type), and rhs
     // holds the alias TOKEN index; both are stored in the `Index` fields but the
@@ -494,6 +495,39 @@ fn parseImport(p: *Parser) Error!Ast.Index {
         .main_token = last_seg.int(),
         .lhs = header,
         .rhs = Ast.Index.from(alias.int()),
+    });
+}
+
+/// The `{x, y as z}` tail of `import a/b.{..}`: each item is a name token and its
+/// `as` alias token (or none), stored as flat token pairs.
+fn parseImportItems(p: *Parser, segs: []const Ast.TokIndex) Error!Ast.Index {
+    try p.expect(.l_brace, "expected '{' after '.' in an import");
+    var cells: std.ArrayList(Ast.TokIndex) = .empty;
+    defer cells.deinit(p.gpa);
+    while (true) {
+        p.skipNewlines();
+        if (p.at(.r_brace) and cells.items.len > 0) break;
+        const name = p.index;
+        if (!p.at(.identifier)) return p.fail(p.peek(), .P0006, "expected a name to import");
+        p.advance();
+        var alias: Ast.TokIndex = Ast.TokIndex.none;
+        if (p.eat(.kw_as)) {
+            alias = Ast.TokIndex.from(p.index);
+            try p.expect(.identifier, "expected an alias name after 'as'");
+        }
+        try cells.appendSlice(p.gpa, &.{ Ast.TokIndex.from(name), alias });
+        p.skipNewlines();
+        if (!p.eat(.comma)) break;
+    }
+    p.skipNewlines();
+    try p.expect(.r_brace, "expected ',' or '}' in an import list");
+    const path = try p.addTokRange(segs);
+    const items = try p.addTokRange(cells.items);
+    return p.addNode(.{
+        .tag = .import_select_decl,
+        .main_token = segs[segs.len - 1].int(),
+        .lhs = path,
+        .rhs = items,
     });
 }
 
@@ -3601,7 +3635,7 @@ test "root is program and children precede parents" {
             .pattern_or => for (Ast.rangeSlice(tree, n.lhs.int())) |c| try testing.expect(c.int() < self),
             // `import_decl` overloads `lhs`/`rhs` as TOKEN indices (path segments,
             // alias) like break/continue — no node children to order.
-            .import_decl => {},
+            .import_decl, .import_select_decl => {},
             // A declared type parameter: its name token, plus an optional bound
             // protocol-ref in `lhs` (`[T has P]`), created before this node.
             .generic_param => if (n.lhs != Ast.none) try testing.expect(n.lhs.int() < self),
@@ -4455,6 +4489,39 @@ test "deep import path parses" {
         "import a/b/c/d\nfn main() {}\n",
         "(program (import a/b/c/d) (fn main () _ (block)))",
     );
+}
+
+test "a selective import parses its names and aliases" {
+    try expectProgram(
+        "import std/io.{println, print as p}\nfn main() {}\n",
+        "(program (import std/io {println print as p}) (fn main () _ (block)))",
+    );
+}
+
+test "a selective import spans lines and takes a trailing comma" {
+    try expectProgram(
+        "import a/b.{\n    x,\n    y as z,\n}\nfn main() {}\n",
+        "(program (import a/b {x y as z}) (fn main () _ (block)))",
+    );
+}
+
+test "a malformed selective import is a parse error" {
+    const gpa = testing.allocator;
+    const cases = [_]struct { src: []const u8, want: []const u8 }{
+        .{ .src = "import a.{}\n", .want = "expected a name to import" },
+        .{ .src = "import a.{x y}\n", .want = "expected ',' or '}' in an import list" },
+        .{ .src = "import a.x\n", .want = "expected '{' after '.' in an import" },
+        .{ .src = "import a.{x as}\n", .want = "expected an alias name after 'as'" },
+    };
+    for (cases) |c| {
+        const tokens = try Lexer.tokenize(gpa, c.src);
+        defer gpa.free(tokens);
+        const result = try parse(gpa, tokens, c.src);
+        defer gpa.free(@constCast(result.diags));
+        defer freeTree(gpa, result.tree);
+        try testing.expect(result.diags.len >= 1);
+        try testing.expectEqualStrings(c.want, result.diags[0].message);
+    }
 }
 
 test "pub fn renders with a pub wrapper" {

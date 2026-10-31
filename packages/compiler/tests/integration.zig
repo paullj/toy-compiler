@@ -21,6 +21,7 @@ test {
     _ = @import("closures_gc.zig");
     _ = @import("closures.zig");
     _ = @import("places.zig");
+    _ = @import("imports.zig");
     _ = @import("shared_cache.zig");
     _ = @import("ref.zig");
     _ = @import("vec.zig");

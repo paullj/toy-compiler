@@ -12,7 +12,7 @@ program may use only builtins and std.
 |-------|-------|-----------------|
 | builtins | the compiler (`symbols/Prelude.zig`, `symbols/Intrinsic.zig`, `resolve_graph.zig` `seeded_builtins`) | everyone, as scoped below |
 | core | `packages/lib/core/*.toy` | bundled modules only (std and core) |
-| std | `packages/lib/std/*.toy` | everyone, through `import std/<name>` |
+| std | `packages/lib/std/*.toy` | everyone, through `import std/<name>` or `import std/<name>.{item, ..}` (see modules.md) |
 
 ## Builtins
 

@@ -943,3 +943,34 @@ test "hover on a struct literal's field names its visibility" {
         try testing.expectEqualStrings(want, h.value);
     }
 }
+
+test "hover on a selectively imported name under its alias shows the item it names" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    try docs.put(gpa, "file:///q/lib.toy", "pub struct Pt { pub x: int }\npub fn area(p: Pt) -> int { p.x }\n", 1);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\import lib.{area as size, Pt as P}
+        \\
+        \\fn main() -> int {
+        \\    p := P { x: 1 }
+        \\    return size(p)
+        \\}
+        \\
+    ;
+    const tu = @import("test_util.zig");
+    const cases = [_]struct { at: []const u8, want: []const u8 }{
+        .{ .at = "size(p)", .want = "fn area(p: Pt) -> int" },
+        .{ .at = "P { x", .want = "pub struct Pt { pub x: int }" },
+        .{ .at = "p := ", .want = "p: Pt" },
+    };
+    for (cases) |c| {
+        const pos = tu.posOf(src, c.at);
+        var h = (try hoverAt(gpa, ws, src, pos.line, pos.character, "file:///q/main.toy")) orelse return error.NoHover;
+        defer h.deinit();
+        const want = try std.fmt.allocPrint(gpa, "```toy\n{s}\n```", .{c.want});
+        defer gpa.free(want);
+        try testing.expectEqualStrings(want, h.value);
+    }
+}

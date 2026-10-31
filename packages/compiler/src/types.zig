@@ -1981,6 +1981,17 @@ pub const GraphCtx = struct {
         file: []const u8 = "",
         /// The modules this one imports directly (graph module ids).
         imports: []const u32 = &.{},
+        /// The types and protocols this module's selective imports bind, each a `pub`
+        /// item its target declares itself (the resolver reports every other selection).
+        selections: []const Selection = &.{},
+    };
+
+    /// A type or protocol `import a/b.{name as local}` binds: `target` declares `name`.
+    pub const Selection = struct {
+        local: []const u8,
+        name: []const u8,
+        target: u32,
+        kind: enum { type, protocol },
     };
 
     /// Resolve an import namespace receiver name in module `mod` to the imported
@@ -2638,12 +2649,30 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // either), BEFORE layout (0b) / fn-sig decode (A) so field/param/ret refs resolve
     // through a full alias map. BEFORE prelude, so a `type X = Ordering` (a prelude enum)
     // is out of scope — the corpus never needs it.
-    for (mods, 0..) |_, mi| {
-        const mod: u32 = @intCast(mi);
+    // A selected alias resolves in its own module first, so the alias pass walks the
+    // import DAG dependencies-first. A selected struct or enum is bound before any alias
+    // can name it.
+    for (t.graph.mods) |*m| for (m.selections) |sel| {
+        if (sel.kind != .type) continue;
+        const owner = &t.graph.mods[sel.target];
+        if (owner.struct_ids.get(sel.name)) |id| {
+            if (t.structs.items[id].mod == sel.target) try m.struct_ids.put(t.gpa, sel.local, id);
+        } else if (owner.enum_ids.get(sel.name)) |id| {
+            if (t.enums.items[id].mod == sel.target) try m.enum_ids.put(t.gpa, sel.local, id);
+        }
+    };
+    const alias_order = try importPostOrder(t.gpa, t.graph.mods);
+    defer t.gpa.free(alias_order);
+    for (alias_order) |mod| {
         _ = t.gphSelect(mod);
         if (t.tree.nodes.len == 0) continue;
         const prog = t.tree.nodes[Ast.root(t.tree.nodes).int()];
         if (prog.tag != .program) continue;
+        const m = &t.graph.mods[mod];
+        for (m.selections) |sel| {
+            if (sel.kind != .type) continue;
+            if (t.graph.mods[sel.target].alias_ids.get(sel.name)) |ty| try m.alias_ids.put(t.gpa, sel.local, ty);
+        }
         try register.registerAliases(t, Ast.rangeSlice(t.tree, prog.lhs.int()));
     }
 
@@ -2687,6 +2716,11 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
         if (prog.tag != .program) continue;
         try register.registerProtocols(t, Ast.rangeSlice(t.tree, prog.lhs.int()), mod);
     }
+    for (t.graph.mods) |*m| for (m.selections) |sel| {
+        if (sel.kind != .protocol) continue;
+        const id = t.graph.mods[sel.target].protocol_ids.get(sel.name) orelse continue;
+        if (t.protocols.items[id].mod == sel.target) try m.protocol_ids.put(t.gpa, sel.local, id);
+    };
 
     // Phase 0a: decode each generic struct TEMPLATE's field types as PATTERNS
     // (`v: T` -> `type_var(0)`; `b: Box[T]` -> `App(Box, [type_var 0])`) into its
@@ -3192,6 +3226,41 @@ fn templateCallee(t: *const Typecheck, recv: Type, member: []const u8, site: Sit
         return Callee.template(m.fn_id);
     }
     return .{};
+}
+
+/// Every module, each after all the modules it imports. The import graph is a DAG.
+fn importPostOrder(gpa: std.mem.Allocator, mods: []const GraphCtx.ModuleCtx) ![]u32 {
+    const order = try gpa.alloc(u32, mods.len);
+    errdefer gpa.free(order);
+    const seen = try gpa.alloc(bool, mods.len);
+    defer gpa.free(seen);
+    @memset(seen, false);
+    // Explicit stack of (module, next import index), so a deep chain cannot overflow.
+    var stack: std.ArrayList([2]u32) = .empty;
+    defer stack.deinit(gpa);
+    var n: usize = 0;
+    for (0..mods.len) |root| {
+        if (seen[root]) continue;
+        seen[root] = true;
+        try stack.append(gpa, .{ @intCast(root), 0 });
+        while (stack.items.len > 0) {
+            const top = &stack.items[stack.items.len - 1];
+            const imps = mods[top[0]].imports;
+            if (top[1] < imps.len) {
+                const next = imps[top[1]];
+                top[1] += 1;
+                if (next < mods.len and !seen[next]) {
+                    seen[next] = true;
+                    try stack.append(gpa, .{ next, 0 });
+                }
+                continue;
+            }
+            order[n] = top[0];
+            n += 1;
+            _ = stack.pop();
+        }
+    }
+    return order;
 }
 
 /// Whether module `importer` directly imports the module with id `target` (any namespace

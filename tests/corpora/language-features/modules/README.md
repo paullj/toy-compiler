@@ -22,6 +22,7 @@ on each `main.toy` entry.
 | `display_generic/`            | an imported generic struct's instance renders under its template name (`Bx{v: 2}`) |
 | `associated_fn/`              | an imported non-generic struct's and enum's associated fns, called through the module (`shapes.Rect.square(3)`) |
 | `qualified_literal/`          | `lib.Pt { .. }`, inferred `lib.Pair { .. }` and `shapes.Shape.sq { .. }` beside same-named local types |
+| `selective/`                  | `import a/b.{x, y as z}` binding a fn, generic fn, struct, enum, protocol and type alias bare |
 | `errors/private_ref/`         | referencing a non-`pub` decl across modules                    |
 | `private_fields/`             | `pub` fields used from another module; private ones only through the owner's methods and derives |
 | `errors/private_literal/`     | a module-qualified literal of a non-`pub` struct                |
