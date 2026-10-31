@@ -25,7 +25,9 @@
 //!   substring; every other fixture must compile, run, and match its exit code, its
 //!   exact stdout and/or a substring of its stderr. The run gets `# stdin: "<bytes>"`
 //!   on a pipe (empty by default, never inherited), `# args: "a" "b c"` after argv[0],
-//!   only the `# env: K=V` variables, and its worker's scratch dir as cwd. The build+run is the same
+//!   only the `# env: K=V` variables, and its worker's scratch dir as cwd. Each
+//!   `# include: "<dir>"` adds an extra import root (the CLI's `-I`), relative to the
+//!   fixture's folder. The build+run is the same
 //!   in-process path the real `toy build` uses (`Graph.discover` -> `resolveGraph`
 //!   -> `checkGraph` -> `lowerGraphProgram` -> `buildImage`), so it follows imports
 //!   and multi-file module graphs. Codegen+exec is gated on macOS/aarch64; off that
@@ -393,6 +395,8 @@ const Expect = struct {
     args: std.ArrayList([]const u8) = .empty,
     /// `K=V` entries; the run's environment holds these and nothing else.
     env: std.ArrayList([]const u8) = .empty,
+    /// Extra import roots, relative to the fixture's folder.
+    include: std.ArrayList([]const u8) = .empty,
 
     fn deinit(self: *Expect, gpa: std.mem.Allocator) void {
         if (self.stdout) |s| gpa.free(s);
@@ -404,6 +408,8 @@ const Expect = struct {
         self.args.deinit(gpa);
         for (self.env.items) |s| gpa.free(s);
         self.env.deinit(gpa);
+        for (self.include.items) |s| gpa.free(s);
+        self.include.deinit(gpa);
     }
 };
 
@@ -468,7 +474,7 @@ fn parseArgs(gpa: std.mem.Allocator, body: []const u8, out: *std.ArrayList([]con
 /// Parse every directive out of `source`. The `# expect:` checks are `exit <N>`,
 /// `stdout "<bytes>"`, `stderr "<substr>"` and `compile-error "<substr>"`; the run
 /// inputs are `# stdin: "<bytes>"` (repeats concatenate), `# args: "a" "b c"` (repeats
-/// append) and `# env: K=V`. Caller `deinit`s.
+/// append), `# env: K=V` and `# include: "<dir>"` (repeats append). Caller `deinit`s.
 fn parseExpect(gpa: std.mem.Allocator, source: []const u8) !Expect {
     var e: Expect = .{};
     errdefer e.deinit(gpa);
@@ -483,6 +489,13 @@ fn parseExpect(gpa: std.mem.Allocator, source: []const u8) !Expect {
         }
         if (std.mem.startsWith(u8, line, "# args:")) {
             try parseArgs(gpa, line["# args:".len..], &e.args);
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "# include:")) {
+            const raw = betweenQuotes(line["# include:".len..]) orelse return error.BadIncludeDirective;
+            const owned = try gpa.dupe(u8, raw);
+            errdefer gpa.free(owned);
+            try e.include.append(gpa, owned);
             continue;
         }
         if (std.mem.startsWith(u8, line, "# env:")) {
@@ -589,10 +602,10 @@ fn renderDiags(gpa: std.mem.Allocator, diags: []const Diagnostic) ![]u8 {
 /// Render a structural discovery error. A parse failure carries the module's full
 /// coded parse-diagnostic list, so route it through `renderDiags` to keep the
 /// `[Pxxxx]:` prefix the substrings expect; other structural errors (cycle, missing
-/// import, …) only carry `message`.
+/// import, …) carry one `message` under their own code.
 fn renderGraphErr(gpa: std.mem.Allocator, err: Graph.Error) ![]u8 {
     if (err.parse_diags.len != 0) return renderDiags(gpa, err.parse_diags);
-    return std.fmt.allocPrint(gpa, "{s}\n", .{err.message});
+    return std.fmt.allocPrint(gpa, "[{s}]: {s}\n", .{ codes.str(err.code()).?, err.message });
 }
 
 /// Build `entry` through the real whole-program path (discover -> resolve ->
@@ -611,7 +624,17 @@ fn compileAndRun(
     e: *const Expect,
     cwd: []const u8,
 ) !RunResult {
-    var graph = try Graph.discover(gpa, io, cache, Driver.default_target, entry, .{});
+    var include: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (include.items) |r| gpa.free(r);
+        include.deinit(gpa);
+    }
+    for (e.include.items) |r| {
+        const joined = try std.fs.path.join(gpa, &.{ std.fs.path.dirname(entry) orelse ".", r });
+        errdefer gpa.free(joined);
+        try include.append(gpa, joined);
+    }
+    var graph = try Graph.discover(gpa, io, cache, Driver.default_target, entry, .{ .roots = .{ .include = include.items } });
     defer graph.deinit(gpa);
     if (graph.err) |err| {
         try checkGraphSpans(gpa, &graph, err.parse_diags);
@@ -1158,6 +1181,8 @@ test "expect harness: parseExpect reads stderr, stdin, args and env directives" 
         \\# args: "w"
         \\# env: K=V=W
         \\# env: EMPTY=
+        \\# include: "lib"
+        \\# include: "../vendor"
         \\
     );
     defer e.deinit(gpa);
@@ -1171,6 +1196,8 @@ test "expect harness: parseExpect reads stderr, stdin, args and env directives" 
     try testing.expectEqualStrings("w", e.args.items[3]);
     try testing.expectEqualStrings("K=V=W", e.env.items[0]);
     try testing.expectEqualStrings("EMPTY=", e.env.items[1]);
+    try testing.expectEqual(@as(usize, 2), e.include.items.len);
+    try testing.expectEqualStrings("../vendor", e.include.items[1]);
 
     // Input directives alone are not a check.
     var only_in = try parseExpect(gpa, "# stdin: \"x\"\n# args: \"a\"\n");
@@ -1182,6 +1209,7 @@ test "expect harness: parseExpect reads stderr, stdin, args and env directives" 
     try testing.expectError(error.BadEnvDirective, parseExpect(gpa, "# env: NOEQ\n"));
     try testing.expectError(error.BadEnvDirective, parseExpect(gpa, "# env: =V\n"));
     try testing.expectError(error.BadStdinDirective, parseExpect(gpa, "# stdin: x\n"));
+    try testing.expectError(error.BadIncludeDirective, parseExpect(gpa, "# include: lib\n"));
     try testing.expectError(error.BadStderrDirective, parseExpect(gpa, "# expect: stderr x\n"));
 }
 

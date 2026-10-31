@@ -34,6 +34,13 @@ const dev_core_opt: []const Spec.Option = if (dev_inspect) &.{
     .{ .long = "dev-core-imports", .action = .set_true, .help = "Let user modules import core/* (dev builds only)" },
 } else &.{};
 
+/// Where imports are looked up, shared by every command that compiles so `check` resolves
+/// a program exactly as `build` does.
+const roots_opts: []const Spec.Option = &.{
+    .{ .long = "root", .value = .string, .value_name = "DIR", .help = "Module root that import paths start from (default: the entry file's folder)" },
+    .{ .long = "include", .short = 'I', .value = .string, .action = .append, .value_name = "DIR", .help = "Extra root to look up imports in, after the module root (repeatable)" },
+};
+
 /// `--target`, shared by every command that takes it, so `check` validates it too.
 const target_opt: Spec.Option = .{ .long = "target", .value = .{ .@"enum" = &toyc.Driver.targets }, .value_name = "TARGET", .help = "Compilation target (default: " ++ toyc.Driver.default_target ++ ")" };
 
@@ -41,10 +48,10 @@ const pass_names = std.meta.fieldNames(toyc.Opt.Pass);
 
 // The build/inspect options MINUS the dev-only ones (`emit_opt`, `dev_core_opt`, spliced
 // in so they can be gated behind `dev_inspect`). `shared_opts` below is `pre_emit ++ emit_opt ++ dev_core_opt ++ post_emit`.
-const pre_emit: []const Spec.Option = &.{
+const pre_emit: []const Spec.Option = &[_]Spec.Option{
     .{ .long = "output", .short = 'o', .value = .string, .value_name = "PATH", .help = "Output path for the built binary (default: .toy/<stamp>/build/<name>)" },
     target_opt,
-};
+} ++ roots_opts;
 const post_emit: []const Spec.Option = &[_]Spec.Option{
     // -j: N>=1; the parser rejects -j0/negatives as a bad value via the Range.
     .{ .short = 'j', .value = .{ .int = .{ .min = 1, .max = null } }, .value_name = "N", .help = "Build worker threads (N>=1; -j1 = serial; default cpu-based)" },
@@ -101,7 +108,7 @@ const check_opts: []const Spec.Option = &[_]Spec.Option{
     .{ .long = "color", .value = .{ .@"enum" = &.{ "auto", "always", "never" } }, .value_name = "WHEN", .help = "Colorize output (default auto: on when stdout is a tty)" },
     target_opt,
     .{ .long = "timings", .action = .set_true, .help = "Print the per-stage wall-clock profile" },
-} ++ dev_core_opt;
+} ++ roots_opts ++ dev_core_opt;
 
 /// The build options `check` does not take, so that using one names it as a build option.
 const check_declined: []const Spec.Option = blk: {

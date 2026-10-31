@@ -1,0 +1,9 @@
+# With -I util, `util/math` and `math` both name util/math.toy: a file has one import path (R0014).
+# include: "util"
+# expect: compile-error "[R0014]: imported module 'math' is the file"
+import util/math
+import math
+
+fn main() -> int {
+    math.sq(2)
+}

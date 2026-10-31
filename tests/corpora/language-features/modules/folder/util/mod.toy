@@ -1,0 +1,4 @@
+pub import util/geo/rect.{area}
+import util/math
+
+pub fn side() -> int { math.sq(2) }

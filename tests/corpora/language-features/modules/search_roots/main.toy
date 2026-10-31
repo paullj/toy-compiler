@@ -1,0 +1,13 @@
+# Extra import roots (the CLI's -I): 'extra' and 'geo/area' are found under lib/,
+# 'more' under vendor/, and 'local' in the module root.
+# include: "lib"
+# include: "vendor"
+# expect: exit 15
+import extra
+import geo/area
+import more.{five}
+import local
+
+fn main() -> int {
+    return extra.one() + area.of(2, 3) + five() + local.three()
+}

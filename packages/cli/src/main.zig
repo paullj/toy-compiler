@@ -99,6 +99,7 @@ pub fn main(init: std.process.Init) !void {
     // faithful reproduction. `applyParsed` fills these from a `Parsed` result.
     var st: State = .{ .paths = .empty };
     defer st.paths.deinit(gpa);
+    defer st.include.deinit(gpa);
 
     // COLLECT argv WITHOUT the program name into a gpa-owned list kept alive for the
     // WHOLE fn: Sink error strings AND Parsed string/append/variadic slices BORROW
@@ -270,13 +271,15 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    if (try checkRootDirs(io, usage, &st)) |code| std.process.exit(code);
+
     // `toy check`: the diagnostics-focused front-end. Runs lex->parse->resolve->typecheck
     // over every input (NEVER codegen), reports ALL diagnostics (no early-bail), applies
     // the severity config, and returns an exit code: 0 clean, 1 when >=1 error survives
     // the config, 2 on a usage error or an unreadable entry. `--exit-zero` forces 0
     // regardless.
     if (st.check_seen) {
-        std.process.exit(try runCheck(gpa, out, level, usage, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.timings, st.sev, st.allow_core_imports));
+        std.process.exit(try runCheck(gpa, out, level, usage, st.target, st.paths.items, st.check_ndjson, st.check_exit_zero, st.timings, st.sev, st.allow_core_imports, roots(&st)));
     }
 
     // The DEFAULT action is to BUILD a signed executable: a bare `toy <file>` (and any
@@ -296,12 +299,12 @@ pub fn main(init: std.process.Init) !void {
 
     // Build the executable: output → `-o`/`--output`, else the default build dir.
     if (build_exe) {
-        std.process.exit(try emitExecutable(gpa, out, level, usage, st.target, st.paths.items, st.out_path, run_after, st.program_args, st.mode, st.codegen_stats, st.opt, st.specialize, st.opt_stats, st.timings, st.jlimit, threads, st.sev, st.allow_core_imports));
+        std.process.exit(try emitExecutable(gpa, out, level, usage, st.target, st.paths.items, st.out_path, run_after, st.program_args, st.mode, st.codegen_stats, st.opt, st.specialize, st.opt_stats, st.timings, st.jlimit, threads, st.sev, st.allow_core_imports, roots(&st)));
     }
 
     // `--emit ir`: print the target-independent IR for the whole program.
     if (st.emit == .ir) {
-        std.process.exit(try emitIr(gpa, out, level, usage, st.target, st.paths.items, st.opt, st.specialize, st.jlimit, st.sev, st.allow_core_imports));
+        std.process.exit(try emitIr(gpa, out, level, usage, st.target, st.paths.items, st.opt, st.specialize, st.jlimit, st.sev, st.allow_core_imports, roots(&st)));
     }
 
     const results = try Driver.run(gpa, io, st.emit, st.target, st.paths.items);
@@ -372,6 +375,10 @@ const State = struct {
     // fn-scope backing list `applyParsed` fills; resolve reads it LATE at render.
     sev: SevCfg.SeverityConfig = .{},
     allow_core_imports: bool = false,
+    // `--root`, borrowing argv; null => the entry file's folder.
+    root: ?[]const u8 = null,
+    // The `-I` roots in argv order; like `paths`, the elements borrow argv.
+    include: std.ArrayList([]const u8) = .empty,
     // `run`'s words after `--`, borrowing argv; they follow the binary's path in its argv.
     program_args: []const []const u8 = &.{},
     paths: std.ArrayList([]const u8),
@@ -415,6 +422,7 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
         }
     }
     st.allow_core_imports = devCoreImports(p);
+    try takeRoots(gpa, p, st);
     if (p.j) |n| {
         // n >= 1 guaranteed by the Range. -j1 => .limited(0) (serial baseline);
         // -jN>=2 => .limited(N) (cap the pool). job_count feeds the threads line.
@@ -429,12 +437,36 @@ fn applyParsed(gpa: std.mem.Allocator, comptime cmd: cli.Spec.Command, p: anytyp
     if (p.opt.len != 0) st.opt = .O0;
     for (p.opt) |pass| st.opt.set(optPass(pass), true);
     for (p.no_opt) |pass| st.opt.set(optPass(pass), false);
-    if (try buildSevRules(gpa, p, sev_rules)) |e| return try sevSpecError(usage, e);
+    if (try buildSevRules(gpa, p, sev_rules)) |e| return try cliValueError(usage, e);
     st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
     // p.file is a variadic slice borrowing argv/arena; copy the ELEMENTS (slices) —
     // not the bytes — into paths, which shares argv's lifetime, so nothing dangles.
     for (p.file) |f| try st.paths.append(gpa, f);
     return null;
+}
+
+fn takeRoots(gpa: std.mem.Allocator, p: anytype, st: *State) !void {
+    st.root = p.root;
+    for (p.include) |r| try st.include.append(gpa, r);
+}
+
+/// The search roots `discover` takes from `--root` and `-I`.
+fn roots(st: *const State) Graph.Roots {
+    return .{ .root = st.root, .include = st.include.items };
+}
+
+/// A `--root` or `-I` that names no directory is a usage error up front: discovery would
+/// only report it as every import being missing.
+fn checkRootDirs(io: Io, usage: Usage, st: *const State) !?u8 {
+    if (st.root) |r| if (!isDir(io, r)) return try cliValueError(usage, .{ .kind = .bad_value, .arg = "--root", .got = r, .expected = "a directory" });
+    for (st.include.items) |r| if (!isDir(io, r)) return try cliValueError(usage, .{ .kind = .bad_value, .arg = "-I", .got = r, .expected = "a directory" });
+    return null;
+}
+
+fn isDir(io: Io, path: []const u8) bool {
+    var dir = Io.Dir.cwd().openDir(io, path, .{}) catch return false;
+    dir.close(io);
+    return true;
 }
 
 /// `--dev-core-imports`, which only a dev build registers.
@@ -463,8 +495,9 @@ fn applyCheckParsed(gpa: std.mem.Allocator, p: anytype, usage: Usage, st: *State
     st.check_ndjson = if (p.format) |f| (f == .ndjson) else false;
     st.check_exit_zero = p.exit_zero;
     st.allow_core_imports = devCoreImports(p);
+    try takeRoots(gpa, p, st);
     st.timings = p.timings;
-    if (try buildSevRules(gpa, p, sev_rules)) |e| return try sevSpecError(usage, e);
+    if (try buildSevRules(gpa, p, sev_rules)) |e| return try cliValueError(usage, e);
     st.sev = .{ .rules = sev_rules.items, .deny_warnings = p.deny_warnings };
     for (p.file) |f| try st.paths.append(gpa, f);
     return null;
@@ -522,8 +555,9 @@ fn warningSpecErr(comptime flag: []const u8, m: []const u8) ?cli.Sink.Error {
     };
 }
 
-/// Render a bad severity spec exactly like a parser error, as a usage error.
-fn sevSpecError(usage: Usage, e: cli.Sink.Error) !?u8 {
+/// Render a value the driver rejects (a bad severity spec, a missing root directory)
+/// exactly like a parser error, as a usage error.
+fn cliValueError(usage: Usage, e: cli.Sink.Error) !?u8 {
     try DiagRender.printCliErrors(usage.w, usage.level, &.{e});
     try usage.w.flush();
     return usage_exit;
@@ -736,6 +770,7 @@ fn emitExecutable(
     threads: usize,
     sev: SevCfg.SeverityConfig,
     allow_core_imports: bool,
+    search: Graph.Roots,
 ) !u8 {
     // A build takes the 1 ROOT (entry) file; the driver discovers the transitive
     // import graph from it and compiles the whole program. `argLine` flushes, because
@@ -863,6 +898,7 @@ fn emitExecutable(
         .ncpu = threads,
         .sev = sev,
         .allow_core_imports = allow_core_imports,
+        .roots = search,
         .timings = timings,
         .last_ns = &last_ns,
         .ns_discover = &ns_discover,
@@ -1031,6 +1067,7 @@ fn emitIr(
     jlimit: Io.Limit,
     sev: SevCfg.SeverityConfig,
     allow_core_imports: bool,
+    search: Graph.Roots,
 ) !u8 {
     // `--emit ir` takes the 1 ROOT (entry) file; discover the whole graph. `argLine`
     // flushes, because the code bubbles up through `std.process.exit(try emitIr(...))`
@@ -1093,6 +1130,7 @@ fn emitIr(
         .ncpu = @max(@as(usize, 1), jlimit.toInt() orelse Engine.hostCpus()),
         .sev = sev,
         .allow_core_imports = allow_core_imports,
+        .roots = search,
         .timings = false,
         .last_ns = null,
         .ns_discover = null,
@@ -1190,6 +1228,7 @@ fn runCheck(
     timings: bool,
     sev: SevCfg.SeverityConfig,
     allow_core_imports: bool,
+    search: Graph.Roots,
 ) !u8 {
     // `check` takes the 1 ROOT (entry) file, exactly like a `-o`/`--emit ir` build:
     // discover its transitive import graph.
@@ -1249,7 +1288,7 @@ fn runCheck(
     // DISCOVER the whole module graph (following imports), reusing `build`'s discoverer.
     // A true I/O/OOM failure propagates as a Zig error (exit 2); a STRUCTURAL problem
     // (missing import, escape, cycle, tainted parse) is recorded in `graph.err`.
-    graph_slot = Graph.discover(gpa, cio, cache, target, entry, .{ .probe = if (timings) &discover_probe else null, .allow_core_imports = allow_core_imports }) catch |e| {
+    graph_slot = Graph.discover(gpa, cio, cache, target, entry, .{ .probe = if (timings) &discover_probe else null, .allow_core_imports = allow_core_imports, .roots = search }) catch |e| {
         try argLine(usage, @errorName(e));
         return 2;
     };
