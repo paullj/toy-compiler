@@ -442,6 +442,10 @@ test "in a bounded template a '_' or an untyped lambda param takes the template'
     try Typecheck.expectDiagCodes(add ++ "fn ap[A, B](f: fn(A) -> B, b: B) -> B { b }\nfn go[K has Add, V](k: K, v: V) -> K { ap(fn(o) { k }, k) }\n", &.{.T0050});
 }
 
+test "a lambda passed where the param type was rejected adds no second error" {
+    try Typecheck.expectDiagCodes("extern fn f(cb: fn(int) -> int) -> int\nfn main() -> int { return unsafe { f(fn(x) { x }) } }\n", &.{.T0037});
+}
+
 const then_impls =
     \\impl Option[T] {
     \\ fn then[U](self, f: fn(T) -> Option[U]) -> Option[U] {

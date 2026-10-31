@@ -29,30 +29,30 @@ fn or_errno(r: int) -> int {
 }
 
 pub fn open_read(path: str) -> int {
-    return or_errno(open(os.to_cstr(path), 0))
+    return or_errno(unsafe { open(os.to_cstr(path), 0) })
 }
 
 # Darwin's O_WRONLY (1) | O_APPEND (8).
 pub fn open_append(path: str) -> int {
-    return or_errno(open(os.to_cstr(path), 9))
+    return or_errno(unsafe { open(os.to_cstr(path), 9) })
 }
 
 # Creates `path` or truncates it, as 0644 (420), rw-r--r-- before the umask.
 pub fn create(path: str) -> int {
-    return or_errno(creat(os.to_cstr(path), 420))
+    return or_errno(unsafe { creat(os.to_cstr(path), 420) })
 }
 
 pub fn close_fd(fd: int) -> int {
-    return or_errno(close(fd))
+    return or_errno(unsafe { close(fd) })
 }
 
 pub fn remove(path: str) -> int {
-    return or_errno(unlink(os.to_cstr(path)))
+    return or_errno(unsafe { unlink(os.to_cstr(path)) })
 }
 
 # access(2) with F_OK (0): whether the path resolves, whatever its permissions.
 pub fn exists(path: str) -> bool {
-    return c_int(access(os.to_cstr(path), 0)) == 0
+    return c_int(unsafe { access(os.to_cstr(path), 0) }) == 0
 }
 
 # Writes all of `s`, again after a short write. Unlike `sys.write_fd` it reports an error,
@@ -60,7 +60,7 @@ pub fn exists(path: str) -> bool {
 pub fn write_all(fd: int, s: str) -> int {
     rest := s
     while rest.len() > 0 {
-        n := sys.write(fd, rest)
+        n := unsafe { sys.write(fd, rest) }
         if n < 0 { return -os.errno() }
         # A write that takes nothing would loop forever, so it reports EIO (5).
         if n == 0 { return -5 }
@@ -77,7 +77,7 @@ pub fn read_some(fd: int, n: int) -> Result[str, int] {
     cap := n
     if cap > 65536 { cap = 65536 }
     buf := text.alloc(cap)
-    got := sys.read(fd, text.window(buf, 0, cap), cap)
+    got := unsafe { sys.read(fd, text.window(buf, 0, cap), cap) }
     if got < 0 { return Result[str, int].err(os.errno()) }
     return Result.ok(text.take(buf, got))
 }
@@ -96,7 +96,7 @@ pub fn read_all(fd: int) -> Result[str, int] {
             buf = next
             cap *= 2
         }
-        n := sys.read(fd, text.window(buf, len, cap - len), cap - len)
+        n := unsafe { sys.read(fd, text.window(buf, len, cap - len), cap - len) }
         if n < 0 { return Result[str, int].err(os.errno()) }
         if n == 0 { break }
         len += n

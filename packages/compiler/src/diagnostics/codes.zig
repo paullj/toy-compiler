@@ -49,7 +49,7 @@ pub const Code = enum(u16) {
     R0007, // invalid-assignment-target
     R0008, // duplicate-label
     R0009, // undefined-label
-    R0010, // extern-not-in-core (an `extern fn` declared outside a `core/` module)
+    R0010, // extern-not-in-core (retired: a program may declare an `extern fn`)
     R0011, // duplicate-binding (a name declared twice in one parameter list, pattern or block)
     R0012, // import-cycle (imports that lead back to a module that is still being imported)
     R0013, // core-import-private (a user module imports a bundled `core/` module)
@@ -134,6 +134,7 @@ pub const Code = enum(u16) {
     T0076, // receiver-mode-mismatch (a conformance method's `self`/`mut self` differs from its protocol's)
     T0077, // type-too-large (a struct or enum larger than the largest value codegen can address)
     T0078, // private-field (a field without `pub` used outside its struct's module)
+    T0079, // extern-call-outside-unsafe (a call to an `extern fn` outside an `unsafe` block)
 
     // Warning band (W####).
     W0001, // unused-variable
@@ -282,6 +283,7 @@ pub const table = [_]Entry{
     .{ .code = .T0076, .str = "T0076", .slug = "receiver-mode-mismatch" },
     .{ .code = .T0077, .str = "T0077", .slug = "type-too-large" },
     .{ .code = .T0078, .str = "T0078", .slug = "private-field" },
+    .{ .code = .T0079, .str = "T0079", .slug = "extern-call-outside-unsafe" },
     .{ .code = .W0001, .str = "W0001", .slug = "unused-variable", .default_severity = .warning },
     .{ .code = .W0002, .str = "W0002", .slug = "unused-parameter", .default_severity = .warning },
     .{ .code = .W0003, .str = "W0003", .slug = "unused-function", .default_severity = .warning },
@@ -648,6 +650,8 @@ test "str/defaultSeverity/slug for none and a real code" {
     try testing.expectEqual(Code.T0077, fromStr("T0077").?);
     try testing.expectEqualStrings("private-field", slug(.T0078).?);
     try testing.expectEqual(Severity.err, defaultSeverity(.T0078));
+    try testing.expectEqualStrings("extern-call-outside-unsafe", slug(.T0079).?);
+    try testing.expectEqual(Code.T0079, fromStr("T0079").?);
 
     try testing.expectEqualStrings("W0013", str(.W0013).?);
     try testing.expectEqualStrings("fn-field-method-clash", slug(.W0013).?);

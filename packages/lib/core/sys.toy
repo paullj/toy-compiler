@@ -1,7 +1,6 @@
-# The quarantined libSystem read and write clients. `extern` is legal only in `core/*`, so
-# the raw syscalls live here; std reaches the fds through the safe wrappers, never naming
-# an extern. A `str` arg spreads to (buf,len) in the next two arg registers, matching C
-# write(fd, buf, count).
+# The quarantined libSystem read and write clients: std reaches the fds through the safe
+# wrappers, never naming an extern. A `str` arg spreads to (buf,len) in the next two arg
+# registers, matching C write(fd, buf, count).
 import core/text
 
 pub extern fn write(fd: int, s: str) -> int
@@ -10,7 +9,7 @@ pub extern fn read(fd: int, buf: rawptr, n: int) -> int
 # One `write` with no short-write loop: every printing binary links this, and changing it
 # would change them all.
 pub fn print(s: str) {
-    write(1, s)
+    unsafe { write(1, s) }
 }
 
 # A pipe or a full disk can take fewer bytes than asked, so the rest is written again. An
@@ -18,7 +17,7 @@ pub fn print(s: str) {
 pub fn write_fd(fd: int, s: str) {
     rest := s
     while rest.len() > 0 {
-        n := write(fd, rest)
+        n := unsafe { write(fd, rest) }
         if n <= 0 { return }
         rest = text.slice(rest, n, rest.len())
     }
@@ -35,7 +34,7 @@ pub fn read_fd_all(fd: int) -> str {
             buf = grow(buf, len, cap * 2)
             cap *= 2
         }
-        n := read(fd, text.window(buf, len, cap - len), cap - len)
+        n := unsafe { read(fd, text.window(buf, len, cap - len), cap - len) }
         if n <= 0 { break }
         len += n
     }
@@ -55,7 +54,7 @@ pub fn read_line_fd(fd: int) -> Option[str] {
             cap *= 2
         }
         p := text.window(buf, len, 1)
-        if read(fd, p, 1) <= 0 {
+        if (unsafe { read(fd, p, 1) }) <= 0 {
             if len == 0 { return Option[str].none }
             return Option.some(text.take(buf, len))
         }

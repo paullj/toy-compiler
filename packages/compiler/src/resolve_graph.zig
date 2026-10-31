@@ -392,13 +392,6 @@ const GraphResolve = struct {
                     },
                     .extern_fn_decl => {
                         const name = g.nameOf(mod, decl.main_token);
-                        // The DECL gate is core-only: an `extern fn` is legal solely in a
-                        // bundled `core/` module. Anywhere else it is never registered, so
-                        // any use of the name is undeclared (R0001).
-                        if (!m.isCore()) {
-                            try g.sink.report(.{ .span = g.nodeSpan(mod, decl_idx), .code = .R0010, .scope = mod }, "'extern' functions are only allowed in 'core/' modules", .{});
-                            continue;
-                        }
                         const gop = try g.tables[mod].fns.getOrPut(g.gpa, name);
                         if (gop.found_existing) {
                             try g.sink.report(.{ .span = g.tokSpan(mod, decl.main_token), .code = .R0002, .scope = mod }, "duplicate function '{s}'", .{name});
@@ -640,8 +633,8 @@ const GraphResolve = struct {
             };
             const owner = &g.graph.modules[found.mod];
             const tag: ?Ast.Node.Tag = if (found.decl == Ast.none) null else owner.nodes[found.decl.int()].tag;
-            // An extern is served only to `core/` modules, as through `mod.member`.
-            const exported = found.exported and !(tag == .extern_fn_decl and !g.graph.modules[mod].isCore());
+            // Core's externs are served only to `core/` modules, as through `mod.member`.
+            const exported = found.exported and !(tag == .extern_fn_decl and owner.isCore() and !g.graph.modules[mod].isCore());
             // A name withheld further down a re-export chain is reported where it is
             // withheld. Either way it is still bound, so its uses add no R0001 or R0006.
             const withheld_deeper = !found.exported and found.withheld_by != target;
@@ -1546,7 +1539,7 @@ const GraphResolve = struct {
             // extern — it calls a safe `core/ffi.abs` wrapper). A std/user module doing
             // `import core/ffi; ffi.labs(..)` falls through to the R0005 not-exported branch
             // below, closing the bypass.
-            if (!(g.fns.items[gid].kind == .import and !g.refCore())) {
+            if (!g.externHidden(gid)) {
                 g.res(node_idx, .{ .func = gid });
                 return;
             }
@@ -1752,23 +1745,20 @@ const GraphResolve = struct {
             }
         }
         if (g.tables[g.cur_mod].fns.get(name)) |gid| {
-            // An `.import` (extern) symbol resolves only in a `core/*` module; anywhere
-            // else it falls through to the undeclared diagnostic. In practice only a
-            // `core/` module holds an import symbol in its own `fns` (the DECL gate is
-            // core-only), but this keeps the quarantine invariant explicit at the bare-name
-            // site too.
-            if (g.fns.items[gid].kind == .import and !g.refCore()) return null;
+            // A selected import of a core extern is bound (its R0005 is the one error)
+            // but still never resolves outside `core/`.
+            if (g.externHidden(gid)) return null;
             return .{ .func = gid };
         }
         return null;
     }
 
-    /// Whether the CURRENTLY-RESOLVING module is under `core/`. An `.import` (extern)
-    /// name resolves only when the referring module is `core/`; `std` reaches C only
-    /// through a safe core wrapper, so a `std`/user module naming an extern gets the
-    /// standard not-exported/unresolved diagnostic.
-    fn refCore(g: *GraphResolve) bool {
-        return g.graph.modules[g.cur_mod].isCore();
+    /// Whether fn `gid` is one of core's externs seen from outside `core/`: `std` reaches
+    /// C only through a safe core wrapper, so naming one gets the standard
+    /// not-exported/unresolved diagnostic. A program's own externs follow `pub`.
+    fn externHidden(g: *GraphResolve, gid: u32) bool {
+        const f = g.fns.items[gid];
+        return f.kind == .import and g.graph.modules[f.module].isCore() and !g.graph.modules[g.cur_mod].isCore();
     }
 
     /// An iterator over exactly the names `lookupName` searches, for near-miss
@@ -4051,11 +4041,10 @@ test "an `as _`-aliased unused import is a deliberate silence (no W0004)" {
     try withResolvedGraph(".toy-test-w4-silence", files, "main.toy", Check.run);
 }
 
-test "an import diagnostic spans the module path; the extern gate spans the declaration" {
+test "an import diagnostic spans the module path" {
     const files = &[_]FixtureFile{
         .{ .path = "main.toy", .source =
         \\import util/lib as l
-        \\extern fn labs(x: int) -> int
         \\fn main() -> int { return 0 }
         \\
         },
@@ -4063,21 +4052,51 @@ test "an import diagnostic spans the module path; the extern gate spans the decl
     };
     const Check = struct {
         fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
-            var seen: u32 = 0;
-            for (r.diags) |d| {
-                const src = g.modules[d.scope].source;
-                const text = src[d.byte_offset..d.end];
-                switch (d.code) {
-                    .W0004 => try testing.expectEqualStrings("util/lib", text),
-                    .R0010 => try testing.expectEqualStrings("extern fn labs(x: int) -> int", text),
-                    else => continue,
-                }
-                seen += 1;
-            }
-            try testing.expectEqual(@as(u32, 2), seen);
+            try testing.expectEqual(@as(usize, 1), r.diags.len);
+            const d = r.diags[0];
+            try testing.expectEqual(codes.Code.W0004, d.code);
+            try testing.expectEqualStrings("util/lib", g.modules[d.scope].source[d.byte_offset..d.end]);
         }
     };
     try withResolvedGraph(".toy-test-import-spans", files, "main.toy", Check.run);
+}
+
+test "a program's externs register like fns: bare and block members resolve, pub ones import" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util/c
+        \\extern fn putchar(ch: int32) -> int32
+        \\extern "m" {
+        \\    fn cos(x: float) -> float
+        \\}
+        \\fn main() -> int {
+        \\    unsafe { putchar(65) }
+        \\    _f := unsafe { cos(0.0) }
+        \\    return unsafe { c.labs(-1) + c.hidden() }
+        \\}
+        \\
+        },
+        .{ .path = "util/c.toy", .source =
+        \\pub extern fn labs(x: int) -> int
+        \\extern { fn hidden() -> int }
+        \\
+        },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 1), r.diags.len);
+            try testing.expectEqual(codes.Code.R0005, r.diags[0].code);
+            try testing.expect(std.mem.indexOf(u8, r.diags[0].message, "hidden") != null);
+            for ([_][]const u8{ "putchar", "cos", "labs", "hidden" }) |want| {
+                const found = for (r.fns) |f| {
+                    if (f.kind == .import and std.mem.eql(u8, f.name, want)) break true;
+                } else false;
+                try testing.expect(found);
+            }
+        }
+    };
+    try withResolvedGraph(".toy-test-user-externs", files, "main.toy", Check.run);
 }
 
 test "a value-index callee resolves its subscript (no W0001)" {

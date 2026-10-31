@@ -433,6 +433,13 @@ fn parseDeclRecoverable(p: *Parser, decls: *std.ArrayList(Ast.Index)) Error!void
         try decls.append(p.gpa, try p.parseImplDecl());
         return;
     }
+    if (p.atExternBlock(0) or (p.at(.kw_pub) and p.atExternBlock(1))) {
+        if (p.at(.kw_pub)) {
+            try p.warn(p.peek(), .P0003, "'pub' goes on each function of an extern block, not on the block");
+            p.advance();
+        }
+        return p.parseExternBlock(decls);
+    }
     // An optional `pub` modifier precedes a fn/struct/enum decl and exports it.
     const is_pub = p.eat(.kw_pub);
     const decl = switch (p.peek().tag) {
@@ -567,8 +574,9 @@ const FnKind = union(enum) {
     conformance_method: Recv,
     /// A bodyless `extern fn` C-ABI declaration: no receiver, no generics, no body
     /// (like `protocol_sig` it synthesizes an empty block). Tagged `extern_fn_decl`
-    /// at `addNode` so resolve/typecheck register it as a dyld import.
-    extern_top_level,
+    /// at `addNode` so resolve/typecheck register it as a dyld import. `lib_tok` is the
+    /// library string of an `extern "lib" { .. }` block.
+    extern_top_level: struct { lib_tok: ?u32 = null },
     local,
 
     const Recv = struct { recv_tok: u32, self_type_ref: Ast.Index, impl_gparams: []const Ast.Index };
@@ -713,8 +721,14 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
     // A protocol method signature has no body: synthesize an empty `block` (its
     // `main_token` is the current token — a leaf with an empty statement Range) so
     // the node shape matches an ordinary fn and pack/unpack stays uniform.
+    // An extern's library rides the synthesized block's otherwise-unused main token, so
+    // the node shape (and every cached AST) stays as it was (see `Ast.externLibrary`).
+    const body_tok = switch (kind) {
+        .extern_top_level => |e| e.lib_tok orelse p.index,
+        else => p.index,
+    };
     const body = if (bodyless)
-        try p.addNode(.{ .tag = .block, .main_token = p.index, .lhs = try p.addRange(&.{}), .rhs = Ast.none })
+        try p.addNode(.{ .tag = .block, .main_token = body_tok, .lhs = try p.addRange(&.{}), .rhs = Ast.none })
     else
         try p.parseBlock();
 
@@ -735,7 +749,52 @@ fn parseFnDecl(p: *Parser, kind: FnKind) Error!Ast.Index {
 /// leading `extern`, then reuses `parseFnDecl`'s bodyless path.
 fn parseExternFn(p: *Parser) Error!Ast.Index {
     try p.expect(.kw_extern, "expected 'extern'");
-    return p.parseFnDecl(.extern_top_level);
+    return p.parseFnDecl(.{ .extern_top_level = .{} });
+}
+
+/// Whether `extern "lib" {` or `extern {` starts `off` tokens ahead.
+fn atExternBlock(p: *const Parser, off: u32) bool {
+    const last = p.tokens.len - 1;
+    if (p.tokens[@min(p.index + off, last)].tag != .kw_extern) return false;
+    const next = p.tokens[@min(p.index + off + 1, last)].tag;
+    return next == .string or next == .l_brace;
+}
+
+/// `extern ["lib"] { [pub] fn .. }`. Each member becomes its own top-level
+/// `extern_fn_decl`, so every pass that walks declarations sees a block member exactly
+/// as a bare `extern fn`; only the library string sets them apart.
+fn parseExternBlock(p: *Parser, decls: *std.ArrayList(Ast.Index)) Error!void {
+    try p.expect(.kw_extern, "expected 'extern'");
+    const lib_tok: ?u32 = if (p.at(.string)) p.index else null;
+    if (lib_tok != null) p.advance();
+    try p.expect(.l_brace, "expected '{' after the extern library name");
+    while (!p.at(.eof)) {
+        p.skipNewlines();
+        if (p.at(.r_brace)) break;
+        if (!p.at(.kw_fn) and !p.at(.kw_pub) and decl_anchors.contains(p.peek().tag)) break;
+        const entry = p.index;
+        if (p.at(.kw_fn) or (p.at(.kw_pub) and p.peek2().tag == .kw_fn)) {
+            const is_pub = p.eat(.kw_pub);
+            // A member is its own recovery unit, as a top-level decl is, so one broken
+            // signature neither hides the next one's errors nor turns the rest of the
+            // block into top-level functions missing their bodies.
+            p.in_error = false;
+            if (p.parseFnDecl(.{ .extern_top_level = .{ .lib_tok = lib_tok } })) |decl| {
+                if (is_pub) try p.pub_decls.append(p.gpa, decl);
+                try decls.append(p.gpa, decl);
+            } else |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.ParseError => {
+                    while (!p.at(.eof) and !p.at(.newline) and !p.at(.r_brace)) p.advance();
+                },
+            }
+            _ = p.eat(.comma);
+        } else {
+            _ = try p.advanceWithError(.P0006, "expected an extern 'fn' or '}'");
+        }
+        std.debug.assert(p.index > entry or p.at(.r_brace) or p.at(.eof));
+    }
+    try p.expect(.r_brace, "expected '}' to close the extern block");
 }
 
 /// `impl Type { fn m(self, ..) -> R { .. } }` — an inherent-method block —
@@ -3401,6 +3460,31 @@ test "extern fn parses bodyless to extern_fn_decl" {
         "extern fn labs(x: int) -> int\n",
         "(program (extern-fn labs ((param x int)) int))",
     );
+}
+
+test "an extern block flattens its members into extern_fn_decls that carry the library" {
+    try expectProgram(
+        "extern \"sqlite3\" {\n    fn sqlite3_libversion_number() -> int32\n    pub fn sqlite3_sleep(ms: int32) -> int32\n}\nextern {\n    fn labs(x: int) -> int\n}\nextern fn putchar(c: int32) -> int32\n",
+        "(program (extern-fn sqlite3_libversion_number \"sqlite3\" () int32) (pub (extern-fn sqlite3_sleep \"sqlite3\" ((param ms int32)) int32)) (extern-fn labs ((param x int)) int) (extern-fn putchar ((param c int32)) int32))",
+    );
+}
+
+test "an extern block recovers per member, and 'pub' on the block is a P0003" {
+    const gpa = testing.allocator;
+    const res = try parseResult(gpa, "pub extern \"m\" {\n    fn a(x int) -> int\n    fn b() -> int\n}\nfn main() -> int {\n    return 0\n}\n");
+    defer gpa.free(@constCast(res.diags));
+    defer freeTree(gpa, res.tree);
+    try testing.expectEqual(@as(usize, 2), res.diags.len);
+    try testing.expectEqual(codes.Code.P0003, res.diags[0].code);
+    var externs: usize = 0;
+    var fns: usize = 0;
+    for (res.tree.nodes) |n| switch (n.tag) {
+        .extern_fn_decl => externs += 1,
+        .fn_decl => fns += 1,
+        else => {},
+    };
+    try testing.expectEqual(@as(usize, 1), fns);
+    try testing.expect(externs >= 1);
 }
 
 test "pub extern fn parses and records the export" {

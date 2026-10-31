@@ -2749,7 +2749,12 @@ pub const BodyChecker = struct {
                 continue;
             }
             const want = bc.paramWant(sig, p);
-            const got = if (sig.pretyped) |pt| pt[i] else try bc.typeOfExpected(a, if (want.kind == .invalid) null else want);
+            // A rejected param type was already reported; the arg is typed quietly, as a
+            // failed call's are, so an untyped lambda there is not blamed for it.
+            const got = if (sig.pretyped) |pt| pt[i] else if (want.kind == .invalid) blk: {
+                try bc.drainArgs(&.{a});
+                break :blk Type.invalid;
+            } else try bc.typeOfExpected(a, want);
             if (!Type.assignable(want, got))
                 try bc.report(.{ .span = bc.spanOf(a), .code = .T0040, .related = sig.decl }, "argument {d}{s}: expected {f}, got {f}{f}{f}", .{ i + 1, bc.pipedArgHint(call, i + 1), bc.fmtType(want), bc.fmtType(got), bc.sigSuffix(sig), bc.captureHint(a, want, got) });
             if (Modes.isMut(sig.mut_mask, i)) try bc.checkMutArg(call, a, i, sig);
@@ -4152,6 +4157,8 @@ pub const BodyChecker = struct {
         }
         const f = bc.model.fns[callee_res.func];
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
+        if (f.kind == .import and !bc.in_unsafe)
+            try bc.sink.report(.{ .span = bc.spanOf(node_idx), .code = .T0079 }, "call to extern function '{s}' requires an 'unsafe' block", .{bc.nameText(callee.main_token)});
         // The bodyless builtins: the bundled-library intrinsics, then the global
         // `panic(str)`. Intercept BEFORE the generic/arg-assignability check below
         // (a builtin carries only a placeholder sig — its arg-checking is token-based here).

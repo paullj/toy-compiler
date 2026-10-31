@@ -41,8 +41,13 @@ and add no module-graph or content-fingerprint surface.
 
 core is the private layer between the compiler and std. It is the only place where:
 
-- an `extern fn` may be declared (R0010 elsewhere), so every C symbol enters here;
+- an extern may take or return a `str` (spread to a C `buf, len` pair), and where
+  std's C symbols enter: core's externs are hidden from every module outside `core/`;
 - a `.core` intrinsic may be named.
+
+Every call to an extern, core's included, sits inside `unsafe { }` (T0079); the core
+wrappers do so internally, so std and its public names are unchanged. A program
+declares its own externs as `ffi.md` describes.
 
 | module | holds |
 |--------|-------|
@@ -57,8 +62,8 @@ core is the private layer between the compiler and std. It is the only place whe
 
 ## std
 
-std is the public library. It wraps core in safe APIs: std never declares an `extern`
-and never names a `.core` intrinsic.
+std is the public library. It wraps core in safe APIs: std never declares an `extern`,
+never names one of core's, and never names a `.core` intrinsic.
 
 | module | holds |
 |--------|-------|

@@ -1,0 +1,6 @@
+# expect: compile-error "call to extern function 'labs' requires an 'unsafe' block"
+extern fn labs(x: int) -> int
+
+fn main() -> int {
+    return labs(-3)
+}

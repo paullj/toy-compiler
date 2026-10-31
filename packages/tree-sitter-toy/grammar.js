@@ -81,6 +81,7 @@ module.exports = grammar({
     _declaration: ($) =>
       choice(
         $.function_declaration,
+        $.extern_block,
         $.struct_declaration,
         $.enum_declaration,
         $.impl_block,
@@ -101,6 +102,16 @@ module.exports = grammar({
         $.parameter_list,
         optional(seq("->", field("return_type", $._type))),
         optional($.block),
+      ),
+
+    // `extern "lib" { fn .. }`; without a library name the block binds libSystem.
+    extern_block: ($) =>
+      seq(
+        "extern",
+        optional(field("library", $.string)),
+        "{",
+        repeat($.function_declaration),
+        "}",
       ),
 
     _local_function_declaration: ($) =>

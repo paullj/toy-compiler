@@ -25,9 +25,9 @@ fn load_i32(p: rawptr) -> int {
 pub fn shortest(f: float) -> Shortest {
     out := gc_alloc(8)
     sign := gc_alloc(8)
-    p := __dtoa(f, 0, 0, out, sign, offset(0, 0))
+    p := unsafe { __dtoa(f, 0, 0, out, sign, offset(0, 0)) }
     digits := os.from_cstr(p)
-    __freedtoa(p)
+    unsafe { __freedtoa(p) }
     return Shortest { digits: digits, point: load_i32(out), neg: load_i32(sign) != 0 }
 }
 
@@ -37,7 +37,7 @@ pub fn parse(s: str) -> Option[float] {
     if s.len() == 0 || s.byte_at(0) <= 32 { return Option[float].none }
     end := gc_alloc(8)
     c := os.to_cstr(s)
-    f := strtod(c, end)
+    f := unsafe { strtod(c, end) }
     start := addr(c)
     stop: int = unsafe { load(end) }
     if stop - start != s.len() { return Option[float].none }

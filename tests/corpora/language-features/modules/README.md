@@ -37,6 +37,8 @@ on each `main.toy` entry.
 | `errors/folder_mod_path/`     | `import util/mod` instead of `import util` (R0003)              |
 | `errors/path_alias/`          | one file imported under two paths through nested roots (R0014)  |
 | `errors/private_ref/`         | referencing a non-`pub` decl across modules                    |
+| `ffi_extern/`                 | a module's `pub extern` called qualified and selected inside `unsafe`; a private block extern behind a safe wrapper |
+| `errors/private_extern/`      | an extern without `pub` named through its module               |
 | `private_fields/`             | `pub` fields used from another module; private ones only through the owner's methods and derives |
 | `errors/private_literal/`     | a module-qualified literal of a non-`pub` struct                |
 | `errors/private_field/`       | reading a field without `pub` from another module               |
