@@ -1,0 +1,17 @@
+# Through an alias or a builtin type, a member that names no associated fn leaves a type
+# used as a value (T0056), and an instance method is T0018, as through the type itself.
+# The resolver lets such a receiver pass, so a later type error is reported too.
+struct K { v: int }
+type A = K
+impl K { fn get(self) -> int { self.v } }
+impl int { fn zero() -> int { 0 } }
+type I = int
+
+fn main() -> int {
+    _a := A.nope()  #~ ERROR [T0056] type 'A' is not a value
+    _b := int.nope  #~ ERROR [T0056] type 'int' is not a value
+    _c := I.nope(1)  #~ ERROR [T0056] type 'I' is not a value
+    _d := A.get()  #~ ERROR [T0018] 'get' is an instance method
+    _e: bool = I.zero()  #~ ERROR [T0041] cannot bind int
+    return 0
+}

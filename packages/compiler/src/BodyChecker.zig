@@ -1277,7 +1277,16 @@ pub const BodyChecker = struct {
             try bc.sink.report(at, "type '{s}' is not a value", .{name});
             return true;
         }
-        const eid = ids.e orelse return false;
+        const eid = ids.e orelse {
+            if (bc.aliasTypeNamed(idx) == null) return false;
+            // `float` names both a type and std/float, so `float.parse` without the
+            // import lands here.
+            if (if (Typecheck.type_names.has(name)) StdNames.importHintFor(name) else null) |hint|
+                try bc.sink.report(at, "type '{s}' is not a value; for the module std/{s}, " ++ StdNames.add_import, .{ name, hint.module, hint.module })
+            else
+                try bc.sink.report(at, "type '{s}' is not a value", .{name});
+            return true;
+        };
         const variants = bc.model.enums[eid].variants;
         if (variants.len == 0) {
             try bc.sink.report(at, "type '{s}' is not a value", .{name});
@@ -1875,8 +1884,8 @@ pub const BodyChecker = struct {
         const recv = bc.tree.nodes[n.lhs.int()];
         var app_ty: Type = undefined;
         var m: Typecheck.TemplateMethod = undefined;
-        if (recv.tag == .type_app and !bc.appHeadIsValue(n.lhs)) {
-            app_ty = bc.typeFromNode(n.lhs);
+        if (bc.appTypeNamed(n.lhs)) |named| {
+            app_ty = named;
             if (!app_ty.isApp()) return null;
             const e = bc.composite.at(app_ty.appIdx());
             if (e.ctor_is_enum and !bc.isAssociatedFnOfEnum(e.ctor, n.main_token)) return null;
@@ -3540,8 +3549,7 @@ pub const BodyChecker = struct {
         const recv = bc.tree.nodes[(fa.lhs).int()];
         const member = bc.nameText(fa.main_token);
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-        if (recv.tag == .type_app and !bc.appHeadIsValue(fa.lhs)) {
-            const app_ty = bc.typeFromNode(fa.lhs);
+        if (bc.appTypeNamed(fa.lhs)) |app_ty| {
             if (!app_ty.isApp()) {
                 try bc.drainArgs(args);
                 return .invalid; // typeFromNode reported it
@@ -3749,7 +3757,31 @@ pub const BodyChecker = struct {
         const ids = bc.typeIdsNamed(recv_idx);
         if (ids.s) |sid| return if (sid < bc.structSyms().len and !bc.structSyms()[sid].is_generic) Type.structT(sid) else null;
         if (ids.e) |eid| return if (!bc.model.enums[eid].is_generic) Type.enumT(eid) else null;
-        return null;
+        const ty = bc.aliasTypeNamed(recv_idx) orelse return null;
+        return if (ty.isApp()) null else ty;
+    }
+
+    /// The type a bare builtin type or alias name names (`int`, or `A` of `type A = K`),
+    /// which the resolver leaves unresolved as a receiver; null for anything else.
+    fn aliasTypeNamed(bc: *const BodyChecker, idx: Ast.Index) ?Type {
+        const n = bc.tree.nodes[idx.int()];
+        if (n.tag != .identifier or bc.resolutions[idx.int()] != .unresolved) return null;
+        const name = bc.nameText(n.main_token);
+        if (bc.activeStructMap().contains(name) or bc.activeEnumMap().contains(name)) return null;
+        if (Typecheck.type_names.get(name)) |t| return t;
+        const ty = bc.activeAliasMap().get(name) orelse return null;
+        return if (ty.kind == .invalid) null else ty;
+    }
+
+    /// The generic-type instance a receiver names: a `Box[int]` type application, or an
+    /// alias of one. Null for a value or any other type.
+    fn appTypeNamed(bc: *BodyChecker, idx: Ast.Index) ?Type {
+        if (bc.tree.nodes[idx.int()].tag == .type_app) {
+            if (bc.appHeadIsValue(idx)) return null;
+            return bc.typeFromNode(idx);
+        }
+        const ty = bc.aliasTypeNamed(idx) orelse return null;
+        return if (ty.isApp()) ty else null;
     }
 
     /// `T.m(args)` naming an instance method `m` through a type, in any of its forms
@@ -3789,6 +3821,12 @@ pub const BodyChecker = struct {
         return .invalid;
     }
 
+    /// Whether `member` names a method or method template of the non-generic `ty`.
+    fn namesMethod(bc: *const BodyChecker, ty: Type, member: []const u8) bool {
+        return Typecheck.pickMethodIndex(bc.model.methods, ty, member, null, null, bc.methodSite()) != .none or
+            bc.concreteTemplate(ty, member) != null;
+    }
+
     /// The template of `member` on the non-generic struct or enum `recv`, a method with
     /// type params of its own (see `Typecheck.templateRecv`), else null.
     fn concreteTemplate(bc: *const BodyChecker, recv: Type, member: []const u8) ?Typecheck.TemplateMethod {
@@ -3808,11 +3846,11 @@ pub const BodyChecker = struct {
         const recv = bc.tree.nodes[(callee.lhs).int()];
         const member = bc.nameText(callee.main_token);
         const args = Ast.rangeSlice(bc.tree, (n.rhs).int());
-        if (recv.tag == .type_app and !bc.appHeadIsValue(callee.lhs)) {
-            const app_ty = bc.typeFromNode(callee.lhs);
+        if (bc.appTypeNamed(callee.lhs)) |app_ty| {
             if (!app_ty.isApp()) return null; // typeFromNode already diagnosed
             const e = bc.composite.at(app_ty.appIdx());
             const m = Typecheck.findGenericMethod(bc.model.templates, e.ctor, e.ctor_is_enum, member, bc.methodSite()) orelse {
+                if (recv.tag != .type_app) return null;
                 // An instance has no methods of its own (`impl Box[int]` is rejected), so a
                 // member no template declares names nothing.
                 try bc.drainArgs(args);
@@ -3837,7 +3875,10 @@ pub const BodyChecker = struct {
             _ = try bc.checkCall(node_idx, args, bc.fnSig(mf, member).substituted(targs_opt));
             return bc.substRet(node_idx, mf, targs_opt orelse return .invalid);
         }
-        if (bc.concreteTypeNamed(callee.lhs)) |ty| return try bc.checkConcreteAssociatedCall(node_idx, n, callee, ty);
+        if (bc.concreteTypeNamed(callee.lhs)) |ty| {
+            if (bc.aliasTypeNamed(callee.lhs) != null and !bc.namesMethod(ty, member)) return null;
+            return try bc.checkConcreteAssociatedCall(node_idx, n, callee, ty);
+        }
         // A bare `Box.new(5)` (no turbofish) naming a generic struct with an associated fn:
         // its type params come from the value args, or the call needs explicit ones.
         if (bc.genericTypeNamed(callee.lhs)) |g| {

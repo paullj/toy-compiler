@@ -1,0 +1,36 @@
+# Feature: an associated fn is called through a type alias, `A.mk(..)`, as through the type it names: an alias of a struct, of a generic instance (`type B = Box[int]`), with a type param of the fn's own, and named as a value
+# expect: stdout "2 3 4 5 6 7 9"
+# expect: exit 0
+import std/io
+
+struct K { v: int }
+type A = K
+
+impl A {
+    fn mk(_u: bool) -> A { K { v: 2 } }
+    fn of[U](_u: U, v: int) -> K { K { v: v } }
+}
+
+struct Box[T] { v: T }
+type B = Box[int]
+
+impl Box[T] {
+    fn mk(v: T) -> Box[T] { Box { v: v } }
+    fn with[U](v: T, _u: U) -> Box[T] { Box { v: v } }
+}
+
+fn put(acc: str, n: int) -> str { if acc == "" { n.to_string() } else { acc.concat(" ").concat(n.to_string()) } }
+
+fn main() -> int {
+    mk := A.mk
+    bmk := B.mk
+    out := put("", A.mk(true).v)
+    out = put(out, A.of("x", 3).v)
+    out = put(out, B.mk(4).v)
+    out = put(out, B.with(5, true).v)
+    out = put(out, mk(false).v + 4)
+    out = put(out, bmk(7).v)
+    out = put(out, B.with[bool](9, false).v)
+    io.print(out)
+    0
+}
