@@ -24,6 +24,8 @@ on each `main.toy` entry.
 | `qualified_literal/`          | `lib.Pt { .. }`, inferred `lib.Pair { .. }` and `shapes.Shape.sq { .. }` beside same-named local types |
 | `selective/`                  | `import a/b.{x, y as z}` binding a fn, generic fn, struct, enum, protocol and type alias bare |
 | `reexport/`                   | `pub import` re-exporting selected items and a whole namespace, used selectively and qualified (`util.extra.twice`) |
+| `search_roots/`               | `# include:` extra roots (the CLI's `-I`) beside the module root |
+| `errors/root_clash/`          | a module both the module root and an extra root hold (R0014)    |
 | `errors/private_ref/`         | referencing a non-`pub` decl across modules                    |
 | `private_fields/`             | `pub` fields used from another module; private ones only through the owner's methods and derives |
 | `errors/private_literal/`     | a module-qualified literal of a non-`pub` struct                |
@@ -44,6 +46,7 @@ directives live in the entry `main.toy`.
 # expect: exit <N>
 # expect: stdout "<bytes>"
 # expect: compile-error "<substr>"   # must fail to compile; substr appears in a diagnostic
+# include: "<dir>"                   # an extra import root, relative to the program's folder
 ```
 
 ## Running

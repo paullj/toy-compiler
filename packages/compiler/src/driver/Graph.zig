@@ -2,7 +2,8 @@
 //!
 //! Given an ENTRY file, discover the whole module graph by following `import`
 //! declarations transitively. A module IS a file, named by a `/`-path; an import
-//! `a/b` resolves to `<root>/a/b.toy` where ROOT is the entry file's directory.
+//! `a/b` resolves to `<root>/a/b.toy` for exactly one ROOT of the search path (see
+//! `Roots`): the module root (default: the entry file's directory), then each extra root.
 //!
 //! Discovery is two-phase and SERIAL at the discover level (a stable, sorted DFS
 //! over each module's imports) so the parse fan-out is never re-entered on a
@@ -10,11 +11,11 @@
 //! lex→parse runs through the existing on-disk content cache, so a warm rebuild
 //! pays nothing.
 //!
-//! This stage produces the GRAPH (parsed modules + edges) and rejects the three
-//! structural errors: a missing module, a path escaping the root, and an import
-//! cycle (the graph must be a DAG). Cross-module name/type resolution, the global
-//! id-space merge, and whole-graph lowering are LATER stages — this one stops at
-//! "the graph is discovered and is a well-formed DAG".
+//! This stage produces the GRAPH (parsed modules + edges) and rejects the structural
+//! errors: a missing module, a path escaping the root, a module found in more than one
+//! root, and an import cycle (the graph must be a DAG). Cross-module name/type
+//! resolution, the global id-space merge, and whole-graph lowering are LATER stages —
+//! this one stops at "the graph is discovered and is a well-formed DAG".
 
 const std = @import("std");
 const Io = std.Io;
@@ -110,7 +111,7 @@ pub const Module = struct {
 /// `cycle` is a `/`-joined arrow path naming the import cycle; owned when present.
 pub const Error = struct {
     pub const Kind = enum {
-        /// `import a/b` named a file that does not exist under the root.
+        /// `import a/b` named a file that no search root holds.
         missing,
         /// The import path escaped the root (`..`, absolute, or otherwise).
         escape,
@@ -118,6 +119,8 @@ pub const Error = struct {
         cycle,
         /// A parse error in a discovered module.
         parse,
+        /// The import path names a file in more than one search root.
+        ambiguous,
     };
     kind: Kind,
     message: []const u8,
@@ -142,6 +145,7 @@ pub const Error = struct {
             // An escaping path names no module of the graph, as a missing one does.
             .missing, .escape => .R0003,
             .cycle => .R0012,
+            .ambiguous => .R0014,
             .parse => .none,
         };
     }
@@ -292,16 +296,24 @@ pub const Graph = struct {
     }
 };
 
+/// Where a non-bundled import path is looked up: the module root, then each extra root.
+/// The CLI (`--root`, `-I`) and the language server (its initialization options) both
+/// hand discovery this one value, so they resolve imports by the same rules. Paths are
+/// used as given, so a cwd-relative root yields cwd-relative diagnostic paths. BORROWED.
+pub const Roots = struct {
+    /// null => the entry file's directory.
+    root: ?[]const u8 = null,
+    /// Extra search roots, in the order given.
+    include: []const []const u8 = &.{},
+};
+
 /// Options for `discover`; every field is optional.
 pub const DiscoverOptions = struct {
     /// `--timings` probe for the discover stage's lex+parse queries (file-read+lex+parse
     /// COMPUTE vs served from the lex/parse content cache). BORROWED; null on a plain
     /// build => the front-end queries read no clock.
     probe: ?*Engine.StageProbe = null,
-    /// Import-resolution root override. null => `dirname(entry_path)`. A non-null ABSOLUTE
-    /// value roots sibling imports at a directory OTHER than the entry file's own dir: an
-    /// editor integration checks a buffer but must resolve the real project's imports.
-    root: ?[]const u8 = null,
+    roots: Roots = .{},
     /// In-memory sources consulted before disk (see `Overlay`). Overlay-served modules
     /// skip the warm manifest and the source cache: their bytes are not a file with a
     /// stable stat.
@@ -389,13 +401,23 @@ pub fn discover(
     entry_path: []const u8,
     opts: DiscoverOptions,
 ) !Graph {
+    var search: std.ArrayList([]const u8) = try .initCapacity(gpa, 1 + opts.roots.include.len);
+    defer search.deinit(gpa);
+    search.appendAssumeCapacity(opts.roots.root orelse std.fs.path.dirname(entry_path) orelse "");
+    for (opts.roots.include) |r| {
+        const dup = for (search.items) |s| {
+            if (std.mem.eql(u8, trimRoot(s), trimRoot(r))) break true;
+        } else false;
+        if (!dup) search.appendAssumeCapacity(r);
+    }
+
     var d: Discoverer = .{
         .gpa = gpa,
         .io = io,
         .cache = cache,
         .target = target,
         .probe = opts.probe,
-        .root = opts.root orelse dirname(entry_path),
+        .roots = search.items,
         .overlay = opts.overlay,
         .bundled_cache = opts.bundled_cache,
     };
@@ -540,8 +562,8 @@ const Discoverer = struct {
     /// `--timings` probe for this stage's lex+parse queries (compute vs
     /// cache). Null on a plain build => no clock reads.
     probe: ?*Engine.StageProbe = null,
-    /// The root directory (entry file's directory). Borrowed from `entry_path`.
-    root: []const u8,
+    /// The search roots, module root first. Borrowed.
+    roots: []const []const u8,
     /// Module slots, indexed by id, in interning order. Entry is id 0.
     slots: std.ArrayList(Slot) = .empty,
     /// Map PHYSICAL FILE IDENTITY (canonicalized resolved path) → slot id. This is
@@ -1023,60 +1045,24 @@ const Discoverer = struct {
                 });
             }
 
-            // Validate + resolve to an on-disk file under the root.
-            const file = resolveFile(d.gpa, d.root, path) catch |e| switch (e) {
-                error.PathEscape => return d.fail(.{
-                    .kind = .escape,
-                    .message = try std.fmt.allocPrint(d.gpa, "import path '{s}' escapes the module root", .{path}),
-                    .module = id,
-                    .span = import_span,
-                }),
-                else => |err| return err,
+            const hit = try d.resolveImport(id, path, import_span);
+            const file = hit.file;
+            const canon = hit.canon;
+            // A file has one import path: nested roots or a folder entry would otherwise
+            // let a second spelling reach a module registered under the first, which
+            // resolve then cannot find by that spelling. The entry is skipped because
+            // importing it under any spelling is a cycle, and R0012 says so better.
+            if (d.by_canon.get(canon)) |prev| if (prev != 0 and !std.mem.eql(u8, d.slots.items[prev].name, path)) {
+                const msg = std.fmt.allocPrint(d.gpa, "imported module '{s}' is the file '{s}', which is already imported as '{s}'", .{ path, d.slots.items[prev].file, d.slots.items[prev].name });
+                d.gpa.free(file);
+                d.gpa.free(canon);
+                return d.fail(.{ .kind = .ambiguous, .message = try msg, .module = id, .span = import_span });
             };
-            errdefer d.gpa.free(file);
-
-            // Canonicalize to physical file identity (resolving symlinks/case) so two
-            // imports that open the SAME file (e.g. `util` and `Util` on a
-            // case-insensitive volume) intern to ONE module — one symbol set, one set
-            // of nominal type ids. `canonicalize` ALSO serves as the presence gate:
-            // `realPathFileAlloc` opens the file, so a null result means the import
-            // names a file that does not exist. Reporting the miss here (at the
-            // offending import's location) folds the old separate `openFile`+`close`
-            // existence check into this one realpath syscall.
-            const canon = (try d.canonicalize(file)) orelse {
-                return d.fail(.{
-                    .kind = .missing,
-                    .message = try std.fmt.allocPrint(d.gpa, "imported module '{s}' not found (looked for '{s}')", .{ path, file }),
-                    .module = id,
-                    .span = import_span,
-                });
+            const name = d.gpa.dupe(u8, path) catch |e| {
+                d.gpa.free(file);
+                d.gpa.free(canon);
+                return e;
             };
-
-            // Guardrail: on a normalizing FS, `import Util` against `util.toy`
-            // silently opens the file but requests the wrong case. The canonical
-            // path's last segment is the on-disk (case-correct) filename; if it
-            // differs from the requested `<lastSeg>.toy`, the import spelling is
-            // wrong. Reject with a clear diagnostic rather than (now) aliasing onto
-            // the canonical module under a mismatched qualifier.
-            {
-                const last_seg = basename(path); // last `/`-segment of the import
-                const want = try std.fmt.allocPrint(d.gpa, "{s}{s}", .{ last_seg, ext });
-                defer d.gpa.free(want);
-                const got = basename(canon); // on-disk filename
-                if (!std.mem.eql(u8, want, got)) {
-                    // Build the message BEFORE freeing canon (`got` borrows it).
-                    const msg = try std.fmt.allocPrint(d.gpa, "imported module '{s}' not found (on-disk file '{s}' differs in case from the import path; looked for '{s}')", .{ path, got, file });
-                    d.gpa.free(canon);
-                    return d.fail(.{
-                        .kind = .missing,
-                        .message = msg,
-                        .module = id,
-                        .span = import_span,
-                    });
-                }
-            }
-
-            const name = try d.gpa.dupe(u8, path);
             const child = d.intern(name, file, canon) catch |e| {
                 d.gpa.free(name);
                 d.gpa.free(file);
@@ -1102,6 +1088,104 @@ const Discoverer = struct {
             }
         }.lt);
         return out;
+    }
+
+    const Resolved = struct { file: []u8, canon: []u8 };
+
+    /// Find import `path` of module `id` in the search roots (owned result). Every root is
+    /// tried, not just up to the first hit, so a module two roots both hold is an error
+    /// rather than one root silently shadowing the other.
+    fn resolveImport(d: *Discoverer, id: u32, path: []const u8, span: Span) DiscoverError!Resolved {
+        validatePath(path) catch return d.fail(.{
+            .kind = .escape,
+            .message = try std.fmt.allocPrint(d.gpa, "import path '{s}' escapes the module root", .{path}),
+            .module = id,
+            .span = span,
+        });
+
+        var hits: std.ArrayList(Resolved) = .empty;
+        defer {
+            for (hits.items) |h| {
+                d.gpa.free(h.file);
+                d.gpa.free(h.canon);
+            }
+            hits.deinit(d.gpa);
+        }
+        var looked: std.ArrayList(u8) = .empty;
+        defer looked.deinit(d.gpa);
+
+        for (d.roots) |root| {
+            const file = try joinRoot(d.gpa, root, path);
+            if (looked.items.len != 0) looked.appendSlice(d.gpa, ", ") catch |e| {
+                d.gpa.free(file);
+                return e;
+            };
+            looked.print(d.gpa, "'{s}'", .{file}) catch |e| {
+                d.gpa.free(file);
+                return e;
+            };
+            // `canonicalize` doubles as the presence gate: null means no such file. The
+            // canonical path is the physical identity, so `util` and `Util` opening one
+            // file on a case-insensitive volume intern to ONE module.
+            const canon = (d.canonicalize(file) catch |e| {
+                d.gpa.free(file);
+                return e;
+            }) orelse {
+                d.gpa.free(file);
+                continue;
+            };
+            // One file reached through two roots (an extra root that repeats or nests in
+            // another) is one module, not a clash.
+            const seen = for (hits.items) |h| {
+                if (std.mem.eql(u8, h.canon, canon)) break true;
+            } else false;
+            if (seen) {
+                d.gpa.free(file);
+                d.gpa.free(canon);
+                continue;
+            }
+            hits.append(d.gpa, .{ .file = file, .canon = canon }) catch |e| {
+                d.gpa.free(file);
+                d.gpa.free(canon);
+                return e;
+            };
+        }
+
+        if (hits.items.len == 0) return d.fail(.{
+            .kind = .missing,
+            .message = try std.fmt.allocPrint(d.gpa, "imported module '{s}' not found (looked for {s})", .{ path, looked.items }),
+            .module = id,
+            .span = span,
+        });
+        if (hits.items.len > 1) {
+            var found: std.ArrayList(u8) = .empty;
+            defer found.deinit(d.gpa);
+            for (hits.items, 0..) |h, i| try found.print(d.gpa, "{s}'{s}'", .{ if (i == 0) "" else ", ", h.file });
+            return d.fail(.{
+                .kind = .ambiguous,
+                .message = try std.fmt.allocPrint(d.gpa, "imported module '{s}' is found in more than one root ({s})", .{ path, found.items }),
+                .module = id,
+                .span = span,
+            });
+        }
+        const hit = hits.pop().?;
+
+        // On a normalizing FS `import Util` opens `util.toy`; the canonical path's last
+        // segment is the on-disk name, so a mismatch means the import is spelled wrong.
+        const want = std.fmt.allocPrint(d.gpa, "{s}{s}", .{ basename(path), ext }) catch |e| {
+            d.gpa.free(hit.file);
+            d.gpa.free(hit.canon);
+            return e;
+        };
+        defer d.gpa.free(want);
+        const got = basename(hit.canon);
+        if (!std.mem.eql(u8, want, got)) {
+            const msg = std.fmt.allocPrint(d.gpa, "imported module '{s}' not found (on-disk file '{s}' differs in case from the import path; looked for '{s}')", .{ path, got, hit.file });
+            d.gpa.free(hit.file);
+            d.gpa.free(hit.canon);
+            return d.fail(.{ .kind = .missing, .message = try msg, .module = id, .span = span });
+        }
+        return hit;
     }
 
     /// Build the `/`-arrow cycle path from the gray ancestor `target` to `from`,
@@ -1195,34 +1279,34 @@ fn joinPath(gpa: std.mem.Allocator, tokens: []const Token, source: []const u8, s
     return buf.toOwnedSlice(gpa);
 }
 
-const PathError = error{ PathEscape, OutOfMemory };
-
-/// Resolve a `/`-joined import path to an on-disk file under `root`:
-/// `<root>/<path>.toy`. Rejects any path that escapes the root: an absolute
-/// path, an empty segment, a `.`/`..` segment, or a backslash. The grammar makes
-/// each segment an identifier, so escapes shouldn't tokenize — but this is the
-/// defense-in-depth check the design mandates at the driver boundary.
-fn resolveFile(gpa: std.mem.Allocator, root: []const u8, path: []const u8) PathError![]u8 {
+/// Reject an import path that could escape a root: an absolute path, an empty segment,
+/// a `.`/`..` segment, or a backslash. The grammar makes each segment an identifier, so
+/// escapes shouldn't tokenize — but this is the defense-in-depth check the design
+/// mandates at the driver boundary.
+fn validatePath(path: []const u8) error{PathEscape}!void {
     if (path.len == 0) return error.PathEscape;
-    if (path[0] == '/') return error.PathEscape; // absolute
+    if (path[0] == '/') return error.PathEscape;
     var it = std.mem.splitScalar(u8, path, '/');
     while (it.next()) |seg| {
-        if (seg.len == 0) return error.PathEscape; // empty segment (`a//b`, leading/trailing `/`)
+        if (seg.len == 0) return error.PathEscape;
         if (std.mem.eql(u8, seg, ".") or std.mem.eql(u8, seg, "..")) return error.PathEscape;
         if (std.mem.indexOfScalar(u8, seg, '\\') != null) return error.PathEscape;
-        if (std.mem.indexOfScalar(u8, seg, '/') != null) return error.PathEscape; // (split removes these; defensive)
     }
-    if (root.len == 0) {
-        return std.fmt.allocPrint(gpa, "{s}{s}", .{ path, ext });
-    }
-    return std.fmt.allocPrint(gpa, "{s}/{s}{s}", .{ root, path, ext });
 }
 
-/// Directory portion of `path` (everything before the last `/`), or `""` when
-/// there is no separator (a bare filename → the current directory).
-fn dirname(path: []const u8) []const u8 {
-    if (std.mem.lastIndexOfScalar(u8, path, '/')) |i| return path[0..i];
-    return "";
+/// `<root>/<path>.toy`, or `<path>.toy` for the current directory, so a root spelled
+/// `.` or `lib/` still shows plain `extra.toy` / `lib/extra.toy` in diagnostics.
+fn joinRoot(gpa: std.mem.Allocator, root: []const u8, path: []const u8) error{OutOfMemory}![]u8 {
+    const trimmed = trimRoot(root);
+    if (trimmed.len == 0) return std.fmt.allocPrint(gpa, "{s}{s}", .{ path, ext });
+    if (std.mem.eql(u8, trimmed, "/")) return std.fmt.allocPrint(gpa, "/{s}{s}", .{ path, ext });
+    return std.fmt.allocPrint(gpa, "{s}/{s}{s}", .{ trimmed, path, ext });
+}
+
+/// `root` without a trailing `/`, and `""` for the current directory.
+fn trimRoot(root: []const u8) []const u8 {
+    const trimmed = if (root.len > 1) std.mem.trimEnd(u8, root, "/") else root;
+    return if (std.mem.eql(u8, trimmed, ".")) "" else trimmed;
 }
 
 /// Final path component (after the last `/`).
@@ -1250,6 +1334,18 @@ fn withFixture(
     entry: []const u8,
     check: *const fn (gpa: std.mem.Allocator, g: *Graph) anyerror!void,
 ) !void {
+    return withFixtureRoots(dir_name, files, entry, null, &.{}, check);
+}
+
+/// `withFixture` with search roots, each given relative to the fixture dir.
+fn withFixtureRoots(
+    comptime dir_name: []const u8,
+    files: []const FixtureFile,
+    entry: []const u8,
+    comptime root: ?[]const u8,
+    comptime include: []const []const u8,
+    check: *const fn (gpa: std.mem.Allocator, g: *Graph) anyerror!void,
+) !void {
     const gpa = testing.allocator;
     var threaded = std.Io.Threaded.init(gpa, .{});
     defer threaded.deinit();
@@ -1275,7 +1371,14 @@ fn withFixture(
     var entry_buf: [std.fs.max_path_bytes]u8 = undefined;
     const entry_path = try std.fmt.bufPrint(&entry_buf, "{s}/{s}", .{ dir_name, entry });
 
-    var g = try discover(gpa, io, cache, "native", entry_path, .{});
+    const inc = comptime blk: {
+        var out: [include.len][]const u8 = undefined;
+        for (include, 0..) |r, i| out[i] = dir_name ++ "/" ++ r;
+        const final = out;
+        break :blk final;
+    };
+    const roots: Roots = .{ .root = if (root) |r| dir_name ++ "/" ++ r else null, .include = &inc };
+    var g = try discover(gpa, io, cache, "native", entry_path, .{ .roots = roots });
     defer g.deinit(gpa);
     try check(gpa, &g);
 }
@@ -1499,16 +1602,16 @@ test "discover: a bundled cache parses each std module once and later graphs mat
     var cache: BundledCache = .{};
     defer cache.deinit(gpa);
 
-    var fresh = try discover(gpa, Io.failing, Cache.disabled, "native", "/ws/main.toy", .{ .root = "/ws", .overlay = overlay });
+    var fresh = try discover(gpa, Io.failing, Cache.disabled, "native", "/ws/main.toy", .{ .roots = .{ .root = "/ws" }, .overlay = overlay });
     defer fresh.deinit(gpa);
     try testing.expect(fresh.err == null);
-    var cold = try discover(gpa, Io.failing, Cache.disabled, "native", "/ws/main.toy", .{ .root = "/ws", .overlay = overlay, .bundled_cache = &cache });
+    var cold = try discover(gpa, Io.failing, Cache.disabled, "native", "/ws/main.toy", .{ .roots = .{ .root = "/ws" }, .overlay = overlay, .bundled_cache = &cache });
     defer cold.deinit(gpa);
     var bundled: usize = 0;
     for (fresh.modules) |m| bundled += @intFromBool(m.bundled);
     try testing.expect(bundled > 0);
     try testing.expectEqual(bundled, cache.map.count());
-    var warm = try discover(gpa, Io.failing, Cache.disabled, "native", "/ws/main.toy", .{ .root = "/ws", .overlay = overlay, .bundled_cache = &cache });
+    var warm = try discover(gpa, Io.failing, Cache.disabled, "native", "/ws/main.toy", .{ .roots = .{ .root = "/ws" }, .overlay = overlay, .bundled_cache = &cache });
     defer warm.deinit(gpa);
     try testing.expectEqual(bundled, cache.map.count());
 
@@ -1932,13 +2035,201 @@ test "discover: warm path FALLS BACK to a read when the cache blobs are missing"
     }
 }
 
-test "resolveFile rejects path escapes" {
+test "discover: one file imported under two paths through nested roots is R0014 naming both" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source = "import util/math\nimport math\nfn main() -> int { return math.sq(2) }\n" },
+        .{ .path = "util/math.toy", .source = "pub fn sq(x: int) -> int { return x * x }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            const e = g.err orelse return error.TestExpectedError;
+            try testing.expectEqual(codes.Code.R0014, e.code());
+            try testing.expectEqual(@as(?u32, 0), e.module);
+            try testing.expectEqualStrings("imported module 'math' is the file '.toy-test-graph-alias/util/math.toy', which is already imported as 'util/math'", e.message);
+        }
+    };
+    try withFixtureRoots(".toy-test-graph-alias", files, "main.toy", null, &.{"util"}, Check.run);
+}
+
+test "discover: a second spelling in another module is R0014 there" {
+    const files = &[_]FixtureFile{
+        .{ .path = "src/main.toy", .source = "import extra\nimport m/x\nfn main() -> int { return extra.e() + x.x() }\n" },
+        .{ .path = "src/extra.toy", .source = "pub fn e() -> int { return 1 }\n" },
+        .{ .path = "src/m/x.toy", .source = "import src/extra\npub fn x() -> int { return extra.e() }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            const e = g.err orelse return error.TestExpectedError;
+            try testing.expectEqual(codes.Code.R0014, e.code());
+            try testing.expect(e.module.? != 0);
+            try testing.expectEqualStrings("imported module 'src/extra' is the file '.toy-test-graph-alias2/src/extra.toy', which is already imported as 'extra'", e.message);
+        }
+    };
+    try withFixtureRoots(".toy-test-graph-alias2", files, "src/main.toy", "src", &.{"."}, Check.run);
+}
+
+test "discover: importing the entry under a root-relative path is still a cycle" {
+    const files = &[_]FixtureFile{
+        .{ .path = "src/main.toy", .source = "import src/a\nfn main() -> int { return a.v() }\n" },
+        .{ .path = "src/a.toy", .source = "import src/main\npub fn v() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            try testing.expectEqual(codes.Code.R0012, g.err.?.code());
+        }
+    };
+    try withFixtureRoots(".toy-test-graph-entrycycle", files, "src/main.toy", ".", &.{}, Check.run);
+}
+
+test "discover: a root given twice is searched once" {
+    const files = &[_]FixtureFile{
+        .{ .path = "src/main.toy", .source = "import nope\nfn main() -> int { return 0 }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            try testing.expectEqual(@as(usize, 1), std.mem.count(u8, g.err.?.message, "'.toy-test-graph-dupe/src/nope.toy'"));
+        }
+    };
+    try withFixtureRoots(".toy-test-graph-dupe", files, "src/main.toy", null, &.{ "src", "src/" }, Check.run);
+}
+
+test "discover: an -I root resolves an import the entry's folder lacks" {
+    const files = &[_]FixtureFile{
+        .{ .path = "src/main.toy", .source = "import extra\nfn main() -> int { return extra.one() }\n" },
+        .{ .path = "lib/extra.toy", .source = "pub fn one() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            try testing.expect(g.err == null);
+            try testing.expectEqual(@as(usize, 2), g.modules.len);
+            const m = g.modules[g.entry().imports[0]];
+            try testing.expectEqualStrings("extra", m.path);
+            try testing.expectEqualStrings(".toy-test-graph-incl/lib/extra.toy", m.displayName());
+        }
+    };
+    try withFixtureRoots(".toy-test-graph-incl", files, "src/main.toy", null, &.{"lib"}, Check.run);
+}
+
+test "discover: --root roots imports at a folder other than the entry's" {
+    const files = &[_]FixtureFile{
+        .{ .path = "src/main.toy", .source = "import lib/extra\nfn main() -> int { return extra.one() }\n" },
+        .{ .path = "lib/extra.toy", .source = "pub fn one() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            try testing.expect(g.err == null);
+            try testing.expectEqualStrings("lib/extra", g.modules[g.entry().imports[0]].path);
+        }
+    };
+    try withFixtureRoots(".toy-test-graph-rootopt", files, "src/main.toy", ".", &.{}, Check.run);
+}
+
+test "discover: a module in two roots is R0014 and names every file" {
+    const files = &[_]FixtureFile{
+        .{ .path = "src/main.toy", .source = "import extra\nfn main() -> int { return extra.one() }\n" },
+        .{ .path = "src/extra.toy", .source = "pub fn one() -> int { return 1 }\n" },
+        .{ .path = "lib/extra.toy", .source = "pub fn one() -> int { return 2 }\n" },
+        .{ .path = "more/extra.toy", .source = "pub fn one() -> int { return 3 }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            const e = g.err orelse return error.TestExpectedError;
+            try testing.expectEqual(Error.Kind.ambiguous, e.kind);
+            try testing.expectEqual(codes.Code.R0014, e.code());
+            try testing.expectEqual(@as(?u32, 0), e.module);
+            try testing.expect(e.span != null);
+            try testing.expectEqualStrings("imported module 'extra' is found in more than one root ('.toy-test-graph-clash/src/extra.toy', '.toy-test-graph-clash/lib/extra.toy', '.toy-test-graph-clash/more/extra.toy')", e.message);
+        }
+    };
+    try withFixtureRoots(".toy-test-graph-clash", files, "src/main.toy", null, &.{ "lib", "more" }, Check.run);
+}
+
+test "discover: one file reached through two roots is one module, not a clash" {
+    const files = &[_]FixtureFile{
+        .{ .path = "src/main.toy", .source = "import extra\nfn main() -> int { return extra.one() }\n" },
+        .{ .path = "src/extra.toy", .source = "pub fn one() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            try testing.expect(g.err == null);
+            try testing.expectEqual(@as(usize, 2), g.modules.len);
+        }
+    };
+    try withFixtureRoots(".toy-test-graph-sameroot", files, "src/main.toy", null, &.{"src"}, Check.run);
+}
+
+test "discover: a module no root holds lists every path looked for" {
+    const files = &[_]FixtureFile{
+        .{ .path = "src/main.toy", .source = "import nope\nfn main() -> int { return 0 }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            const e = g.err orelse return error.TestExpectedError;
+            try testing.expectEqual(codes.Code.R0003, e.code());
+            try testing.expectEqualStrings("imported module 'nope' not found (looked for '.toy-test-graph-nowhere/src/nope.toy', '.toy-test-graph-nowhere/lib/nope.toy')", e.message);
+        }
+    };
+    try withFixtureRoots(".toy-test-graph-nowhere", files, "src/main.toy", null, &.{"lib"}, Check.run);
+}
+
+test "discover: a warm rebuild follows a changed -I set and a newly added clashing file" {
+    // Resolution is never cached: every build looks each import up in the CURRENT roots,
+    // and the warm manifest is keyed by the file it found, so neither a different -I set
+    // nor a file added to another root can be served a stale module.
     const gpa = testing.allocator;
-    try testing.expectError(error.PathEscape, resolveFile(gpa, "root", "/abs/path"));
-    try testing.expectError(error.PathEscape, resolveFile(gpa, "root", ".."));
-    try testing.expectError(error.PathEscape, resolveFile(gpa, "root", "a/../b"));
-    try testing.expectError(error.PathEscape, resolveFile(gpa, "root", "a//b"));
-    const ok = try resolveFile(gpa, "root", "a/b");
-    defer gpa.free(ok);
-    try testing.expectEqualStrings("root/a/b.toy", ok);
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-warm-roots";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir ++ "/src");
+    try Io.Dir.cwd().createDirPath(io, dir ++ "/a");
+    try Io.Dir.cwd().createDirPath(io, dir ++ "/b");
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/src/main.toy", .data = "import extra\nfn main() -> int { return extra.v() }\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/a/extra.toy", .data = "pub fn v() -> int { return 1 }\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/b/extra.toy", .data = "pub fn v() -> int { return 2 }\n" });
+    const cache_dir = dir ++ "/.cache";
+
+    const Build = struct {
+        fn run(a: std.mem.Allocator, i: Io, include: []const []const u8) !Graph {
+            var pack = Cache.Pack.init(a);
+            defer pack.deinit();
+            pack.load(a, i, cache_dir);
+            const cache = try Cache.initPack(i, cache_dir, &pack);
+            const g = try discover(a, i, cache, "native", dir ++ "/src/main.toy", .{ .roots = .{ .include = include } });
+            pack.flush(i, cache_dir);
+            return g;
+        }
+        fn extraLiteral(g: *const Graph) ?[]const u8 {
+            return firstNumberLiteral(&g.modules[g.entry().imports[0]]);
+        }
+    };
+
+    inline for (.{ .{ dir ++ "/a", "1" }, .{ dir ++ "/a", "1" }, .{ dir ++ "/b", "2" } }) |step| {
+        var g = try Build.run(gpa, io, &.{step[0]});
+        defer g.deinit(gpa);
+        try testing.expect(g.err == null);
+        try testing.expectEqualStrings(step[1], Build.extraLiteral(&g).?);
+    }
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/src/extra.toy", .data = "pub fn v() -> int { return 3 }\n" });
+    var g = try Build.run(gpa, io, &.{dir ++ "/b"});
+    defer g.deinit(gpa);
+    try testing.expectEqual(Error.Kind.ambiguous, g.err.?.kind);
+}
+
+test "validatePath rejects path escapes" {
+    const gpa = testing.allocator;
+    try testing.expectError(error.PathEscape, validatePath("/abs/path"));
+    try testing.expectError(error.PathEscape, validatePath(".."));
+    try testing.expectError(error.PathEscape, validatePath("a/../b"));
+    try testing.expectError(error.PathEscape, validatePath("a//b"));
+    try validatePath("a/b");
+    inline for (.{ .{ "root", "root/a/b.toy" }, .{ "root/", "root/a/b.toy" }, .{ "", "a/b.toy" }, .{ ".", "a/b.toy" }, .{ "./", "a/b.toy" }, .{ "/", "/a/b.toy" } }) |c| {
+        const got = try joinRoot(gpa, c[0], "a/b");
+        defer gpa.free(got);
+        try testing.expectEqualStrings(c[1], got);
+    }
 }

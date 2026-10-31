@@ -33,6 +33,7 @@ const Analysis = @import("Analysis.zig");
 const Documents = @import("Documents.zig");
 const Workspace = @import("Workspace.zig");
 const Graph = @import("toy_compiler").Graph;
+const lsp_uri = @import("uri.zig");
 
 pub const ExitCode = enum(u8) { ok = 0, no_shutdown = 1 };
 
@@ -71,6 +72,10 @@ pub const Server = struct {
     encoding: position.Encoding = .utf16,
     got_initialize: bool = false,
     shutdown_requested: bool = false,
+    /// The import search roots from `initialize`'s `initializationOptions` (see
+    /// `configureRoots`); every string is owned.
+    root: ?[]const u8 = null,
+    include: std.ArrayList([]const u8) = .empty,
 
     pub fn init(gpa: std.mem.Allocator) Server {
         return .{ .gpa = gpa, .threaded = .init(gpa, .{}), .arena = .init(gpa), .docs = .{} };
@@ -81,6 +86,9 @@ pub const Server = struct {
         while (it.next()) |an| an.*.deinit();
         self.analyses.deinit(self.gpa);
         self.std_cache.deinit(self.gpa);
+        if (self.root) |r| self.gpa.free(r);
+        for (self.include.items) |r| self.gpa.free(r);
+        self.include.deinit(self.gpa);
         self.docs.deinit(self.gpa);
         self.arena.deinit();
         self.threaded.deinit();
@@ -90,7 +98,7 @@ pub const Server = struct {
     /// Recomputed from the PINNED server each call: `Threaded.io()` captures
     /// `&self.threaded`, so it must never be cached across the by-value move out of `init`.
     fn workspace(self: *Server) Workspace {
-        return .{ .io = self.threaded.io(), .docs = &self.docs, .disk = host_has_disk, .encoding = self.encoding, .std_cache = &self.std_cache };
+        return .{ .io = self.threaded.io(), .docs = &self.docs, .disk = host_has_disk, .encoding = self.encoding, .std_cache = &self.std_cache, .roots = .{ .root = self.root, .include = self.include.items } };
     }
 
     /// The analysis of `uri`'s current text, checked now unless an earlier request on this
@@ -106,6 +114,31 @@ pub const Server = struct {
         try self.analyses.put(self.gpa, an.uri, an);
         self.checks += 1;
         return an;
+    }
+
+    /// Take the import search roots from `initializationOptions`: `root` (a string, the
+    /// CLI's `--root`) and `include` (an array of strings, the CLI's `-I`s). A relative
+    /// path is taken against the workspace folder (`rootUri`), so a project setting can
+    /// be written once for every machine. A value of the wrong shape is ignored.
+    fn configureRoots(self: *Server, params: std.json.Value) !void {
+        const opts = objGet(params, "initializationOptions") orelse return;
+        const base_uri = getStr(params, "rootUri");
+        const base = if (base_uri) |u| try lsp_uri.uriToPath(self.gpa, u) else null;
+        defer if (base) |b| self.gpa.free(b);
+        if (getStr(opts, "root")) |r| self.root = try self.absolute(base, r);
+        const list = objGet(opts, "include") orelse return;
+        if (list != .array) return;
+        for (list.array.items) |v| if (v == .string) {
+            const abs = try self.absolute(base, v.string);
+            errdefer self.gpa.free(abs);
+            try self.include.append(self.gpa, abs);
+        };
+    }
+
+    fn absolute(self: *Server, base: ?[]const u8, path: []const u8) ![]const u8 {
+        if (std.fs.path.isAbsolute(path)) return self.gpa.dupe(u8, path);
+        const b = base orelse return self.gpa.dupe(u8, path);
+        return std.fs.path.join(self.gpa, &.{ b, path });
     }
 
     fn drop(self: *Server, uri: []const u8) void {
@@ -267,6 +300,7 @@ pub const Server = struct {
             }
             self.got_initialize = true;
             self.encoding = negotiateEncoding(root);
+            try self.configureRoots(objGet(root, "params") orelse .null);
             if (id) |iv| try protocol.writeResponse(a, writer, iv, protocol.InitializeResult{
                 .capabilities = .{ .positionEncoding = self.encoding.name() },
             });
@@ -680,6 +714,21 @@ const TestSession = struct {
         return out.items;
     }
 };
+
+test "lsp roots: initializationOptions root and include resolve imports like --root and -I" {
+    const gpa = testing.allocator;
+    var ts = TestSession.init(gpa);
+    defer ts.deinit();
+    try ts.initialize(.{ .rootUri = "file:///toy-lsp-roots-ws", .initializationOptions = .{ .root = "/toy-lsp-roots-ws", .include = &[_][]const u8{"lib"} } });
+    try ts.open("file:///toy-lsp-roots-ws/lib/extra.toy", "pub fn seven() -> int { return 7 }\n");
+    try ts.open("file:///toy-lsp-roots-ws/vendor/more.toy", "pub fn one() -> int { return 1 }\n");
+    try ts.open("file:///toy-lsp-roots-ws/src/main.toy", "import extra\nimport vendor/more\nfn main() -> int { return extra.seven() + more.one() }\n");
+    try ts.finish();
+    const pubs = try ts.publishes();
+    const last = pubs[pubs.len - 1];
+    try testing.expectEqualStrings("file:///toy-lsp-roots-ws/src/main.toy", getStr(last, "uri").?);
+    try testing.expectEqual(@as(usize, 0), objGet(last, "diagnostics").?.array.items.len);
+}
 
 /// The 0-based index of the line carrying the `#~ ERROR` annotation — computed from the
 /// fixture itself, never from server output, so the range assertion is independent.

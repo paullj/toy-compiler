@@ -114,6 +114,8 @@ pub const Orchestrator = struct {
     sev: SevCfg.SeverityConfig,
     /// `--dev-core-imports` (see `Graph.allow_core_imports`).
     allow_core_imports: bool = false,
+    /// `--root` / `-I` (see `Graph.Roots`).
+    roots: Graph.Roots = .{},
 
     // `--timings` per-stage laps (each stage closure charges its own bucket). Null
     // pointers on paths that don't profile (`--emit ir`) => no lap.
@@ -248,7 +250,7 @@ fn fnResolveDigest(gf: ResolveGraph.GlobalFn) u64 {
 const DiscoverCompute = struct {
     o: Orchestrator,
     pub fn run(c: DiscoverCompute) !void {
-        c.o.graph.* = try Graph.discover(c.o.gpa, c.o.io, c.o.cache, c.o.target, c.o.entry, .{ .probe = c.o.discover_probe, .allow_core_imports = c.o.allow_core_imports });
+        c.o.graph.* = try Graph.discover(c.o.gpa, c.o.io, c.o.cache, c.o.target, c.o.entry, .{ .probe = c.o.discover_probe, .allow_core_imports = c.o.allow_core_imports, .roots = c.o.roots });
         if (c.o.graph.*.?.err != null) {
             c.o.failed_stage.* = .discover;
             return error.StageDiagnostics;

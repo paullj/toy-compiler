@@ -26,6 +26,9 @@ disk: bool = true,
 encoding: position.Encoding = .utf16,
 /// The session's parsed bundled modules, or null to parse them on every discover.
 std_cache: ?*Graph.BundledCache = null,
+/// The import search roots, as the CLI's `--root`/`-I` give them; a null `root` is the
+/// checked document's own folder.
+roots: Graph.Roots = .{},
 
 /// Discover the module graph rooted at `uri`, whose current text is `text` (which may differ
 /// from the stored document: completion and signature help check a repaired copy). A
@@ -33,7 +36,6 @@ std_cache: ?*Graph.BundledCache = null,
 pub fn discover(ws: Workspace, gpa: std.mem.Allocator, uri: []const u8, text: []const u8) !Graph.Graph {
     const path = try pathOf(gpa, uri);
     defer gpa.free(path);
-    const root = std.fs.path.dirname(path) orelse "";
 
     // The front-end asks for sources by decoded path, but a client's uri may percent-encode
     // it (`file:///a%20b/x.toy`): index the open documents by path, not by rebuilt uri.
@@ -56,7 +58,7 @@ pub fn discover(ws: Workspace, gpa: std.mem.Allocator, uri: []const u8, text: []
     entry.value_ptr.* = text;
 
     const overlay: Graph.Overlay = .{ .ctx = &by_path, .getFn = lookup, .disk = ws.disk };
-    return Graph.discover(gpa, ws.io, Cache.disabled, toyc.Driver.default_target, path, .{ .root = root, .overlay = overlay, .bundled_cache = ws.std_cache });
+    return Graph.discover(gpa, ws.io, Cache.disabled, toyc.Driver.default_target, path, .{ .roots = ws.roots, .overlay = overlay, .bundled_cache = ws.std_cache });
 }
 
 const untitled_path = "untitled.toy";
@@ -122,6 +124,30 @@ test "an import finds an open document whose uri percent-encodes its path" {
     defer g.deinit(gpa);
     try testing.expect(g.err == null);
     try testing.expectEqual(@as(usize, 2), g.modules.len);
+}
+
+test "the search roots resolve an import from an extra root, and a clash is R0014" {
+    const gpa = testing.allocator;
+    var docs: Documents = .{};
+    defer docs.deinit(gpa);
+    try docs.put(gpa, "file:///ws/lib/extra.toy", "pub fn seven() -> int { return 7 }\n", 1);
+    const src = "import extra\nfn main() -> int { return extra.seven() }\n";
+
+    const ws: Workspace = .{ .io = Io.failing, .docs = &docs, .disk = false, .roots = .{ .include = &.{"/ws/lib"} } };
+    var g = try ws.discover(gpa, "file:///ws/src/main.toy", src);
+    defer g.deinit(gpa);
+    try testing.expect(g.err == null);
+    try testing.expectEqual(@as(usize, 2), g.modules.len);
+
+    try docs.put(gpa, "file:///ws/src/extra.toy", "pub fn seven() -> int { return 8 }\n", 1);
+    var clash = try ws.discover(gpa, "file:///ws/src/main.toy", src);
+    defer clash.deinit(gpa);
+    try testing.expectEqual(Graph.Error.Kind.ambiguous, clash.err.?.kind);
+
+    const rooted: Workspace = .{ .io = Io.failing, .docs = &docs, .disk = false, .roots = .{ .root = "/ws" } };
+    var r = try rooted.discover(gpa, "file:///ws/src/main.toy", "import lib/extra\nfn main() -> int { return extra.seven() }\n");
+    defer r.deinit(gpa);
+    try testing.expect(r.err == null);
 }
 
 test "an untitled buffer still checks and can import bundled std" {
