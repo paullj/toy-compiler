@@ -459,6 +459,12 @@ pub const Node = extern struct {
         /// `none` is unit). The distinct tag keeps every top-level `fn_decl` heuristic
         /// (global fn table, LSP enclosing-fn search) blind to it.
         local_fn,
+
+        /// `import a/b.{x, y as z}`: binds only the selected names, never the module.
+        /// Appended at END (frozen ordinal; `parse_version` bumped 25->26). `main_token`
+        /// is the last path segment and `lhs` the path TOKEN range, as for `import_decl`;
+        /// `rhs` is a TOKEN range of `(name, alias-or-none)` pairs (`importItems`).
+        import_select_decl,
     };
 };
 
@@ -753,6 +759,30 @@ pub fn importPathToks(tree: Tree, node: Node) []const TokIndex {
     return @ptrCast(tree.extra[r.start .. r.start + r.len]);
 }
 
+/// One selected name of an `import_select_decl`: its name token and its `as` alias
+/// token (`none` without one).
+pub const ImportItem = extern struct {
+    name: TokIndex,
+    alias: TokIndex,
+
+    /// The token of the name the item binds in the importing module.
+    pub fn bound(item: ImportItem) TokIndex {
+        return item.alias.unwrap() orelse item.name;
+    }
+};
+
+/// The selected names of an `import_select_decl`, decoded from its `rhs` token range.
+pub fn importItems(tree: Tree, node: Node) []const ImportItem {
+    const r = rangeAt(tree, node.rhs.int());
+    const cells = tree.extra[r.start .. r.start + r.len];
+    return @as([*]const ImportItem, @ptrCast(cells.ptr))[0 .. r.len / 2];
+}
+
+/// Whether `tag` is an import of either shape; both carry the module path in `lhs`.
+pub fn isImport(tag: Node.Tag) bool {
+    return tag == .import_decl or tag == .import_select_decl;
+}
+
 /// Decode the 3-cell `impl_has_decl` header at `header` (its `rhs` slot):
 /// `{protocol_ref_node, methods_start, methods_len}`. `protocol` is the
 /// (bare or qualified) protocol-reference node; `methods` is the run of method
@@ -830,7 +860,7 @@ pub const parse_magic: u32 = 0x544f5950;
 
 /// The packed-encoding version `ParseHeader` writes and `unpack` requires. One constant,
 /// so the writer and the reader can never disagree.
-pub const parse_version: u32 = 25;
+pub const parse_version: u32 = 26;
 
 /// Header prefixing a packed `Tree` blob. `extern` so it serializes by memcpy.
 pub const ParseHeader = extern struct {
@@ -1191,6 +1221,20 @@ fn renderNode(out: *std.Io.Writer, tree: Tree, tokens: []const Token, source: []
                 try out.print(" as {s}", .{tokens[alias.int()].text(source)});
             }
             try out.writeByte(')');
+        },
+        .import_select_decl => {
+            try out.writeAll("(import");
+            for (importPathToks(tree, n), 0..) |seg_tok, i| {
+                try out.writeByte(if (i == 0) ' ' else '/');
+                try out.writeAll(tokens[seg_tok.int()].text(source));
+            }
+            try out.writeAll(" {");
+            for (importItems(tree, n), 0..) |item, i| {
+                if (i != 0) try out.writeByte(' ');
+                try out.writeAll(tokens[item.name.int()].text(source));
+                if (item.alias.unwrap()) |alias| try out.print(" as {s}", .{tokens[alias.int()].text(source)});
+            }
+            try out.writeAll("})");
         },
         .while_stmt => {
             try out.writeAll("(while ");

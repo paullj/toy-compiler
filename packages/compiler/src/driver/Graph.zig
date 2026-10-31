@@ -192,6 +192,104 @@ pub const Graph = struct {
     pub fn entry(g: *const Graph) *const Module {
         return &g.modules[g.entry_index];
     }
+
+    /// The module an import decl of module `mod` names, matched by its `/`-joined path.
+    pub fn importTarget(g: *const Graph, mod: u32, decl: Ast.Node) ?u32 {
+        const m = &g.modules[mod];
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        var len: usize = 0;
+        for (Ast.importPathToks(m.tree(), decl), 0..) |seg, i| {
+            const txt = m.tokens[seg.int()].text(m.source);
+            const sep: usize = @intFromBool(i != 0);
+            if (len + sep + txt.len > buf.len) return null;
+            if (sep != 0) buf[len] = '/';
+            @memcpy(buf[len + sep .. len + sep + txt.len], txt);
+            len += sep + txt.len;
+        }
+        for (g.modules, 0..) |om, oi| {
+            if (std.mem.eql(u8, om.path, buf[0..len])) return @intCast(oi);
+        }
+        return null;
+    }
+
+    /// What module `mod` offers other modules under `name`: an item it declares, or a
+    /// name one of its imports binds. A re-exported item is followed to the module that
+    /// declares it, so every importer sees the item itself. `exported` is false when
+    /// the module has the name but does not export it (a private item, or a plain
+    /// `import`).
+    pub const Export = struct {
+        /// The declaring module of an item, or the module a namespace names.
+        mod: u32,
+        /// The item's decl in `mod`; none for a namespace.
+        decl: Ast.Index,
+        exported: bool,
+        /// When not `exported`: the module whose own decl or import withholds the name.
+        /// A re-export through other modules reports there, so its importers need not.
+        withheld_by: u32 = 0,
+    };
+
+    pub fn exportOf(g: *const Graph, mod: u32, name: []const u8) ?Export {
+        // Imports form a DAG, so a chain of re-exports is at most one hop per module.
+        var cur = mod;
+        var want = name;
+        var out: Export = .{ .mod = mod, .decl = Ast.none, .exported = true };
+        for (0..g.modules.len) |_| {
+            const m = &g.modules[cur];
+            const decl_idx = g.topItem(cur, want, .with_imports) orelse return null;
+            const decl = m.nodes[decl_idx.int()];
+            const tree = m.tree();
+            if (out.exported and !tree.isPub(decl_idx)) {
+                out.exported = false;
+                out.withheld_by = cur;
+            }
+            switch (decl.tag) {
+                .import_decl => {
+                    out.mod = g.importTarget(cur, decl) orelse return null;
+                    return out;
+                },
+                .import_select_decl => for (Ast.importItems(tree, decl)) |item| {
+                    if (!std.mem.eql(u8, m.tokens[item.bound().int()].text(m.source), want)) continue;
+                    cur = g.importTarget(cur, decl) orelse return null;
+                    want = m.tokens[item.name.int()].text(m.source);
+                    break;
+                },
+                else => {
+                    out.mod = cur;
+                    out.decl = decl_idx;
+                    return out;
+                },
+            }
+        }
+        return null;
+    }
+
+    /// The top-level item of module `mod` named `name`, or with `.with_imports` the
+    /// first decl that binds `name` for other modules to name: an item, or an import
+    /// binding it as a namespace or a selected name.
+    pub fn topItem(g: *const Graph, mod: u32, name: []const u8, comptime scope: enum { items, with_imports }) ?Ast.Index {
+        const m = &g.modules[mod];
+        if (m.nodes.len == 0) return null;
+        const tree = m.tree();
+        const prog = m.nodes[Ast.root(m.nodes).int()];
+        if (prog.tag != .program) return null;
+        for (Ast.rangeSlice(tree, prog.lhs.int())) |decl_idx| {
+            const decl = m.nodes[decl_idx.int()];
+            switch (decl.tag) {
+                .fn_decl, .extern_fn_decl, .struct_decl, .tuple_struct_decl, .enum_decl, .protocol_decl, .type_alias_decl => {
+                    if (std.mem.eql(u8, m.tokens[decl.main_token].text(m.source), name)) return decl_idx;
+                },
+                .import_decl => if (scope == .with_imports) {
+                    const bound = Ast.importAliasTok(decl).unwrap() orelse Ast.TokIndex.from(decl.main_token);
+                    if (std.mem.eql(u8, m.tokens[bound.int()].text(m.source), name)) return decl_idx;
+                },
+                .import_select_decl => if (scope == .with_imports) for (Ast.importItems(tree, decl)) |item| {
+                    if (std.mem.eql(u8, m.tokens[item.bound().int()].text(m.source), name)) return decl_idx;
+                },
+                else => {},
+            }
+        }
+        return null;
+    }
 };
 
 /// Options for `discover`; every field is optional.
@@ -878,7 +976,7 @@ const Discoverer = struct {
 
         for (Ast.rangeSlice(tree, prog.lhs.int())) |decl_idx| {
             const decl = s_nodes[decl_idx.int()];
-            if (decl.tag != .import_decl) continue;
+            if (!Ast.isImport(decl.tag)) continue;
 
             // Rebuild the `/`-joined import path from the segment TOKEN indices.
             const seg_tokens = Ast.importPathToks(tree, decl);
@@ -1077,7 +1175,7 @@ fn importTokenSpan(d: *Discoverer, from: u32, target: u32) ?Span {
     if (prog.tag != .program) return null;
     for (Ast.rangeSlice(tree, prog.lhs.int())) |decl_idx| {
         const decl = s.nodes[decl_idx.int()];
-        if (decl.tag != .import_decl) continue;
+        if (!Ast.isImport(decl.tag)) continue;
         const seg_tokens = Ast.importPathToks(tree, decl);
         const path = joinPath(d.gpa, s.tokens, s.source, seg_tokens) catch return null;
         defer d.gpa.free(path);

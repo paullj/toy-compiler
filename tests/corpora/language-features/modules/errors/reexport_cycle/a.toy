@@ -1,0 +1,3 @@
+pub import b.{g as f}
+
+pub fn h() -> int { 1 }

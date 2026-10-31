@@ -1,0 +1,4 @@
+pub import util/shapes.{Rect, Color, Named, Meters, area as size, pick}
+pub import util/extra
+
+pub fn total(r: Rect) -> int { size(r) + 1 }

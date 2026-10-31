@@ -1,0 +1,7 @@
+# Feature: re-exports that loop (a re-exports from b, b from a) are an import cycle.
+# expect: compile-error "import cycle detected"
+import a.{f}
+
+fn main() -> int {
+    return f()
+}

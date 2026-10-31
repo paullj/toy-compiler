@@ -424,17 +424,50 @@ pub const refs = struct {
         _ = node_idx;
         const g = self.graphCtx();
         const recv = self.tree.nodes[n.lhs.int()];
-        if (recv.tag != .identifier) return .invalid;
-        const recv_name = refs.nameText(self, recv.main_token);
-        const target = g.namespaceOfIn(self.graph_mod, recv_name) orelse {
+        const target = refs.moduleOf(self, n.lhs) orelse {
+            if (recv.tag != .identifier) return .invalid;
+            const recv_name = refs.nameText(self, recv.main_token);
             self.sink.report(.{ .span = refs.tokSpan(self, recv.main_token), .code = .T0002 }, err_unknown_module, .{recv_name}) catch {};
             return .invalid;
         };
         const member = refs.nameText(self, n.main_token);
-        if (g.mods[target].struct_ids.get(member)) |id| return Type.structT(id);
-        if (g.mods[target].enum_ids.get(member)) |id| return Type.enumT(id);
-        self.sink.report(.{ .span = refs.tokSpan(self, n.main_token), .code = .T0003 }, err_module_no_type, .{member}) catch {};
+        const ty: Type, const kind: []const u8, const exported = if (g.mods[target].struct_ids.get(member)) |id|
+            .{ Type.structT(id), "struct", refs.exportsType(g, target, member, self.structSyms()[id]) }
+        else if (g.mods[target].enum_ids.get(member)) |id|
+            .{ Type.enumT(id), "enum", refs.exportsType(g, target, member, self.enumSyms()[id]) }
+        else {
+            self.sink.report(.{ .span = refs.tokSpan(self, n.main_token), .code = .T0003 }, err_module_no_type, .{member}) catch {};
+            return .invalid;
+        };
+        if (exported) return ty;
+        self.sink.report(.{ .span = refs.tokSpan(self, n.main_token), .code = .R0005 }, "{s} '{s}' is not exported by module '{s}'", .{ kind, member, g.mods[target].path }) catch {};
         return .invalid;
+    }
+
+    /// Whether `target.member` names the type `sym` that `member` binds in `target`: a
+    /// pub type `target` declares, or one a `pub import` of it re-exports. A type the
+    /// module only imports stays its own, as the resolver rules where it walks type refs
+    /// (not every type position is resolved).
+    pub fn exportsType(g: *const GraphCtx, target: u32, member: []const u8, sym: anytype) bool {
+        if (!sym.pub_export) return false;
+        if (sym.mod == target) return true;
+        for (g.mods[target].selections) |sel| {
+            if (std.mem.eql(u8, sel.local, member)) return sel.exported;
+        }
+        return false;
+    }
+
+    /// The module a qualifier node names in graph mode: an import namespace, or `ns.sub`
+    /// where `ns` re-exports the namespace `sub`. Read from the tree, not the resolver's
+    /// bindings, since not every type position is resolved.
+    pub fn moduleOf(self: anytype, idx: Ast.Index) ?u32 {
+        const g = self.graphCtx();
+        const n = self.tree.nodes[idx.int()];
+        return switch (n.tag) {
+            .identifier => g.namespaceOfIn(self.graph_mod, refs.nameText(self, n.main_token)),
+            .field_access => g.mods[refs.moduleOf(self, n.lhs) orelse return null].pub_namespaces.get(refs.nameText(self, n.main_token)),
+            else => null,
+        };
     }
 
     /// Resolve a type application `Box[int]` / `Either[int,bool]` (a `type_app` node) to
@@ -1968,6 +2001,8 @@ pub const GraphCtx = struct {
         protocol_ids: std.StringHashMapUnmanaged(u32) = .empty,
         /// Import namespace name → imported module id (graph module id).
         namespaces: std.StringHashMapUnmanaged(u32) = .empty,
+        /// The namespaces a `pub import` re-exports, a subset of `namespaces`.
+        pub_namespaces: std.StringHashMapUnmanaged(u32) = .empty,
         /// Bare alias name -> RESOLVED target `Type` (this module's `type X = Y` decls
         /// + the if-absent-seeded prelude `byte = uint8`). A pure lookup in
         /// `typeFromNode`; all cycle risk is confined to the one-shot resolve pass that
@@ -1981,6 +2016,20 @@ pub const GraphCtx = struct {
         file: []const u8 = "",
         /// The modules this one imports directly (graph module ids).
         imports: []const u32 = &.{},
+        /// The types and protocols this module's selective imports bind, each followed
+        /// through re-exports to the module that declares it (the resolver reports every
+        /// selection that is not exported).
+        selections: []const Selection = &.{},
+    };
+
+    /// A type or protocol `import a/b.{name as local}` binds: `target` declares `name`.
+    /// `exported` when a `pub import` re-exports it.
+    pub const Selection = struct {
+        local: []const u8,
+        name: []const u8,
+        target: u32,
+        kind: enum { type, protocol },
+        exported: bool = false,
     };
 
     /// Resolve an import namespace receiver name in module `mod` to the imported
@@ -2638,12 +2687,30 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
     // either), BEFORE layout (0b) / fn-sig decode (A) so field/param/ret refs resolve
     // through a full alias map. BEFORE prelude, so a `type X = Ordering` (a prelude enum)
     // is out of scope — the corpus never needs it.
-    for (mods, 0..) |_, mi| {
-        const mod: u32 = @intCast(mi);
+    // A selected alias resolves in its own module first, so the alias pass walks the
+    // import DAG dependencies-first. A selected struct or enum is bound before any alias
+    // can name it.
+    for (t.graph.mods) |*m| for (m.selections) |sel| {
+        if (sel.kind != .type) continue;
+        const owner = &t.graph.mods[sel.target];
+        if (owner.struct_ids.get(sel.name)) |id| {
+            if (t.structs.items[id].mod == sel.target) try m.struct_ids.put(t.gpa, sel.local, id);
+        } else if (owner.enum_ids.get(sel.name)) |id| {
+            if (t.enums.items[id].mod == sel.target) try m.enum_ids.put(t.gpa, sel.local, id);
+        }
+    };
+    const alias_order = try importPostOrder(t.gpa, t.graph.mods);
+    defer t.gpa.free(alias_order);
+    for (alias_order) |mod| {
         _ = t.gphSelect(mod);
         if (t.tree.nodes.len == 0) continue;
         const prog = t.tree.nodes[Ast.root(t.tree.nodes).int()];
         if (prog.tag != .program) continue;
+        const m = &t.graph.mods[mod];
+        for (m.selections) |sel| {
+            if (sel.kind != .type) continue;
+            if (t.graph.mods[sel.target].alias_ids.get(sel.name)) |ty| try m.alias_ids.put(t.gpa, sel.local, ty);
+        }
         try register.registerAliases(t, Ast.rangeSlice(t.tree, prog.lhs.int()));
     }
 
@@ -2673,6 +2740,18 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
             if (importer.enum_ids.get(e.name) == null)
                 try importer.enum_ids.put(t.gpa, e.name, @intCast(eid));
         }
+        // A type a direct import re-exports is bare too, as if that module declared it.
+        for (t.graph.mods, 0..) |*om, oi| {
+            if (!importerImports(importer, @intCast(oi))) continue;
+            for (om.selections) |sel| {
+                if (!sel.exported or sel.kind != .type) continue;
+                if (om.struct_ids.get(sel.local)) |id| {
+                    if (importer.struct_ids.get(sel.local) == null) try importer.struct_ids.put(t.gpa, sel.local, id);
+                } else if (om.enum_ids.get(sel.local)) |id| {
+                    if (importer.enum_ids.get(sel.local) == null) try importer.enum_ids.put(t.gpa, sel.local, id);
+                }
+            }
+        }
     }
 
     // Phase 0c: register every module's `protocol` decls into ONE global id
@@ -2687,6 +2766,11 @@ fn runGraph(t: *Typecheck, mods: []const GraphModuleInput, fns: []const GraphFnI
         if (prog.tag != .program) continue;
         try register.registerProtocols(t, Ast.rangeSlice(t.tree, prog.lhs.int()), mod);
     }
+    for (t.graph.mods) |*m| for (m.selections) |sel| {
+        if (sel.kind != .protocol) continue;
+        const id = t.graph.mods[sel.target].protocol_ids.get(sel.name) orelse continue;
+        if (t.protocols.items[id].mod == sel.target) try m.protocol_ids.put(t.gpa, sel.local, id);
+    };
 
     // Phase 0a: decode each generic struct TEMPLATE's field types as PATTERNS
     // (`v: T` -> `type_var(0)`; `b: Box[T]` -> `App(Box, [type_var 0])`) into its
@@ -3192,6 +3276,41 @@ fn templateCallee(t: *const Typecheck, recv: Type, member: []const u8, site: Sit
         return Callee.template(m.fn_id);
     }
     return .{};
+}
+
+/// Every module, each after all the modules it imports. The import graph is a DAG.
+fn importPostOrder(gpa: std.mem.Allocator, mods: []const GraphCtx.ModuleCtx) ![]u32 {
+    const order = try gpa.alloc(u32, mods.len);
+    errdefer gpa.free(order);
+    const seen = try gpa.alloc(bool, mods.len);
+    defer gpa.free(seen);
+    @memset(seen, false);
+    // Explicit stack of (module, next import index), so a deep chain cannot overflow.
+    var stack: std.ArrayList([2]u32) = .empty;
+    defer stack.deinit(gpa);
+    var n: usize = 0;
+    for (0..mods.len) |root| {
+        if (seen[root]) continue;
+        seen[root] = true;
+        try stack.append(gpa, .{ @intCast(root), 0 });
+        while (stack.items.len > 0) {
+            const top = &stack.items[stack.items.len - 1];
+            const imps = mods[top[0]].imports;
+            if (top[1] < imps.len) {
+                const next = imps[top[1]];
+                top[1] += 1;
+                if (next < mods.len and !seen[next]) {
+                    seen[next] = true;
+                    try stack.append(gpa, .{ next, 0 });
+                }
+                continue;
+            }
+            order[n] = top[0];
+            n += 1;
+            _ = stack.pop();
+        }
+    }
+    return order;
 }
 
 /// Whether module `importer` directly imports the module with id `target` (any namespace
@@ -4413,13 +4532,10 @@ pub fn protocolIdFromNode(t: *Typecheck, ref_idx: Ast.Index) ?u32 {
         return null;
     }
     if (n.tag == .field_access) {
-        const recv = t.tree.nodes[n.lhs.int()];
-        if (recv.tag != .identifier) return null;
-        const target = t.graph.namespaceOfIn(t.graph_mod, t.nameText(recv.main_token)) orelse return null;
-        if (t.graph.mods[target].protocol_ids.get(t.nameText(n.main_token))) |id| {
-            if (t.protocols.items[id].pub_export) return id;
-        }
-        return null;
+        const target = refs.moduleOf(t, n.lhs) orelse return null;
+        const name = t.nameText(n.main_token);
+        const id = t.graph.mods[target].protocol_ids.get(name) orelse return null;
+        return if (refs.exportsType(t.graph, target, name, t.protocols.items[id])) id else null;
     }
     return null;
 }
@@ -4444,12 +4560,10 @@ pub fn receiverTypeFromNode(t: *Typecheck, node_idx: Ast.Index) ?Type {
         return null;
     }
     if (n.tag == .field_access) {
-        const recv = t.tree.nodes[n.lhs.int()];
-        if (recv.tag != .identifier) return null;
-        const target = t.graph.namespaceOfIn(t.graph_mod, t.nameText(recv.main_token)) orelse return null;
+        const target = refs.moduleOf(t, n.lhs) orelse return null;
         const member = t.nameText(n.main_token);
-        if (t.graph.mods[target].struct_ids.get(member)) |id| return Type.structT(id);
-        if (t.graph.mods[target].enum_ids.get(member)) |id| return Type.enumT(id);
+        if (t.graph.mods[target].struct_ids.get(member)) |id| return if (refs.exportsType(t.graph, target, member, t.structs.items[id])) Type.structT(id) else null;
+        if (t.graph.mods[target].enum_ids.get(member)) |id| return if (refs.exportsType(t.graph, target, member, t.enums.items[id])) Type.enumT(id) else null;
         return null;
     }
     return null;

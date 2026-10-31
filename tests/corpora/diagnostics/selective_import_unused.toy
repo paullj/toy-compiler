@@ -1,0 +1,6 @@
+# A selected name the module never uses is W0004 at that name.
+import std/io.{println, eprintln as warn}  #~ WARN [W0004] unused import 'warn'
+
+fn main() {
+    println(1)
+}

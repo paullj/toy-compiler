@@ -1,0 +1,8 @@
+# Feature: only a `pub import` re-exports; a name a plain import binds stays private
+# to the importing module.
+# expect: compile-error "function 'helper' is not exported by module 'util'"
+import util.{helper}
+
+fn main() -> int {
+    return helper()
+}

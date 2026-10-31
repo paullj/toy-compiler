@@ -1,0 +1,3 @@
+import util/inner.{helper}
+
+pub fn uses() -> int { helper() }

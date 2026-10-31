@@ -1,0 +1,5 @@
+# Only a `pub` item can be selected: a private one is R0005 at that name.
+import std/fs.{has_nul}  #~ ERROR [R0005] function 'has_nul' is not exported by module 'std/fs'
+
+fn main() {
+}

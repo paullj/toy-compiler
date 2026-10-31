@@ -583,10 +583,12 @@ pub fn fieldVisible(an: *const Analysis, f: Field) bool {
 /// A type's declaration: its module and its decl node.
 pub const TypeDecl = struct { module: u32, node: u32 };
 
-/// The declaration of the type named `name` (a struct, tuple struct, enum or protocol), in
-/// whichever module declares it; the entry module wins a name clash. The resolver leaves a
-/// type name unresolved, so the name is all there is to go on.
+/// The declaration of the type named `name` (a struct, tuple struct, enum or protocol): the
+/// one a selective import of the entry module binds under `name`, else the one whichever
+/// module declares; the entry module wins a name clash. The resolver leaves a type name
+/// unresolved, so the name is all there is to go on.
 pub fn typeDecl(an: *const Analysis, name: []const u8) ?TypeDecl {
+    if (an.selectedTypeDecl(name)) |td| return td;
     var found: ?TypeDecl = null;
     for (an.graph.modules, 0..) |*tm, mi| {
         if (tm.nodes.len == 0) continue;
@@ -603,6 +605,28 @@ pub fn typeDecl(an: *const Analysis, name: []const u8) ?TypeDecl {
         }
     }
     return found;
+}
+
+/// The type a selective import of the entry module binds as `local`, followed through
+/// re-exports by the lookup the compiler binds it with.
+fn selectedTypeDecl(an: *const Analysis, local: []const u8) ?TypeDecl {
+    const m = an.module();
+    if (m.nodes.len == 0) return null;
+    const tree = m.tree();
+    const decl_idx = an.graph.topItem(an.entry(), local, .with_imports) orelse return null;
+    const decl = m.nodes[decl_idx.int()];
+    if (decl.tag != .import_select_decl) return null;
+    for (Ast.importItems(tree, decl)) |item| {
+        if (!std.mem.eql(u8, m.tokens[item.bound().int()].text(m.source), local)) continue;
+        const target = an.graph.importTarget(an.entry(), decl) orelse return null;
+        const found = an.graph.exportOf(target, m.tokens[item.name.int()].text(m.source)) orelse return null;
+        if (found.decl == Ast.none) return null;
+        return switch (an.graph.modules[found.mod].nodes[found.decl.int()].tag) {
+            .struct_decl, .tuple_struct_decl, .enum_decl, .protocol_decl => .{ .module = found.mod, .node = found.decl.int() },
+            else => null,
+        };
+    }
+    return null;
 }
 
 /// The name token of `decl` in `mod`, or null when there is no openable source: a seeded

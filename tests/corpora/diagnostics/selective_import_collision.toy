@@ -1,0 +1,15 @@
+# A name binds once per module: a selected name that a top-level declaration or an
+# earlier import already binds is R0004 at the later name; `as` renames it.
+import std/io.{println, print}
+import std/fs.{exists as print}  #~ ERROR [R0004] imported name 'print' collides with an earlier import (use `as` to rename it)
+import std/fs.{remove as println}  #~ ERROR [R0004] imported name 'println' collides with an earlier import (use `as` to rename it)
+import std/fs.{open}  #~ ERROR [R0004] imported name 'open' collides with a top-level declaration named 'open' (use `as` to rename it)
+
+fn open() {
+    print(1)
+    println(2)
+}
+
+fn main() {
+    open()
+}

@@ -935,12 +935,121 @@
       "type": "SEQ",
       "members": [
         {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "pub"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
           "type": "STRING",
           "value": "import"
         },
         {
           "type": "SYMBOL",
           "name": "import_path"
+        },
+        {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "CHOICE",
+              "members": [
+                {
+                  "type": "SEQ",
+                  "members": [
+                    {
+                      "type": "STRING",
+                      "value": "as"
+                    },
+                    {
+                      "type": "FIELD",
+                      "name": "alias",
+                      "content": {
+                        "type": "SYMBOL",
+                        "name": "identifier"
+                      }
+                    }
+                  ]
+                },
+                {
+                  "type": "SEQ",
+                  "members": [
+                    {
+                      "type": "STRING",
+                      "value": "."
+                    },
+                    {
+                      "type": "STRING",
+                      "value": "{"
+                    },
+                    {
+                      "type": "SEQ",
+                      "members": [
+                        {
+                          "type": "SYMBOL",
+                          "name": "import_item"
+                        },
+                        {
+                          "type": "REPEAT",
+                          "content": {
+                            "type": "SEQ",
+                            "members": [
+                              {
+                                "type": "STRING",
+                                "value": ","
+                              },
+                              {
+                                "type": "SYMBOL",
+                                "name": "import_item"
+                              }
+                            ]
+                          }
+                        },
+                        {
+                          "type": "CHOICE",
+                          "members": [
+                            {
+                              "type": "STRING",
+                              "value": ","
+                            },
+                            {
+                              "type": "BLANK"
+                            }
+                          ]
+                        }
+                      ]
+                    },
+                    {
+                      "type": "STRING",
+                      "value": "}"
+                    }
+                  ]
+                }
+              ]
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        }
+      ]
+    },
+    "import_item": {
+      "type": "SEQ",
+      "members": [
+        {
+          "type": "FIELD",
+          "name": "name",
+          "content": {
+            "type": "SYMBOL",
+            "name": "identifier"
+          }
         },
         {
           "type": "CHOICE",

@@ -1,0 +1,6 @@
+# A selected name the module does not declare is R0006 at that name.
+import std/io.{println, prinln}  #~ ERROR [R0006] module 'std/io' has no member 'prinln'
+
+fn main() {
+    println(1)
+}

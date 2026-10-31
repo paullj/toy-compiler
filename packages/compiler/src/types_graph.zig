@@ -67,7 +67,9 @@ pub fn checkGraphWith(
             mc.enum_ids.deinit(gpa);
             mc.protocol_ids.deinit(gpa);
             mc.namespaces.deinit(gpa);
+            mc.pub_namespaces.deinit(gpa);
             mc.alias_ids.deinit(gpa);
+            gpa.free(mc.selections);
         }
         gpa.free(ctx.mods);
     }
@@ -90,8 +92,8 @@ pub fn checkGraphWith(
     // name. Mirrors resolve_graph's binding so the type checker sees the same
     // namespaces (an unused or duplicate import is harmless here — resolve already
     // diagnosed collisions). Determinism: decls walked in source order.
-    for (graph.modules, 0..) |*m, mi| {
-        try bindNamespaces(gpa, graph, &ctx.mods[mi], m);
+    for (ctx.mods, 0..) |*mc, mi| {
+        try bindNamespaces(gpa, graph, mc, @intCast(mi));
     }
 
     const fns = try gpa.alloc(Typecheck.GraphFnInput, res.fns.len);
@@ -122,54 +124,65 @@ pub fn checkGraphWith(
     return Typecheck.checkGraph(gpa, &ctx, mods, fns, graph.entry_index, jobs);
 }
 
-/// Bind module `m`'s import namespaces into `mc.namespaces` (namespace name →
+/// Bind module `mod`'s import namespaces into `mc.namespaces` (namespace name →
 /// imported module id). The namespace name is the `as` alias when present, else
-/// the import path's last segment.
+/// the import path's last segment. A selected name is followed to what it names.
 fn bindNamespaces(
     gpa: std.mem.Allocator,
     graph: *const Graph.Graph,
     mc: *Typecheck.GraphCtx.ModuleCtx,
-    m: *const Graph.Module,
+    mod: u32,
 ) !void {
+    const m = &graph.modules[mod];
     if (m.nodes.len == 0) return;
     const tree = m.tree();
     const prog = m.nodes[Ast.root(m.nodes).int()];
     if (prog.tag != .program) return;
+    var selections: std.ArrayList(Typecheck.GraphCtx.Selection) = .empty;
+    defer selections.deinit(gpa);
     for (Ast.rangeSlice(tree, prog.lhs.int())) |decl_idx| {
         const decl = m.nodes[decl_idx.int()];
-        if (decl.tag != .import_decl) continue;
-        const target = importTarget(graph, m, decl) orelse continue;
+        if (!Ast.isImport(decl.tag)) continue;
+        const target = graph.importTarget(mod, decl) orelse continue;
+        const is_pub = tree.isPub(decl_idx);
+        if (decl.tag == .import_select_decl) {
+            for (Ast.importItems(tree, decl)) |item| {
+                const local = m.tokens[item.bound().int()].text(m.source);
+                const found = graph.exportOf(target, m.tokens[item.name.int()].text(m.source)) orelse continue;
+                if (!found.exported) continue;
+                if (found.decl == Ast.none) {
+                    const gop = try mc.namespaces.getOrPut(gpa, local);
+                    if (gop.found_existing) continue;
+                    gop.value_ptr.* = found.mod;
+                    if (is_pub) try mc.pub_namespaces.put(gpa, local, found.mod);
+                    continue;
+                }
+                const owner = &graph.modules[found.mod];
+                const item_decl = owner.nodes[found.decl.int()];
+                const kind: @FieldType(Typecheck.GraphCtx.Selection, "kind") = switch (item_decl.tag) {
+                    .struct_decl, .tuple_struct_decl, .enum_decl, .type_alias_decl => .type,
+                    .protocol_decl => .protocol,
+                    else => continue,
+                };
+                try selections.append(gpa, .{
+                    .local = local,
+                    .name = owner.tokens[item_decl.main_token].text(owner.source),
+                    .target = found.mod,
+                    .kind = kind,
+                    .exported = is_pub,
+                });
+            }
+            continue;
+        }
         const ns_tok: u32 = if (Ast.importAliasTok(decl).unwrap()) |alias| alias.int() else decl.main_token;
         const ns_name = m.tokens[ns_tok].text(m.source);
         // First binding wins (resolve_graph already diagnosed collisions).
         const gop = try mc.namespaces.getOrPut(gpa, ns_name);
-        if (!gop.found_existing) gop.value_ptr.* = target;
+        if (gop.found_existing) continue;
+        gop.value_ptr.* = target;
+        if (is_pub) try mc.pub_namespaces.put(gpa, ns_name, target);
     }
-}
-
-/// The graph module id an `import_decl` in module `m` refers to (rebuild its
-/// `/`-joined path, match a module's canonical name), or null if unresolved.
-fn importTarget(graph: *const Graph.Graph, m: *const Graph.Module, decl: Ast.Node) ?u32 {
-    const tree = m.tree();
-    const segs = Ast.importPathToks(tree, decl);
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    var len: usize = 0;
-    for (segs, 0..) |seg, i| {
-        const txt = m.tokens[seg.int()].text(m.source);
-        if (i != 0) {
-            if (len >= buf.len) return null;
-            buf[len] = '/';
-            len += 1;
-        }
-        if (len + txt.len > buf.len) return null;
-        @memcpy(buf[len .. len + txt.len], txt);
-        len += txt.len;
-    }
-    const path = buf[0..len];
-    for (graph.modules, 0..) |om, oi| {
-        if (std.mem.eql(u8, om.path, path)) return @intCast(oi);
-    }
-    return null;
+    mc.selections = try selections.toOwnedSlice(gpa);
 }
 
 const testing = std.testing;
@@ -826,6 +839,68 @@ test "a cross-module struct field type resolves through a qualified field annota
         }
     };
     try withCheckedGraph(".toy-test-typ-xfield", files, "main.toy", Check.run);
+}
+
+test "a re-exported type is bare through a whole-module import, as if declared there" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util
+        \\fn main() -> int {
+        \\    s: Shape = util.mk()
+        \\    t := Shape { w: 2 }
+        \\    return s.w + t.w
+        \\}
+        \\
+        },
+        .{ .path = "util.toy", .source =
+        \\pub import shapes.{Shape}
+        \\pub fn mk() -> Shape { Shape { w: 3 } }
+        \\
+        },
+        .{ .path = "shapes.toy", .source = "pub struct Shape { pub w: int }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            try testing.expectEqual(@as(usize, 0), r.diags.len);
+            try testing.expectEqual(@as(usize, 0), tr.diags.len);
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-reexport-bare", files, "main.toy", Check.run);
+}
+
+test "a type a module only imports is not its member, in any type position" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source =
+        \\import util
+        \\fn main() -> int {
+        \\    x: util.Rect = util.mk()
+        \\    y: Option[util.Rect] = Option.none
+        \\    match y { Option.some(r) -> r.w, Option.none -> x.w }
+        \\}
+        \\
+        },
+        .{ .path = "util.toy", .source =
+        \\import util/shapes.{Rect}
+        \\pub fn mk() -> Rect { Rect { w: 7 } }
+        \\
+        },
+        .{ .path = "util/shapes.toy", .source = "pub struct Rect { pub w: int }\n" },
+    };
+    const Check = struct {
+        fn run(g: *const Graph.Graph, r: *ResolveGraph.GraphResult, tr: *GraphResult) anyerror!void {
+            _ = g;
+            _ = r;
+            // An invalid type argument still cascades (T0013), as an unknown one does.
+            var n: usize = 0;
+            for (tr.diags) |d| if (d.code == .R0005) {
+                try testing.expectEqualStrings("struct 'Rect' is not exported by module 'util'", d.message);
+                n += 1;
+            };
+            try testing.expectEqual(@as(usize, 2), n);
+        }
+    };
+    try withCheckedGraph(".toy-test-typ-plain-select-qualified", files, "main.toy", Check.run);
 }
 
 test "single-module graph typechecks like the single-file checker" {

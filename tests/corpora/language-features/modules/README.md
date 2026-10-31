@@ -22,11 +22,15 @@ on each `main.toy` entry.
 | `display_generic/`            | an imported generic struct's instance renders under its template name (`Bx{v: 2}`) |
 | `associated_fn/`              | an imported non-generic struct's and enum's associated fns, called through the module (`shapes.Rect.square(3)`) |
 | `qualified_literal/`          | `lib.Pt { .. }`, inferred `lib.Pair { .. }` and `shapes.Shape.sq { .. }` beside same-named local types |
+| `selective/`                  | `import a/b.{x, y as z}` binding a fn, generic fn, struct, enum, protocol and type alias bare |
+| `reexport/`                   | `pub import` re-exporting selected items and a whole namespace, used selectively and qualified (`util.extra.twice`) |
 | `errors/private_ref/`         | referencing a non-`pub` decl across modules                    |
 | `private_fields/`             | `pub` fields used from another module; private ones only through the owner's methods and derives |
 | `errors/private_literal/`     | a module-qualified literal of a non-`pub` struct                |
 | `errors/private_field/`       | reading a field without `pub` from another module               |
 | `errors/cycle/`               | an import cycle (graph must be a DAG)                           |
+| `errors/reexport_cycle/`      | re-exports that loop are an import cycle                        |
+| `errors/reexport_private/`    | a plain import's names are not re-exported                      |
 | `errors/missing/`             | importing a module file that does not exist                    |
 | `errors/main_not_in_entry/`   | `main` defined only in an imported module                      |
 | `errors/collision/`           | two imports sharing a last path segment without `as`           |
