@@ -1,7 +1,8 @@
 # Modules and imports
 
-A module is a file. `import a/b` loads `<root>/a/b.toy`, where the root is the entry
-file's folder unless `--root` says otherwise (see [Search roots](#search-roots)); `std/*`
+A module is a file. `import a/b` loads `<root>/a/b.toy`, or `<root>/a/b/mod.toy` for a
+folder (see [Folder modules](#folder-modules)), where the root is the entry file's folder
+unless `--root` says otherwise (see [Search roots](#search-roots)); `std/*`
 paths name the bundled standard library. Imports form a DAG: a cycle is an error. Run
 examples: `tests/corpora/language-features/modules/`.
 
@@ -84,6 +85,42 @@ A `pub import` is an import, so re-exports that loop are an import cycle (R0012)
 module outside `core/` may re-export a `core/` module, whole or selectively (R0013):
 that would hand the standard library's private layer to every importer.
 
+## Folder modules
+
+A folder can be a module. `import util` loads `util.toy`, or `util/mod.toy` when the
+folder holds one; `import util/math` still loads `util/math.toy`. The module is named
+`util` either way, in diagnostics and in the namespace it binds; `import util/mod` is
+R0003, since that file is the module `util`. Exactly one of the two files may exist: a
+`util.toy` beside a `util/mod.toy` is R0014, which names both.
+
+`mod.toy` imports its children by their full path and can re-export their items, so a
+folder presents one surface:
+
+```toy
+// util/mod.toy
+pub import util/geo/rect.{area}
+import util/math
+
+pub fn side() -> int { math.sq(2) }
+
+// main.toy
+import util.{area}
+import util
+
+fn main() -> int {
+    return area(3, 4) + util.side()
+}
+```
+
+Folder modules work in every search root, and a missing module's R0003 lists both files
+it looked for in each root (`'util.toy', 'util/mod.toy'`). Turning `util.toy` into
+`util/mod.toy`, or back, needs no clean build.
+
+Because children are imported by their path from the module root, checking
+`util/mod.toy` on its own (`toy check util/mod.toy`, or opening it in an editor with no
+`root` set) roots imports at `util/` and cannot find `util/math`. Pass `--root .`, or set
+the language server's `root`.
+
 ## Search roots
 
 Every command that compiles (`toy build`, `toy run`, `toy check`, and a bare `toy`)
@@ -95,9 +132,11 @@ takes the same two options:
 
 A `std/` or `core/` path always names the bundled library. Any other import path is
 looked up in the module root and in every `-I` root, and exactly one of them must hold
-the file. A module that two roots both hold is R0014, which lists every match, so no
-root silently shadows another. The same file reached through two roots (an `-I` that
-repeats the module root) is one module.
+the file (`<path>.toy` or `<path>/mod.toy`). A module that two roots both hold is R0014,
+which lists every match, so no root silently shadows another. The same file reached
+through two roots (an `-I` that repeats the module root) is one module. One file
+imported under two paths is R0014 too: with `-I util`, `import util/math` and
+`import math` cannot both appear in one program.
 
 ```
 project/
@@ -133,13 +172,13 @@ folder is its root, as with the CLI. Clients expose this as a server setting (Ne
 
 | Code | When |
 |---|---|
-| R0003 | the imported module does not exist in any search root, or its path leaves the root |
+| R0003 | the imported module does not exist in any search root, its path leaves the root, or it names a folder module's `mod` file |
 | R0004 | two imports, or an import and a top-level declaration, bind one name |
 | R0005 | a referenced or selected item is not `pub`, or is imported without `pub import` |
 | R0006 | the module has no item of a referenced or selected name |
 | R0012 | imports, or re-exports, form a cycle |
 | R0013 | a user module imports a private `core/` module, or any module outside `core/` re-exports one |
-| R0014 | more than one search root holds the imported module |
+| R0014 | more than one file could be the imported module (two search roots hold it, or `util.toy` sits beside `util/mod.toy`), or one file is imported under two paths |
 | T0011 | a selected type is bound under a builtin type's name (`Shape as int`) |
 | W0004 | an import, or a selected name, is never used |
 

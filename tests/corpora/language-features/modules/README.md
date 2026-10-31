@@ -3,7 +3,8 @@
 Multi-file programs. Unlike the single-file corpus in `examples/`, each
 program here is a **directory** whose entry file is `main.toy`; the compiler
 discovers the rest of the module graph by following that entry's transitive
-imports (`import a/b` -> `<root>/a/b.toy`, root = the entry file's directory).
+imports (`import a/b` -> `<root>/a/b.toy`, or `<root>/a/b/mod.toy` for a folder
+module; root = the entry file's directory).
 
 These live in their own subtree because the non-entry files have no `main` and
 must never be compiled standalone — the corpus harness prunes `modules/` from the
@@ -26,6 +27,10 @@ on each `main.toy` entry.
 | `reexport/`                   | `pub import` re-exporting selected items and a whole namespace, used selectively and qualified (`util.extra.twice`) |
 | `search_roots/`               | `# include:` extra roots (the CLI's `-I`) beside the module root |
 | `errors/root_clash/`          | a module both the module root and an extra root hold (R0014)    |
+| `folder/`                     | a folder module (`import util` -> `util/mod.toy`) importing and re-exporting its children |
+| `errors/folder_clash/`        | `util.toy` beside `util/mod.toy` (R0014)                        |
+| `errors/folder_mod_path/`     | `import util/mod` instead of `import util` (R0003)              |
+| `errors/path_alias/`          | one file imported under two paths through nested roots (R0014)  |
 | `errors/private_ref/`         | referencing a non-`pub` decl across modules                    |
 | `private_fields/`             | `pub` fields used from another module; private ones only through the owner's methods and derives |
 | `errors/private_literal/`     | a module-qualified literal of a non-`pub` struct                |

@@ -1,0 +1,7 @@
+# A `util.toy` beside a folder module's `util/mod.toy` makes `import util` ambiguous (R0014).
+# expect: compile-error "[R0014]: imported module 'util' matches more than one file"
+import util
+
+fn main() -> int {
+    util.v()
+}

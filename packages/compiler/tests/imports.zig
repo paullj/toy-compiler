@@ -123,7 +123,7 @@ test "search roots: -I resolves a sibling folder; a warm rebuild follows a chang
         defer gpa.free(r.out);
         defer gpa.free(r.err);
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
-        try std.testing.expect(std.mem.indexOf(u8, r.out, "imported module 'extra' not found (looked for 'src/extra.toy')") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.out, "imported module 'extra' not found (looked for 'src/extra.toy', 'src/extra/mod.toy')") != null);
     }
     try harness.buildIn(gpa, io, w, &.{ "build", "src/main.toy", "-I", "lib", "-o", "p1" });
     try std.testing.expectEqual(@as(u8, 1), try harness.runExitIn(gpa, io, w, "p1"));
@@ -138,9 +138,47 @@ test "search roots: -I resolves a sibling folder; a warm rebuild follows a chang
         defer gpa.free(r.out);
         defer gpa.free(r.err);
         try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
-        try std.testing.expect(std.mem.indexOf(u8, r.out, "error[R0014]: imported module 'extra' is found in more than one root ('src/extra.toy', 'lib/extra.toy', 'alt/extra.toy')") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.out, "error[R0014]: imported module 'extra' matches more than one file ('src/extra.toy', 'lib/extra.toy', 'alt/extra.toy')") != null);
         try std.testing.expect(std.mem.indexOf(u8, r.out, "--> src/main.toy:1:8") != null);
     }
+}
+
+test "folder modules: a warm rebuild follows util.toy replaced by util/mod.toy and back" {
+    const gpa = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    try harness.skipUnlessBackend(io);
+    const root = ".toy-test-imports-folder";
+    defer Io.Dir.cwd().deleteTree(io, root) catch {};
+    const w = try project(gpa, io, root, &.{
+        .{ "main.toy", "import util.{v}\nfn main() -> int { v() }\n" },
+        .{ "util.toy", "pub fn v() -> int { 1 }\n" },
+    });
+    defer gpa.free(w);
+
+    try harness.buildIn(gpa, io, w, &.{ "build", "main.toy", "-o", "p1" });
+    try std.testing.expectEqual(@as(u8, 1), try harness.runExitIn(gpa, io, w, "p1"));
+
+    try Io.Dir.cwd().deleteFile(io, root ++ "/util.toy");
+    try Io.Dir.cwd().createDirPath(io, root ++ "/util");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/util/mod.toy", .data = "pub import util/num.{two as v}\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/util/num.toy", .data = "pub fn two() -> int { 2 }\n" });
+    try harness.buildIn(gpa, io, w, &.{ "build", "main.toy", "-o", "p2" });
+    try std.testing.expectEqual(@as(u8, 2), try harness.runExitIn(gpa, io, w, "p2"));
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = root ++ "/util.toy", .data = "pub fn v() -> int { 3 }\n" });
+    {
+        const r = try toyIn(gpa, io, w, &.{ "build", "main.toy", "-o", "p3" });
+        defer gpa.free(r.out);
+        defer gpa.free(r.err);
+        try std.testing.expectEqual(std.process.Child.Term{ .exited = 1 }, r.term);
+        try std.testing.expect(std.mem.indexOf(u8, r.out, "error[R0014]: imported module 'util' matches more than one file ('util.toy', 'util/mod.toy')") != null);
+    }
+
+    try Io.Dir.cwd().deleteTree(io, root ++ "/util");
+    try harness.buildIn(gpa, io, w, &.{ "build", "main.toy", "-o", "p4" });
+    try std.testing.expectEqual(@as(u8, 3), try harness.runExitIn(gpa, io, w, "p4"));
 }
 
 test "search roots: --root starts import paths at another folder, and a missing root dir is a usage error" {

@@ -1,0 +1,8 @@
+# A folder module is imported by its folder; spelling out its entry file is R0003.
+# expect: compile-error "[R0003]: import path 'util/mod' names a folder module's entry file; import it as 'util'"
+import util
+import util/mod
+
+fn main() -> int {
+    util.v()
+}

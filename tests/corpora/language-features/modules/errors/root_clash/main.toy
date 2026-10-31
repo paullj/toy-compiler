@@ -1,6 +1,6 @@
 # A module that both the module root and an -I root hold is ambiguous (R0014).
 # include: "lib"
-# expect: compile-error "[R0014]: imported module 'util' is found in more than one root"
+# expect: compile-error "[R0014]: imported module 'util' matches more than one file"
 import util
 
 fn main() -> int {

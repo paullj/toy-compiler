@@ -1,0 +1,17 @@
+# expect: stdout "12\n9\n4\n"
+# expect: exit 0
+# A folder is a module: `import util` loads `util/mod.toy` because no `util.toy`
+# exists, while `import util/math` still loads `util/math.toy`. The folder's
+# mod.toy imports its children and re-exports one item (`pub import`), which an
+# importer selects as an item of `util`.
+import std/io.{println}
+import util.{area}
+import util
+import util/math
+
+fn main() -> int {
+    println(area(3, 4))
+    println(math.sq(3))
+    println(util.side())
+    0
+}

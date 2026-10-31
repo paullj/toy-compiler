@@ -53,7 +53,7 @@ pub const Code = enum(u16) {
     R0011, // duplicate-binding (a name declared twice in one parameter list, pattern or block)
     R0012, // import-cycle (imports that lead back to a module that is still being imported)
     R0013, // core-import-private (a user module imports a bundled `core/` module)
-    R0014, // ambiguous-module (an import path names a file in more than one search root)
+    R0014, // ambiguous-module (an import path matches more than one file, or a file is imported under two paths)
 
     // Type band (T####).
     T0001, // unknown-type

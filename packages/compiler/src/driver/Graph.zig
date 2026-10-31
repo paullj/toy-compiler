@@ -2,8 +2,9 @@
 //!
 //! Given an ENTRY file, discover the whole module graph by following `import`
 //! declarations transitively. A module IS a file, named by a `/`-path; an import
-//! `a/b` resolves to `<root>/a/b.toy` for exactly one ROOT of the search path (see
-//! `Roots`): the module root (default: the entry file's directory), then each extra root.
+//! `a/b` resolves to `<root>/a/b.toy` or the folder module `<root>/a/b/mod.toy`, exactly
+//! one file over every ROOT of the search path (see `Roots`): the module root (default:
+//! the entry file's directory), then each extra root.
 //!
 //! Discovery is two-phase and SERIAL at the discover level (a stable, sorted DFS
 //! over each module's imports) so the parse fan-out is never re-entered on a
@@ -12,8 +13,8 @@
 //! pays nothing.
 //!
 //! This stage produces the GRAPH (parsed modules + edges) and rejects the structural
-//! errors: a missing module, a path escaping the root, a module found in more than one
-//! root, and an import cycle (the graph must be a DAG). Cross-module name/type
+//! errors: a missing module, a path escaping the root, a module matching more than one
+//! file, and an import cycle (the graph must be a DAG). Cross-module name/type
 //! resolution, the global id-space merge, and whole-graph lowering are LATER stages —
 //! this one stops at "the graph is discovered and is a well-formed DAG".
 
@@ -31,6 +32,8 @@ const BundledStd = @import("bundled_std");
 
 /// The `.toy` source extension that an import path maps onto.
 pub const ext = ".toy";
+/// A folder module's entry: `import util` may load `util/mod.toy`.
+const folder_entry = "mod";
 
 /// The bundled standard library source for an import path (e.g. `core/ffi`), or
 /// null when the path names no bundled module. The returned bytes are static
@@ -119,7 +122,7 @@ pub const Error = struct {
         cycle,
         /// A parse error in a discovered module.
         parse,
-        /// The import path names a file in more than one search root.
+        /// The import path matches more than one file (two roots, or `a.toy` and `a/mod.toy`).
         ambiguous,
     };
     kind: Kind,
@@ -636,6 +639,9 @@ const Discoverer = struct {
             if (!o.disk) return null;
         }
         if (d.realpath_cache.get(file)) |canon| return try d.gpa.dupe(u8, canon);
+        // realpath also succeeds on a directory, which must not count as a module file.
+        const st = Io.Dir.cwd().statFile(d.io, file, .{}) catch return null;
+        if (st.kind != .file) return null;
         const rp = Io.Dir.cwd().realPathFileAlloc(d.io, file, d.gpa) catch return null;
         // `realPathFileAlloc` returns a sentinel `[:0]u8` (allocated len+1); to keep
         // `canon` a plain `[]u8` that frees cleanly, copy and release it.
@@ -1090,11 +1096,12 @@ const Discoverer = struct {
         return out;
     }
 
-    const Resolved = struct { file: []u8, canon: []u8 };
+    const Resolved = struct { file: []u8, canon: []u8, folder: bool = false };
 
-    /// Find import `path` of module `id` in the search roots (owned result). Every root is
-    /// tried, not just up to the first hit, so a module two roots both hold is an error
-    /// rather than one root silently shadowing the other.
+    /// Find import `path` of module `id` in the search roots (owned result): `<path>.toy`,
+    /// or a folder module's `<path>/mod.toy`. Every candidate of every root is tried, not
+    /// just up to the first hit, so two files one import could mean (two roots, or a file
+    /// beside a folder module) are an error rather than one silently shadowing the other.
     fn resolveImport(d: *Discoverer, id: u32, path: []const u8, span: Span) DiscoverError!Resolved {
         validatePath(path) catch return d.fail(.{
             .kind = .escape,
@@ -1102,6 +1109,22 @@ const Discoverer = struct {
             .module = id,
             .span = span,
         });
+        // `util/mod.toy` is the folder module `util`; a second spelling would name the same
+        // file under another module name.
+        if (std.mem.eql(u8, basename(path), folder_entry)) {
+            const parent = std.fs.path.dirname(path);
+            return d.fail(.{
+                .kind = .missing,
+                .message = try if (parent) |dir|
+                    std.fmt.allocPrint(d.gpa, "import path '{s}' names a folder module's entry file; import it as '{s}'", .{ path, dir })
+                else
+                    std.fmt.allocPrint(d.gpa, "import path '{s}' names a folder module's entry file, which is imported by its folder's path", .{path}),
+                .module = id,
+                .span = span,
+            });
+        }
+        const folder_path = try std.fmt.allocPrint(d.gpa, "{s}/{s}", .{ path, folder_entry });
+        defer d.gpa.free(folder_path);
 
         var hits: std.ArrayList(Resolved) = .empty;
         defer {
@@ -1114,8 +1137,8 @@ const Discoverer = struct {
         var looked: std.ArrayList(u8) = .empty;
         defer looked.deinit(d.gpa);
 
-        for (d.roots) |root| {
-            const file = try joinRoot(d.gpa, root, path);
+        for (d.roots) |root| for ([_][]const u8{ path, folder_path }, 0..) |spelling, k| {
+            const file = try joinRoot(d.gpa, root, spelling);
             if (looked.items.len != 0) looked.appendSlice(d.gpa, ", ") catch |e| {
                 d.gpa.free(file);
                 return e;
@@ -1144,12 +1167,12 @@ const Discoverer = struct {
                 d.gpa.free(canon);
                 continue;
             }
-            hits.append(d.gpa, .{ .file = file, .canon = canon }) catch |e| {
+            hits.append(d.gpa, .{ .file = file, .canon = canon, .folder = k == 1 }) catch |e| {
                 d.gpa.free(file);
                 d.gpa.free(canon);
                 return e;
             };
-        }
+        };
 
         if (hits.items.len == 0) return d.fail(.{
             .kind = .missing,
@@ -1163,23 +1186,26 @@ const Discoverer = struct {
             for (hits.items, 0..) |h, i| try found.print(d.gpa, "{s}'{s}'", .{ if (i == 0) "" else ", ", h.file });
             return d.fail(.{
                 .kind = .ambiguous,
-                .message = try std.fmt.allocPrint(d.gpa, "imported module '{s}' is found in more than one root ({s})", .{ path, found.items }),
+                .message = try std.fmt.allocPrint(d.gpa, "imported module '{s}' matches more than one file ({s})", .{ path, found.items }),
                 .module = id,
                 .span = span,
             });
         }
         const hit = hits.pop().?;
 
-        // On a normalizing FS `import Util` opens `util.toy`; the canonical path's last
-        // segment is the on-disk name, so a mismatch means the import is spelled wrong.
-        const want = std.fmt.allocPrint(d.gpa, "{s}{s}", .{ basename(path), ext }) catch |e| {
+        // On a normalizing FS `import Util` opens `util.toy` (or `util/mod.toy`); the
+        // canonical path names the on-disk spelling, so a case-only mismatch means the
+        // import is spelled wrong. Any other mismatch is a symlink, which is accepted: a
+        // second import through its target's name is caught as one file with two paths.
+        const want = std.fmt.allocPrint(d.gpa, "{s}{s}{s}", .{ basename(path), if (hit.folder) "/" ++ folder_entry else "", ext }) catch |e| {
             d.gpa.free(hit.file);
             d.gpa.free(hit.canon);
             return e;
         };
         defer d.gpa.free(want);
-        const got = basename(hit.canon);
-        if (!std.mem.eql(u8, want, got)) {
+        const got = hit.canon[hit.canon.len -| want.len..];
+        const whole = got.len == hit.canon.len or hit.canon[hit.canon.len - got.len - 1] == '/';
+        if (whole and !std.mem.eql(u8, want, got) and std.ascii.eqlIgnoreCase(want, got)) {
             const msg = std.fmt.allocPrint(d.gpa, "imported module '{s}' not found (on-disk file '{s}' differs in case from the import path; looked for '{s}')", .{ path, got, hit.file });
             d.gpa.free(hit.file);
             d.gpa.free(hit.canon);
@@ -2138,7 +2164,7 @@ test "discover: a module in two roots is R0014 and names every file" {
             try testing.expectEqual(codes.Code.R0014, e.code());
             try testing.expectEqual(@as(?u32, 0), e.module);
             try testing.expect(e.span != null);
-            try testing.expectEqualStrings("imported module 'extra' is found in more than one root ('.toy-test-graph-clash/src/extra.toy', '.toy-test-graph-clash/lib/extra.toy', '.toy-test-graph-clash/more/extra.toy')", e.message);
+            try testing.expectEqualStrings("imported module 'extra' matches more than one file ('.toy-test-graph-clash/src/extra.toy', '.toy-test-graph-clash/lib/extra.toy', '.toy-test-graph-clash/more/extra.toy')", e.message);
         }
     };
     try withFixtureRoots(".toy-test-graph-clash", files, "src/main.toy", null, &.{ "lib", "more" }, Check.run);
@@ -2166,7 +2192,7 @@ test "discover: a module no root holds lists every path looked for" {
         fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
             const e = g.err orelse return error.TestExpectedError;
             try testing.expectEqual(codes.Code.R0003, e.code());
-            try testing.expectEqualStrings("imported module 'nope' not found (looked for '.toy-test-graph-nowhere/src/nope.toy', '.toy-test-graph-nowhere/lib/nope.toy')", e.message);
+            try testing.expectEqualStrings("imported module 'nope' not found (looked for '.toy-test-graph-nowhere/src/nope.toy', '.toy-test-graph-nowhere/src/nope/mod.toy', '.toy-test-graph-nowhere/lib/nope.toy', '.toy-test-graph-nowhere/lib/nope/mod.toy')", e.message);
         }
     };
     try withFixtureRoots(".toy-test-graph-nowhere", files, "src/main.toy", null, &.{"lib"}, Check.run);
@@ -2218,6 +2244,200 @@ test "discover: a warm rebuild follows a changed -I set and a newly added clashi
     var g = try Build.run(gpa, io, &.{dir ++ "/b"});
     defer g.deinit(gpa);
     try testing.expectEqual(Error.Kind.ambiguous, g.err.?.kind);
+}
+
+test "discover: import util loads util/mod.toy, named util, and it imports its children" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source = "import util\nfn main() -> int { return util.area() }\n" },
+        .{ .path = "util/mod.toy", .source = "import util/math\npub fn area() -> int { return math.sq(3) }\n" },
+        .{ .path = "util/math.toy", .source = "pub fn sq(x: int) -> int { return x * x }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            try testing.expect(g.err == null);
+            try testing.expectEqual(@as(usize, 3), g.modules.len);
+            const util = g.modules[g.entry().imports[0]];
+            try testing.expectEqualStrings("util", util.path);
+            try testing.expectEqualStrings(".toy-test-graph-folder/util/mod.toy", util.displayName());
+            try testing.expectEqualStrings("util/math", g.modules[util.imports[0]].path);
+        }
+    };
+    try withFixture(".toy-test-graph-folder", files, "main.toy", Check.run);
+}
+
+test "discover: util.toy beside util/mod.toy is R0014 naming both" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source = "import util\nfn main() -> int { return util.v() }\n" },
+        .{ .path = "util.toy", .source = "pub fn v() -> int { return 1 }\n" },
+        .{ .path = "util/mod.toy", .source = "pub fn v() -> int { return 2 }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            const e = g.err orelse return error.TestExpectedError;
+            try testing.expectEqual(codes.Code.R0014, e.code());
+            try testing.expectEqualStrings("imported module 'util' matches more than one file ('.toy-test-graph-folderclash/util.toy', '.toy-test-graph-folderclash/util/mod.toy')", e.message);
+        }
+    };
+    try withFixture(".toy-test-graph-folderclash", files, "main.toy", Check.run);
+}
+
+test "discover: a folder module in two roots is R0014" {
+    const files = &[_]FixtureFile{
+        .{ .path = "src/main.toy", .source = "import util\nfn main() -> int { return util.v() }\n" },
+        .{ .path = "src/util/mod.toy", .source = "pub fn v() -> int { return 1 }\n" },
+        .{ .path = "lib/util/mod.toy", .source = "pub fn v() -> int { return 2 }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            const e = g.err orelse return error.TestExpectedError;
+            try testing.expectEqual(codes.Code.R0014, e.code());
+            try testing.expectEqualStrings("imported module 'util' matches more than one file ('.toy-test-graph-folderroots/src/util/mod.toy', '.toy-test-graph-folderroots/lib/util/mod.toy')", e.message);
+        }
+    };
+    try withFixtureRoots(".toy-test-graph-folderroots", files, "src/main.toy", null, &.{"lib"}, Check.run);
+}
+
+test "discover: a missing module lists its file and its folder's mod.toy" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source = "import util\nfn main() -> int { return 0 }\n" },
+        .{ .path = "util/math.toy", .source = "pub fn sq(x: int) -> int { return x * x }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            const e = g.err orelse return error.TestExpectedError;
+            try testing.expectEqual(codes.Code.R0003, e.code());
+            try testing.expectEqualStrings("imported module 'util' not found (looked for '.toy-test-graph-nofolder/util.toy', '.toy-test-graph-nofolder/util/mod.toy')", e.message);
+        }
+    };
+    try withFixture(".toy-test-graph-nofolder", files, "main.toy", Check.run);
+}
+
+test "discover: a folder module's mod spelling is R0003 naming the folder import" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source = "import util\nimport util/mod\nfn main() -> int { return util.v() }\n" },
+        .{ .path = "util/mod.toy", .source = "pub fn v() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            const e = g.err orelse return error.TestExpectedError;
+            try testing.expectEqual(codes.Code.R0003, e.code());
+            try testing.expectEqualStrings("import path 'util/mod' names a folder module's entry file; import it as 'util'", e.message);
+        }
+    };
+    try withFixture(".toy-test-graph-modpath", files, "main.toy", Check.run);
+}
+
+test "discover: a lone mod import is R0003 too" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source = "import mod\nfn main() -> int { return mod.v() }\n" },
+        .{ .path = "mod.toy", .source = "pub fn v() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            const e = g.err orelse return error.TestExpectedError;
+            try testing.expectEqual(codes.Code.R0003, e.code());
+            try testing.expectEqualStrings("import path 'mod' names a folder module's entry file, which is imported by its folder's path", e.message);
+        }
+    };
+    try withFixture(".toy-test-graph-lonemod", files, "main.toy", Check.run);
+}
+
+test "discover: a directory named util.toy does not clash with util/mod.toy" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source = "import util\nfn main() -> int { return util.v() }\n" },
+        .{ .path = "util.toy/keep", .source = "" },
+        .{ .path = "util/mod.toy", .source = "pub fn v() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            try testing.expect(g.err == null);
+            try testing.expectEqualStrings(".toy-test-graph-dirfile/util/mod.toy", g.modules[g.entry().imports[0]].displayName());
+        }
+    };
+    try withFixture(".toy-test-graph-dirfile", files, "main.toy", Check.run);
+}
+
+test "discover: a wrong-case import of a file or a folder module names the on-disk spelling" {
+    const files = &[_]FixtureFile{
+        .{ .path = "main.toy", .source = "import Util\nfn main() -> int { return Util.v() }\n" },
+        .{ .path = "util/mod.toy", .source = "pub fn v() -> int { return 1 }\n" },
+    };
+    const Check = struct {
+        fn run(_: std.mem.Allocator, g: *Graph) anyerror!void {
+            const e = g.err orelse return error.TestExpectedError;
+            try testing.expectEqual(codes.Code.R0003, e.code());
+            // A case-sensitive volume finds no file at all; only a normalizing one opens it.
+            if (std.mem.indexOf(u8, e.message, "differs in case") != null)
+                try testing.expectEqualStrings("imported module 'Util' not found (on-disk file 'util/mod.toy' differs in case from the import path; looked for '.toy-test-graph-case/Util/mod.toy')", e.message);
+        }
+    };
+    try withFixture(".toy-test-graph-case", files, "main.toy", Check.run);
+}
+
+test "discover: a symlinked folder module resolves under the import's name" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-graph-symlink";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir ++ "/shared");
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/main.toy", .data = "import util\nfn main() -> int { return util.v() }\n" });
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/shared/mod.toy", .data = "pub fn v() -> int { return 1 }\n" });
+    try Io.Dir.cwd().symLink(io, "shared", dir ++ "/util", .{ .is_directory = true });
+
+    var g = try discover(gpa, io, Cache.disabled, "native", dir ++ "/main.toy", .{});
+    defer g.deinit(gpa);
+    try testing.expect(g.err == null);
+    try testing.expectEqualStrings("util", g.modules[g.entry().imports[0]].path);
+}
+
+test "discover: a warm rebuild follows util.toy replaced by util/mod.toy and back" {
+    const gpa = testing.allocator;
+    var threaded = std.Io.Threaded.init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const dir = ".toy-test-warm-folder";
+    Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().createDirPath(io, dir);
+    defer Io.Dir.cwd().deleteTree(io, dir) catch {};
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/main.toy", .data = "import util\nfn main() -> int { return util.v() }\n" });
+    const cache_dir = dir ++ "/.cache";
+
+    const Build = struct {
+        fn run(a: std.mem.Allocator, i: Io) !Graph {
+            var pack = Cache.Pack.init(a);
+            defer pack.deinit();
+            pack.load(a, i, cache_dir);
+            const cache = try Cache.initPack(i, cache_dir, &pack);
+            const g = try discover(a, i, cache, "native", dir ++ "/main.toy", .{});
+            pack.flush(i, cache_dir);
+            return g;
+        }
+        fn check(a: std.mem.Allocator, i: Io, want: []const u8) !void {
+            var g = try run(a, i);
+            defer g.deinit(a);
+            try testing.expect(g.err == null);
+            const m = &g.modules[g.entry().imports[0]];
+            try testing.expectEqualStrings("util", m.path);
+            try testing.expectEqualStrings(want, firstNumberLiteral(m).?);
+        }
+    };
+
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/util.toy", .data = "pub fn v() -> int { return 1 }\n" });
+    try Build.check(gpa, io, "1");
+    try Build.check(gpa, io, "1");
+    try Io.Dir.cwd().deleteFile(io, dir ++ "/util.toy");
+    try Io.Dir.cwd().createDirPath(io, dir ++ "/util");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/util/mod.toy", .data = "pub fn v() -> int { return 2 }\n" });
+    try Build.check(gpa, io, "2");
+    try Build.check(gpa, io, "2");
+    try Io.Dir.cwd().deleteTree(io, dir ++ "/util");
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = dir ++ "/util.toy", .data = "pub fn v() -> int { return 3 }\n" });
+    try Build.check(gpa, io, "3");
 }
 
 test "validatePath rejects path escapes" {

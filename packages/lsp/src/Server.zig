@@ -730,6 +730,21 @@ test "lsp roots: initializationOptions root and include resolve imports like --r
     try testing.expectEqual(@as(usize, 0), objGet(last, "diagnostics").?.array.items.len);
 }
 
+test "lsp folder module: import util resolves util/mod.toy as the CLI does" {
+    const gpa = testing.allocator;
+    var ts = TestSession.init(gpa);
+    defer ts.deinit();
+    try ts.initialize(.{ .rootUri = "file:///toy-lsp-folder-ws" });
+    try ts.open("file:///toy-lsp-folder-ws/util/math.toy", "pub fn sq(x: int) -> int { return x * x }\n");
+    try ts.open("file:///toy-lsp-folder-ws/util/mod.toy", "pub import util/math.{sq}\n");
+    try ts.open("file:///toy-lsp-folder-ws/main.toy", "import util.{sq}\nfn main() -> int { return sq(3) }\n");
+    try ts.finish();
+    const pubs = try ts.publishes();
+    const last = pubs[pubs.len - 1];
+    try testing.expectEqualStrings("file:///toy-lsp-folder-ws/main.toy", getStr(last, "uri").?);
+    try testing.expectEqual(@as(usize, 0), objGet(last, "diagnostics").?.array.items.len);
+}
+
 /// The 0-based index of the line carrying the `#~ ERROR` annotation — computed from the
 /// fixture itself, never from server output, so the range assertion is independent.
 fn annotatedLine(src: []const u8) u32 {
