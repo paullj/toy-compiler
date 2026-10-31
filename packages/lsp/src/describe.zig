@@ -81,25 +81,7 @@ pub const Describer = struct {
         }
         if (try d.qualifiedVariant(tok)) return true;
         // A type name is left unresolved by the resolver; match it against the type tables.
-        return d.typeDefinition(d.selectedName(d.text(tok)));
-    }
-
-    /// The item a selective import binds as `local` (`import a.{Item as local}`), else
-    /// `local` itself.
-    fn selectedName(d: *const Describer, local: []const u8) []const u8 {
-        const m = d.module();
-        if (m.nodes.len == 0) return local;
-        const tree = m.tree();
-        const prog = m.nodes[Ast.root(m.nodes).int()];
-        if (prog.tag != .program) return local;
-        for (Ast.rangeSlice(tree, prog.lhs.int())) |decl_idx| {
-            const decl = m.nodes[decl_idx.int()];
-            if (decl.tag != .import_select_decl) continue;
-            for (Ast.importItems(tree, decl)) |item| {
-                if (std.mem.eql(u8, d.text(item.bound().int()), local)) return d.text(item.name.int());
-            }
-        }
-        return local;
+        return d.typeDefinition(d.text(tok));
     }
 
     /// `Enum.variant` spelled through the type name (`Option.some(x)`) is a field access,

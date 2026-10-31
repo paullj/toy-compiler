@@ -1264,10 +1264,11 @@ pub const BodyChecker = struct {
                 return .{ .s = bc.activeStructMap().get(name), .e = bc.activeEnumMap().get(name) };
             },
             .field_access => {
-                const inner = bc.tree.nodes[r.lhs.int()];
-                if (inner.tag != .identifier or bc.resolutions[r.lhs.int()] != .module) return .{};
+                const target = switch (bc.resolutions[r.lhs.int()]) {
+                    .module => |m| m,
+                    else => return .{},
+                };
                 const g = bc.model.graph;
-                const target = g.namespaceOfIn(bc.graph_mod, bc.nameText(inner.main_token)) orelse return .{};
                 const name = bc.nameText(r.main_token);
                 return .{ .s = g.mods[target].struct_ids.get(name), .e = g.mods[target].enum_ids.get(name) };
             },
@@ -1688,11 +1689,10 @@ pub const BodyChecker = struct {
         const g = bc.model.graph;
         const n = bc.tree.nodes[(node_idx).int()];
         if (n.tag != .field_access) return null;
-        const recv = bc.tree.nodes[(n.lhs).int()];
-        if (recv.tag != .identifier) return null;
-        if (bc.resolutions[(n.lhs).int()] != .module) return null;
-        const recv_name = bc.nameText(recv.main_token);
-        const target = g.namespaceOfIn(bc.graph_mod, recv_name) orelse return null;
+        const target = switch (bc.resolutions[n.lhs.int()]) {
+            .module => |m| m,
+            else => return null,
+        };
         const member = bc.nameText(n.main_token);
         return g.mods[target].enum_ids.get(member);
     }
@@ -2066,7 +2066,7 @@ pub const BodyChecker = struct {
             }
             // The parser cannot tell a module head from an enum, so `lib.Pt { .. }`
             // lands here too; the resolver bound its head to the module.
-            if (lhs_node.tag == .identifier and bc.resolutions[n.lhs.int()] == .module)
+            if (bc.resolutions[n.lhs.int()] == .module)
                 return bc.typeOfModuleStructInit(node_idx, n, node_form, args);
             const found = switch (lhs_node.tag) {
                 .field_access => bc.qualifiedEnumId(n.lhs),
@@ -3694,10 +3694,11 @@ pub const BodyChecker = struct {
             },
             .type_app => return if (bc.appHeadIsValue(recv)) null else "type",
             .field_access => {
-                const inner = bc.tree.nodes[r.lhs.int()];
-                if (inner.tag != .identifier or bc.resolutions[r.lhs.int()] != .module) return null;
+                const target = switch (bc.resolutions[r.lhs.int()]) {
+                    .module => |m| m,
+                    else => return null,
+                };
                 const g = bc.model.graph;
-                const target = g.namespaceOfIn(bc.graph_mod, bc.nameText(inner.main_token)) orelse return null;
                 const member = bc.nameText(r.main_token);
                 if (g.mods[target].struct_ids.get(member) != null or g.mods[target].enum_ids.get(member) != null) return "type";
                 return null;

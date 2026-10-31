@@ -419,9 +419,12 @@ fn parseDecls(p: *Parser, decls: *std.ArrayList(Ast.Index)) error{OutOfMemory}!v
 /// `p.diags`; the error unwinds to the decl loop, which resyncs. This is the
 /// per-decl tolerance unit.
 fn parseDeclRecoverable(p: *Parser, decls: *std.ArrayList(Ast.Index)) Error!void {
-    // `import` decls have no `pub` modifier (imports are not re-exported).
-    if (p.at(.kw_import)) {
-        try decls.append(p.gpa, try p.parseImport());
+    // `pub import` re-exports what the import binds.
+    if (p.at(.kw_import) or (p.at(.kw_pub) and p.peek2().tag == .kw_import)) {
+        const is_pub = p.eat(.kw_pub);
+        const decl = try p.parseImport();
+        if (is_pub) try p.pub_decls.append(p.gpa, decl);
+        try decls.append(p.gpa, decl);
         return;
     }
     // `impl` blocks have no `pub` modifier either: a method's export follows its
@@ -440,7 +443,7 @@ fn parseDeclRecoverable(p: *Parser, decls: *std.ArrayList(Ast.Index)) Error!void
         .kw_protocol => try p.parseProtocolDecl(),
         .kw_type => try p.parseTypeAlias(),
         else => return p.fail(p.peek(), .P0003, if (is_pub)
-            "expected a function, struct, or enum declaration after 'pub'"
+            "expected a function, struct, enum, or import declaration after 'pub'"
         else
             "expected a function, struct, enum, or import declaration"),
     };
@@ -4632,14 +4635,21 @@ test "module-qualified variant construction parses (3-level field_access)" {
 test "pub modifier requires a declaration" {
     // Contract: parse ALWAYS returns a tree; the error travels in `diags`.
     const gpa = testing.allocator;
-    const source = "pub import a/b\n";
+    const source = "pub impl P {}\n";
     const tokens = try Lexer.tokenize(gpa, source);
     defer gpa.free(tokens);
     const result = try parse(gpa, tokens, source);
     defer gpa.free(@constCast(result.diags));
     defer freeTree(gpa, result.tree);
     try testing.expect(result.diags.len >= 1);
-    try testing.expectEqualStrings("expected a function, struct, or enum declaration after 'pub'", result.diags[0].message);
+    try testing.expectEqualStrings("expected a function, struct, enum, or import declaration after 'pub'", result.diags[0].message);
+}
+
+test "pub import of either shape renders with a pub wrapper" {
+    try expectProgram(
+        "pub import a/b\npub import c.{x as y}\nimport d\n",
+        "(program (pub (import a/b)) (pub (import c {x as y})) (import d))",
+    );
 }
 
 test "import path missing a segment after slash is an error" {

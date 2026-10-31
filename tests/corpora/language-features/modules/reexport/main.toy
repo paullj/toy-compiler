@@ -1,0 +1,33 @@
+# expect: stdout "6\n10\n5\nrect\n4\n6\n7\n8\n3\n9\n2\n"
+# expect: exit 0
+# `pub import` re-exports: `util` re-exports items of `util/shapes` (one renamed) and
+# the whole `util/extra` namespace. An importer names each one as an item of `util`,
+# selectively or qualified, and a re-exported type keeps its methods and conformances.
+import std/io.{println}
+import util.{Rect, Color as C, Named, Meters, size, pick, extra}
+import util
+
+fn show[T has Named](x: T) -> str { x.name() }
+
+fn main() -> int {
+    r := Rect { w: 2, h: 3 }
+    println(size(r))
+    println(r.perimeter())
+    m: Meters = 5
+    println(m)
+    println(show(r))
+    println(pick[int](3, 4))
+    q := util.Rect { w: 1, h: 6 }
+    println(util.size(q))
+    println(util.total(r))
+    println(extra.twice(4))
+    p: util.extra.Pt = util.extra.Pt { x: 3 }
+    println(p.x)
+    println(util.extra.twice(4) + 1)
+    d: util.extra.Dir = util.extra.Dir.down
+    println(util.extra.code(d))
+    match C.green {
+        C.red -> 1,
+        C.green -> 0,
+    }
+}

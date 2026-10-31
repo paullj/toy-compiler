@@ -192,6 +192,7 @@ module.exports = grammar({
 
     import_declaration: ($) =>
       seq(
+        optional("pub"),
         "import",
         $.import_path,
         optional(

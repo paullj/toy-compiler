@@ -130,7 +130,7 @@ pub fn isQualifiedVariant(tree: Ast.Tree, resolutions: []const Resolution, acces
     const recv = tree.nodes[recv_idx.int()];
     return switch (recv.tag) {
         .identifier => resolutions[recv_idx.int()] == .unresolved,
-        .field_access => tree.nodes[recv.lhs.int()].tag == .identifier and resolutions[recv.lhs.int()] == .module,
+        .field_access => resolutions[recv.lhs.int()] == .module,
         .type_app => !leftmostHeadIsValue(tree, resolutions, recv.lhs),
         else => false,
     };

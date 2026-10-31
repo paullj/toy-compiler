@@ -1,0 +1,12 @@
+pub struct Pt { pub x: int }
+
+pub enum Dir { up, down }
+
+pub fn twice(x: int) -> int { 2 * x }
+
+pub fn code(d: Dir) -> int {
+    match d {
+        Dir.up -> 1,
+        Dir.down -> 2,
+    }
+}

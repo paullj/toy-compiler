@@ -49,7 +49,39 @@ The list can span lines and may end with a comma. Each selected name is the item
 itself, so diagnostics and editor hovers show the item's own name (`Color`, not `C`).
 
 A selected name is local to the importing module: a module that imports this one does
-not see it.
+not see it, unless the import is a `pub import`.
+
+## Re-exports
+
+`pub import` re-exports what the import binds. `pub import a/b.{x}` makes `x` an item
+of the importing module, and a whole-module `pub import a/b` makes the namespace `b`
+one. Importers see a re-exported name as if the module declared it: selectively
+(`import util.{x}`) and qualified (`util.x`, `util.b.item`). It is still the item
+itself, so a re-exported type keeps its methods, conformances and variants, and a
+whole-module `import util` makes a re-exported struct or enum nameable bare as well.
+
+```toy
+// util.toy
+pub import util/shapes.{Rect, area as size}
+pub import util/extra
+
+// main.toy
+import util.{Rect, size}
+import util
+
+fn main() -> int {
+    r := Rect { w: 2, h: 3 }
+    return size(r) + util.size(r) + util.extra.twice(1)
+}
+```
+
+This lets a module gather its children's items into one surface. A plain `import`
+re-exports nothing, and only `pub` items can be re-exported. A `pub import` is used by
+the modules that import this one, so it never warns W0004.
+
+A `pub import` is an import, so re-exports that loop are an import cycle (R0012). No
+module outside `core/` may re-export a `core/` module, whole or selectively (R0013):
+that would hand the standard library's private layer to every importer.
 
 ## Errors
 
@@ -57,9 +89,11 @@ not see it.
 |---|---|
 | R0003 | the imported module does not exist |
 | R0004 | two imports, or an import and a top-level declaration, bind one name |
-| R0005 | a referenced or selected item is not `pub` |
+| R0005 | a referenced or selected item is not `pub`, or is imported without `pub import` |
 | R0006 | the module has no item of a referenced or selected name |
-| R0013 | a user module imports a private `core/` module, whole or selectively |
+| R0012 | imports, or re-exports, form a cycle |
+| R0013 | a user module imports a private `core/` module, or any module outside `core/` re-exports one |
+| T0011 | a selected type is bound under a builtin type's name (`Shape as int`) |
 | W0004 | an import, or a selected name, is never used |
 
 `toy explain <code>` shows the page for each.

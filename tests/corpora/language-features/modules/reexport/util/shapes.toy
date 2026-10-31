@@ -1,0 +1,21 @@
+pub struct Rect { pub w: int, pub h: int }
+
+pub enum Color { red, green }
+
+pub protocol Named {
+    fn name(self) -> str
+}
+
+pub type Meters = int
+
+impl Rect {
+    fn perimeter(self) -> int { 2 * (self.w + self.h) }
+}
+
+impl Rect has Named {
+    fn name(self) -> str { "rect" }
+}
+
+pub fn area(r: Rect) -> int { r.w * r.h }
+
+pub fn pick[T](_a: T, b: T) -> T { b }

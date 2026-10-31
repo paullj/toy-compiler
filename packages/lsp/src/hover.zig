@@ -974,3 +974,25 @@ test "hover on a selectively imported name under its alias shows the item it nam
         try testing.expectEqualStrings(want, h.value);
     }
 }
+
+test "hover on a name a re-export renames shows the item it names" {
+    const gpa = testing.allocator;
+    var docs: @import("Documents.zig") = .{};
+    defer docs.deinit(gpa);
+    try docs.put(gpa, "file:///r/inner.toy", "pub struct Pt { pub x: int }\n", 1);
+    try docs.put(gpa, "file:///r/util.toy", "pub import inner.{Pt as Point}\n", 1);
+    const ws: Workspace = .{ .io = std.Io.failing, .docs = &docs, .disk = false };
+    const src =
+        \\import util.{Point}
+        \\
+        \\fn main() -> int {
+        \\    p := Point { x: 1 }
+        \\    return p.x
+        \\}
+        \\
+    ;
+    const pos = @import("test_util.zig").posOf(src, "Point { x");
+    var h = (try hoverAt(gpa, ws, src, pos.line, pos.character, "file:///r/main.toy")) orelse return error.NoHover;
+    defer h.deinit();
+    try testing.expectEqualStrings("```toy\npub struct Pt { pub x: int }\n```", h.value);
+}

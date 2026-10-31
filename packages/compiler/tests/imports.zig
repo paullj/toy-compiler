@@ -1,6 +1,7 @@
-//! Warm-cache soundness for selective imports. A selection binds a local name to another
-//! module's item, so changing what a name selects must rebuild every fn that names it,
-//! even though the fn's own text is unchanged.
+//! Warm-cache soundness for selective imports and re-exports. A selection binds a local
+//! name to another module's item, so changing what a name selects, or what a `pub import`
+//! re-exports under it, must rebuild every fn that names it, even though the fn's own text
+//! is unchanged.
 
 const flip = @import("places.zig").flip;
 
@@ -41,5 +42,30 @@ test "warm cache: a selected fn whose module changes its body serves the new bod
         5,
         &.{.{ .name = "lib.toy", .src = "pub fn val() -> int { 6 }\n" }},
         6,
+    );
+}
+
+test "warm cache: re-pointing a re-export rebuilds the importer's caller" {
+    const lib =
+        \\pub fn one() -> int { 1 }
+        \\pub fn two() -> int { 2 }
+        \\
+    ;
+    try flip(
+        ".toy-test-imports-reexport",
+        &.{ .{ .name = "main.toy", .src = "import mid.{f}\nimport mid\nfn main() -> int { f() + mid.f() }\n" }, .{ .name = "mid.toy", .src = "pub import lib.{one as f}\n" }, .{ .name = "lib.toy", .src = lib } },
+        2,
+        &.{.{ .name = "mid.toy", .src = "pub import lib.{two as f}\n" }},
+        4,
+    );
+}
+
+test "warm cache: a re-exported struct whose layout changes rebuilds the fns that touch it" {
+    try flip(
+        ".toy-test-imports-reexport-struct",
+        &.{ .{ .name = "main.toy", .src = "import mid.{S, mk}\nfn get(s: S) -> int { s.x }\nfn main() -> int { get(mk(3)) }\n" }, .{ .name = "mid.toy", .src = "pub import lib.{S, mk}\n" }, .{ .name = "lib.toy", .src = "pub struct S { pub x: int }\npub fn mk(x: int) -> S { S { x: x } }\n" } },
+        3,
+        &.{.{ .name = "lib.toy", .src = "pub struct S { pub pad: int, pub x: int }\npub fn mk(x: int) -> S { S { pad: 9, x: x + 1 } }\n" }},
+        4,
     );
 }
